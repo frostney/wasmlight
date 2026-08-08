@@ -1,0 +1,12 @@
+# Hash-stable checkouts everywhere: lwpt's frozen install verifies the
+# committed .lwpt/modules tree byte-for-byte, so Windows autocrlf must
+# never rewrite text files. FPC is LF-happy on all platforms.
+* text=auto eol=lf
+*.tar.gz binary
+*.zip binary
+*.p12 binary
+
+# Compiled WebAssembly fixtures. These are byte-exact by design — the
+# decoder is asserted against their precise section offsets — so they must
+# never go through text normalisation, whatever content heuristics guess.
+*.wasm binary

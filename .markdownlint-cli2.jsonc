@@ -1,0 +1,33 @@
+// markdownlint-cli2 config for wasmlight's Markdown corpus.
+//
+// Consumed by .github/workflows/pr.yml's `docs` job
+// (DavidAnson/markdownlint-cli2-action@v19). The job is blocking — any
+// failure rejects the PR. Mirrors lwpt's config.
+//
+// Disabled rules below are deliberate: they're either incompatible
+// with our documentation style (long-form prose) or with legitimate
+// bare-URL one-liners.
+{
+  "config": {
+    "MD013": false,   // line-length — our docs intentionally have long sentences
+    "MD024": false,   // no-duplicate-heading — docs repeat section headings
+    "MD033": false,   // no-inline-html — we use occasional <details> blocks
+    "MD034": false,   // no-bare-urls — legitimate bare https://... lines
+    "MD041": false,   // first-line-must-be-h1 — some docs start with their title which IS the H1
+    "MD060": false,   // table-column-style — keep the compact separator style
+
+    "MD003": { "style": "atx" },           // heading style: # not underline
+    "MD007": { "indent": 2 },              // list indent: 2 spaces
+    "MD040": true,                          // fenced-code-blocks must have a language tag
+    "MD046": { "style": "fenced" }         // code-block style: ``` not indent
+  },
+  "ignores": [
+    "build/",
+    "node_modules/",
+    ".lwpt/",
+    ".agents/",
+    ".claude/",
+    "tests/spec/testsuite/",
+    "CHANGELOG.md"
+  ]
+}

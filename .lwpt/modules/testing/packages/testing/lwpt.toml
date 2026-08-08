@@ -1,0 +1,19 @@
+# Testing — assertion + suite + runner framework for *.Test.pas files.
+#
+# Co-developed with GocciaScript and retained byte-verbatim. Established as
+# an in-monorepo LWPT package per ADR-0015 (replaces the earlier embedded-
+# blob + `lwpt export testing` model with regular workspace-package
+# consumption). The CmdTest discovery loop in LWPT.Command.Testing finds tests
+# via this package's units once `lwpt install` has linked it into
+# `.lwpt/modules/testing/` — same path as every other workspace dep.
+#
+# The framework canary (TestingPascalLibrary.Test.pas) is the
+# package's self-test: it exercises TPL's most basic invariants
+# through writeln + exit-code assertions, using TPL itself at
+# arm's length. If THIS test fails or fails to compile, the
+# framework is what's broken, not the consumer's tests of it.
+
+[package]
+name    = "testing"
+version = "0.1.0"
+units   = ["source"]

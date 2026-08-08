@@ -1,0 +1,514 @@
+{ Unit suite for Wasm.Binary. The LEB128 cases are the ones that matter:
+  the boundary encodings, and every way a malformed encoding must be
+  rejected rather than silently truncated. }
+program Wasm.Binary.Test;
+
+{$I Shared.inc}
+
+uses
+  SysUtils,
+
+  TestingPascalLibrary,
+  Wasm.Binary,
+  Wasm.Core;
+
+type
+  TBinaryTests = class(TTestSuite)
+  private
+    { The reader borrows its buffer and never owns it, so the buffer has
+      to outlive every reader built over it — hence a suite field rather
+      than a local in the helper. }
+    FBuffer: TWasmBytes;
+
+    function ReaderOver(const AValues: array of Byte): TWasmReader;
+    { Runs AReadKind over AValues and asserts it raises EWasmDecodeError.
+      AReadKind picks the primitive so one helper covers every width. }
+    procedure ExpectRejected(const AReadKind, ADescription: string;
+      const AValues: array of Byte);
+    { Asserts rejection and names the case in the failure message. Phrased
+      as a value comparison rather than a bare Fail() so the test records
+      an assertion even on the happy path. }
+    procedure AssertRejected(const ADescription: string;
+      const ARejected: Boolean);
+  public
+    procedure SetupTests; override;
+
+    procedure TestReadByteAdvances;
+    procedure TestUnsignedSingleByte;
+    procedure TestUnsignedMultiByte;
+    procedure TestUnsignedU32Max;
+    procedure TestUnsignedU64Max;
+    procedure TestSignedNegativeOne;
+    procedure TestSignedTwoByteNegative;
+    procedure TestSignedPositivePadding;
+    procedure TestSignedMultiByteNegative;
+    procedure TestSignedI32Extremes;
+    procedure TestSignedI64Min;
+    procedure TestRejectsOverWideU32;
+    procedure TestRejectsOverLongU32;
+    procedure TestRejectsOverWideI32;
+    procedure TestRejectsTruncatedLeb;
+    procedure TestFixedU32IsLittleEndian;
+    procedure TestReadName;
+    procedure TestReadNameRejectsOverrun;
+    procedure TestSubReaderIsBounded;
+    procedure TestRemainingAndEof;
+    procedure TestAcceptsLegalSignFilledEncodings;
+    procedure TestAcceptsLegalZeroPaddedEncodings;
+    procedure TestReadS33SpansTypeCodesAndIndices;
+    procedure TestReadNameRejectsInvalidUtf8;
+    procedure TestReadNameAcceptsValidUtf8;
+    procedure TestPositionSetter;
+  end;
+
+function TBinaryTests.ReaderOver(const AValues: array of Byte): TWasmReader;
+var
+  I: Integer;
+begin
+  SetLength(FBuffer, Length(AValues));
+  for I := 0 to High(AValues) do
+    FBuffer[I] := AValues[I];
+  Result.InitFromBytes(FBuffer);
+end;
+
+procedure TBinaryTests.ExpectRejected(const AReadKind, ADescription: string;
+  const AValues: array of Byte);
+var
+  Reader: TWasmReader;
+  Rejected: Boolean;
+begin
+  if (AReadKind <> 'u32') and (AReadKind <> 'u64') and (AReadKind <> 'i32')
+     and (AReadKind <> 'i64') and (AReadKind <> 's33')
+     and (AReadKind <> 'name') then
+    Fail('unknown read kind ' + AReadKind);
+
+  Reader := ReaderOver(AValues);
+  Rejected := False;
+
+  { The assertion is made after the try, not inside the handler: a Fail()
+    in the try block would be swallowed by the handler, and FPC will not
+    parse a generic call as the lone statement of an `on ... do`. }
+  try
+    if AReadKind = 'u32' then
+      Reader.ReadU32
+    else if AReadKind = 'u64' then
+      Reader.ReadU64
+    else if AReadKind = 'i32' then
+      Reader.ReadI32
+    else if AReadKind = 'i64' then
+      Reader.ReadI64
+    else if AReadKind = 's33' then
+      Reader.ReadS33
+    else
+      Reader.ReadName;
+  except
+    on E: EWasmDecodeError do
+      Rejected := True;
+  end;
+
+  AssertRejected(ADescription, Rejected);
+end;
+
+procedure TBinaryTests.AssertRejected(const ADescription: string;
+  const ARejected: Boolean);
+var
+  Outcome: string;
+begin
+  if ARejected then
+    Outcome := 'rejected'
+  else
+    Outcome := 'ACCEPTED';
+  Expect<string>(ADescription + ': ' + Outcome)
+    .ToBe(ADescription + ': rejected');
+end;
+
+procedure TBinaryTests.TestReadByteAdvances;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$01, $02]);
+  Expect<Integer>(R.ReadByte).ToBe(1);
+  Expect<Integer>(Integer(R.Position)).ToBe(1);
+  Expect<Integer>(R.PeekByte).ToBe(2);
+  Expect<Integer>(Integer(R.Position)).ToBe(1);
+  Expect<Integer>(R.ReadByte).ToBe(2);
+  Expect<Boolean>(R.Eof).ToBe(True);
+end;
+
+procedure TBinaryTests.TestUnsignedSingleByte;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$00, $7F]);
+  Expect<Int64>(Int64(R.ReadU32)).ToBe(0);
+  Expect<Int64>(Int64(R.ReadU32)).ToBe(127);
+end;
+
+procedure TBinaryTests.TestUnsignedMultiByte;
+var
+  R: TWasmReader;
+begin
+  { 624485, the spec's own worked example. }
+  R := ReaderOver([$E5, $8E, $26]);
+  Expect<Int64>(Int64(R.ReadU32)).ToBe(624485);
+  Expect<Boolean>(R.Eof).ToBe(True);
+end;
+
+procedure TBinaryTests.TestUnsignedU32Max;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$FF, $FF, $FF, $FF, $0F]);
+  Expect<Int64>(Int64(R.ReadU32)).ToBe(4294967295);
+end;
+
+procedure TBinaryTests.TestUnsignedU64Max;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $01]);
+  { Compared as hex: the assertion helper has no unsigned-64 formatter, so
+    a hex string keeps a failure message readable. }
+  Expect<string>(IntToHex(Int64(R.ReadU64), 16)).ToBe('FFFFFFFFFFFFFFFF');
+end;
+
+procedure TBinaryTests.TestSignedNegativeOne;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$7F]);
+  Expect<Integer>(R.ReadI32).ToBe(-1);
+end;
+
+procedure TBinaryTests.TestSignedTwoByteNegative;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$80, $7F]);
+  Expect<Integer>(R.ReadI32).ToBe(-128);
+end;
+
+procedure TBinaryTests.TestSignedPositivePadding;
+var
+  R: TWasmReader;
+begin
+  { 63 fits one byte; 64 does not, because bit 6 is the sign bit. }
+  R := ReaderOver([$3F]);
+  Expect<Integer>(R.ReadI32).ToBe(63);
+  R := ReaderOver([$C0, $00]);
+  Expect<Integer>(R.ReadI32).ToBe(64);
+end;
+
+procedure TBinaryTests.TestSignedMultiByteNegative;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$C0, $BB, $78]);
+  Expect<Integer>(R.ReadI32).ToBe(-123456);
+end;
+
+procedure TBinaryTests.TestSignedI32Extremes;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$FF, $FF, $FF, $FF, $07]);
+  Expect<Integer>(R.ReadI32).ToBe(2147483647);
+  R := ReaderOver([$80, $80, $80, $80, $78]);
+  Expect<Integer>(R.ReadI32).ToBe(Low(Integer));
+end;
+
+procedure TBinaryTests.TestSignedI64Min;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$80, $80, $80, $80, $80, $80, $80, $80, $80, $7F]);
+  Expect<Int64>(R.ReadI64).ToBe(Low(Int64));
+end;
+
+procedure TBinaryTests.TestRejectsOverWideU32;
+begin
+  { The fifth byte of a u32 carries four significant bits; $1F sets a
+    fifth, so the encoding spells a value wider than the type. }
+  ExpectRejected('u32', 'u32 with bits above 32',
+    [$FF, $FF, $FF, $FF, $1F]);
+  ExpectRejected('u64', 'u64 with bits above 64',
+    [$FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $02]);
+end;
+
+procedure TBinaryTests.TestRejectsOverLongU32;
+begin
+  { Six bytes for a u32: the fifth still sets its continuation bit. }
+  ExpectRejected('u32', 'u32 longer than five bytes',
+    [$80, $80, $80, $80, $80, $00]);
+end;
+
+procedure TBinaryTests.TestRejectsOverWideI32;
+begin
+  { $4F has its sign bit (bit 3) set but does not sign-extend bits 4..6. }
+  ExpectRejected('i32', 'i32 without full sign extension',
+    [$FF, $FF, $FF, $FF, $4F]);
+  ExpectRejected('i32', 'i32 with bits above 32',
+    [$FF, $FF, $FF, $FF, $17]);
+end;
+
+procedure TBinaryTests.TestRejectsTruncatedLeb;
+begin
+  { Continuation bit set on the last available byte. }
+  ExpectRejected('u32', 'truncated u32', [$80]);
+  ExpectRejected('i64', 'truncated i64', [$FF, $FF]);
+end;
+
+procedure TBinaryTests.TestFixedU32IsLittleEndian;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$01, $00, $00, $00]);
+  Expect<Int64>(Int64(R.ReadFixedU32)).ToBe(1);
+  R := ReaderOver([$78, $56, $34, $12]);
+  Expect<Int64>(Int64(R.ReadFixedU32)).ToBe($12345678);
+end;
+
+procedure TBinaryTests.TestReadName;
+var
+  R: TWasmReader;
+begin
+  R := ReaderOver([$04, Ord('n'), Ord('a'), Ord('m'), Ord('e')]);
+  Expect<string>(R.ReadName).ToBe('name');
+  Expect<Boolean>(R.Eof).ToBe(True);
+
+  R := ReaderOver([$00]);
+  Expect<string>(R.ReadName).ToBe('');
+end;
+
+procedure TBinaryTests.TestReadNameRejectsOverrun;
+begin
+  { Declares nine bytes, supplies two. }
+  ExpectRejected('name', 'name longer than the input',
+    [$09, Ord('a'), Ord('b')]);
+end;
+
+procedure TBinaryTests.TestSubReaderIsBounded;
+var
+  R, Sub: TWasmReader;
+  Rejected: Boolean;
+begin
+  R := ReaderOver([$AA, $BB, $CC, $DD]);
+  Sub := R.SubReader(2);
+  Expect<Integer>(Integer(Sub.Size)).ToBe(2);
+  Expect<Integer>(Sub.ReadByte).ToBe($AA);
+  Expect<Integer>(Sub.ReadByte).ToBe($BB);
+  Expect<Boolean>(Sub.Eof).ToBe(True);
+
+  { The parent advanced past the sub-range, not into it. }
+  Expect<Integer>(Integer(R.Position)).ToBe(2);
+  Expect<Integer>(R.ReadByte).ToBe($CC);
+
+  Rejected := False;
+  try
+    Sub.ReadByte;
+  except
+    on E: EWasmDecodeError do
+      Rejected := True;
+  end;
+  AssertRejected('read past a sub-reader bound', Rejected);
+end;
+
+procedure TBinaryTests.TestRemainingAndEof;
+var
+  R: TWasmReader;
+  Rejected: Boolean;
+begin
+  R := ReaderOver([$01, $02, $03]);
+  Expect<Integer>(Integer(R.Remaining)).ToBe(3);
+  Expect<Boolean>(R.Eof).ToBe(False);
+  R.Skip(3);
+  Expect<Integer>(Integer(R.Remaining)).ToBe(0);
+  Expect<Boolean>(R.Eof).ToBe(True);
+
+  Rejected := False;
+  try
+    R.Skip(1);
+  except
+    on E: EWasmDecodeError do
+      Rejected := True;
+  end;
+  AssertRejected('skip past end of input', Rejected);
+end;
+
+procedure TBinaryTests.TestAcceptsLegalSignFilledEncodings;
+var
+  R: TWasmReader;
+begin
+  { The spec caps sN at ceil(N/7) bytes and its Note says trailing
+    sign-fill WITHIN that bound is allowed. Every other LEB128 test here
+    asserts that something malformed is rejected; this asserts the
+    converse, which is the gap a real bug lived in — a 9-byte s64 leaves
+    the sign-extension shift at 63, where negating a power of two
+    overflows and raised EIntOverflow instead of returning a value.
+    https://webassembly.github.io/spec/core/binary/values.html#binary-int }
+
+  { -1 as s64 in 9 bytes (maximal is 10). }
+  R := ReaderOver([$FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $7F]);
+  Expect<Int64>(R.ReadI64).ToBe(-1);
+
+  { -(2^56) in 9 bytes: the same shift, a different value. }
+  R := ReaderOver([$80, $80, $80, $80, $80, $80, $80, $80, $7F]);
+  Expect<string>(IntToHex(R.ReadI64, 16)).ToBe('FF00000000000000');
+
+  { -1 as s64 in the full 10 bytes, which routes around the shift above
+    and so would pass even with the bug present. }
+  R := ReaderOver([$FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $7F]);
+  Expect<Int64>(R.ReadI64).ToBe(-1);
+
+  { -1 as s32, sign-filled to the maximal five bytes. }
+  R := ReaderOver([$FF, $FF, $FF, $FF, $7F]);
+  Expect<Integer>(R.ReadI32).ToBe(-1);
+end;
+
+procedure TBinaryTests.TestAcceptsLegalZeroPaddedEncodings;
+var
+  R: TWasmReader;
+begin
+  { The unsigned counterpart: zero padding up to the width limit is
+    legal, however redundant. }
+  R := ReaderOver([$80, $80, $80, $80, $00]);
+  Expect<Int64>(Int64(R.ReadU32)).ToBe(0);
+
+  R := ReaderOver([$80, $80, $80, $80, $80, $80, $80, $80, $80, $00]);
+  Expect<string>(IntToHex(Int64(R.ReadU64), 16)).ToBe('0000000000000000');
+
+  { A small value spelled the long way. }
+  R := ReaderOver([$81, $80, $80, $80, $00]);
+  Expect<Int64>(Int64(R.ReadU32)).ToBe(1);
+end;
+
+procedure TBinaryTests.TestReadS33SpansTypeCodesAndIndices;
+var
+  R: TWasmReader;
+begin
+  { s33 is the width used wherever a type code and a type index share a
+    position. It has to reach both: negative type codes AND indices past
+    what an s32 holds. }
+  R := ReaderOver([$7F]);
+  Expect<Int64>(R.ReadS33).ToBe(-1);        { i32's type code }
+  R := ReaderOver([$70]);
+  Expect<Int64>(R.ReadS33).ToBe(-16);       { funcref's heap type }
+  R := ReaderOver([$00]);
+  Expect<Int64>(R.ReadS33).ToBe(0);         { type index 0 }
+
+  { 2^31 — a valid type index that ReadI32 would reject, which is why
+    reaching for ReadI32 in a heap-type position is wrong. }
+  R := ReaderOver([$80, $80, $80, $80, $08]);
+  Expect<Int64>(R.ReadS33).ToBe(Int64(2147483648));
+
+  { Still bounded: six bytes exceeds ceil(33/7) = 5. }
+  ExpectRejected('s33', 's33 longer than five bytes',
+    [$80, $80, $80, $80, $80, $00]);
+end;
+
+procedure TBinaryTests.TestReadNameRejectsInvalidUtf8;
+begin
+  { The UTF-8 side condition lives in the BINARY grammar, so these are
+    malformed modules, not invalid ones — they must fail in the reader.
+    Each family below is one the spec's `utf8` relation excludes and a
+    permissive check would wave through. }
+  ExpectRejected('name', 'lone continuation byte', [$01, $80]);
+  ExpectRejected('name', 'byte that never starts a sequence', [$01, $FF]);
+  ExpectRejected('name', 'truncated two-byte sequence', [$01, $C2]);
+  ExpectRejected('name', 'overlong NUL', [$02, $C0, $80]);
+  ExpectRejected('name', 'overlong two-byte form', [$02, $C1, $BF]);
+  ExpectRejected('name', 'surrogate U+D800', [$03, $ED, $A0, $80]);
+  ExpectRejected('name', 'above U+10FFFF', [$04, $F5, $80, $80, $80]);
+  ExpectRejected('name', 'four-byte form past U+10FFFF',
+    [$04, $F4, $90, $80, $80]);
+  ExpectRejected('name', 'overlong four-byte form',
+    [$04, $F0, $8F, $BF, $BF]);
+  ExpectRejected('name', 'sequence truncated by the name length',
+    [$02, $E2, $82]);
+end;
+
+procedure TBinaryTests.TestReadNameAcceptsValidUtf8;
+var
+  R: TWasmReader;
+begin
+  { The boundary cases on the accepting side, so the validator cannot be
+    tightened into rejecting legal names. }
+  R := ReaderOver([$02, $C2, $80]);                 { U+0080, shortest 2-byte }
+  Expect<Integer>(Length(R.ReadName)).ToBe(2);
+  R := ReaderOver([$03, $E0, $A0, $80]);            { U+0800, shortest 3-byte }
+  Expect<Integer>(Length(R.ReadName)).ToBe(3);
+  R := ReaderOver([$03, $ED, $9F, $BF]);            { U+D7FF, just below surrogates }
+  Expect<Integer>(Length(R.ReadName)).ToBe(3);
+  R := ReaderOver([$03, $EE, $80, $80]);            { U+E000, just above them }
+  Expect<Integer>(Length(R.ReadName)).ToBe(3);
+  R := ReaderOver([$04, $F0, $90, $80, $80]);       { U+10000, shortest 4-byte }
+  Expect<Integer>(Length(R.ReadName)).ToBe(4);
+  R := ReaderOver([$04, $F4, $8F, $BF, $BF]);       { U+10FFFF, the maximum }
+  Expect<Integer>(Length(R.ReadName)).ToBe(4);
+  R := ReaderOver([$03, $E2, $82, $AC]);            { U+20AC euro sign }
+  Expect<Integer>(Length(R.ReadName)).ToBe(3);
+end;
+
+procedure TBinaryTests.TestPositionSetter;
+var
+  R: TWasmReader;
+  Rejected: Boolean;
+begin
+  R := ReaderOver([$0A, $0B, $0C]);
+  R.Position := 2;
+  Expect<Integer>(R.ReadByte).ToBe($0C);
+
+  { Seeking to exactly the end is legal; past it is not. }
+  R.Position := 3;
+  Expect<Boolean>(R.Eof).ToBe(True);
+
+  Rejected := False;
+  try
+    R.Position := 4;
+  except
+    on E: EWasmDecodeError do
+      Rejected := True;
+  end;
+  AssertRejected('seek past end of input', Rejected);
+end;
+
+procedure TBinaryTests.SetupTests;
+begin
+  Test('ReadByte and PeekByte track position', TestReadByteAdvances);
+  Test('single-byte unsigned LEB128', TestUnsignedSingleByte);
+  Test('multi-byte unsigned LEB128', TestUnsignedMultiByte);
+  Test('u32 maximum', TestUnsignedU32Max);
+  Test('u64 maximum', TestUnsignedU64Max);
+  Test('signed LEB128 -1', TestSignedNegativeOne);
+  Test('signed LEB128 -128', TestSignedTwoByteNegative);
+  Test('signed LEB128 needs padding past bit 6', TestSignedPositivePadding);
+  Test('signed LEB128 -123456', TestSignedMultiByteNegative);
+  Test('i32 extremes', TestSignedI32Extremes);
+  Test('i64 minimum', TestSignedI64Min);
+  Test('rejects over-wide unsigned encodings', TestRejectsOverWideU32);
+  Test('rejects over-long unsigned encodings', TestRejectsOverLongU32);
+  Test('rejects over-wide signed encodings', TestRejectsOverWideI32);
+  Test('rejects truncated encodings', TestRejectsTruncatedLeb);
+  Test('fixed-width u32 is little-endian', TestFixedU32IsLittleEndian);
+  Test('reads names', TestReadName);
+  Test('rejects a name longer than the input', TestReadNameRejectsOverrun);
+  Test('sub-readers are bounded', TestSubReaderIsBounded);
+  Test('Remaining and Eof', TestRemainingAndEof);
+  Test('accepts legal sign-filled encodings',
+    TestAcceptsLegalSignFilledEncodings);
+  Test('accepts legal zero-padded encodings',
+    TestAcceptsLegalZeroPaddedEncodings);
+  Test('s33 spans type codes and type indices',
+    TestReadS33SpansTypeCodesAndIndices);
+  Test('rejects names that are not valid UTF-8',
+    TestReadNameRejectsInvalidUtf8);
+  Test('accepts valid UTF-8 names at the boundaries',
+    TestReadNameAcceptsValidUtf8);
+  Test('Position setter seeks and bounds', TestPositionSetter);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TBinaryTests.Create('Wasm.Binary'));
+  TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
+end.

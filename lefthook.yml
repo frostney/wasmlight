@@ -1,0 +1,31 @@
+# wasmlight pre-commit hook.
+#
+# Install once per fresh clone:  lefthook install
+#
+# Local pre-commit runs the canonical formatter (`lwpt format`) and
+# re-stages any files it rewrites. The heavyweight gates — `lwpt build`,
+# `lwpt test` — run on the PR / CI workflows (see .github/workflows/) so
+# local commits stay fast.
+#
+# lwpt is expected on PATH (`brew install frostney/tap/lwpt`, or the
+# release tarball — see docs/quick-start.md). Point WASMLIGHT_LWPT at
+# another lwpt binary to override.
+#
+# Do NOT bypass with `git commit --no-verify` unless a maintainer
+# explicitly authorises it on the PR.
+
+min_version: 1.5.0
+
+pre-commit:
+  parallel: true
+
+  commands:
+
+    format:
+      glob: "*.{pas,inc,dpr,toml}"
+      run: ${WASMLIGHT_LWPT:-lwpt} format
+      stage_fixed: true
+      fail_text: |
+        lwpt format failed. Inspect the output above; the formatter only
+        fails when it cannot parse a file. If lwpt is missing entirely
+        (fresh clone), install it first — see docs/quick-start.md.

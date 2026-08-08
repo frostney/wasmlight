@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "wasm": {
+      "command": "npx",
+      "args": ["-y", "wasm-mcp@0.2.16"]
+    }
+  }
+}

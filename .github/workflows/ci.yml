@@ -1,0 +1,181 @@
+name: CI
+
+# Post-merge confirmation across the full platform matrix, mirroring the
+# lwpt / duetto CI pattern. Sister workflow:
+#
+#   pr.yml — every PR: the fast three-platform gate (the authoritative
+#            pre-merge signal).
+#
+# ci.yml runs ONLY on push to main + manual dispatch. PRs do not trigger
+# it — pr.yml owns the PR flow. This avoids paying for the same commit
+# twice; post-merge, ci.yml runs once on main to confirm the merged tree
+# is green on every architecture.
+#
+# The lwpt toolchain comes from its published release (checksum-verified
+# per-platform archive, no sibling checkout, no bootstrap); dependencies
+# resolve from the same release tag and are verified against the
+# committed lockfile + .lwpt/modules tree via install --frozen.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LWPT_VERSION: "0.4.0"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            lwpt-asset: linux-x64
+            fpc-install: apt
+            format-check: true   # platform-independent; one runner runs it
+          - target: aarch64-linux
+            runner: ubuntu-24.04-arm
+            lwpt-asset: linux-arm64
+            fpc-install: apt
+          - target: aarch64-darwin
+            runner: macos-latest
+            lwpt-asset: macos-arm64
+            fpc-install: brew
+          - target: x86_64-darwin
+            runner: macos-15-intel
+            lwpt-asset: macos-x64
+            fpc-install: brew
+          - target: x86_64-win64
+            runner: windows-latest
+            lwpt-asset: windows-x64
+            lwpt-archive: zip
+            fpc-install: installer
+            fpc-win-target: x86_64-win64
+            exe: .exe
+          - target: i386-win32
+            runner: windows-latest
+            lwpt-asset: windows-x86
+            lwpt-archive: zip
+            fpc-install: installer
+            fpc-win-target: i386-win32
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install FPC (apt)
+        if: matrix.fpc-install == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install FPC (brew)
+        if: matrix.fpc-install == 'brew'
+        run: |
+          brew install fpc
+          fpc -iV
+
+      - name: Install FPC (Windows combo installer)
+        if: matrix.fpc-install == 'installer'
+        shell: pwsh
+        run: |
+          $url = "https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile fpc-setup.exe -MaximumRedirection 10 -UserAgent "Wget/1.21"
+          $f = Get-Item fpc-setup.exe
+          Write-Host "downloaded $($f.Length) bytes"
+          $hash = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower()
+          if ($hash -ne "8c255390544b051388b577eb61c6191a04883264afe0e3369b3600a56daf7bde") { Write-Error "installer SHA-256 mismatch: $hash"; exit 1 }
+          $proc = Start-Process -Wait -PassThru -FilePath $f.FullName -ArgumentList "/VERYSILENT","/NORESTART","/SP-","/DIR=C:\fpc322"
+          Write-Host "installer exit code $($proc.ExitCode)"
+          if ($proc.ExitCode -ne 0) { exit 1 }
+
+      - name: Locate FPC (Windows)
+        if: matrix.fpc-install == 'installer'
+        run: |
+          FPC_BIN=$(find /c/fpc322 -name fpc.exe -type f 2>/dev/null | head -1)
+          if [ -z "$FPC_BIN" ]; then echo "::error::fpc.exe not found in the combo install"; exit 1; fi
+          echo "Using FPC at $FPC_BIN"
+          echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
+          echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
+          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
+          if [ -n "$INSTANTFPC_BIN" ]; then
+            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
+          fi
+          FPC_UNIT_PATHS=""
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+            UNIT_PATH=""
+            for unit_target in ${{ matrix.fpc-win-target }} i386-win32 x86_64-win64; do
+              UNIT_PATH=$(find /c/fpc322 -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
+              if [ -n "$UNIT_PATH" ]; then break; fi
+            done
+            if [ -n "$UNIT_PATH" ]; then
+              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
+              if [ -z "$FPC_UNIT_PATHS" ]; then
+                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
+              else
+                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
+              fi
+            fi
+          done
+          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+          if [ "${{ matrix.fpc-win-target }}" = "x86_64-win64" ]; then
+            PPCX64=$(find /c/fpc322 -name ppcrossx64.exe -type f 2>/dev/null | head -1)
+            if [ -z "$PPCX64" ]; then echo "::error::ppcrossx64.exe not found in the combo install"; exit 1; fi
+            echo "LWPT_FPC=$(cygpath -w "$PPCX64")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ASSET="lwpt-${LWPT_VERSION}-${{ matrix.lwpt-asset }}"
+          BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
+          EXT="tar.gz"
+          if [ "${{ matrix.lwpt-archive }}" = "zip" ]; then EXT="zip"; fi
+          curl -fsSLO "${BASE}/${ASSET}.${EXT}"
+          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
+          else
+            sha256sum -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
+          fi
+          if [ "$EXT" = "zip" ]; then unzip -q "${ASSET}.zip"; else tar xzf "${ASSET}.tar.gz"; fi
+          echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
+
+      - name: lwpt install --frozen (verify lockfile + committed modules)
+        run: lwpt install --frozen
+
+      - name: lwpt format --check (one runner)
+        if: matrix.format-check == true
+        run: lwpt format --check
+
+      - name: lwpt build (all programs)
+        run: lwpt build
+
+      - name: lwpt test (co-located unit suites)
+        run: lwpt test
+
+      - name: wasmlight smoke
+        run: |
+          set -euo pipefail
+          ./build/wasmlight${{ matrix.exe }} --version
+          # A real compiled module whose data count section (id 12) precedes
+          # its code section (id 10) — the case a decoder written on
+          # increasing section ids rejects.
+          ./build/wasmlight${{ matrix.exe }} inspect tests/fixtures/valid/datacount.wasm
+          printf 'notwasm!' > "$RUNNER_TEMP/bad.wasm"
+          if ./build/wasmlight${{ matrix.exe }} inspect "$RUNNER_TEMP/bad.wasm"; then
+            echo "::error::a non-module was accepted"; exit 1
+          fi
