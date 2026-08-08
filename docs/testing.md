@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Two suites today, 33 tests, all green.
+  independent programs. Eleven suites today, 233 tests, all green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite is the intended external
@@ -75,7 +75,16 @@ instead.
 | Suite | Covers |
 | --- | --- |
 | `Wasm.Binary.Test` | LEB128 boundary encodings (u32/u64/s32/s64 extremes), and every rejection path: overlong, over-wide, truncated, unterminated. Plus fixed-width reads, names, sub-reader bounds, cursor arithmetic. |
-| `Wasm.Decoder.Test` | Preamble acceptance and rejection, section walk and extents, ordering rules, duplicate sections, custom-section names and the overrun case, section lookup. |
+| `Wasm.Core.Test` | The type vocabulary and the section-order table — the two encodings this project once got wrong: signed type codes sharing an encoding space with type indices, and section ids not being the encoding order. |
+| `Wasm.Decoder.Common.Test` | The shared type-form readers: type codes as literal bytes (overlong sLEB spellings of valid codes are malformed), limits with exactly four assigned flag bytes under both address types, the mut/attribute bytes' tiny assigned ranges. |
+| `Wasm.Decoder.Types.Test` | The type section's 3.0 recursive-type grammar: rec/sub/comptype form codes as literal bytes, `$4F` final vs `$50` non-final, both shorthands normalising into one model shape, exact body consumption. |
+| `Wasm.Decoder.Entities.Test` | Imports through tags: all five extern kinds, both table forms (default-init and 3.0 explicit-init), init-expression spans pinned exactly, start, and duplicate export names decoding fine (name disjointness is validity). |
+| `Wasm.Decoder.Segments.Test` | Element, code, data, and data count: all eight element flag encodings, code entries with run-length locals and body spans, all three data flags, span offsets asserted absolute against nonzero bases. |
+| `Wasm.Decoder.Expr.Test` | The expression skipper over every immediate-shape family, including the `$FB`/`$FC`/`$FD` prefixed spaces; exact span arithmetic; non-constant instructions skipping fine (constness is validation). |
+| `Wasm.Decoder.Test` | Preamble acceptance and rejection, section walk and extents, ordering rules, duplicate sections, custom-section names and the overrun case, section lookup, end-to-end decodes, and the cross-section function/code and data-count rules. |
+| `Wasm.Module.Test` | The model's storage contract: entity lists round-trip, indexed getters range-check, `Clear` resets everything, and index-space counts include imports first. |
+| `Wasm.Fixtures.Test` | The fixture cross-check described above: every valid fixture decodes, every malformed one is rejected, no section extent escapes its module. |
+| `Wasm.Wast.Test` | The `.wast` lexer, s-expression parser, and command classifier (Track C's first slice): nesting block comments, string literals decoding to bytes, testsuite-local directives classifying as unknown rather than failing the script. |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and

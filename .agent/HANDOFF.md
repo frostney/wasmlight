@@ -1,52 +1,64 @@
 # Handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-08 (evening session — Track A implementation)
 
 ## Current state
 
-- Repo audit: everything committed is green (`lwpt install --frozen`,
-  `lwpt build`, `lwpt test`, `lwpt format --check`, `wasmlight inspect`
-  smoke-tested on valid + malformed fixtures). Shipped surface = decode
-  skeleton per docs/roadmap.md; roadmap's shipped table verified honest.
-- A grilling session settled both open roadmap questions plus a
-  cross-check of all ADRs against production runtimes (Wasmtime, V8,
-  SpiderMonkey, JSC, WAMR, wasm3, wazero — research reports were
-  session-only, conclusions are all recorded in the ADRs).
+- **Track A (section body decoding) is delivered and verified.** All 13
+  known sections decode into a populated TWasmModule; the 3.0 recursive
+  type grammar, all 8 element encodings, both table forms, the four
+  limits flag forms, and the full opcode→immediate table (core +
+  $FB/$FC/$FD spaces) are implemented and spec-checked against the
+  pinned commit via wasm-mcp. Function bodies stay as spans — the fused
+  validation walk owns instruction grammar (ADR-0007).
+- **Track C first slice exists**: Wasm.Wast (lexer, s-expr parser,
+  command classifier; lazy module handling preserved; runner absent).
+- Gates: `lwpt format --check`, `lwpt build`, `lwpt test` — 11 suites,
+  233 tests, all green. Docs updated (architecture, testing,
+  quick-start, roadmap, AGENTS.md) and markdownlint-clean.
+- Everything is UNCOMMITTED — the user commits themselves.
 
-## Decisions taken (all recorded in docs/adr/)
+## How it was built (matters for continuing)
 
-- **ADR-0013 (new):** i64 memories take guard-assisted bounds checks;
-  strategy static per memory by address type; 2×2 platform matrix;
-  constants are wasmbench-tuned; Spectre hardening assigned to Track I.
-- **ADR-0014 (new):** Component Model deferred to post-v1 (supersedes
-  ADR-0002's component half); v1 host surface is WASI preview1 only;
-  re-entry condition: post-rework canonical ABI landed + covered by the
-  component-model WAST suite.
-- Amendments: ADR-0001 (no OSR, tier-up at function entry only;
-  differential tests compare traps + final memory/globals), ADR-0007
-  (shared-IR cost recorded: 2–4× memory, instantiation latency;
-  wasmbench obligation; lazy-emission escape hatch named), ADR-0012
-  (register-IR precedents; risk concentrated in unreachable/multi-value/
-  br_table), ADR-0011 (allocation sites are safepoints too), ADR-0009
-  (siglongjmp-skipped frames must hold no managed Pascal state;
-  sigsetjmp cost measured), ADR-0003 (lifetime rule in doc comments;
-  WAMR-style freeability query later), ADR-0008 (threads ⇒ separate
-  synchronised SharedMemory type, never store locks), ADR-0005 +
-  AGENTS.md chokepoint bullet updated for the address-type matrix.
-- roadmap.md: "Open questions" → "Settled questions"; Track K removed
-  (moved to After 3.0); Track F cites ADR-0014.
+- Parallel subagent waves against a pinned contract:
+  scratchpad/track-a-contract.md (session scratchpad — regenerate a
+  similar contract for Track B; it pinned names, error rules, and the
+  malformed/invalid boundary).
+- Two-axis review (spec + standards). Codex was OUT OF CREDITS until
+  Aug 10 — Claude-family fallback used, logged in
+  ~/.claude/orchestrator/DELEGATIONS.log.
+- Review found and fixed: misplaced-`else` hole in the expression
+  skipper (major, confirmed); "section size mismatch" canonical prefix
+  unification (testsuite prefix-matches error strings — messages are
+  conformance surface); absolute-offset convention everywhere; helper
+  dedup into Wasm.Decoder.Common; 7 boundary-test additions.
 
-## Open questions
+## Knowledge worth keeping (spec traps confirmed this session)
 
-- None from the grilling — frontier emptied, user confirmed.
+- Limits min/max are u64 in ALL four flag forms (0x00/01/04/05); no
+  shared flag exists in the pinned 3.0 grammar.
+- $4F = sub final, $50 = sub (transposition trap); negative type codes
+  are literal bytes, NOT sLEB-decodable (overlong forms malformed);
+  positive s33 type indices MAY be zero-padded.
+- memarg: bit 6 of align flags signals a trailing memidx; offset is
+  u64; flags >= 0x80 malformed.
+- $FD unassigned gaps inside 0..255 and relaxed ops at 256..275 are
+  pinned in Wasm.Decoder.Expr comments.
+- Function/code and datacount/data consistency are BINARY grammar rules
+  (malformed, with canonical message prefixes, already implemented).
+- The "data count must be present if code uses memory.init/data.drop"
+  rule needs a body walk → deferred to Track B, comment pinned at the
+  CodeEntry.Body site: that check must raise EWasmDecodeError.
 
-## Next steps
+## Next steps (dependency order)
 
-1. Commit the doc changes (13 modified + 2 new files, all lint-clean;
-   nothing committed yet).
-2. Start Track A (section body decoding) — no prerequisites; the
-   recursive type section is the biggest sub-piece.
-3. Stand up Track C's harness skeleton early (assert_malformed can judge
-   the decoder before any tier exists).
-4. **User decision:** do NOT file GitHub issues until everything in the
-   roadmap is implemented.
+1. **Track B — validation + register IR** (unblocked). Biggest design
+   task: the IR instruction set + register assignment during the fused
+   validation walk (ADR-0007/0012 pin the shape; ADR-0012 lists the
+   risk spots: unreachable code, multi-value merges, br_table). Write a
+   contract like Track A's before spawning agents.
+2. **Track C — wast runner** (unblocked): assert_malformed can judge
+   the decoder TODAY using Wasm.Wast + DecodeModule; needs a wat->wasm
+   path for text modules (module binary works now).
+3. Track D onward per docs/roadmap.md.
+4. User decision standing: NO GitHub issues until the roadmap is done.

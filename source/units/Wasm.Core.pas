@@ -103,6 +103,134 @@ type
     function Describe: string;
   end;
 
+  { Address types index a linear memory or a table; Wasm 3.0 makes both
+    64-bit addressable. The address type is carried INSIDE the limits
+    encoding (a flag bit), not next to it, which is why decoding limits
+    yields one of these rather than taking one.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-limits }
+  TWasmAddrType = (watI32, watI64);
+
+  { Limits as decoded from the flags byte. Min and Max are u64 in the
+    ENCODING for BOTH address types — every alternative of the binary
+    grammar reads u64, including the i32 ones. Whether the values fit the
+    address type is a validation question, so the decoder must not narrow
+    them and this record must not either.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-limits }
+  TWasmLimits = record
+    AddrType: TWasmAddrType;
+    HasMax: Boolean;
+    Min: UInt64;
+    Max: UInt64;
+
+    function Describe: string;
+  end;
+
+  { https://webassembly.github.io/spec/core/binary/types.html#binary-tabletype }
+  TWasmTableType = record
+    RefType: TWasmRefType;
+    Limits: TWasmLimits;
+
+    function Describe: string;
+  end;
+
+  { https://webassembly.github.io/spec/core/binary/types.html#binary-memtype }
+  TWasmMemType = record
+    Limits: TWasmLimits;
+
+    function Describe: string;
+  end;
+
+  { https://webassembly.github.io/spec/core/binary/types.html#binary-globaltype }
+  TWasmGlobalType = record
+    Mut: Boolean;
+    ValueType: TWasmValueType;
+
+    function Describe: string;
+  end;
+
+  { A tag type is a function type reference; the binary form is an
+    attribute byte (0x00 is the only assigned value) and a type index.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-tagtype }
+  TWasmTagType = record
+    TypeIndex: UInt32;
+  end;
+
+  { Packed storage types, usable only as struct/array field storage —
+    they are NOT value types and never appear on the operand stack.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-packtype }
+  TWasmPackedType = (wpkI8, wpkI16);
+
+  { A field's storage: either a full value type or a packed type. }
+  TWasmStorageType = record
+    IsPacked: Boolean;
+    PackedType: TWasmPackedType;
+    ValueType: TWasmValueType;
+
+    function Describe: string;
+  end;
+
+  { https://webassembly.github.io/spec/core/binary/types.html#binary-fieldtype }
+  TWasmFieldType = record
+    Mut: Boolean;
+    Storage: TWasmStorageType;
+
+    function Describe: string;
+  end;
+
+  { Composite types — what a type-section entry defines once the rec/sub
+    wrapping is unwrapped: a function, struct, or array shape.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-comptype }
+  TWasmCompKind = (wckFunc, wckStruct, wckArray);
+
+  TWasmFuncType = record
+    Params: array of TWasmValueType;
+    Results: array of TWasmValueType;
+  end;
+
+  TWasmStructType = record
+    Fields: array of TWasmFieldType;
+  end;
+
+  TWasmArrayType = record
+    Elem: TWasmFieldType;
+  end;
+
+  TWasmCompType = record
+    Kind: TWasmCompKind;
+    Func: TWasmFuncType;
+    Struct: TWasmStructType;
+    Arr: TWasmArrayType;
+  end;
+
+  { One member of a recursion group: optionally non-final, with declared
+    supertype indices, around a composite type. A bare comptype in the
+    binary is shorthand for a final subtype with no supertypes.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-subtype }
+  TWasmSubType = record
+    IsFinal: Boolean;
+    SuperTypes: array of UInt32;
+    Comp: TWasmCompType;
+  end;
+
+  { A type-section entry. Every entry is a recursion group — a bare
+    subtype is shorthand for a group of one — and each member gets its
+    own type index.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-rectype }
+  TWasmRecType = record
+    SubTypes: array of TWasmSubType;
+  end;
+
+  { External kinds, with ordinals matching the import/export description
+    discriminator bytes (0x00..0x04).
+    https://webassembly.github.io/spec/core/binary/types.html#binary-externtype }
+  TWasmExternKind = (
+    wxkFunc   = 0,
+    wxkTable  = 1,
+    wxkMem    = 2,
+    wxkGlobal = 3,
+    wxkTag    = 4
+  );
+
   { Section ids. NOTE that these are ids, not positions — the encoding
     order is the grammar's prescribed order, which differs (see
     SectionOrderPosition). Custom sections may appear anywhere. }
@@ -183,6 +311,23 @@ const
   TYPE_CODE_REF_NULL = -29;   { $63 — long form: nullable ref to a heap type }
   TYPE_CODE_REF      = -28;   { $64 — long form: non-null ref to a heap type }
 
+  { Recursive/composite type form codes, the type section's grammar. Note
+    that $4F is the FINAL form and $50 the non-final one — final is the
+    lower byte, which is the easy pair to transpose.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-rectype
+    https://webassembly.github.io/spec/core/binary/types.html#binary-comptype }
+  TYPE_CODE_REC       = -50;  { $4E — rec subtype* }
+  TYPE_CODE_SUB_FINAL = -49;  { $4F — sub final typeidx* comptype }
+  TYPE_CODE_SUB       = -48;  { $50 — sub typeidx* comptype }
+  TYPE_CODE_ARRAY     = -34;  { $5E — array fieldtype }
+  TYPE_CODE_STRUCT    = -33;  { $5F — struct fieldtype* }
+  TYPE_CODE_FUNC      = -32;  { $60 — func params results }
+
+  { Packed storage types. I16 is the LOWER byte of the two.
+    https://webassembly.github.io/spec/core/binary/types.html#binary-packtype }
+  TYPE_CODE_I16 = -9;   { $77 }
+  TYPE_CODE_I8  = -8;   { $78 }
+
 { True when ACode is a number type. }
 function TryDecodeNumType(const ACode: Int64;
   out AType: TWasmNumType): Boolean;
@@ -214,6 +359,26 @@ function MakeRefType(const ANullable: Boolean;
 function MakeNumValueType(const ANum: TWasmNumType): TWasmValueType;
 function MakeVecValueType: TWasmValueType;
 function MakeRefValueType(const ARef: TWasmRefType): TWasmValueType;
+
+function MakeLimits(const AAddrType: TWasmAddrType;
+  const AMin: UInt64): TWasmLimits;
+function MakeLimitsWithMax(const AAddrType: TWasmAddrType;
+  const AMin, AMax: UInt64): TWasmLimits;
+function MakeTableType(const ARefType: TWasmRefType;
+  const ALimits: TWasmLimits): TWasmTableType;
+function MakeMemType(const ALimits: TWasmLimits): TWasmMemType;
+function MakeGlobalType(const AMut: Boolean;
+  const AValueType: TWasmValueType): TWasmGlobalType;
+function MakeTagType(const ATypeIndex: UInt32): TWasmTagType;
+function MakeValueStorageType(
+  const AValueType: TWasmValueType): TWasmStorageType;
+function MakePackedStorageType(
+  const APacked: TWasmPackedType): TWasmStorageType;
+function MakeFieldType(const AMut: Boolean;
+  const AStorage: TWasmStorageType): TWasmFieldType;
+function MakeFuncCompType(const AFunc: TWasmFuncType): TWasmCompType;
+function MakeStructCompType(const AStruct: TWasmStructType): TWasmCompType;
+function MakeArrayCompType(const AArr: TWasmArrayType): TWasmCompType;
 
 function ExecutionTierName(const ATier: TWasmExecutionTier): string;
 
@@ -452,6 +617,162 @@ begin
 
   AType := MakeNumValueType(wntI32);
   Result := False;
+end;
+
+{ --- external and composite types ---------------------------------------- }
+
+function TWasmLimits.Describe: string;
+begin
+  { The text format spells limits as `addrtype? min max?`, and i32 is the
+    default address type, abbreviated to nothing — so only i64 is marked.
+    https://webassembly.github.io/spec/core/text/types.html#text-limits }
+  if AddrType = watI64 then
+    Result := 'i64 ' + IntToStr(Min)
+  else
+    Result := IntToStr(Min);
+  if HasMax then
+    Result := Result + ' ' + IntToStr(Max);
+end;
+
+function TWasmTableType.Describe: string;
+begin
+  { `tabletype ::= addrtype? limits reftype` — element type last.
+    https://webassembly.github.io/spec/core/text/types.html#text-tabletype }
+  Result := Limits.Describe + ' ' + RefType.Describe;
+end;
+
+function TWasmMemType.Describe: string;
+begin
+  Result := Limits.Describe;
+end;
+
+function TWasmGlobalType.Describe: string;
+begin
+  { Immutable is the unmarked case; only `mut` gets the parenthesised form.
+    https://webassembly.github.io/spec/core/text/types.html#text-globaltype }
+  if Mut then
+    Result := '(mut ' + ValueType.Describe + ')'
+  else
+    Result := ValueType.Describe;
+end;
+
+function TWasmStorageType.Describe: string;
+begin
+  if not IsPacked then
+    Exit(ValueType.Describe);
+  if PackedType = wpkI8 then
+    Result := 'i8'
+  else
+    Result := 'i16';
+end;
+
+function TWasmFieldType.Describe: string;
+begin
+  if Mut then
+    Result := '(mut ' + Storage.Describe + ')'
+  else
+    Result := Storage.Describe;
+end;
+
+function MakeLimits(const AAddrType: TWasmAddrType;
+  const AMin: UInt64): TWasmLimits;
+begin
+  Result.AddrType := AAddrType;
+  Result.HasMax := False;
+  Result.Min := AMin;
+  Result.Max := 0;
+end;
+
+function MakeLimitsWithMax(const AAddrType: TWasmAddrType;
+  const AMin, AMax: UInt64): TWasmLimits;
+begin
+  Result.AddrType := AAddrType;
+  Result.HasMax := True;
+  Result.Min := AMin;
+  Result.Max := AMax;
+end;
+
+function MakeTableType(const ARefType: TWasmRefType;
+  const ALimits: TWasmLimits): TWasmTableType;
+begin
+  Result.RefType := ARefType;
+  Result.Limits := ALimits;
+end;
+
+function MakeMemType(const ALimits: TWasmLimits): TWasmMemType;
+begin
+  Result.Limits := ALimits;
+end;
+
+function MakeGlobalType(const AMut: Boolean;
+  const AValueType: TWasmValueType): TWasmGlobalType;
+begin
+  Result.Mut := AMut;
+  Result.ValueType := AValueType;
+end;
+
+function MakeTagType(const ATypeIndex: UInt32): TWasmTagType;
+begin
+  Result.TypeIndex := ATypeIndex;
+end;
+
+function MakeValueStorageType(
+  const AValueType: TWasmValueType): TWasmStorageType;
+begin
+  Result.IsPacked := False;
+  Result.PackedType := wpkI8;
+  Result.ValueType := AValueType;
+end;
+
+function MakePackedStorageType(
+  const APacked: TWasmPackedType): TWasmStorageType;
+begin
+  Result.IsPacked := True;
+  Result.PackedType := APacked;
+  Result.ValueType := MakeNumValueType(wntI32);
+end;
+
+function MakeFieldType(const AMut: Boolean;
+  const AStorage: TWasmStorageType): TWasmFieldType;
+begin
+  Result.Mut := AMut;
+  Result.Storage := AStorage;
+end;
+
+{ The inactive arms are reset to fixed defaults rather than left as the
+  caller's stack garbage, so two comp types built the same way always
+  compare and hash the same. }
+
+function DefaultFieldType: TWasmFieldType;
+begin
+  Result := MakeFieldType(False,
+    MakeValueStorageType(MakeNumValueType(wntI32)));
+end;
+
+function MakeFuncCompType(const AFunc: TWasmFuncType): TWasmCompType;
+begin
+  Result.Kind := wckFunc;
+  Result.Func := AFunc;
+  Result.Struct.Fields := nil;
+  Result.Arr.Elem := DefaultFieldType;
+end;
+
+function MakeStructCompType(const AStruct: TWasmStructType): TWasmCompType;
+begin
+  Result.Kind := wckStruct;
+  Result.Func.Params := nil;
+  Result.Func.Results := nil;
+  Result.Struct := AStruct;
+  Result.Arr.Elem := DefaultFieldType;
+end;
+
+function MakeArrayCompType(const AArr: TWasmArrayType): TWasmCompType;
+begin
+  Result.Kind := wckArray;
+  Result.Func.Params := nil;
+  Result.Func.Results := nil;
+  Result.Struct.Fields := nil;
+  Result.Arr := AArr;
 end;
 
 function ExecutionTierName(const ATier: TWasmExecutionTier): string;

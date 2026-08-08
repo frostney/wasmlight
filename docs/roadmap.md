@@ -4,8 +4,9 @@
 
 - This file is the honest picture of what exists. Every other doc
   describes shipped behaviour only; anything not shipped is listed here.
-- **Shipped:** the binary reader, the type vocabulary, the module model,
-  the structural decoder, and `wasmlight inspect`.
+- **Shipped:** the binary reader, the type vocabulary, the populated
+  module model, the full section-body decoder (Track A), the first slice
+  of the `.wast` harness front end, and `wasmlight inspect`.
 - **Longest pole: garbage collection.** Not by instruction count — by
   structural reach. It rewrites the type section, adds a runtime
   subtyping check, and puts a collector under every tier.
@@ -45,12 +46,19 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Decoded module model with section lookup | `Wasm.Module` | `Wasm.Decoder.Test` |
 | UTF-8 validation of names (a decode rule) | `Wasm.Binary` | `Wasm.Binary.Test` |
 | `s33` reader for heap types and block types | `Wasm.Binary` | `Wasm.Binary.Test` |
+| Section body decoding, all 13 known sections | `Wasm.Decoder` + `Wasm.Decoder.*` | the `Wasm.Decoder.*` suites + `Wasm.Fixtures.Test` |
+| 3.0 recursive-type decode (rectype/subtype/comptype) | `Wasm.Decoder.Types` | `Wasm.Decoder.Types.Test` |
+| Expression skipper, full 3.0 opcode immediate table | `Wasm.Decoder.Expr` | `Wasm.Decoder.Expr.Test` |
+| Cross-section grammar checks (function/code, data count) | `Wasm.Decoder` | `Wasm.Decoder.Test` |
+| Populated module model with index-space counts | `Wasm.Module` | `Wasm.Module.Test` |
+| `.wast` lexer, s-expression parser, command classifier | `Wasm.Wast` | `Wasm.Wast.Test` |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
-| `wasmlight inspect` | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
+| `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | Decoder and LEB128 benchmarks | `source/apps/wasmbench.pas` | measurement only |
 
-Everything below is **Absent** unless marked otherwise. Nothing is
-partially delivered.
+Everything below is **Absent** unless marked otherwise. The one partial
+delivery is Track C, whose script front end exists without its runner —
+noted in the track itself.
 
 ## The counted backlog
 
@@ -97,19 +105,21 @@ of assertions is not passing a majority of features.
 Ordered by dependency, not by priority. A track may start when its
 prerequisites are complete.
 
-### Track A — Section body decoding (no prerequisites)
+### Track A — Section body decoding — **delivered**
 
-Turn located sections into a populated model: types, imports, functions,
-tables, memories, globals, exports, elements, code, data, tags.
+Turned located sections into a populated model: types, imports,
+functions, tables, memories, globals, exports, elements, code, data,
+tags — the `Wasm.Decoder.Common/Types/Entities/Segments/Expr` units,
+verified by their co-located suites and the fixture cross-check.
 
-The type section is **not** a list of function types under 3.0 — it
+The type section was **not** a list of function types under 3.0 — it
 decodes into a list of *recursive types*, requiring `rectype` (mutually
 recursive groups), `subtype` (declared supertypes plus a `final` flag),
 and `comptype` (functype | structtype | arraytype) with mutable and
-**packed** field types. This is the largest single piece of Track A and it
-exists only because of the GC target.
+**packed** field types. This was the largest single piece of Track A and
+it exists only because of the GC target.
 
-### Track B — Validation and the IR (needs A)
+### Track B — Validation and the IR (needs A — now unblocked)
 
 The spec's static type check, emitting the register-based IR
 ([ADR-0007](adr/0007-validation-emits-the-lowered-ir.md),
@@ -117,11 +127,17 @@ The spec's static type check, emitting the register-based IR
 `valid-rectype` / `valid-comptype` / `valid-heaptype` / `valid-typeuse`
 clauses and null-tracking for non-nullable reference types.
 
-### Track C — Conformance harness (needs A; grows with every later track)
+### Track C — Conformance harness (needs A — now unblocked; grows with every later track)
 
 A `.wast` script runner. This is deliberately early: it is the only
 external judge the project has, and every later track's claim of
-correctness routes through it. Requirements the corpus imposes, none
+correctness routes through it.
+
+The first slice is delivered: `Wasm.Wast` holds the lexer, s-expression
+parser, and top-level command classifier, keeping module payloads as raw
+trees so the lazy-decoding requirement below is preserved by
+construction. The runner — module assembly, execution, and assertion
+judging — is still absent. Requirements the corpus imposes, none
 optional:
 
 - **Lazy decoding.** `(module quote ...)` (1,311 occurrences) and

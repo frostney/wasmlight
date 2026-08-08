@@ -36,10 +36,24 @@ Read bottom-up; each layer may use only the layers below it.
 | Tier seam | `Wasm.Exec` | the contract every tier implements; trap trampoline, epoch check, safepoints | planned |
 | IR | `Wasm.Ir` | register-based lowered form every tier consumes | planned |
 | Validation | `Wasm.Validate` | the spec's static type check, run once, emitting the IR | planned |
-| Module model | `Wasm.Module` | decoded module: sections located, not parsed | **shipped** |
+| Module model | `Wasm.Module` | decoded module: populated entity lists, with unparsed payloads kept as spans | **shipped** |
 | Decode | `Wasm.Decoder` | binary → module model | **shipped** |
 | Primitives | `Wasm.Binary` | bounds-checked cursor, LEB128, little-endian reads | **shipped** |
 | Vocabulary | `Wasm.Core` | value/heap/reference types, section ids and their prescribed order, tiers, error hierarchy | **shipped** |
+
+The Decode layer is one unit in the table and five behind it:
+`Wasm.Decoder` owns the preamble and the section walk, and hands each
+section body to `Wasm.Decoder.Common` (the shared type-form readers),
+`Wasm.Decoder.Types` (the 3.0 recursive-type grammar),
+`Wasm.Decoder.Entities` (imports through tags), `Wasm.Decoder.Segments`
+(element, code, data), and `Wasm.Decoder.Expr` (the expression skipper).
+They are one layer — all of them sit between `Wasm.Binary` and
+`Wasm.Module`.
+
+`Wasm.Wast` sits beside the library rather than in this stack: it is the
+staged first slice of the conformance harness ([roadmap.md](roadmap.md),
+Track C) — a `.wast` lexer, s-expression parser, and command classifier
+with no execution and no module decoding behind it yet.
 
 `Wasm.Core` depends on nothing in the project. Nothing depends on
 `source/apps/` — the programs are consumers of the library, never a place
@@ -50,8 +64,9 @@ for library logic.
 Every WebAssembly conformance rule is enforced **below** the tier seam.
 
 - **Decode** rejects bytes that are not a module: wrong preamble, unknown
-  section id, a section longer than the module, known sections out of id
-  order, a malformed LEB128.
+  section id, a section longer than the module, known sections out of the
+  grammar's prescribed order, a malformed LEB128, a section body the
+  grammar rejects.
 - **Validation** rejects modules that are not well-typed. It runs once,
   over the whole module, before any tier sees a function body.
 - **Tiers** receive code already known to be well-typed. A tier's only
@@ -103,6 +118,11 @@ load-bearing, because a host discriminates on them:
 Never collapse them, and never raise a bare `EWasmError` where a specific
 one applies.
 
+One tooling-side subclass sits outside this contract: `Wasm.Wast`
+defines `EWastParseError` (under `EWasmError`) for problems in its own
+`.wast` script text. A script is harness input, not a module, so it is
+not part of what a host discriminates on when decoding modules.
+
 ## What is shipped today
 
 The decode path, end to end:
@@ -118,13 +138,29 @@ and rejects malformed LEB128 — including encodings that are overlong, or
 that set bits above the value's width — so nothing downstream has to
 re-validate widths.
 
-`DecodeModule` walks the section sequence, locating each body without
-parsing it, and enforces the structural rules listed above. Custom
-sections are exempt from ordering and have their names read through a
-sub-reader bounded by the declared section size, so a name length that
-overruns its section cannot read into the next one.
+`DecodeModule` walks the section sequence, enforces the structural rules
+listed above, and decodes every known section's body into the model
+through the per-section decoders: types with the full 3.0 recursive-type
+grammar (rec groups, sub types, func/struct/array composites), imports,
+functions, tables (including the 3.0 explicit-init form), memories,
+globals, exports, start, element and data segments, code entries with
+their local groups and body spans, and tags. It also enforces the two
+cross-section rules the module grammar itself imposes — function/code
+section lengths must agree, and a data count must match the data
+section. Custom sections are exempt from ordering and have their names
+read through a sub-reader bounded by the declared section size, so a
+name length that overruns its section cannot read into the next one.
 
-`wasmlight inspect` is the shipped consumer of this path.
+Expressions — init expressions and offsets — carry no size prefix, so
+`Wasm.Decoder.Expr` walks the full 3.0 opcode immediate table to find
+where each one ends, recording the extent as a span without interpreting
+anything. Function bodies are bounded by their size prefix and are
+deliberately **not** instruction-walked here: the instruction grammar
+inside them belongs to the fused validation walk that emits the IR
+([ADR-0007](adr/0007-validation-emits-the-lowered-ir.md)).
+
+`wasmlight inspect` is the shipped consumer of this path: the section
+table plus an entity-count summary per index space.
 
 ## Related documents
 

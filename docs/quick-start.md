@@ -53,13 +53,16 @@ lwpt test            # co-located unit suites
 ## Run something
 
 ```bash
-./build/wasmlight inspect module.wasm    # decode and report the section table
+./build/wasmlight inspect module.wasm    # section table + entity counts
 ./build/wasmlight --version
 ./build/wasmbench --iterations 20000     # component benchmarks
 ```
 
-`inspect` is the whole shipped surface today — see
-[roadmap.md](roadmap.md) for what comes next and in what order.
+`inspect` decodes the module and reports its section table plus a
+summary of entity counts per index space (imports broken down by kind,
+start function and data count when present). It is the whole shipped
+surface today — see [roadmap.md](roadmap.md) for what comes next and in
+what order.
 
 For the full command set (formatter, benchmarks, CI gates) see
 [tooling.md](tooling.md).

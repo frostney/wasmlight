@@ -35,6 +35,14 @@ type
       an assertion even on the happy path. }
     procedure AssertRejected(const ADescription: string;
       const ARejected: Boolean);
+    { Builds and decodes; returns the EWasmDecodeError message, or '' when
+      the module was accepted. For asserting message PREFIXES — which are
+      conformance surface (docs/roadmap.md, Track C). }
+    function RejectionMessage(const AValues: array of Byte): string;
+    { Asserts AMessage starts with APrefix, phrased so a failure prints
+      the actual message ('' means the module was wrongly accepted). }
+    procedure AssertMessagePrefix(const ADescription, AMessage,
+      APrefix: string);
     procedure WriteVersion(var ABytes: TWasmBytes;
       const AB0, AB1, AB2, AB3: Byte);
   protected
@@ -60,6 +68,11 @@ type
     procedure TestRejectsDuplicateSection;
     procedure TestRejectsCustomNameOverrunningItsSection;
     procedure TestSectionLookup;
+    procedure TestDecodesTypeFunctionCode;
+    procedure TestDecodesGlobalExportStart;
+    procedure TestRejectsFunctionCodeCountMismatch;
+    procedure TestRejectsDataCountMismatch;
+    procedure TestCustomSectionAmongPopulatedSections;
   end;
 
 procedure TDecoderTests.BuildModule(const AValues: array of Byte);
@@ -112,6 +125,28 @@ procedure TDecoderTests.ExpectRejected(const ADescription: string;
 begin
   BuildModule(AValues);
   AssertRejected(ADescription, WasRejected(FBytes));
+end;
+
+function TDecoderTests.RejectionMessage(
+  const AValues: array of Byte): string;
+begin
+  BuildModule(AValues);
+  Result := '';
+  try
+    DecodeModule(FBytes, FModule);
+  except
+    on E: EWasmDecodeError do
+      Result := E.Message;
+  end;
+end;
+
+procedure TDecoderTests.AssertMessagePrefix(const ADescription, AMessage,
+  APrefix: string);
+begin
+  { The comparison carries the message slice, so a failure shows what was
+    actually raised — and '' shows the module was wrongly ACCEPTED. }
+  Expect<string>(ADescription + ': ' + Copy(AMessage, 1, Length(APrefix)))
+    .ToBe(ADescription + ': ' + APrefix);
 end;
 
 procedure TDecoderTests.BeforeEach;
@@ -232,9 +267,15 @@ var
   I: Integer;
   Pair: TWasmBytes;
 begin
+  { Bodies are decoded now, so each section carries the minimal VALID
+    body — a single $00, which reads as the empty vector for the vec
+    sections, function index 0 for start, and count 0 for data count. A
+    size-0 body would be rejected as truncated before the ordering check
+    on the SECOND header ever ran, and the test would pass for the wrong
+    reason. }
   for I := 0 to High(PRESCRIBED) - 1 do
   begin
-    BuildModule([PRESCRIBED[I + 1], $00, PRESCRIBED[I], $00]);
+    BuildModule([PRESCRIBED[I + 1], $01, $00, PRESCRIBED[I], $01, $00]);
     Pair := FBytes;
     AssertRejected(Format('id %d before id %d',
       [PRESCRIBED[I + 1], PRESCRIBED[I]]), WasRejected(Pair));
@@ -245,28 +286,33 @@ procedure TDecoderTests.TestCustomSectionsDoNotResetOrdering;
 begin
   { A custom section must be exempt from ordering WITHOUT clearing the
     high-water mark. If it reset the watermark, a repeated or descending
-    known section on the far side of it would be accepted. }
+    known section on the far side of it would be accepted. The known
+    sections carry the minimal valid empty-vector body so the ordering
+    check, not a body decode, is what rejects. }
   ExpectRejected('repeated memory across a custom section',
-    [$05, $00, $00, $02, $01, Ord('x'), $05, $00]);
+    [$05, $01, $00, $00, $02, $01, Ord('x'), $05, $01, $00]);
   ExpectRejected('descending known sections across a custom section',
-    [$06, $00, $00, $02, $01, Ord('x'), $05, $00]);
+    [$06, $01, $00, $00, $02, $01, Ord('x'), $05, $01, $00]);
 end;
 
 procedure TDecoderTests.TestWalksSections;
 begin
-  { type section, 2 bytes of body; function section, 1 byte of body. }
-  DecodeBuilt([$01, $02, $AA, $BB,
-               $03, $01, $CC]);
+  { type section, 4 bytes of body (one nullary functype); function
+    section, 1 byte of body (empty vector). Bodies are decoded now, so
+    they must be well-formed — the section-table claims under test are
+    the ids, offsets, and sizes. }
+  DecodeBuilt([$01, $04, $01, $60, $00, $00,
+               $03, $01, $00]);
 
   Expect<Integer>(FModule.SectionCount).ToBe(2);
 
   Expect<Integer>(FModule[0].Id).ToBe(Ord(wsType));
   Expect<Integer>(Integer(FModule[0].BodyOffset)).ToBe(10);
-  Expect<Integer>(Integer(FModule[0].BodySize)).ToBe(2);
+  Expect<Integer>(Integer(FModule[0].BodySize)).ToBe(4);
   Expect<string>(FModule[0].DisplayName).ToBe('type');
 
   Expect<Integer>(FModule[1].Id).ToBe(Ord(wsFunction));
-  Expect<Integer>(Integer(FModule[1].BodyOffset)).ToBe(14);
+  Expect<Integer>(Integer(FModule[1].BodyOffset)).ToBe(16);
   Expect<Integer>(Integer(FModule[1].BodySize)).ToBe(1);
 end;
 
@@ -312,14 +358,14 @@ end;
 procedure TDecoderTests.TestRejectsOutOfOrderSections;
 begin
   { function (3) then type (1). }
-  ExpectRejected('descending section ids', [$03, $00, $01, $00]);
+  ExpectRejected('descending section ids', [$03, $01, $00, $01, $01, $00]);
   { global (6) then memory (5) — adjacent in both id and prescribed
     order, so this fails under either rule. }
-  ExpectRejected('global before memory', [$06, $00, $05, $00]);
+  ExpectRejected('global before memory', [$06, $01, $00, $05, $01, $00]);
   { code (10) then data count (12): ascending ids, but the data count
     section is prescribed BEFORE code, so this is out of order. A rule
     written on ids alone accepts this. }
-  ExpectRejected('data count after code', [$0A, $00, $0C, $01, $00]);
+  ExpectRejected('data count after code', [$0A, $01, $00, $0C, $01, $00]);
 end;
 
 procedure TDecoderTests.TestAcceptsPrescribedOrderNotIdOrder;
@@ -334,7 +380,7 @@ begin
                $0D, $01, $00,         { tag        id 13, position  6 }
                $06, $01, $00,         { global     id  6, position  7 }
                $09, $01, $00,         { element    id  9, position 10 }
-               $0C, $01, $01,         { data count id 12, position 11 }
+               $0C, $01, $00,         { data count id 12, position 11 }
                $0A, $01, $00,         { code       id 10, position 12 }
                $0B, $01, $00]);       { data       id 11, position 13 }
 
@@ -350,7 +396,7 @@ end;
 
 procedure TDecoderTests.TestRejectsDuplicateSection;
 begin
-  ExpectRejected('two type sections', [$01, $00, $01, $00]);
+  ExpectRejected('two type sections', [$01, $01, $00, $01, $01, $00]);
 end;
 
 procedure TDecoderTests.TestRejectsCustomNameOverrunningItsSection;
@@ -367,7 +413,7 @@ var
   OutOfRange: TWasmSectionInfo;
   Raised: Boolean;
 begin
-  DecodeBuilt([$01, $00, $0A, $00]);
+  DecodeBuilt([$01, $01, $00, $0A, $01, $00]);
 
   Expect<Integer>(FModule.IndexOfSection(wsType)).ToBe(0);
   Expect<Integer>(FModule.IndexOfSection(wsCode)).ToBe(1);
@@ -385,6 +431,134 @@ begin
       Raised := True;
   end;
   Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TDecoderTests.TestDecodesTypeFunctionCode;
+var
+  RecType: TWasmRecType;
+  Func: TWasmFuncType;
+  Entry: TWasmCodeEntry;
+begin
+  { type: one functype i32 -> i32; function: one entry of type 0; code:
+    one entry with two i64 locals in one group and a 3-byte body
+    (local.get 0; end). }
+  DecodeBuilt([$01, $06, $01, $60, $01, $7F, $01, $7F,
+               $03, $02, $01, $00,
+               $0A, $08, $01, $06, $01, $02, $7E, $20, $00, $0B]);
+
+  { The type: the bare-comptype shorthand normalises to a final subtype
+    with no supertypes in a rec group of one. }
+  Expect<Integer>(FModule.TypeCount).ToBe(1);
+  RecType := FModule.Types[0];
+  Expect<Integer>(Length(RecType.SubTypes)).ToBe(1);
+  Expect<Boolean>(RecType.SubTypes[0].IsFinal).ToBe(True);
+  Expect<Integer>(Length(RecType.SubTypes[0].SuperTypes)).ToBe(0);
+  Expect<Integer>(Ord(RecType.SubTypes[0].Comp.Kind)).ToBe(Ord(wckFunc));
+  Func := RecType.SubTypes[0].Comp.Func;
+  Expect<Integer>(Length(Func.Params)).ToBe(1);
+  Expect<string>(Func.Params[0].Describe).ToBe('i32');
+  Expect<Integer>(Length(Func.Results)).ToBe(1);
+  Expect<string>(Func.Results[0].Describe).ToBe('i32');
+
+  Expect<Integer>(FModule.FunctionTypeIndexCount).ToBe(1);
+  Expect<Integer>(Integer(FModule.FunctionTypeIndices[0])).ToBe(0);
+
+  { The code entry. Offsets are absolute into the buffer: preamble 8,
+    type section 8..15, function section 16..19, code body at 22 — count
+    22, entry size 23, entry content 24.., body span 27..29. }
+  Expect<Integer>(FModule.CodeEntryCount).ToBe(1);
+  Entry := FModule.CodeEntries[0];
+  Expect<Integer>(Length(Entry.Locals)).ToBe(1);
+  Expect<Integer>(Integer(Entry.Locals[0].Count)).ToBe(2);
+  Expect<string>(Entry.Locals[0].ValueType.Describe).ToBe('i64');
+  Expect<Integer>(Integer(Entry.Body.Offset)).ToBe(27);
+  Expect<Integer>(Integer(Entry.Body.Size)).ToBe(3);
+end;
+
+procedure TDecoderTests.TestDecodesGlobalExportStart;
+var
+  Global: TWasmGlobal;
+  ExportEntry: TWasmExport;
+begin
+  { global: one (mut i32) with init `i32.const 0; end`; export: "g" as a
+    global; start: function index 0. That the start index names no
+    function is a VALIDATION defect, so this decodes. }
+  DecodeBuilt([$06, $06, $01, $7F, $01, $41, $00, $0B,
+               $07, $05, $01, $01, Ord('g'), $03, $00,
+               $08, $01, $00]);
+
+  Expect<Integer>(FModule.GlobalCount).ToBe(1);
+  Global := FModule.Globals[0];
+  Expect<Boolean>(Global.GlobalType.Mut).ToBe(True);
+  Expect<string>(Global.GlobalType.ValueType.Describe).ToBe('i32');
+  { The init expr span: global body at 10, count 10, valtype 11, mut 12,
+    expr 13..15 including its `end`. }
+  Expect<Integer>(Integer(Global.Init.Offset)).ToBe(13);
+  Expect<Integer>(Integer(Global.Init.Size)).ToBe(3);
+
+  Expect<Integer>(FModule.ExportCount).ToBe(1);
+  ExportEntry := FModule.&Exports[0];
+  Expect<string>(ExportEntry.Name).ToBe('g');
+  Expect<Integer>(Ord(ExportEntry.Kind)).ToBe(Ord(wxkGlobal));
+  Expect<Integer>(Integer(ExportEntry.Index)).ToBe(0);
+
+  Expect<Boolean>(FModule.HasStart).ToBe(True);
+  Expect<Integer>(Integer(FModule.StartFuncIndex)).ToBe(0);
+end;
+
+procedure TDecoderTests.TestRejectsFunctionCodeCountMismatch;
+const
+  { The upstream testsuite asserts this exact phrase, so it is
+    conformance surface, not just a diagnostic (docs/roadmap.md).
+    https://webassembly.github.io/spec/core/binary/modules.html#binary-module }
+  PREFIX = 'function and code section have inconsistent lengths';
+begin
+  { One function declared, code section ABSENT — an absent section is
+    the empty vector, so the lengths 1 and 0 disagree. }
+  AssertMessagePrefix('function without code',
+    RejectionMessage([$03, $02, $01, $00]), PREFIX);
+
+  { One code entry, function section absent — the other direction. }
+  AssertMessagePrefix('code without function',
+    RejectionMessage([$0A, $04, $01, $02, $00, $0B]), PREFIX);
+
+  { Both present, counts 2 vs 1. }
+  AssertMessagePrefix('two functions, one code entry',
+    RejectionMessage([$03, $03, $02, $00, $00,
+                      $0A, $04, $01, $02, $00, $0B]), PREFIX);
+end;
+
+procedure TDecoderTests.TestRejectsDataCountMismatch;
+const
+  { Same status as the function/code phrase: the testsuite asserts it.
+    https://webassembly.github.io/spec/core/binary/modules.html#binary-datacntsec }
+  PREFIX = 'data count and data section have inconsistent lengths';
+begin
+  { Data count declares 1, data section absent (= empty vector). }
+  AssertMessagePrefix('data count 1, no data section',
+    RejectionMessage([$0C, $01, $01]), PREFIX);
+
+  { Data count declares 0, data section holds one passive segment. }
+  AssertMessagePrefix('data count 0, one data segment',
+    RejectionMessage([$0C, $01, $00,
+                      $0B, $04, $01, $01, $01, $AA]), PREFIX);
+end;
+
+procedure TDecoderTests.TestCustomSectionAmongPopulatedSections;
+begin
+  { A custom section sitting between decoded known sections must still be
+    name-read and skipped, leaving the known-section content intact. }
+  DecodeBuilt([$01, $04, $01, $60, $00, $00,       { type: () -> () }
+               $00, $03, $01, Ord('m'), $EE,       { custom "m" + payload }
+               $03, $02, $01, $00,                 { function: type 0 }
+               $0A, $04, $01, $02, $00, $0B]);     { code: 1 empty body }
+
+  Expect<Integer>(FModule.SectionCount).ToBe(4);
+  Expect<Integer>(FModule.CustomSectionCount).ToBe(1);
+  Expect<string>(FModule[1].Name).ToBe('m');
+  Expect<Integer>(FModule.TypeCount).ToBe(1);
+  Expect<Integer>(FModule.FunctionTypeIndexCount).ToBe(1);
+  Expect<Integer>(FModule.CodeEntryCount).ToBe(1);
 end;
 
 procedure TDecoderTests.SetupTests;
@@ -412,6 +586,15 @@ begin
   Test('rejects a custom name overrunning its section',
     TestRejectsCustomNameOverrunningItsSection);
   Test('looks sections up by id', TestSectionLookup);
+  Test('decodes type + function + code end to end',
+    TestDecodesTypeFunctionCode);
+  Test('decodes global + export + start end to end',
+    TestDecodesGlobalExportStart);
+  Test('rejects function/code count mismatches',
+    TestRejectsFunctionCodeCountMismatch);
+  Test('rejects a data count mismatch', TestRejectsDataCountMismatch);
+  Test('decodes known sections around a custom section',
+    TestCustomSectionAmongPopulatedSections);
 end;
 
 begin

@@ -106,7 +106,7 @@ lwpt install --frozen  # CI mode: verify lockfile + committed modules, no networ
 lwpt format --check    # formatter gate (no flag = rewrite in place)
 lwpt build             # both programs (Linux, macOS, Windows)
 lwpt test              # co-located unit suites
-./build/wasmlight inspect <module.wasm>   # decode + report the section table
+./build/wasmlight inspect <module.wasm>   # decode + report sections and entity counts
 ./build/wasmbench                          # component benchmarks (measurement only)
 ```
 
@@ -134,7 +134,7 @@ they still belong in a test.
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `Wasm.Core` (vocabulary + errors), `Wasm.Binary` (bounds-checked reader, LEB128), `Wasm.Module` (decoded model), `Wasm.Decoder` (binary → model) |
+| `source/units/` | Library: `Wasm.Core` (vocabulary + errors), `Wasm.Binary` (bounds-checked reader, LEB128), `Wasm.Module` (decoded model), `Wasm.Decoder` + `Wasm.Decoder.*` (Common/Types/Entities/Segments/Expr — binary → model, all section bodies), `Wasm.Wast` (.wast lexer/parser, Track C first slice) |
 | `source/apps/` | Programs: `wasmlight` (CLI), `wasmbench` (benchmarks) |
 | `scripts/` | InstantFPC automation (`stamp-version.pas`) |
 | `tests/fixtures/` | Real toolchain-compiled `.wasm` cross-check corpus (committed; regenerate with `regenerate.sh`) |

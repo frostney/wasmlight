@@ -1,17 +1,23 @@
 { Wasm.Decoder — binary format to TWasmModule.
 
-  Structural decode only: the preamble, the section sequence, and each
-  section's declared extent. Section *bodies* are located, not parsed —
-  the per-section decoders and the type checker sit above this unit
-  (docs/architecture.md), and keeping the two apart is what lets a host
-  ask "which sections does this module have" without paying for a full
-  decode.
+  The full structural decode: the preamble, the section sequence, each
+  section's declared extent, and every known section's BODY, decoded
+  through the per-section decoders (Wasm.Decoder.Types / .Entities /
+  .Segments) into the model. The section table (TWasmSectionInfo) is
+  still recorded alongside the decoded content, so a host can ask "which
+  sections does this module have" and where each body sits in the buffer.
+  What deliberately stays out is the instruction grammar INSIDE function
+  bodies: those are located as spans and walked by the fused validation
+  pass, which emits the IR every tier consumes (ADR-0007).
 
-  Everything rejected here is rejected because the spec says the bytes are
-  not a module: wrong preamble, an unknown section id, a section that
-  claims more bytes than remain, or known sections out of the grammar's
+  Everything rejected here is rejected because the spec says the bytes
+  are not a module: wrong preamble, an unknown section id, a section that
+  claims more bytes than remain, known sections out of the grammar's
   PRESCRIBED order — which is not id order (see
-  Wasm.Core.SectionOrderPosition). }
+  Wasm.Core.SectionOrderPosition) — a body the section decoders find
+  malformed, or the two cross-section consistency rules the module
+  grammar itself imposes (function/code lengths, data count — see
+  CheckCrossSectionConsistency). }
 unit Wasm.Decoder;
 
 {$I Shared.inc}
@@ -24,6 +30,9 @@ uses
 
   Wasm.Binary,
   Wasm.Core,
+  Wasm.Decoder.Entities,
+  Wasm.Decoder.Segments,
+  Wasm.Decoder.Types,
   Wasm.Module;
 
 { Decode ABytes into AModule. AModule is cleared first. ABytes must
@@ -89,6 +98,72 @@ begin
       [Version, WASM_BINARY_VERSION]);
 
   AModule.Version := Version;
+end;
+
+{ Dispatch one known non-custom section body to its decoder. ABody is a
+  SubReader over exactly the declared size and ABase the body's absolute
+  buffer offset, so spans stored into the model are absolute (ADR-0003).
+  Each decoder consumes the body EXACTLY — leftover bytes and early
+  truncation are both malformed, per the section framing
+  (https://webassembly.github.io/spec/core/binary/modules.html#binary-section). }
+procedure DecodeSectionBody(const AId: TWasmSectionId;
+  var ABody: TWasmReader; const ABase: NativeUInt;
+  const AModule: TWasmModule);
+begin
+  case AId of
+    wsType:      DecodeTypeSection(ABody, ABase, AModule);
+    wsImport:    DecodeImportSection(ABody, ABase, AModule);
+    wsFunction:  DecodeFunctionSection(ABody, ABase, AModule);
+    wsTable:     DecodeTableSection(ABody, ABase, AModule);
+    wsMemory:    DecodeMemorySection(ABody, ABase, AModule);
+    wsGlobal:    DecodeGlobalSection(ABody, ABase, AModule);
+    wsExport:    DecodeExportSection(ABody, ABase, AModule);
+    wsStart:     DecodeStartSection(ABody, ABase, AModule);
+    wsElement:   DecodeElementSection(ABody, ABase, AModule);
+    wsCode:      DecodeCodeSection(ABody, ABase, AModule);
+    wsData:      DecodeDataSection(ABody, ABase, AModule);
+    wsDataCount: DecodeDataCountSection(ABody, ABase, AModule);
+    wsTag:       DecodeTagSection(ABody, ABase, AModule);
+  end;
+end;
+
+{ The two consistency rules the MODULE grammar imposes across sections —
+  binary-format side conditions, so violating either is MALFORMED, not
+  invalid (https://webassembly.github.io/spec/core/binary/modules.html#binary-module):
+
+    "The lengths of lists produced by the (possibly empty) function and
+     code section must match up."
+
+    "Similarly, the optional data count must match the length of the data
+     segment list." (Also at #binary-datacntsec: "If this count does not
+     match the length of the data segment list, the module is malformed.")
+
+  An ABSENT section produces the empty list — "All sections can be
+  empty" and every section is optional in the module production — so one
+  side present and nonempty while the other is absent fails the same
+  comparison. The message prefixes are conformance surface: the spec
+  testsuite asserts them (docs/roadmap.md, Track C), so they must start
+  with the canonical phrases below.
+
+  The clause's third rule — the data count section "must be present if
+  any data index occurs in the code section" (memory.init / data.drop) —
+  needs instruction inspection inside function bodies, which is the fused
+  validation walk's territory (ADR-0007). It is deliberately deferred to
+  that pass (Track B), not checked here. }
+procedure CheckCrossSectionConsistency(const AModule: TWasmModule);
+begin
+  if AModule.FunctionTypeIndexCount <> AModule.CodeEntryCount then
+    raise EWasmDecodeError.CreateFmt(
+      'function and code section have inconsistent lengths ' +
+      '(%d function(s), %d code entries)',
+      [AModule.FunctionTypeIndexCount, AModule.CodeEntryCount]);
+
+  if AModule.HasDataCount and
+    (AModule.DataCount <> UInt32(AModule.DataSegmentCount)) then
+    raise EWasmDecodeError.CreateFmt(
+      'data count and data section have inconsistent lengths ' +
+      '(declared %u, %d segment(s))',
+      [AModule.DataCount, AModule.DataSegmentCount]);
 end;
 
 procedure DecodeModule(const ABytes: TWasmBytes; const AModule: TWasmModule);
@@ -159,11 +234,21 @@ begin
           '(prescribed position %d, after position %d)',
           [SectionIdName(RawId), SectionStart, Position, HighestPosition]);
       HighestPosition := Position;
-      Reader.Skip(BodySize);
+
+      { Decode the body through a SubReader over exactly the declared
+        size, so a body can never read past its own extent and every
+        span stored into the model is ABase-relative-made-absolute
+        (ADR-0003). The SubReader call also advances Reader past the
+        body, replacing the skip this walk used to do. }
+      Body := Reader.SubReader(BodySize);
+      DecodeSectionBody(TWasmSectionId(RawId), Body,
+        Section.BodyOffset, AModule);
     end;
 
     AModule.AddSection(Section);
   end;
+
+  CheckCrossSectionConsistency(AModule);
 end;
 
 procedure DecodeModuleFile(const APath: string; const AModule: TWasmModule;

@@ -73,6 +73,48 @@ begin
   end;
 end;
 
+{ The decoded model in one glance: entity counts per index space, plus
+  the two optional scalars (start function, data count) when present.
+  Imports break down by kind because the kind decides which index space
+  each one occupies — the counts here and the sections table above are
+  the same module seen at two altitudes. }
+procedure PrintEntitySummary(const AModule: TWasmModule);
+const
+  LABEL_WIDTH = 20;
+
+  procedure CountLine(const ALabel: string; const ACount: Integer);
+  begin
+    WriteLn(PadRight(ALabel, LABEL_WIDTH), Format(' %10d', [ACount]));
+  end;
+
+begin
+  WriteLn;
+  CountLine('types (rec groups)', AModule.TypeCount);
+  WriteLn(PadRight('imports', LABEL_WIDTH),
+    Format(' %10d', [AModule.ImportCount]),
+    Format('  (func %d, table %d, memory %d, global %d, tag %d)',
+      [AModule.ImportCountOfKind(wxkFunc),
+       AModule.ImportCountOfKind(wxkTable),
+       AModule.ImportCountOfKind(wxkMem),
+       AModule.ImportCountOfKind(wxkGlobal),
+       AModule.ImportCountOfKind(wxkTag)]));
+  CountLine('functions', AModule.FunctionTypeIndexCount);
+  CountLine('tables', AModule.TableCount);
+  CountLine('memories', AModule.MemoryCount);
+  CountLine('globals', AModule.GlobalCount);
+  CountLine('exports', AModule.ExportCount);
+  CountLine('elements', AModule.ElementCount);
+  CountLine('code entries', AModule.CodeEntryCount);
+  CountLine('data segments', AModule.DataSegmentCount);
+  CountLine('tags', AModule.TagCount);
+  if AModule.HasStart then
+    WriteLn(PadRight('start function', LABEL_WIDTH),
+      Format(' %10u', [AModule.StartFuncIndex]));
+  if AModule.HasDataCount then
+    WriteLn(PadRight('data count', LABEL_WIDTH),
+      Format(' %10u', [AModule.DataCount]));
+end;
+
 function HandleInspect(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
@@ -96,6 +138,7 @@ begin
       try
         DecodeModuleFile(APositionals[I], Module, Bytes);
         PrintSections(Module, APositionals[I]);
+        PrintEntitySummary(Module);
       except
         on E: EWasmError do
         begin
@@ -178,7 +221,7 @@ begin
   try
     SetLength(InspectOpts, 0);
     Registry.Add(TSubcommand.Create('inspect',
-      'Decode a module and report its section table',
+      'Decode a module and report its sections and entity counts',
       '<module.wasm> [<module.wasm>...]',
       @HandleInspect, InspectOpts));
 

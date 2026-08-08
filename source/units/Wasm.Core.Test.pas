@@ -33,6 +33,14 @@ type
     procedure TestSectionOrderIsATotalOrder;
     procedure TestCustomSectionIsUnordered;
     procedure TestSectionIdNaming;
+    procedure TestLimitsDescribe;
+    procedure TestGlobalTypeDescribe;
+    procedure TestTableAndMemTypeDescribe;
+    procedure TestStorageAndFieldTypeDescribe;
+    procedure TestCompositeTypeCodes;
+    procedure TestExternKindOrdinals;
+    procedure TestExternalTypeConstructors;
+    procedure TestCompTypeConstructors;
   end;
 
 function TCoreTests.DescribeCode(const ACode: Int64): string;
@@ -191,6 +199,137 @@ begin
   Expect<string>(SectionIdName(14)).ToBe('unknown(14)');
 end;
 
+procedure TCoreTests.TestLimitsDescribe;
+begin
+  { Text format: `addrtype? min max?` — i32 is the default address type
+    and is left unmarked; only i64 is spelled out. }
+  Expect<string>(MakeLimits(watI32, 1).Describe).ToBe('1');
+  Expect<string>(MakeLimitsWithMax(watI32, 1, 2).Describe).ToBe('1 2');
+  Expect<string>(MakeLimits(watI64, 0).Describe).ToBe('i64 0');
+  Expect<string>(MakeLimitsWithMax(watI64, 1, 2).Describe).ToBe('i64 1 2');
+  { The bounds are u64-valued for both address types; a value above the
+    u32 range must render, not wrap. }
+  Expect<string>(MakeLimits(watI32, UInt64(1) shl 32).Describe)
+    .ToBe('4294967296');
+end;
+
+procedure TCoreTests.TestGlobalTypeDescribe;
+begin
+  { Immutable is the unmarked case; only `mut` gets parentheses. }
+  Expect<string>(MakeGlobalType(False, MakeNumValueType(wntI32)).Describe)
+    .ToBe('i32');
+  Expect<string>(MakeGlobalType(True, MakeNumValueType(wntI32)).Describe)
+    .ToBe('(mut i32)');
+  Expect<string>(MakeGlobalType(True,
+    MakeRefValueType(MakeRefType(True, MakeAbsHeapType(wahFunc)))).Describe)
+    .ToBe('(mut funcref)');
+end;
+
+procedure TCoreTests.TestTableAndMemTypeDescribe;
+begin
+  { `tabletype ::= addrtype? limits reftype` — element type last. }
+  Expect<string>(MakeTableType(
+    MakeRefType(True, MakeAbsHeapType(wahFunc)),
+    MakeLimitsWithMax(watI32, 0, 10)).Describe).ToBe('0 10 funcref');
+  Expect<string>(MakeTableType(
+    MakeRefType(True, MakeConcreteHeapType(5)),
+    MakeLimits(watI64, 1)).Describe).ToBe('i64 1 (ref null 5)');
+  Expect<string>(MakeMemType(MakeLimitsWithMax(watI32, 1, 2)).Describe)
+    .ToBe('1 2');
+  Expect<string>(MakeMemType(MakeLimits(watI64, 0)).Describe)
+    .ToBe('i64 0');
+end;
+
+procedure TCoreTests.TestStorageAndFieldTypeDescribe;
+begin
+  Expect<string>(MakePackedStorageType(wpkI8).Describe).ToBe('i8');
+  Expect<string>(MakePackedStorageType(wpkI16).Describe).ToBe('i16');
+  Expect<string>(MakeValueStorageType(MakeNumValueType(wntF64)).Describe)
+    .ToBe('f64');
+  Expect<string>(
+    MakeFieldType(True, MakePackedStorageType(wpkI8)).Describe)
+    .ToBe('(mut i8)');
+  Expect<string>(
+    MakeFieldType(False, MakeValueStorageType(MakeNumValueType(wntI32)))
+    .Describe).ToBe('i32');
+end;
+
+procedure TCoreTests.TestCompositeTypeCodes;
+begin
+  { The rec/sub/comptype/packed codes as SIGNED values ($4E.. $78 in a
+    hex dump). $4F is FINAL and $50 non-final — the transposable pair. }
+  Expect<Int64>(TYPE_CODE_REC).ToBe(-50);        { $4E }
+  Expect<Int64>(TYPE_CODE_SUB_FINAL).ToBe(-49);  { $4F }
+  Expect<Int64>(TYPE_CODE_SUB).ToBe(-48);        { $50 }
+  Expect<Int64>(TYPE_CODE_ARRAY).ToBe(-34);      { $5E }
+  Expect<Int64>(TYPE_CODE_STRUCT).ToBe(-33);     { $5F }
+  Expect<Int64>(TYPE_CODE_FUNC).ToBe(-32);       { $60 }
+  Expect<Int64>(TYPE_CODE_I16).ToBe(-9);         { $77 }
+  Expect<Int64>(TYPE_CODE_I8).ToBe(-8);          { $78 }
+end;
+
+procedure TCoreTests.TestExternKindOrdinals;
+begin
+  { The ordinals ARE the import/export description discriminator bytes. }
+  Expect<Integer>(Ord(wxkFunc)).ToBe(0);
+  Expect<Integer>(Ord(wxkTable)).ToBe(1);
+  Expect<Integer>(Ord(wxkMem)).ToBe(2);
+  Expect<Integer>(Ord(wxkGlobal)).ToBe(3);
+  Expect<Integer>(Ord(wxkTag)).ToBe(4);
+end;
+
+procedure TCoreTests.TestExternalTypeConstructors;
+var
+  Limits: TWasmLimits;
+begin
+  Limits := MakeLimitsWithMax(watI64, 3, 7);
+  Expect<Boolean>(Limits.AddrType = watI64).ToBe(True);
+  Expect<Boolean>(Limits.HasMax).ToBe(True);
+  Expect<Int64>(Int64(Limits.Min)).ToBe(3);
+  Expect<Int64>(Int64(Limits.Max)).ToBe(7);
+
+  Limits := MakeLimits(watI32, 1);
+  Expect<Boolean>(Limits.HasMax).ToBe(False);
+  Expect<Int64>(Int64(Limits.Max)).ToBe(0);
+
+  Expect<Int64>(Int64(MakeTagType(9).TypeIndex)).ToBe(9);
+  Expect<Boolean>(MakeGlobalType(True, MakeVecValueType).Mut).ToBe(True);
+  Expect<Boolean>(MakePackedStorageType(wpkI16).IsPacked).ToBe(True);
+  Expect<Boolean>(
+    MakeValueStorageType(MakeVecValueType).IsPacked).ToBe(False);
+end;
+
+procedure TCoreTests.TestCompTypeConstructors;
+var
+  Func: TWasmFuncType;
+  Struct: TWasmStructType;
+  Arr: TWasmArrayType;
+  Comp: TWasmCompType;
+begin
+  SetLength(Func.Params, 2);
+  Func.Params[0] := MakeNumValueType(wntI32);
+  Func.Params[1] := MakeNumValueType(wntI64);
+  SetLength(Func.Results, 1);
+  Func.Results[0] := MakeNumValueType(wntF64);
+  Comp := MakeFuncCompType(Func);
+  Expect<Boolean>(Comp.Kind = wckFunc).ToBe(True);
+  Expect<Integer>(Length(Comp.Func.Params)).ToBe(2);
+  Expect<string>(Comp.Func.Results[0].Describe).ToBe('f64');
+  Expect<Integer>(Length(Comp.Struct.Fields)).ToBe(0);
+
+  SetLength(Struct.Fields, 1);
+  Struct.Fields[0] := MakeFieldType(True, MakePackedStorageType(wpkI8));
+  Comp := MakeStructCompType(Struct);
+  Expect<Boolean>(Comp.Kind = wckStruct).ToBe(True);
+  Expect<string>(Comp.Struct.Fields[0].Describe).ToBe('(mut i8)');
+  Expect<Integer>(Length(Comp.Func.Params)).ToBe(0);
+
+  Arr.Elem := MakeFieldType(False, MakePackedStorageType(wpkI16));
+  Comp := MakeArrayCompType(Arr);
+  Expect<Boolean>(Comp.Kind = wckArray).ToBe(True);
+  Expect<string>(Comp.Arr.Elem.Describe).ToBe('i16');
+end;
+
 procedure TCoreTests.SetupTests;
 begin
   Test('number type codes', TestNumTypeCodes);
@@ -206,6 +345,14 @@ begin
   Test('section order is a total order', TestSectionOrderIsATotalOrder);
   Test('custom sections are unordered', TestCustomSectionIsUnordered);
   Test('section id naming', TestSectionIdNaming);
+  Test('limits spelling', TestLimitsDescribe);
+  Test('global type spelling', TestGlobalTypeDescribe);
+  Test('table and memory type spelling', TestTableAndMemTypeDescribe);
+  Test('storage and field type spelling', TestStorageAndFieldTypeDescribe);
+  Test('composite type codes', TestCompositeTypeCodes);
+  Test('extern kind ordinals', TestExternKindOrdinals);
+  Test('external type constructors', TestExternalTypeConstructors);
+  Test('composite type constructors', TestCompTypeConstructors);
 end;
 
 begin
