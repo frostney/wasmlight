@@ -31,7 +31,17 @@ Consequences:
   reference must be discoverable.
 - Safepoints are the epoch-check locations from
   [ADR-0006](./0006-epoch-interruption-not-fuel.md) — loop back-edges and
-  function entries. Sharing them is deliberate.
+  function entries — plus every allocation site and every runtime call
+  that can trigger collection. A `struct.new` that finds the heap
+  exhausted must be able to collect immediately, not fail until the next
+  back-edge; allocation sites are where production runtimes trigger GC.
+  Sharing the back-edge and entry locations with the epoch check remains
+  deliberate.
 - Host code holding a reference across a call that can allocate needs a
   root registration mechanism; raw Pascal pointers into the GC heap are
   not roots the collector can see.
+- Deriving the maps from the typed IR rather than from the code
+  generator has independent production confirmation: Wasmtime moved from
+  register-allocator-derived stack maps to maps emitted at the IR level
+  after the regalloc-derived ones caused miscompiles and blocked
+  optimisations. The IR is the right layer for this information.

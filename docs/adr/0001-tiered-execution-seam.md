@@ -31,3 +31,21 @@ Consequences: the JIT and AOT backends are per-architecture work
 differential-testing obligation against the interpreter rather than a
 fresh conformance campaign. Platforms that forbid writable-executable
 memory remain fully supported at interpreter speed.
+
+Tier-up takes effect at the next function entry only: a running
+activation never migrates tiers, so there is no on-stack replacement.
+That consequence is owned, not hidden — a long-running hot loop stays in
+the tier it entered in, the same trade V8's WebAssembly pipeline
+documents and accepts for its no-OSR dynamic tiering. The loop
+back-edge safepoints already required by
+[ADR-0006](./0006-epoch-interruption-not-fuel.md) (epoch checks) and
+[ADR-0011](./0011-precise-gc-from-ir-derived-stack-maps.md) (stack
+maps) are structurally where an OSR entry point would go, so nothing
+decided here forecloses one if a measured need ever justifies the
+machinery.
+
+The differential-testing obligation is stricter than comparing return
+values. A differential run against the interpreter must compare which
+trap fires and when, and the final contents of exported memories and
+globals — the same oracle Wasmtime's differential fuzzing uses. A tier
+that produces the right value with the wrong side effects is wrong.

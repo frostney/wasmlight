@@ -50,10 +50,11 @@ information validation already computed
 ([ADR-0011](docs/adr/0011-precise-gc-from-ir-derived-stack-maps.md)).
 
 Above the core sits the host surface: WASI preview1 for modules built by
-today's toolchains, and the Component Model — component decode and
-canonical ABI lowering — so wasmlight consumes WIT-described components
-rather than only core modules
-([ADR-0002](docs/adr/0002-wasi-p1-and-component-model.md)).
+today's toolchains
+([ADR-0002](docs/adr/0002-wasi-p1-and-component-model.md)). The
+Component Model — component decode and canonical ABI lowering — is
+deferred to post-v1, deferred rather than dropped
+([ADR-0014](docs/adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
 wasmlight is a member of the lwpt ecosystem: built, tested, formatted, and
 released through lwpt, and consumable by any lwpt project.

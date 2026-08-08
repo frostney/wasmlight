@@ -26,8 +26,12 @@ Consequences:
 - Trap delivery must work from a signal handler / SEH filter. That
   constrains the trap mechanism, which is why it is decided separately
   rather than assumed here.
-- 32-bit targets cannot reserve 4 GiB. Their fate is an open decision, and
-  it is a real one: the CI matrix currently includes an `i386-win32` leg.
+- 32-bit targets cannot reserve 4 GiB. Their fate was settled by
+  [ADR-0010](./0010-32-bit-targets-are-supported-on-bounds-checks.md):
+  they stay supported, on the fallback path.
+- i64-addressed memories cannot be covered by any reservation and take
+  the guard-assisted check path of
+  [ADR-0013](./0013-i64-memories-take-guard-assisted-bounds-checks.md).
 - The signal/SEH handler is correctness-critical and sits between the OS
   and the trap semantics, so it is exercised by the conformance corpus
   rather than trusted.

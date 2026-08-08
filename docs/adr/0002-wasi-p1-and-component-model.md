@@ -1,5 +1,11 @@
 # The host surface is WASI preview1 plus the Component Model
 
+**Superseded by
+[ADR-0014](./0014-the-component-model-is-deferred-to-post-v1.md):** the
+Component Model half of this decision is deferred to post-v1; the WASI
+preview1 half and the deny-by-default capability model carry forward
+there.
+
 wasmlight targets both host-interface generations: **WASI preview1**,
 because it is what today's toolchains actually emit and what makes the
 runtime useful the day the interpreter lands, and the **Component

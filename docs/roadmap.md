@@ -166,8 +166,9 @@ version.
 
 ### Track F — Embedding API and WASI preview1 (needs E)
 
-`Wasm.Engine`, `wasmlight run`, and the deny-by-default capability set
-([ADR-0002](adr/0002-wasi-p1-and-component-model.md)).
+`Wasm.Engine`, `wasmlight run`, and the deny-by-default capability set.
+The v1 host surface is WASI preview1 only
+([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
 ### Track G — SIMD (needs B, E) — **largest chunk, most parallel**
 
@@ -199,10 +200,6 @@ which constrains register allocation.
 Artifacts record the IR version they were compiled from and are rejected
 on mismatch.
 
-### Track K — Component Model (needs F) — see the open question below
-
-Component decoding and canonical ABI lowering.
-
 ## Dependency shape
 
 ```mermaid
@@ -218,7 +215,6 @@ graph LR
   E --> H
   E --> I[I: baseline JIT]
   I --> J[J: AOT]
-  F --> K[K: Component Model]
   C -.judges.-> E
   C -.judges.-> G
   C -.judges.-> H
@@ -241,8 +237,9 @@ choice, and finding out later is expensive.
 - **memory64 is in 3.0, and it strains guard pages.** A 64-bit-addressed
   memory cannot be covered by a 4 GiB reservation, so the guard-page
   strategy in [ADR-0005](adr/0005-guard-page-linear-memory.md) does not
-  reach it. The strategy split is therefore not only host bitness — see
-  the open question below.
+  reach it. The strategy split is therefore not only host bitness but
+  also per-memory address type — settled in
+  [ADR-0013](adr/0013-i64-memories-take-guard-assisted-bounds-checks.md).
 - **Multiple memories are in 3.0.** Every memory instruction carries a
   memory index immediate where 1.0 had a reserved zero byte. Decoders that
   assert `0x00` are wrong; ours must not learn that habit in Track A.
@@ -255,23 +252,26 @@ choice, and finding out later is expensive.
   set, which is why the corpus needs `(either ...)`. These 20 instructions
   cannot be tested by exact comparison.
 
-## Open questions
+## Settled questions
 
-1. **How does guard-page memory reach memory64?** Options: explicit
-   bounds checks for any i64-addressed memory (a third path alongside
-   64-bit guard pages and 32-bit checks); or dynamic-bound checks with a
-   reserved region sized to the declared maximum where one exists. This
-   changes ADR-0005's consequences and should be settled before Track D
-   builds the memory layer.
-2. **Is the Component Model still a v1 goal?**
-   [ADR-0002](adr/0002-wasi-p1-and-component-model.md) puts it in v1
-   scope, but the evidence has moved: it is a **phase 1** proposal with an
-   empty `affected_specs`, specified out-of-band in
-   `WebAssembly/component-model`, and **nothing in the core testsuite
-   exercises it**. So it is both less settled and less verifiable than
-   ADR-0002 assumed — it would need its own conformance story built from
-   scratch. Worth re-deciding, and if it moves, ADR-0002 should be
-   superseded rather than quietly reinterpreted.
+Both questions this roadmap used to carry as open are now decided; the
+arguments live in the ADRs, not here.
+
+1. **How does guard-page memory reach memory64?** Settled by
+   [ADR-0013](adr/0013-i64-memories-take-guard-assisted-bounds-checks.md):
+   the access strategy is selected statically per memory by address
+   type. i32 memories keep guard pages on 64-bit hosts and explicit
+   checks on 32-bit ones; i64 memories always carry an explicit bounds
+   check — guard-assisted on 64-bit hosts, so static offsets fold into
+   an offset-independent compare, and plain checks with index-width
+   reduction on 32-bit hosts. All of it stays behind the single memory
+   chokepoint, and every route traps identically.
+2. **Is the Component Model still a v1 goal?** No. Settled by
+   [ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md),
+   which supersedes the component half of ADR-0002: the Component Model
+   is post-v1, the v1 host surface is WASI preview1 only, and the
+   deny-by-default capability model carries forward unchanged. The
+   re-entry condition is recorded under "After 3.0" below.
 
 ## After 3.0
 
@@ -288,6 +288,14 @@ Policy) are JS/web-embedding only and do not apply.
 Phase 3 items with test corpora already present: custom descriptors (14
 files), custom page sizes (5), wide arithmetic (1). Stack switching is
 phase 3 with **no corpus yet**.
+
+The **Component Model** sits here by decision, not oversight
+([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)).
+It re-enters once the announced canonical-ABI rework (lazy lowering)
+has landed and is covered by the reference WAST suite in
+`WebAssembly/component-model/test`. That suite exists now — updating
+the older observation that nothing exercised the proposal — but it is
+Wasmtime-anchored rather than a neutral conformance bar.
 
 ## Not planned
 

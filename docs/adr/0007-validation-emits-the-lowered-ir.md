@@ -31,3 +31,28 @@ Consequences:
   a **precise** garbage collector tractable under
   [ADR-0004](./0004-conformance-target-is-the-3-0-draft.md) — the runtime
   can know which slots hold references without tagging values.
+- This diverges from every production runtime surveyed. None shares one
+  lowered IR across interpreter and compiler tiers — the industry
+  pattern is each tier re-walking validated bytecode, and
+  JavaScriptCore migrated its interpreter *back* to in-place execution
+  specifically to cut memory and startup. The closest kin — wasm3,
+  WAMR's fast interpreter, Wasmtime's Pulley — are translate-then-
+  interpret designs whose cost is measured: a translated form occupies
+  roughly 2–4× the original bytecode in resident memory, against about
+  +30% for in-place interpretation with a control-flow sidetable
+  (Titzer, ["A fast in-place interpreter for
+  WebAssembly"](https://arxiv.org/abs/2205.01183), 2022) — plus
+  whole-module IR emission latency before anything executes, where a
+  lazy per-function pipeline pays only for what runs.
+- The decision stands despite that divergence. The single-copy
+  conformance argument is load-bearing for this project in a way it is
+  not for engines with large teams and fuzzer farms; the IR is the
+  input to AOT artifacts regardless, so the emission path exists either
+  way; and wasmlight is not a browser, so instantiation is not
+  page-load-critical.
+- Diverging carries a measurement obligation: `wasmbench` measures IR
+  bytes per bytecode byte and instantiation latency from the first
+  IR-producing milestone. The named escape hatch, adopted only if
+  measurement demands it, is splitting a validate-only pass from
+  per-function lazy IR emission — which would weaken "validation emits
+  the IR" but never "no tier reads the raw binary".

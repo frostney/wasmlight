@@ -34,3 +34,17 @@ Consequences:
   Everything above sees one `EWasmTrap`.
 - Every tier must be re-entrant through the trampoline; a tier that keeps
   mutable state across a guest call has to make it trampoline-safe.
+- The Pascal frames between the trampoline and the faulting access —
+  every frame `siglongjmp` can skip — must hold no managed state: no
+  ansistrings, no dynamic arrays, no interfaces. A skipped frame never
+  runs its implicit finalisation, so refcounts leak or corrupt, and FPC
+  gives no diagnostic. This exact bug class — skipped destructors —
+  pushed Wasmtime off its longjmp design in 2025 after six years in
+  production. For wasmlight the constraint is tractable because the hot
+  path already avoids the RTL by policy
+  ([code style](../code-style.md)), but it is a constraint to state and
+  enforce, not an assumption to rely on.
+- The per-invocation `sigsetjmp` is a real but modest cost paid on every
+  host-to-guest call — Wasmtime measured roughly 7% on an empty call
+  when it removed its own. `wasmbench` must measure host-to-guest call
+  overhead so the cost is a number, not a guess.

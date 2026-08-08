@@ -8,9 +8,11 @@
 - The **tier seam** ([ADR-0001](adr/0001-tiered-execution-seam.md)) is the
   central boundary: interpreter, baseline JIT, and AOT implement one
   contract and are selected per function by the runtime.
-- The host surface — WASI preview1 and the Component Model
+- The host surface — WASI preview1
   ([ADR-0002](adr/0002-wasi-p1-and-component-model.md)) — sits above the
-  seam and reaches a guest only through imports, deny-by-default.
+  seam and reaches a guest only through imports, deny-by-default. The
+  Component Model is post-v1
+  ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 - A decoded module **borrows** the caller's bytes
   ([ADR-0003](adr/0003-module-borrows-its-buffer.md)).
 - The target is the **3.0 draft at a pinned commit**
@@ -27,7 +29,7 @@ Read bottom-up; each layer may use only the layers below it.
 
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Component.*` | WASI preview1 host, component decode, canonical ABI | planned |
+| Host surface | `Wasm.Wasi.*` | WASI preview1 host; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | planned |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, instantiate, invoke | planned |
 | Runtime state | `Wasm.Runtime`, `Wasm.Memory`, `Wasm.Gc` | store, instances, memories, tables, globals; guard-page and bounds-checked memory; the precise collector | planned |
 | Execution tiers | `Wasm.Exec.Interp`, `Wasm.Exec.Jit.*`, `Wasm.Exec.Aot` | three implementations of one seam | planned |

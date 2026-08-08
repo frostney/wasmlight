@@ -41,13 +41,16 @@ canonical vocabulary before planning anything.
   [ADR-0012](docs/adr/0012-the-ir-is-register-based.md)). No execution
   tier may re-derive or enforce a spec rule, no tier reads the raw binary,
   and there is no mode that skips validation for "trusted" modules.
-- **Memory access goes through one chokepoint.** Guard pages on 64-bit,
-  explicit bounds checks on 32-bit
+- **Memory access goes through one chokepoint.** The strategy is chosen
+  per memory by address type: guard pages for i32 memories on 64-bit
+  hosts, guard-assisted explicit checks for i64 memories, explicit
+  checks on 32-bit targets
   ([ADR-0005](docs/adr/0005-guard-page-linear-memory.md),
-  [ADR-0010](docs/adr/0010-32-bit-targets-are-supported-on-bounds-checks.md)).
-  That is a **platform** difference, never a tier difference, and both
-  must trap identically. A new caller that bypasses the chokepoint is the
-  failure mode this design is most exposed to.
+  [ADR-0010](docs/adr/0010-32-bit-targets-are-supported-on-bounds-checks.md),
+  [ADR-0013](docs/adr/0013-i64-memories-take-guard-assisted-bounds-checks.md)).
+  That is a platform-and-address-type difference, never a tier
+  difference, and all must trap identically. A new caller that bypasses
+  the chokepoint is the failure mode this design is most exposed to.
 - **Every backend emits the epoch check and can produce a stack map** at
   loop back-edges and function entries
   ([ADR-0006](docs/adr/0006-epoch-interruption-not-fuel.md),

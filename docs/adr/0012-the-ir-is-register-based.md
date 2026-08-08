@@ -34,3 +34,20 @@ Consequences:
   validation to be correct. A bug there is a miscompilation, not a
   rejected module, so it needs its own differential testing against the
   interpreter rather than riding on validation's test coverage.
+- Register-based interpretation is production-proven: wasm3, WAMR's
+  fast interpreter, and Wasmtime's Pulley bytecode are all
+  register-based, and Pulley's virtual registers are allocated by
+  Cranelift's own pipeline — confirming registers as the input form a
+  compiler wants.
+- The correctness risk of assigning registers during validation
+  concentrates in three places, and each is where that differential
+  testing should aim. Unreachable code: the validator's stack is
+  polymorphic after `unreachable` or `br`, so there are no concrete
+  values to assign registers to — emission needs an explicit
+  unreachable mode, historically a bug farm in production validators.
+  Multi-value block boundaries: block parameters and multiple results
+  fix register targets at merge points, requiring phi-like moves at
+  `br` and `end`. And `br_table`: one instruction, many targets, each
+  needing the same merge treatment. Malformed-input tests with literal
+  bytes — already this repo's testing policy — plus the upstream
+  suite's coverage of exactly these constructs are the net.

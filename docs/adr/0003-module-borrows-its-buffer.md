@@ -25,5 +25,13 @@ answering it.
 Consequences: memory-mapping a `.wasm` file is a natural later
 optimisation, since nothing in the model assumes the bytes are on the
 heap. Any future API that returns a module while dropping its buffer is a
-bug, and the lifetime requirement belongs in the doc comment of every
-entry point that produces a module.
+bug. The borrow contract is invisible to the Pascal compiler — no borrow
+checker exists to catch an embedder freeing the buffer under a live
+module — so documentation is the only line of defence: the lifetime rule
+must appear in the doc comment of every entry point that produces a
+module, not merely somewhere in the docs. The contract has production
+precedent: WAMR's embedder API holds the caller's buffer for the module's
+whole life and pairs the rule with an explicit "is the underlying binary
+freeable" query. When wasmlight's embedding API lands, an equivalent
+query is the honest way to make the contract checkable at run time rather
+than by crash.

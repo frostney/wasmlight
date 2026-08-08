@@ -31,3 +31,11 @@ Consequences:
   error unless a debug-build check makes it detectable. If it is worth
   detecting, that is a deliberate feature with a cost, not a free
   guarantee.
+- If the threads proposal is ever adopted — post-3.0 work, and already
+  flagged above as requiring this ADR's revisit — the correct shape is a
+  separate, internally-synchronised shared-memory type. The shared memory
+  is the only shared piece; no lock is ever added to the store itself.
+  Wasmtime's split between its exclusive-access store and its dedicated
+  thread-safe shared-memory type is the production template. Recording
+  this now keeps the lazy alternative — sprinkling locks on the store —
+  from looking acceptable later.
