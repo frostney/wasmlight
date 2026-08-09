@@ -98,6 +98,17 @@ const
   MSG_LOCALS_IMPLEMENTATION_LIMIT =
     'implementation limit: too many locals';
 
+  { `valid-memarg` classifies a memory argument "by the address type" of
+    the memory: the static offset must fit that address type, so for a
+    32-bit (i32) memory the offset must be < 2^32, while a memory64 admits
+    the full u64. `syntax-loadn` spells out why — an i32 memory yields a
+    33-bit effective address, which the 32-bit static offset cannot
+    overflow. The offset is decoded as a u64 (Wasm.Decoder.Expr's
+    SkipMemarg reads it as such), so the bound is a VALIDATION rule against
+    the memory's address type, not a decode side condition. address.wast
+    asserts the prefix "offset out of range" for offset=2^32 on `(memory 1)`. }
+  MSG_OFFSET_OUT_OF_RANGE = 'offset out of range';
+
 type
   TWasmValTypeList = array of TWasmValueType;
   TWasmRegList = array of UInt32;
@@ -987,7 +998,7 @@ type
     procedure CheckFieldAccess(const AField: TWasmFieldType;
       const APacked: Boolean; const AWhat: string);
     procedure CheckFieldMutable(const AField: TWasmFieldType;
-      const AWhat: string);
+      const APrefix, AWhat: string);
     procedure ReadMemarg(const AOp: Byte; out AMemIdx: UInt32;
       out AOffset: UInt64; const AOpOffset: NativeUInt);
 
@@ -1197,9 +1208,9 @@ end;
 function TBodyWalker.CtrlIndex(const ADepth: UInt32): Integer;
 begin
   if ADepth >= UInt32(FCtrlCount) then
-    ValErr(MSG_UNKNOWN_LABEL,
-      Format('label %u is out of range (%d label(s) in scope)',
-        [ADepth, FCtrlCount]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_LABEL, ADepth),
+      Format('out of range (%d label(s) in scope)',
+        [FCtrlCount]));
   Result := FCtrlCount - 1 - Integer(ADepth);
 end;
 
@@ -1500,8 +1511,8 @@ begin
   if Code >= 0 then
   begin
     if Code > High(UInt32) then
-      ValErr(MSG_UNKNOWN_TYPE,
-        Format('block type index %d is out of range', [Code]));
+      ValErr(UnknownIndex(MSG_UNKNOWN_TYPE, Code),
+        'block type index is out of range');
     Comp := FTypes.Expand(UInt32(Code));
     if Comp.Kind <> wckFunc then
       ValErr(MSG_TYPE_MISMATCH,
@@ -1590,9 +1601,9 @@ function TBodyWalker.CheckTable(const AIndex: UInt32;
   const AOffset: NativeUInt): TWasmTableType;
 begin
   if AIndex >= UInt32(Length(FSpaces.Tables)) then
-    ValErr(MSG_UNKNOWN_TABLE,
-      Format('table %u is out of range (%d table(s)) at offset %u',
-        [AIndex, Length(FSpaces.Tables), AOffset]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_TABLE, AIndex),
+      Format('out of range (%d table(s)) at offset %u',
+        [Length(FSpaces.Tables), AOffset]));
   Result := FSpaces.Tables[AIndex];
 end;
 
@@ -1614,9 +1625,9 @@ function TBodyWalker.CheckGlobal(const AIndex: UInt32;
   const AOffset: NativeUInt): TWasmGlobalType;
 begin
   if AIndex >= UInt32(Length(FSpaces.Globals)) then
-    ValErr(MSG_UNKNOWN_GLOBAL,
-      Format('global %u is out of range (%d global(s)) at offset %u',
-        [AIndex, Length(FSpaces.Globals), AOffset]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_GLOBAL, AIndex),
+      Format('out of range (%d global(s)) at offset %u',
+        [Length(FSpaces.Globals), AOffset]));
   Result := FSpaces.Globals[AIndex];
 end;
 
@@ -1630,9 +1641,9 @@ function TBodyWalker.CheckTag(const AIndex: UInt32;
   const AOffset: NativeUInt): TWasmFuncType;
 begin
   if AIndex >= UInt32(Length(FSpaces.Tags)) then
-    ValErr(MSG_UNKNOWN_TAG,
-      Format('tag %u is out of range (%d tag(s)) at offset %u',
-        [AIndex, Length(FSpaces.Tags), AOffset]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_TAG, AIndex),
+      Format('out of range (%d tag(s)) at offset %u',
+        [Length(FSpaces.Tags), AOffset]));
   Result := FuncTypeAt(FSpaces.Tags[AIndex]);
   if Length(Result.Results) <> 0 then
     ValErr(MSG_TYPE_MISMATCH,
@@ -1644,9 +1655,9 @@ function TBodyWalker.CheckElem(const AIndex: UInt32;
   const AOffset: NativeUInt): TWasmRefType;
 begin
   if AIndex >= UInt32(Length(FSpaces.ElemTypes)) then
-    ValErr(MSG_UNKNOWN_ELEM_SEGMENT,
-      Format('elem segment %u is out of range (%d segment(s)) at '
-        + 'offset %u', [AIndex, Length(FSpaces.ElemTypes), AOffset]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_ELEM_SEGMENT, AIndex),
+      Format('out of range (%d segment(s)) at offset %u',
+        [Length(FSpaces.ElemTypes), AOffset]));
   Result := FSpaces.ElemTypes[AIndex];
 end;
 
@@ -1666,9 +1677,9 @@ begin
       + 'module has no data count section',
       [MSG_DATA_COUNT_REQUIRED, AOffset]));
   if AIndex >= FSpaces.DataCount then
-    ValErr(MSG_UNKNOWN_DATA_SEGMENT,
-      Format('data segment %u is out of range (%u segment(s)) at '
-        + 'offset %u', [AIndex, FSpaces.DataCount, AOffset]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_DATA_SEGMENT, AIndex),
+      Format('out of range (%u segment(s)) at offset %u',
+        [FSpaces.DataCount, AOffset]));
 end;
 
 { `appendix/algorithm-validation-of-opcode-sequences`: every struct
@@ -1734,15 +1745,16 @@ begin
       + ' without a sign extension');
 end;
 
-{ UNCONFIRMED as a MESSAGE: the reference interpreter is believed to spell
-  this `field is immutable`, which is not one of the prefixes
-  Wasm.Validator.Types declares. It is reported inside the `type mismatch`
-  family until Track C's runner says otherwise — one call site, one line. }
+{ The prefix names the aggregate whose member is immutable — `immutable
+  field` for a struct, `immutable array` for every array write — because
+  that is what upstream's scripts prefix-match (struct.wast, array*.wast).
+  Confirmed by corpus run 2026-08-09; the instruction that tripped it is
+  appended as context. }
 procedure TBodyWalker.CheckFieldMutable(const AField: TWasmFieldType;
-  const AWhat: string);
+  const APrefix, AWhat: string);
 begin
   if not AField.Mut then
-    ValErr(MSG_TYPE_MISMATCH, AWhat + ' writes an immutable field');
+    ValErr(APrefix, AWhat + ' writes an immutable member');
 end;
 
 { memarg. The ENCODING is Track A's, reproduced byte for byte from
@@ -1827,9 +1839,9 @@ begin
   Start := FReader.Position;
   Idx := FReader.ReadU32;
   if Idx >= UInt32(Length(FLocalTypes)) then
-    ValErr(MSG_UNKNOWN_LOCAL,
-      Format('local %u is out of range (%d local(s)) at offset %u',
-        [Idx, Length(FLocalTypes), FBase + Start]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_LOCAL, Idx),
+      Format('out of range (%d local(s)) at offset %u',
+        [Length(FLocalTypes), FBase + Start]));
 
   { get_local (`appendix/algorithm-stacks`): a local whose type is not
     defaultable starts uninitialized and may not be read until set. }
@@ -1860,9 +1872,9 @@ begin
   Start := FReader.Position;
   Idx := FReader.ReadU32;
   if Idx >= UInt32(Length(FLocalTypes)) then
-    ValErr(MSG_UNKNOWN_LOCAL,
-      Format('local %u is out of range (%d local(s)) at offset %u',
-        [Idx, Length(FLocalTypes), FBase + Start]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_LOCAL, Idx),
+      Format('out of range (%d local(s)) at offset %u',
+        [Length(FLocalTypes), FBase + Start]));
 
   E := PopValExpect(FLocalTypes[Idx]);
   if Emitting then
@@ -2214,7 +2226,10 @@ begin
     EntryIdx := CtrlIndex(Entries[I]);
     Types := LabelTypes(EntryIdx);
     if Length(Types) <> Arity then
-      ValErr(MSG_INVALID_RESULT_ARITY,
+      { Upstream folds a br_table label-arity divergence into `type
+        mismatch` (br_table.wast, unreached-invalid.wast), not a distinct
+        arity prefix — confirmed by corpus run 2026-08-09. }
+      ValErr(MSG_TYPE_MISMATCH,
         Format('br_table target %d has arity %d, default has %d, at '
           + 'offset %u', [I, Length(Types), Arity, FBase + Start]));
     TmpRegs := PopVals(Types);
@@ -2285,9 +2300,9 @@ begin
   Start := FReader.Position;
   FuncIdx := FReader.ReadU32;
   if FuncIdx >= UInt32(Length(FSpaces.FuncTypes)) then
-    ValErr(MSG_UNKNOWN_FUNCTION,
-      Format('function %u is out of range (%d function(s)) at offset %u',
-        [FuncIdx, Length(FSpaces.FuncTypes), FBase + Start]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_FUNCTION, FuncIdx),
+      Format('out of range (%d function(s)) at offset %u',
+        [Length(FSpaces.FuncTypes), FBase + Start]));
 
   Ft := FuncTypeAt(FSpaces.FuncTypes[FuncIdx]);
   Params := CopyValTypes(Ft.Params);
@@ -2332,9 +2347,9 @@ begin
   TableIdx := FReader.ReadU32;
 
   if TableIdx >= UInt32(Length(FSpaces.Tables)) then
-    ValErr(MSG_UNKNOWN_TABLE,
-      Format('table %u is out of range (%d table(s)) at offset %u',
-        [TableIdx, Length(FSpaces.Tables), FBase + Start]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_TABLE, TableIdx),
+      Format('out of range (%d table(s)) at offset %u',
+        [Length(FSpaces.Tables), FBase + Start]));
 
   { The table must hold function references. }
   if not FTypes.MatchesRefType(FSpaces.Tables[TableIdx].RefType,
@@ -2447,7 +2462,7 @@ begin
   if ASet then
   begin
     if not G.Mut then
-      ValErr(MSG_GLOBAL_IS_IMMUTABLE,
+      ValErr(MSG_IMMUTABLE_GLOBAL,
         Format('global %u is not mutable at offset %u', [Idx, AOffset]));
     Reg := PopValExpect(G.ValueType).Reg;
     if Emitting then
@@ -2528,6 +2543,13 @@ var
 begin
   ReadMemarg(AOp, MemIdx, StaticOffset, AOffset);
   Mem := CheckMemory(MemIdx, AOffset);
+  { `valid-memarg`: the static offset must fit the memory's address type.
+    A memory64 admits the full u64 offset; an i32 memory caps it at 2^32-1
+    ($FFFFFFFF). Only the i32 case can overflow, since the offset is a u64. }
+  if (Mem.Limits.AddrType <> watI64) and (StaticOffset > $FFFFFFFF) then
+    ValErr(MSG_OFFSET_OUT_OF_RANGE,
+      Format('static offset %u does not fit the i32 memory %u at offset %u',
+        [StaticOffset, MemIdx, AOffset]));
   Value := MakeNumValueType(MEM_SIG[AOp].Value);
   IrOp := TWasmIrOp(Ord(iroI32Load) + Integer(AOp) - $28);
 
@@ -2643,9 +2665,9 @@ var
 begin
   Idx := FReader.ReadU32;
   if Idx >= UInt32(Length(FSpaces.FuncTypes)) then
-    ValErr(MSG_UNKNOWN_FUNCTION,
-      Format('function %u is out of range (%d function(s)) at offset %u',
-        [Idx, Length(FSpaces.FuncTypes), AOffset]));
+    ValErr(UnknownIndex(MSG_UNKNOWN_FUNCTION, Idx),
+      Format('out of range (%d function(s)) at offset %u',
+        [Length(FSpaces.FuncTypes), AOffset]));
 
   if (Idx >= UInt32(Length(FSpaces.DeclaredFuncs))) or (not FSpaces.DeclaredFuncs[Idx]) then
     ValErr(MSG_UNDECLARED_FUNCTION_REFERENCE,
@@ -2970,8 +2992,13 @@ begin
       begin
         DataIdx := FReader.ReadU32;
         MemIdx := FReader.ReadU32;
-        CheckData(DataIdx, AOffset);
+        { The IMMEDIATES decode (dataidx, memidx), but the typing rule
+          `Instr_ok/memory.init` premises the MEMORY (x) before the data
+          segment (y), so an out-of-range memory is reported first —
+          upstream asserts `unknown memory` even when the data index is
+          also out of range (memory_init.wast, corpus run 2026-08-09). }
         DstMem := CheckMemory(MemIdx, AOffset);
+        CheckData(DataIdx, AOffset);
 
         Cnt := PopValExpect(MakeI32).Reg;
         Src := PopValExpect(MakeI32).Reg;
@@ -3052,8 +3079,13 @@ begin
       begin
         ElemIdx := FReader.ReadU32;
         TableIdx := FReader.ReadU32;
-        ElemRef := CheckElem(ElemIdx, AOffset);
+        { The IMMEDIATES decode (elemidx, tableidx), but the typing rule
+          `Instr_ok/table.init` premises the TABLE (x) before the element
+          segment (y), so an out-of-range table is reported first —
+          upstream asserts `unknown table` even when the elem index is
+          also out of range (table_init.wast, corpus run 2026-08-09). }
         Tt := CheckTable(TableIdx, AOffset);
+        ElemRef := CheckElem(ElemIdx, AOffset);
         if not FTypes.MatchesRefType(ElemRef, Tt.RefType) then
           ValErr(MSG_TYPE_MISMATCH,
             Format('elem segment %u holds %s, table %u holds %s',
@@ -3227,7 +3259,7 @@ begin
       begin
         FieldIdx := FReader.ReadU32;
         Field := StructFieldAt(TypeIdx, FieldIdx, AOffset);
-        CheckFieldMutable(Field, 'struct.set');
+        CheckFieldMutable(Field, MSG_IMMUTABLE_FIELD, 'struct.set');
         ValReg := PopValExpect(UnpackField(Field)).Reg;
         RefReg := PopValExpect(MakeConcreteRef(True, TypeIdx)).Reg;
         if Emitting then
@@ -3285,7 +3317,7 @@ var
   begin
     if (not Elem.Storage.IsPacked)
       and (Elem.Storage.ValueType.Kind = wvkRef) then
-      ValErr(MSG_TYPE_MISMATCH,
+      ValErr(MSG_ARRAY_NOT_NUMERIC,
         AWhat + ' needs a numeric or packed element type, found '
         + Elem.Storage.Describe);
   end;
@@ -3467,7 +3499,7 @@ begin
     { array.set x : [(ref null x) i32 t] -> [] }
     14:
       begin
-        CheckFieldMutable(Elem, 'array.set');
+        CheckFieldMutable(Elem, MSG_IMMUTABLE_ARRAY, 'array.set');
         ValReg := PopValExpect(ElemTy).Reg;
         IdxReg := PopValExpect(MakeI32).Reg;
         RefReg := PopValExpect(MakeConcreteRef(True, TypeIdx)).Reg;
@@ -3478,7 +3510,7 @@ begin
     { array.fill x : [(ref null x) i32 t i32] -> [] }
     16:
       begin
-        CheckFieldMutable(Elem, 'array.fill');
+        CheckFieldMutable(Elem, MSG_IMMUTABLE_ARRAY, 'array.fill');
         CntReg := PopValExpect(MakeI32).Reg;
         ValReg := PopValExpect(ElemTy).Reg;
         IdxReg := PopValExpect(MakeI32).Reg;
@@ -3500,10 +3532,10 @@ begin
       begin
         SrcTypeIdx := FReader.ReadU32;
         SrcElem := ArrayTypeAt(SrcTypeIdx);
-        CheckFieldMutable(Elem, 'array.copy');
+        CheckFieldMutable(Elem, MSG_IMMUTABLE_ARRAY, 'array.copy');
         if not FTypes.MatchesStorageType(SrcElem.Storage,
           Elem.Storage) then
-          ValErr(MSG_TYPE_MISMATCH,
+          ValErr(MSG_ARRAY_TYPES_MISMATCH,
             'array.copy reads ' + SrcElem.Storage.Describe
             + ' into ' + Elem.Storage.Describe);
 
@@ -3531,7 +3563,7 @@ begin
   else
     begin
       SegIdx := FReader.ReadU32;
-      CheckFieldMutable(Elem, 'array.init');
+      CheckFieldMutable(Elem, MSG_IMMUTABLE_ARRAY, 'array.init');
       if ASub = 18 then
       begin
         CheckData(SegIdx, AOffset);

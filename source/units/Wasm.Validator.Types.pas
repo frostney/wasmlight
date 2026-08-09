@@ -107,7 +107,22 @@ const
   MSG_INVALID_RESULT_ARITY = 'invalid result arity';
   MSG_ALIGNMENT_TOO_LARGE = 'alignment must not be larger than natural';
   MSG_UNDECLARED_FUNCTION_REFERENCE = 'undeclared function reference';
-  MSG_GLOBAL_IS_IMMUTABLE = 'global is immutable';
+  { Writing through an immutable handle. Upstream spells the space in the
+    noun, not "X is immutable": a mutable-global write is `immutable
+    global` (global.wast), a struct.set to a const field is `immutable
+    field` (struct.wast), and every array write to a const element —
+    array.set/fill/copy/init — is `immutable array` (array*.wast).
+    Confirmed against the upstream testsuite by corpus run 2026-08-09. }
+  MSG_IMMUTABLE_GLOBAL = 'immutable global';
+  MSG_IMMUTABLE_FIELD = 'immutable field';
+  MSG_IMMUTABLE_ARRAY = 'immutable array';
+  { array.copy whose source element storage does not match the
+    destination's (array_copy.wast), and array.init_data/new_data on an
+    array whose element is a reference rather than a number, vector, or
+    packed field (array_init_data.wast / array_new_data.wast). Confirmed
+    against the upstream testsuite by corpus run 2026-08-09. }
+  MSG_ARRAY_TYPES_MISMATCH = 'array types do not match';
+  MSG_ARRAY_NOT_NUMERIC = 'array type is not numeric or vector';
   MSG_SIZE_MINIMUM_GT_MAXIMUM =
     'size minimum must not be greater than maximum';
   MSG_MEMORY_SIZE_LIMIT = 'memory size must be at most 65536 pages (4GiB)';
@@ -300,19 +315,32 @@ function IsBotValType(const A: TWasmValueType): Boolean;
   because Track D's casts need it without a module in hand. }
 function AbsHeapSubtype(const A, B: TWasmAbsHeapType): Boolean;
 
-{ `unknown memory <index>` — the prefix for a memory index that names no
-  memory. The index sits INSIDE the prefix, space-separated and with no
-  colon, because that is what upstream's scripts assert; the raise site
-  then appends its own context after the usual colon. }
+{ `unknown <thing> <index>` — the prefix for an index that names nothing
+  in its space. The index sits INSIDE the prefix, space-separated and
+  with no colon, because that is what upstream's scripts assert (they
+  prefix-match `unknown global 7`, `unknown table 0`, …); the raise site
+  then appends its own context after the usual colon. Every index-space
+  `unknown X` message routes through here so the "index in the prefix, no
+  colon" shape is written once — see the twelve MSG_UNKNOWN_* constants. }
+function UnknownIndex(const ANoun: string; const AIndex: Int64): string;
+
+{ `unknown memory <index>` — the memory-specific spelling of the above,
+  kept as a named entry point because the memory reconciliation predates
+  the generic helper and several callers reference it. }
 function UnknownMemoryPrefix(const AIndex: UInt32): string;
 
 implementation
 
 { --- message prefixes ---------------------------------------------------- }
 
+function UnknownIndex(const ANoun: string; const AIndex: Int64): string;
+begin
+  Result := ANoun + ' ' + IntToStr(AIndex);
+end;
+
 function UnknownMemoryPrefix(const AIndex: UInt32): string;
 begin
-  Result := MSG_UNKNOWN_MEMORY + ' ' + IntToStr(Int64(AIndex));
+  Result := UnknownIndex(MSG_UNKNOWN_MEMORY, Int64(AIndex));
 end;
 
 { --- the bottom type ----------------------------------------------------- }

@@ -1,99 +1,108 @@
 # Handoff
 
-Updated: 2026-08-09 (Track E — the interpreter)
+Updated: 2026-08-09 (Track C — the wat text-format assembler)
 
 ## Current state
 
-- **Tracks A, B, D delivered; C partial; E (interpreter) delivered.**
-  The interpreter is the TIER OF RECORD (ADR-0001) and executes every
-  non-SIMD, non-throwing IR op: numeric (full IEEE 754 + NaN rules),
-  parametric, variable, control, memory (via the chokepoint), table,
-  reference, and GC — plus host calls, the epoch check, O(1) tail calls,
-  and the start function.
+- **Tracks A, B, D, E delivered; Track C substantially delivered.** The
+  runtime decodes, validates, instantiates, and EXECUTES WebAssembly,
+  and the wat assembler now assembles text + (module quote) modules so
+  the conformance harness judges the corpus at scale.
 - Gates on the merged tree: `lwpt format`, `lwpt build`, `lwpt test`
-  (26 suites), `lwpt install --frozen` — all green.
-- **Everything is UNCOMMITTED** (the whole interpreter + runtime is
-  untracked/modified work; the user commits between turns — HEAD is
-  still an early commit, so `git stash` is NOT a valid baseline here).
+  (32 suites, 852 tests), `lwpt install --frozen` — all green. Docs
+  markdownlint-clean.
+- **Corpus (WebAssembly/testsuite@de54fd27, 288 files, errors=0):**
+  pass=38900 fail=444 skip=26161 staged=1620. Judged (pass+fail+staged)
+  rose from ~1,075 to ~40,900. ROOT (3.0): pass=38367 fail=88.
+  PROPOSALS (post-3.0, outside ADR-0004): pass=533 fail=356.
+- **Everything is UNCOMMITTED** (the user commits between turns; HEAD is
+  an early commit, so `git stash`/HEAD is NOT a valid baseline — the
+  whole runtime + assembler is untracked working state).
 
-## What shipped this session (Track E)
+## What shipped this session (Track C wat assembler)
 
-- `Wasm.Interp.Numeric` — leaf numeric functions, bit-exact, the
-  positive-canonical-NaN rule, trapping + saturating truncations. Masks
-  FP exceptions per-arch (x86_64 MXCSR / i386 x87 at 53-bit precision /
-  aarch64 FPCR) — exported MaskFpuExceptions is the one shared routine.
-  IMPORTANT: FP exceptions are NOT masked by default on aarch64-darwin;
-  the interpreter re-masks on each thread's first invoke.
-- `Wasm.Interp` — the explicit activation stack (NO Pascal recursion per
-  wasm call), the dispatch loop, O(1) tail-call frame replacement, the
-  GC frame-walk discharge (zero ref slots at entry, PushFrame before the
-  first safepoint, RefRegBits/RegisterCount/Slots), memory chokepoint
-  access only, host calls, the tier seam (RegisterInterpreter sets
-  TierInvoke/TierContext/TierContextFree). TRAP-1 discipline: Run holds
-  no managed Pascal local across any TrapNow (a longjmp abandons
-  finalization — this bit once; every message/alloc path is a leaf).
-- `Wasm.Wast.Values` + runner integration — value parser (hex floats,
-  nan:canonical/arithmetic classes, ref forms), the result comparator
-  (bitwise + NaN-class + ref identity), module registry / register /
-  cross-module import; assert_return/assert_trap/invoke/assert_exhaustion
-  now EXECUTE.
-- Track D prereqs added this session: split null-trap kinds
-  (struct/array/i31/func), barriered ArrayCopy/ArrayInitFromData/Elem +
-  Store.TableCopy + sliced TableInitFromElem, Store.TierContext teardown,
-  Store.MemoryPages/MemoryGrow accessors.
-- Design docs persisted in .agent/design/: interp-spec.md (+ ir-spec,
-  runtime-spec, wat-assembler from prior sessions).
+Six flat Wasm.Wat.* units (design doc: .agent/design/wat-assembler.md):
+- Wasm.Wat.Numbers — int/float literals→bits; one bignum rounder for
+  hex + decimal floats (round-half-to-even, subnormals, overflow-after-
+  rounding), INT64_MIN edge, nan payloads. Canonical-NaN consts now in
+  Wasm.Core.
+- Wasm.Wat.Lexer — strict tokenizer; the reserved-token maximal-munch
+  rule (owns the 555-command 'unknown operator' bucket), annotation
+  validation, UTF-8 source decoding.
+- Wasm.Wat.Emit — the single home for LEB/byte emission + section
+  builder with size backpatching (no name section).
+- Wasm.Wat.Opcodes — 238 mnemonics → opcode+immediate-shape+natural
+  align; the deliberate mirror of Wasm.Decoder.Expr (guarded by a
+  no-duplicate build check). $FD SIMD gap → Track G.
+- Wasm.Wat.Names — the twelve identifier spaces, label stack
+  (innermost-first shadowing), implicit-typeuse dedup/insert (the §7
+  risk, isolated).
+- Wasm.Wat.Assembler — two-pass declare/emit, full instruction grammar,
+  folded-instruction unfold (folded-if arm order proven at byte level),
+  inline segments. AssembleWat/AssembleQuote → bytes → the shipped
+  DecodeModule/ValidateModule/instantiate/interpret path.
+- Integration: EWasmTextError promoted to Wasm.Core (sibling of
+  EWasmDecodeError); Wasm.Wast.Runner wires text/quote modules and runs
+  assert_return/trap/invoke/exhaustion AND assert_trap-over-module
+  (instantiation traps + persisted segments); wasmspec ROOT/PROPOSALS
+  split.
 
-## The honest ceiling (important)
+## Review outcome (Opus-5 standards review + the corpus as behavior oracle)
 
-The corpus barely moved (1032 vs 1034 pass) NOT because the interpreter
-is weak but because **241 of 257 spec files are text-format modules**
-that need the WAT ASSEMBLER (Track C's unshipped remainder) to even
-instantiate. Exactly one corpus assertion governs a binary module. The
-tier is proven by ~87 direct-API + value/runner unit tests (incl. a 1e6
-tail-call loop in bounded stack, mid-construction GC collection,
-call_indirect subtype dispatch). **The wat assembler is now the highest-
-leverage next step for conformance signal** — it unlocks ~6,600 judgeable
-commands per its design doc, and THEN assert_return/assert_trap execute
-across the real corpus and settle the remaining execution-tier prefixes.
+The six units came back HIGH QUALITY — clean leaf-to-root DAG, single-
+homed emission, exemplary bignum boundary tests, correct error
+hierarchy; findings were comment/vocabulary/dedup only, all applied.
+Corpus-driven fixes this session:
+- SERIOUS: far-OOB guard-page access raised EStackOverflow (first
+  in-process SIGSEGV doesn't reach the trampoline) and aborted a whole
+  file. Fixed: the interpreter now does EXPLICIT bounds checks on every
+  memory strategy; guard pages are reserved as a future JIT (Track I)
+  optimization once signal->trampoline delivery is proven. Plus
+  defense-in-depth: foreign RTL exceptions converted at the invoke
+  boundary, per-command isolation so one bad command can't abort a run.
+- Assembler bugs: br_on_cast double-$FB-prefix; unknown-type false
+  rejection (numeric typeidx now deferred to validation); typeuse-in-
+  instruction parse gap; data-count emission; inline-function-type check;
+  reserved/unexpected-token boundary.
+- Validator: 12 'unknown <thing> N' prefixes (index-in-prefix,
+  generalized from the historic unknown-memory fix); table.init/
+  memory.init check order; immutable-global/field/array wording;
+  offset-out-of-range (i32 memory, offset >= 2^32).
+- Runtime: zero-member (rec) group accepted; uninitialized-element index
+  detail; array.new_elem check-before-alloc; bare (ref.extern) matcher.
 
-## Review outcome (2-axis, Opus-5 — codex still credit-limited)
+## Remaining fails (characterized, NOT 3.0 regressions)
 
-Interpreter came back ship-quality: no confirmed high-sev exec defect;
-chokepoint, TRAP-1, single-thread, tail-call O(1), NaN semantics, split
-trap messages, comparator all verified clean. Found + fixed:
-- **call_indirect used engine-id EQUALITY, needed SUBTYPING** (3.0
-  func-ref/GC merge) — a table fn of a proper subtype was wrongly
-  trapped; now uses Engine.Matches(actual, expected), corpus-confirmed
-  (type-subtyping.wast:294).
-- x87 control word forced 80-bit extended precision on i386 (double-
-  rounds f32/f64) → set to 53-bit ($027F).
-- Stale unit header (claimed memory/GC unimplemented), FP-mask dedup,
-  Wave→Track comment vocabulary, dead locals, write-barrier old-value
-  note for a future generational barrier.
-
-Known deferrals (documented, not blocking): M7 extern/any convert
-imprecision (needs a wrapper/flag at the convert site, lands with the
-GC-heavy execution — currently latent, all its corpus cases are text-
-format/skipped); Windows guard-page/SEH staged to bounds-checks;
-`PRODUCTION` build mode still defined nowhere.
+- ~356 PROPOSALS fails: custom-descriptors, custom-page-sizes, threads,
+  wide-arithmetic — post-3.0, outside the ADR-0004 pinned target.
+- ~1,620 staged: SIMD ($FD) — validation staged to Track G; the
+  assembler emits vector text so the marker stays a validator concern.
+- ~88 ROOT fails: legacy exception-handling text encodings (Track H),
+  the pre-existing binary-leb128 wording (limits read at u64 vs address-
+  type u32 width — structural, deliberately deferred), a few edges.
+- ~25,700 skips: assertions against staged (SIMD) modules, and
+  assert_return/trap needing modules the assembler stages.
 
 ## Next steps (dependency order)
 
-1. **Track C rest — the WAT ASSEMBLER** (design doc ready at
-   .agent/design/wat-assembler.md). Highest leverage: unlocks the text
-   corpus so the interpreter's assert_return/assert_trap actually run at
-   scale. 7 waves, first three unlock zero corpus but are independently
-   testable (numbers → lexer → emit).
-2. **Track G — SIMD** (decode done; validation staged here,
-   IR_FORMAT_VERSION→2; execution needs the v128 value side-vector the
-   interpreter reserved).
-3. **Track H — exception handling** (try_table IR + handler tables
-   already emitted; iroThrow/iroThrowRef staged in the interpreter).
-4. **Track I/J — baseline JIT / AOT**: differential-tested against THIS
-   interpreter (ADR-0001). Observational-identity items to match are in
-   interp-spec §8 (trap timing, NaN bits, FP rounding, side-effect order
-   at a trap).
+1. **Track G — SIMD**: decode done; validation staged (raises the
+   staged message, IR_FORMAT_VERSION->2); execution needs the v128 value
+   side-vector the interpreter reserved; the assembler's Wave 7 adds
+   vector text forms (Wasm.Wat.Opcodes gap + lane literals). This
+   retires the ~1,620 staged + a large chunk of skips.
+2. **Track H — exception handling**: try_table IR + handler tables
+   already emitted; iroThrow/iroThrowRef staged in the interpreter;
+   Track E's runner already handles non-throwing try_table. Retires the
+   legacy-EH ROOT fails (modulo the legacy vs 3.0 encoding note).
+3. **Track I/J — baseline JIT / AOT**: differential-tested against the
+   interpreter (ADR-0001); interp-spec §8 lists the observational-
+   identity items. Guard-page memory becomes the JIT's inline-access
+   optimization once signal->trampoline delivery is proven robust
+   in-process (the interpreter uses explicit checks today).
+4. Small residuals if desired: the binary-leb128 limits-width decode
+   fix; a spectest host module in the runner would unlock more linking
+   assertions; the throw.wast full-form 'type mismatch [i32]' bracket
+   wording (4 fails, low value).
 5. User decision standing: NO GitHub issues until the roadmap is done.
 6. Local hygiene: builds drop gitignored .o/.ppu into
    .lwpt/modules/testing/, breaking a LOCAL `lwpt install --frozen`

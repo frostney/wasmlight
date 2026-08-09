@@ -440,7 +440,12 @@ begin
 
   R := ACtx^.Store.Tables[TableAddr].Elems[Idx];
   if RefIsNull(R) then
-    TrapNow(wtkUninitializedElement);
+    { The corpus spells the INDEXED form, 'uninitialized element 2'
+      (bulk.wast:222), where the trailing number is the element index that
+      was null; it rides in the trampoline Detail and is appended after the
+      jump. The runner prefix-matches, so a corpus expecting the bare
+      'uninitialized element' still passes against the indexed spelling. }
+    TrapNowDetail(wtkUninitializedElement, UInt32(Idx));
 
   FuncAddr := ACtx^.Store.FuncRefAddr(R);
   Expected := ACaller^.Instance.EngineTypeIds[TypeIdx];
@@ -798,17 +803,29 @@ var
   TypeIdx, ElemIdx: UInt32;
   ElemAddr: TWasmElemAddr;
   Obj: TWasmRef;
+  ElemOffset, Count, SrcLen: UInt32;
 begin
   Store := ACtx^.Store;
   Reg := Frame(ACtx^.Values, AAct^.Base);
   { Imm = IrPack(typeIndex, elemIndex); A = element offset, B = length. }
   IrUnpack(AIns^.Imm, TypeIdx, ElemIdx);
-  Obj := Store.Heap.AllocArray(AAct^.Instance.EngineTypeIds[TypeIdx],
-    Reg[AIns^.B].U32);
-  Reg[AIns^.Dest].Bits := UInt64(Obj);
   ElemAddr := AAct^.Instance.ElemAddrs[ElemIdx];
+  { exec-array.new_elem checks the ELEMENT-SEGMENT source range BEFORE
+    allocating the array; otherwise an overflowing count allocates gigabytes
+    and traps 'out of memory' where the spec (and corpus array.wast:283) want
+    'out of bounds table access'. AllocArray is the safepoint, so the check
+    has to precede it. The array-range half of the check is trivially
+    satisfied here (dest is the fresh array, offset 0, length = count), so
+    only the segment side matters. A dropped segment reads as empty. }
+  ElemOffset := Reg[AIns^.A].U32;
+  Count := Reg[AIns^.B].U32;
+  SrcLen := UInt32(Length(Store.Elems[ElemAddr].Refs));
+  if (ElemOffset > SrcLen) or (Count > SrcLen - ElemOffset) then
+    TrapNow(wtkTableOutOfBounds);
+  Obj := Store.Heap.AllocArray(AAct^.Instance.EngineTypeIds[TypeIdx], Count);
+  Reg[AIns^.Dest].Bits := UInt64(Obj);
   Store.Heap.ArrayInitFromElem(Obj, 0, Store.Elems[ElemAddr].Refs,
-    Reg[AIns^.A].U32, Reg[AIns^.B].U32);
+    ElemOffset, Count);
 end;
 
 { array.fill: aux [ref, index, value, count] (Wasm.Validator.Body order). }
@@ -1916,14 +1933,42 @@ begin
       outer frames alone. try/except (not try/finally): matching the
       trampoline's own test pattern, the exception is re-raised on ordinary
       ground. }
-    on E: Exception do
+    on E: EWasmError do
     begin
+      { Our own hierarchy — EWasmTrap and the staged-op EWasmError included
+        (EWasmTrap is an EWasmError). Re-raise unchanged so a host, and the
+        .wast runner, classify it exactly. }
       if Outermost then
       begin
         AStore.Heap.ResetFrames;
         ResetInterpContext(AStore);
       end;
       raise;
+    end;
+    on E: Exception do
+    begin
+      { Defense in depth (Track C Wave 6b, Bug 3): a NON-EWasm exception
+        escaping guest execution is a guest-triggered RTL fault the
+        interpreter failed to convert at its source — historically an
+        EStackOverflow from the first-in-process guard fault (now fixed by
+        the explicit memory check), or a stray EAccessViolation /
+        EDivByZero / ERangeError. ADR-0009's whole point is that a guest
+        fault surfaces as one catchable EWasmError, never as a raw RTL
+        exception that escapes the trampoline and aborts an entire corpus
+        file. Convert it to EWasmError so exactly one honest, catchable
+        error reaches the host. It is deliberately NOT laundered into a
+        specific EWasmTrap: the interpreter raises its own canonical traps
+        at each fault site (out-of-bounds, divide-by-zero, exhaustion,
+        ...), so anything reaching here is unexpected and must stay VISIBLE
+        as an error rather than pass as a trap. }
+      if Outermost then
+      begin
+        AStore.Heap.ResetFrames;
+        ResetInterpContext(AStore);
+      end;
+      raise EWasmError.CreateFmt(
+        'unexpected runtime fault in guest execution: %s (%s)',
+        [E.Message, E.ClassName]);
     end;
   end;
 end;

@@ -274,6 +274,46 @@ type
   EWasmLinkError = class(EWasmError);
   EWasmTrap = class(EWasmError);
 
+  { A text-format syntax error, raised by the `wat` assembler and its
+    sub-units (Wasm.Wat.*). A SIBLING of EWasmDecodeError, never a subclass:
+    text malformedness is a claim about SOURCE TEXT, a decode error a claim
+    about BINARY bytes (the hierarchy is load-bearing). Keeping it apart is
+    what lets the conformance runner discriminate a real text error (which
+    `assert_malformed` over a text/quote module expects) from a decode error
+    on the assembler's OWN output (which is an internal defect — INV-1 in
+    .agent/design/wat-assembler.md, never a malformed pass).
+
+    Line and Column locate the fault, 1-based, for diagnostics; the corpus
+    match on `assert_malformed` is a PREFIX match, so the canonical string
+    must lead Message and any positional suffix is harmless. Promoted here
+    (design §1) from the per-unit local copies each Wasm.Wat.* unit
+    used to carry, so they are all the one type. }
+  EWasmTextError = class(EWasmError)
+  public
+    Line: Integer;
+    Column: Integer;
+  end;
+
+const
+  { The canonical NaN bit patterns: the positive quiet NaN with the mantissa
+    MSB set and every other payload bit clear (2^(m-1)). Load-bearing and
+    shared — the text-format numeric parser (Wasm.Wat.Numbers) produces bare
+    `nan` as this pattern, and the execution/result-class helpers
+    (Wasm.Interp.Numeric, Wasm.Wast.Values) recognise and produce it. Kept
+    here so there is ONE spelling of a value all of them must agree on. }
+  WASM_F32_CANONICAL_NAN = UInt32($7FC00000);
+  WASM_F64_CANONICAL_NAN = UInt64($7FF8000000000000);
+
+  { Shared text-error message prefixes. These are UPSTREAM'S canonical strings
+    and the conformance corpus matches them as a PREFIX of ours, so the two
+    that more than one Wasm.Wat.* unit raises live here to keep the corpus-
+    matched spelling from drifting between units (design §4). `unknown
+    operator` and `unexpected token` are raised by both the numeric parser
+    (Wasm.Wat.Numbers) and the assembler (Wasm.Wat.Assembler); the prefixes
+    only one unit raises stay as MSG_* in that unit. }
+  MSG_UNKNOWN_OPERATOR = 'unknown operator';
+  MSG_UNEXPECTED_TOKEN = 'unexpected token';
+
 { Human-readable section name for diagnostics and `wasmlight inspect`.
   Ids outside the known set render as `unknown(<id>)` rather than raising —
   an unknown section id is a decode error the caller reports with its own

@@ -77,6 +77,7 @@ type
     procedure TestCompareRefNull;
     procedure TestCompareRefExternIdentity;
     procedure TestCompareRefExternMismatch;
+    procedure TestCompareRefExternBareAnyNonNull;
   end;
 
 function TWastValuesTests.ParseVal(const AText: string): TWastVal;
@@ -431,6 +432,22 @@ begin
     ActualBits(UInt64(WASM_REF_NULL)), TWasmRef(16))).ToBe(False);
 end;
 
+procedure TWastValuesTests.TestCompareRefExternBareAnyNonNull;
+var
+  Expected: TWastVal;
+begin
+  { A BARE `(ref.extern)` matcher (no N) carries no identity, so the runner
+    hands the comparator a null AExpectedRef. Any non-null externref must
+    then match — the same any-non-null rule bare `(ref.func)` already uses.
+    Mirrors extern.wast, whose `(ref.extern)` results have no index. }
+  Expected := MakeRefExpect(wvcRefExtern);
+  Expect<Boolean>(WastValMatches(Expected, ActualBits(UInt64(40)),
+    WASM_REF_NULL)).ToBe(True);
+  { A null result is still not a non-null externref. }
+  Expect<Boolean>(WastValMatches(Expected,
+    ActualBits(UInt64(WASM_REF_NULL)), WASM_REF_NULL)).ToBe(False);
+end;
+
 procedure TWastValuesTests.SetupTests;
 begin
   Test('i32 decimal', TestInt32Decimal);
@@ -475,6 +492,8 @@ begin
   Test('compare ref null', TestCompareRefNull);
   Test('compare ref extern identity', TestCompareRefExternIdentity);
   Test('compare ref extern mismatch', TestCompareRefExternMismatch);
+  Test('compare bare ref extern matches any non-null externref',
+    TestCompareRefExternBareAnyNonNull);
 end;
 
 begin

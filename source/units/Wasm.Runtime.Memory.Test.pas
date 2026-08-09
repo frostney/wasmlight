@@ -37,15 +37,18 @@ uses
 procedure ChildExit(ACode: cint); cdecl; external 'c' name '_exit';
 
 { Guest region for the forked-child fault test: a real out-of-bounds store
-  one page past the committed region. Offset 0 folds, so no explicit check
-  runs — the store lands in the PROT_NONE guard and the MMU faults, which
-  is exactly the path the in-process suites cannot exercise. }
+  one byte past the committed region. It writes through Base DIRECTLY,
+  bypassing the chokepoint — since Track C Wave 6b the helper MemCheck does
+  an explicit check and would trap before any dereference, so exercising
+  the genuine MMU fault path now requires a raw store into the PROT_NONE
+  guard. This keeps proving the handler -> trampoline delivery the guard
+  reservation exists for; the interpreter no longer depends on it. }
 procedure GuestOobWrite(const AData: Pointer);
 var
   Mem: PWasmMemoryInst;
 begin
   Mem := PWasmMemoryInst(AData);
-  MemAddress(Mem^, Mem^.ByteSize, 0, 1)^ := 42;
+  PByte(NativeUInt(Mem^.Base) + NativeUInt(Mem^.ByteSize))^ := 42;
 end;
 {$ENDIF}
 
@@ -87,6 +90,7 @@ type
     procedure TestOverflowFormsCannotWrapIntoRange;
     procedure TestRangeChecksTheWholeSpan;
     procedure TestRoundTripThroughTheChokepoint;
+    procedure TestFarOutOfBoundsTrapsInProcessWithoutFaulting;
     procedure TestLargeStaticOffsetFallsThroughToAFullCheck;
     procedure TestGuardFoldAccountsForAccessWidth;
     procedure TestFoldUsesTheInstanceGuardNotTheConstant;
@@ -402,6 +406,35 @@ begin
   end;
 end;
 
+procedure TRuntimeMemoryTests.TestFarOutOfBoundsTrapsInProcessWithoutFaulting;
+var
+  Memory: TWasmMemoryInst;
+begin
+  { The address.wast regression, as a direct-API test. On the guard
+    platform these accesses once relied on the MMU and, in a fresh process,
+    the first such fault surfaced through the RTL as EStackOverflow and
+    aborted the whole corpus file. Since Track C Wave 6b the chokepoint
+    checks explicitly, so each traps cleanly IN-PROCESS with the canonical
+    message and no crash — the test running to completion is itself the
+    proof there was no fault. Uses MemoryInit (the real strategy for the
+    host), so it is a guard-page memory where guard pages exist.
+
+    - index 0xFFFFFFFF, offset 1: the `good3 (i32.const -1)` shape, an
+      effective address at ~4 GiB (inside the reservation on a guard host).
+    - index 0, offset 0xFFFFFFFF: the `bad` shape, offset ~4 GiB. }
+  MemoryInit(Memory, MemTypeOf(watI32, 1));
+  try
+    Expect<Boolean>(AccessTraps(Memory, UInt64($FFFFFFFF), 1, 1)).ToBe(True);
+    Expect<Boolean>(AccessTraps(Memory, 0, UInt64($FFFFFFFF), 4)).ToBe(True);
+    Expect<Boolean>(AccessTraps(Memory, 1, UInt64($FFFFFFFF), 4)).ToBe(True);
+    { And an in-bounds access next to those still resolves, so the check is
+      a bound, not a blanket rejection. }
+    Expect<Boolean>(AccessTraps(Memory, 0, 0, 4)).ToBe(False);
+  finally
+    MemoryFree(Memory);
+  end;
+end;
+
 procedure TRuntimeMemoryTests.TestLargeStaticOffsetFallsThroughToAFullCheck;
 var
   Memory: TWasmMemoryInst;
@@ -417,8 +450,7 @@ begin
     Expect<Boolean>(AccessTraps(Memory, 0, WASM_STATIC_OFFSET_FOLD + 1, 1))
       .ToBe(True);
     Expect<Boolean>(AccessTraps(Memory, 0, High(UInt64), 1)).ToBe(True);
-    { Below the threshold the offset folds into the guard and the access
-      is taken without a check, so an in-bounds one still works. }
+    { A small offset with an in-bounds top passes the explicit check. }
     Expect<Boolean>(AccessTraps(Memory, 0, 8, 4)).ToBe(False);
   finally
     MemoryFree(Memory);
@@ -430,8 +462,8 @@ begin
   try
     Expect<Boolean>(AccessTraps(Memory, 0, WASM_STATIC_OFFSET_FOLD + 1, 1))
       .ToBe(True);
-    { Below the threshold the guard absorbs the offset and only the index
-      is compared, which is the point of the strategy. }
+    { The explicit check compares index, offset and width against the
+      current size on every strategy: an index at the size traps. }
     Expect<Boolean>(AccessTraps(Memory, Memory.ByteSize, 0, 1)).ToBe(True);
     Expect<Boolean>(AccessTraps(Memory, Memory.ByteSize - 1, 0, 1))
       .ToBe(False);
@@ -446,23 +478,22 @@ var
   Memory: TWasmMemoryInst;
 begin
   {$IF DEFINED(UNIX) AND DEFINED(CPU64)}
-  { H1, the escape case. The maximum i32 index (2^32-1) with an offset
-    equal to the guard and an 8-byte access reaches the last reserved byte
-    and then 7 bytes past it — outside every mapping, where a fault is not
-    ours to claim. The fold decision must be WIDTH-aware and CHECK this
-    access rather than fold it; the check then traps because the index is
-    far outside the 1-page declared memory. Under the old
-    `AOffset > WASM_STATIC_OFFSET_FOLD` fold this access was silently
-    folded. }
+  { Track C Wave 6b: the helper no longer folds — it checks explicitly on
+    every strategy — so any access whose top exceeds the one-page memory
+    traps, whatever the offset. The former H1 escape (a wide access at the
+    maximum i32 index with an offset equal to the guard reaching past the
+    reservation) cannot recur: the explicit check precedes every
+    dereference. Both the wide max-index access AND an offset one width
+    below the guard now trap out of the one-page memory. }
   MemoryInit(Memory, MemTypeOf(watI32, 1));
   try
     Expect<Boolean>(AccessTraps(Memory, UInt64($FFFFFFFF),
       WASM_STATIC_OFFSET_FOLD, 8)).ToBe(True);
-    { Exactly one access width below the guard still folds: offset + size
-      = guard, so the address stays inside the reservation and is left to
-      the MMU — no explicit trap is raised here. }
+    { Once relied on the MMU (offset + size = guard, address inside the
+      reservation); now an explicit check traps it, because index 0 with a
+      2 GiB offset is far past a one-page memory. }
     Expect<Boolean>(AccessTraps(Memory, 0,
-      WASM_STATIC_OFFSET_FOLD - 8, 8)).ToBe(False);
+      WASM_STATIC_OFFSET_FOLD - 8, 8)).ToBe(True);
   finally
     MemoryFree(Memory);
   end;
@@ -499,20 +530,18 @@ const
 var
   Memory: TWasmMemoryInst;
 begin
-  { Fix 2: the fold decision must read AMem.GuardBytes, not the
-    WASM_STATIC_OFFSET_FOLD constant. With the guard shrunk to 128 KiB an
-    offset equal to that guard is ABOVE the width-aware fold threshold and
-    must take the full-precision check and trap. Folding against the 2 GiB
-    constant instead would wrongly fold it and let it pass — this test
-    fails against the pre-fix code. }
+  { Track C Wave 6b: the helper no longer folds against any guard size —
+    it checks explicitly — so the shrunk guard changes nothing about which
+    accesses trap. Both an offset equal to the guard and one a width below
+    it are far past this one-page memory and trap. The instance still
+    reports the guard it was reserved with (it sizes the reservation and
+    survives for a future JIT's inline no-check path). }
   MemoryInitForTest(Memory, MemTypeOf(watI64, 1), wmsGuardAssisted,
     SmallGuard);
   try
     Expect<UInt64>(Memory.GuardBytes).ToBe(SmallGuard);
     Expect<Boolean>(AccessTraps(Memory, 0, SmallGuard, 8)).ToBe(True);
-    { One access width below the shrunk guard folds: only the index is
-      checked, and index 0 is in bounds, so no explicit trap. }
-    Expect<Boolean>(AccessTraps(Memory, 0, SmallGuard - 16, 8)).ToBe(False);
+    Expect<Boolean>(AccessTraps(Memory, 0, SmallGuard - 16, 8)).ToBe(True);
   finally
     MemoryFree(Memory);
   end;
@@ -950,6 +979,8 @@ begin
   Test('a range check covers the whole span', TestRangeChecksTheWholeSpan);
   Test('bytes round-trip through the chokepoint',
     TestRoundTripThroughTheChokepoint);
+  Test('a far out-of-bounds access traps in-process without faulting',
+    TestFarOutOfBoundsTrapsInProcessWithoutFaulting);
   Test('a static offset above the fold takes a full-precision check',
     TestLargeStaticOffsetFallsThroughToAFullCheck);
   Test('the guard fold accounts for the access width at the reservation top',

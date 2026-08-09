@@ -3,14 +3,15 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Twenty-three suites today, 590 tests, all green.
+  independent programs. Thirty-two suites today, 852 tests, all green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
-  `build/wasmspec`, which judges the binary-module subset (decode and
-  validation) and skips what needs an execution tier. The measured
-  binary-subset conformance is reported below; `assert_return` and
-  `assert_trap` remain out of reach until a tier lands.
+  `build/wasmspec`, which now assembles text modules, decodes, validates,
+  instantiates, and *executes* `assert_return` / `assert_trap` / `invoke`
+  / `assert_exhaustion` through the interpreter. The measured conformance
+  is reported below; vector text (Track G), a few host-import and
+  exception-handling cases, and `assert_unlinkable` still skip.
 - Two framework gotchas bite newcomers; both are listed below.
 
 ## Running
@@ -32,7 +33,7 @@ non-zero if any test or compile fails.
 | --- | --- | --- |
 | Co-located unit suites | The decoder and validator match *our reading* of the spec | shipped |
 | Fixture cross-check | It matches *what toolchains actually emit* | shipped |
-| Spec testsuite | It matches *the spec*, judged externally | shipped for the binary subset; execution assertions await a tier |
+| Spec testsuite | It matches *the spec*, judged externally | shipped — assembles, validates, instantiates, and executes; vector text and a few edges still skip |
 
 The middle tier exists because the first two claims are not the same one.
 The section-order bug this project fixed was invisible to hand-written
@@ -96,13 +97,22 @@ instead.
 | `Wasm.Validator.Test` | Module-level rules and the assembled IR: a module exercising every index space validates and its IR carries each space imports-first, plus canonical types, per-function code, initialisers, segments, start, and C.REFS. The phase-order rules are the point of the rejections — a global initialiser reading a later global, a table initialiser reading a defined global, a duplicate export name, a start function with parameters, a tag whose type has results, limits out of range. |
 | `Wasm.Fixtures.Test` | The fixture cross-check described above: every valid fixture decodes and (bar `simd.wasm`) validates, every malformed one is rejected, two lower to the IR their source implies, and no section extent escapes its module. |
 | `Wasm.Wast.Test` | The `.wast` lexer, s-expression parser, and command classifier (Track C's first slice): nesting block comments, string literals decoding to bytes, testsuite-local directives classifying as unknown rather than failing the script. |
-| `Wasm.Wast.Runner.Test` | The command runner over inline scripts (modules as literal `\hh` bytes): `assert_malformed` / `assert_invalid` passing on a prefix match and failing on a wrong prefix or wrong error class, top-level modules judged, everything needing a tier or an assembler skipped, the staged-SIMD carve-out gated on the wanted class, and the empty-expected-string degrading to a class-only match. |
+| `Wasm.Wast.Runner.Test` | The command runner over inline scripts: `assert_malformed` / `assert_invalid` passing on a prefix match and failing on a wrong prefix or wrong error class (text operands keyed on `EWasmTextError`, binary on `EWasmDecodeError`), top-level modules assembled/decoded/validated/instantiated, `assert_return` / `assert_trap` / `invoke` executed through the interpreter and compared, the staged-`$FD` carve-out gated on the wanted class, and the empty-expected-string degrading to a class-only match. |
+| `Wasm.Wast.Values.Test` | The assertion value parser and result comparator: hex and decimal float text packed to exact bits, `nan:canonical` / `nan:arithmetic` matched as classes rather than bit patterns, `±0` and subnormal boundaries, and the reference matchers `ref.null` / `ref.extern` / `ref.func`. |
+| `Wasm.Wat.Numbers.Test` | The numeric-literal parser at its boundaries: `iN` magnitudes in the union `[-2^(N-1), 2^N-1]`, overlong/over-range rejections with upstream prefixes, and hex/decimal floats — subnormals, rounding ties, NaN payloads — to exact bits. |
+| `Wasm.Wat.Lexer.Test` | The strict tokenizer: keyword/reserved/identifier/number/string/paren classification, the maximal-munch reserved-token rule the corpus's `assert_malformed` cases hinge on, string-escape decoding, and block-comment nesting. |
+| `Wasm.Wat.Emit.Test` | The binary emitter as the inverse of the decoder: canonical (shortest) LEB128, the type/limits/composite encoders, and section size backpatching — proven by feeding emitted bytes back through `DecodeModule` and comparing the model. |
+| `Wasm.Wat.Opcodes.Test` | The mnemonic table: every non-vector spelling mapped to its opcode byte(s), immediate shape, and natural alignment, cross-checked against the ranges `Wasm.Decoder.Expr` already enforces. |
+| `Wasm.Wat.Names.Test` | Identifier and label resolution across the twelve index contexts: forward references in module scope, the shadowing label stack, per-type field namespaces, `duplicate <space>` detection, and the implicit-typeuse dedup/insert table. |
+| `Wasm.Wat.Assembler.Test` | The assembler end to end: every module field (types with rec/sub/final/struct/array and field names, imports/exports with inline abbreviations, memories, tables, globals, tags, elem/data sugar, start, funcs with param/result/local merging) and the instruction skeleton lowering to bytes that decode and validate. |
 | `Wasm.Runtime.Values.Test` | The 8-byte value slot: `i31` payload boundaries and zero-extension, references keeping the low bit clear, narrow writes zeroing the whole slot, and `aux-default` defaults. |
 | `Wasm.Runtime.Traps.Test` | The trap path: confirmed trap messages against the pinned spec, kinds kept distinct, the fault-attribution reservation registry exact at both ends, and the trampoline converting a trap into exactly one `EWasmTrap` — nested invocations unwinding to their own. |
 | `Wasm.Runtime.Memory.Test` | The chokepoint: the strategy matrix decided by (platform, address type), the off-by-one bound with static offset and access size folded in, every strategy trapping at the same access, guard reservations registered for attribution, and growth preserving/zeroing pages and respecting both maxima. |
 | `Wasm.Runtime.Store.Test` | The engine type table and instances: alpha-equivalent rec groups from two modules sharing engine ids and distinct ones staying apart, the supertype display agreeing with the validator, import matching (functions, tables, memories, globals, tags) with the right variance, runtime casts across modules, and host-root rooting. |
 | `Wasm.Runtime.Instantiate.Test` | The instantiation sequence: global initialisers in order, active data and element segments reaching memory and tables through the chokepoint, segments dropped and buffers released, constant-expression GC allocation, link errors raised before any mutation, and out-of-bounds active segments trapping after their partial effect. |
 | `Wasm.Runtime.Gc.Test` | The precise collector: field offsets by declaration order and packed width, eight-byte alignment per size class, packed fields extending and stores truncating, null/OOB access trapping, reclamation and reuse, host roots and root scopes, unreachable cycles collected, the frame walk keeping exactly the flagged registers, and allocation-site triggering. |
+| `Wasm.Interp.Numeric.Test` | The numeric leaf functions on raw bit patterns: modulo-2^N integer arithmetic, the trapping conversions, sign extension, and float ops preserving NaN payloads across the call boundary — each case a literal input and expected bits. |
+| `Wasm.Interp.Test` | The dispatch loop over the IR: numeric/parametric/variable/control/call flow, the explicit activation stack with `return_call` replacing the top frame in bounded stack, traps long-jumping to the trampoline as exactly one `EWasmTrap`, the epoch check at loop back-edges, and the frame register file zeroed at entry. |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and
@@ -132,10 +142,11 @@ The upstream corpus at
 [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) is the
 external conformance net, in the role the Autobahn suite plays for the
 sibling duetto project: an independent judge that the project does not
-get to grade itself against. It is wired up now, through `build/wasmspec`
-(`source/apps/wasmspec.pas`), over the subset the shipped layers can
-judge. See [`tests/spec/README.md`](../tests/spec/README.md) for fetching
-the corpus, running the harness, and the full failure breakdown.
+get to grade itself against. It is wired up through `build/wasmspec`
+(`source/apps/wasmspec.pas`), which now assembles text modules, decodes,
+validates, instantiates, and executes assertions through the interpreter.
+See [`tests/spec/README.md`](../tests/spec/README.md) for fetching the
+corpus, running the harness, and the full failure breakdown.
 
 Its shape, measured against `WebAssembly/testsuite@main`: **288 `.wast`
 files** (257 of them the 3.0 root corpus), ~192,500 lines, and **~64,100
@@ -145,70 +156,78 @@ assertions** — `assert_return` 53,291, `assert_trap` 5,252,
 
 ### What is judged, and what is measured
 
-Decode and validation are shipped; there is no execution tier and no
-text-format assembler. So `wasmspec` gives a real verdict to exactly the
-commands that carry the module in `(module binary "...")` form — top-level
-`module` (must decode **and** validate), `assert_malformed` (must raise
-`EWasmDecodeError`), and `assert_invalid` (must raise
-`EWasmValidationError`) — and reports everything else as `SKIP` with a
-reason. The skip column is never folded into the totals, so a report
+Decode, validation, the wat text-format assembler, and the interpreter are
+all shipped, so `wasmspec` gives a real verdict to most of the corpus.
+Top-level modules (text, `(module quote ...)`, or binary) assemble, decode,
+validate, and instantiate; `assert_malformed` and `assert_invalid` judge
+the rejection (text operands via `EWasmTextError`, binary via
+`EWasmDecodeError`, `assert_invalid` via `EWasmValidationError`); and
+`assert_return`, `assert_trap`, `invoke`, and `assert_exhaustion` run
+through the interpreter and compare. Everything not judged is `SKIP` with a
+reason, and the skip column is never folded into the totals, so a report
 cannot read as more conformance than was measured.
 
 The current run over the whole checkout
 (`WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`):
 
 ```text
-TOTAL files=288 errors=0 pass=1034 fail=35 skip=66050 staged=6 total=67125
+ROOT      pass=38367 fail=88  skip=25239 staged=1620 total=65314
+PROPOSALS pass=533   fail=356 skip=922   staged=0    total=1811
+TOTAL files=288 errors=0 pass=38900 fail=444 skip=26161 staged=1620 total=67125
 ```
 
-The 3.0 root corpus alone is `pass=787 fail=17 staged=6`; the non-root
-trees add `pass=247 fail=18`. Judged commands — `pass + fail + staged` =
-**1,075** — are the `(module binary ...)` cases the runner reached, which
-is the ceiling until a text assembler exists. The `skip` column is the size
-of the unbuilt work, not a coverage gap in the shipped layers.
+Judged commands — `pass + fail + staged` — rose from **1,075** (the old
+binary-only ceiling) to **~40,900** of the corpus's ~67,000. The `skip`
+column is dominated by assertions against modules that did not instantiate
+— overwhelmingly the staged vector files (`no instantiated module`, 25,721
+of the skips) — not a coverage gap in the shipped layers.
 
-This is honest, bounded conformance: within the binary subset, the decoder
-and validator reject what upstream rejects, with the right error class, and
-with a message upstream's expected string is a prefix of — bar the 35
-documented failures, which are post-3.0 proposals outside the pinned target
-plus a handful of message-wording divergences (see
-[`tests/spec/README.md`](../tests/spec/README.md)). It is **not** a claim
-about execution: `assert_return`, `assert_trap`, and the rest still skip,
-so nothing here says a module *runs* correctly.
+This is honest conformance and it now reaches execution: within the 3.0
+target the assembler builds what upstream builds, the validator rejects
+what upstream rejects with the right class and a prefix-matching message,
+and the interpreter produces the results and traps the corpus asserts. The
+444 failures are **not** 3.0 regressions — 356 of them are `PROPOSALS`
+(post-3.0 features outside the pinned target), and the 88 `ROOT` failures
+are the legacy exception-handling encodings, the pre-existing
+`binary-leb128` wording divergences, and a few assembler/execution edges
+(see [`tests/spec/README.md`](../tests/spec/README.md)).
 
-`STAGED` (6) is its own status: a case that trips the staged `$FD` vector
-message and would otherwise fail, kept apart so the vector files cannot
-bury a real divergence. It is never counted as a pass.
+`STAGED` (1,620) is its own status: a module whose text needs `$FD` vector
+support the assembler does not yet emit trips `unknown operator` and is set
+apart so the vector files cannot bury a real divergence. It is never
+counted as a pass, and every assertion downstream of it skips.
 
-### What the corpus still imposes, for the tiers to come
-
-Two of the harness requirements are already met and two more are pinned by
-construction; the rest wait on an execution tier:
+### What the corpus imposes, and where each stands
 
 1. **Lazy decoding — met.** `(module quote ...)` and `(module binary ...)`
    — 1,311 and 1,069 occurrences — are assembled or decoded at *command
    execution* time, not script-parse time, so `assert_malformed` observes
    the failure it exists to observe.
-2. **Failure strings are prefix-matched — met for the binary subset.** The
-   reference interpreter checks that the expected string is a prefix of the
-   actual message, so our error messages are part of conformance. Running
-   this corpus is what settled the decode- and validation-reachable
-   prefixes; the prefixes only an execution tier can reach still carry
-   `UNCONFIRMED` markers in the source.
-3. **NaN classes, not bit patterns.** `nan:canonical` (3,283) and
-   `nan:arithmetic` (3,391) will rule out bitwise float comparison once
-   `assert_return` is judged.
+2. **Failure strings are prefix-matched — met.** The reference interpreter
+   checks that the expected string is a prefix of the actual message, so
+   our error messages are part of conformance. Running this corpus settled
+   the decode, validation, assembler, and trap-message prefixes; any prefix
+   no shipped path reaches yet still carries an `UNCONFIRMED` marker.
+3. **NaN classes, not bit patterns — met.** `nan:canonical` (3,283) and
+   `nan:arithmetic` (3,391) are matched as classes, so `assert_return`
+   over a NaN result compares the class rather than the payload bits.
 4. **`(either ...)` results** (32 occurrences) for relaxed-SIMD outcomes
-   that are implementation-defined within a documented set.
-5. **Host references** — `(ref.extern n)` (140) and `(ref.host n)` — will
-   need a host-reference notion in the harness once actions run.
+   that are implementation-defined within a documented set — reached once
+   vector execution lands with Track G.
+5. **Host references** — `(ref.extern n)` (140) and `(ref.host n)` — parse
+   into identity matchers in `Wasm.Wast.Values`; imports the harness does
+   not provide still skip (`import not provided by the harness`).
 
-Two traps, both handled: `assert_malformed_custom` and
-`assert_invalid_custom` are testsuite-local extensions absent from the
-reference grammar, so the runner classifies them as unknown and skips
-rather than choking; and `assert_return` is 83% of all assertions but is
-concentrated in the SIMD files, so **sequence by file, not by assertion
-count** — a majority of assertions is not a majority of features.
+What still skips, never as a silent pass: the vector text staged to Track
+G (and every assertion downstream of it), host imports the harness does
+not provide, exception handling (Track H, 41 cases), and
+`assert_unlinkable` (linkage is not yet judged). Two traps, both handled:
+`assert_malformed_custom` and `assert_invalid_custom` are testsuite-local
+extensions absent from the reference grammar, so the runner classifies
+them as unknown and skips rather than choking; and `assert_return` is 83%
+of all assertions but is concentrated in the SIMD files, so **sequence by
+file, not by assertion count** — a majority of assertions is not a
+majority of features.
 
 Once a second execution tier exists, the harness runs per tier: every tier
 must produce identical outcomes

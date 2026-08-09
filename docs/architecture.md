@@ -21,12 +21,12 @@
   not future additions to it.
 - Shipped today: decode, validation and the IR, the runtime state below
   the tier seam (store, instances, the memory chokepoint, traps,
-  instantiation, the precise collector), and the `.wast` runner over the
-  corpus's binary subset. That runtime row landed ahead of the tiers that
-  will sit on it, so the shipped rows in the table below are no longer
-  contiguous. The execution tiers, the embedding API, and the host surface
-  are staged in [roadmap.md](roadmap.md) and described here as design, not
-  as behaviour you can call.
+  instantiation, the precise collector), the interpreter tier that
+  executes the IR, the wat text-format assembler, and the `.wast` runner
+  that assembles, decodes, validates, instantiates, and executes over the
+  whole corpus. The baseline JIT and AOT tiers, the embedding API, and the
+  host surface are staged in [roadmap.md](roadmap.md) and described here as
+  design, not as behaviour you can call.
 
 ## Layering
 
@@ -37,8 +37,8 @@ Read bottom-up; each layer may use only the layers below it.
 | Host surface | `Wasm.Wasi.*` | WASI preview1 host; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | planned |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, instantiate, invoke | planned |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
-| Execution tiers | `Wasm.Exec.Interp`, `Wasm.Exec.Jit.*`, `Wasm.Exec.Aot` | three implementations of one seam | planned |
-| Tier seam | `Wasm.Exec` | the contract every tier implements; trap trampoline, epoch check, safepoints | planned |
+| Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`); baseline JIT and AOT to come | three implementations of one seam — the interpreter is the tier of record | interpreter **shipped**; JIT/AOT planned |
+| Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
 | IR | `Wasm.Ir` | register-based lowered form every tier consumes | **shipped** |
 | Validation | `Wasm.Validator` | the spec's static type check, run once, emitting the IR | **shipped** |
 | Module model | `Wasm.Module` | decoded module: populated entity lists, with unparsed payloads kept as spans | **shipped** |
@@ -75,16 +75,26 @@ structures plus a disassembler, with no validation logic in it — which is
 also why the IR module carries its own index-space snapshots instead of
 pointing back at `TWasmModule`.
 
-`Wasm.Wast` and `Wasm.Wast.Runner` sit beside the library rather than in
-this stack: they are the conformance harness ([roadmap.md](roadmap.md),
-Track C). `Wasm.Wast` is the front end — a `.wast` lexer, s-expression
-parser, and command classifier that keeps module payloads as raw trees so
-decoding stays lazy. `Wasm.Wast.Runner` is what turns those trees into
-verdicts: it assembles each `(module binary ...)` case and runs it through
-decode and validation, judging `assert_malformed`, `assert_invalid`, and
-top-level `module` commands and tallying everything that needs an
-execution tier as skipped. `wasmspec` is the program that points it at the
-corpus.
+`Wasm.Wast`, `Wasm.Wast.Values`, `Wasm.Wast.Runner`, and the six
+`Wasm.Wat.*` units sit beside the library rather than in this stack: they
+are the conformance harness ([roadmap.md](roadmap.md), Track C).
+`Wasm.Wast` is the front end — a `.wast` lexer, s-expression parser, and
+command classifier that keeps module payloads as raw trees so decoding
+stays lazy — and `Wasm.Wast.Values` parses assertion arguments and
+expected results. The `Wasm.Wat.*` units are the **text-format
+assembler**: a strict tokenizer, a numeric-literal parser, an
+identifier/label resolver, an opcode table, and a binary emitter, driven
+by `Wasm.Wat.Assembler`, which lowers module text and `(module quote ...)`
+to bytes. Those bytes re-enter the *same* shipped
+`DecodeModule → ValidateModule → instantiate → interpret` path a binary
+module takes — the assembler is a producer of bytes, never a second
+decoder or a second validator, so it is a clean inverse of the decode
+stack and shares none of the runtime path. `Wasm.Wast.Runner` turns the
+command trees into verdicts: it assembles or decodes each module,
+validates and instantiates it, and *executes* `assert_return`,
+`assert_trap`, `invoke`, and `assert_exhaustion` through the interpreter,
+prefix-matching messages and comparing results. `wasmspec` is the program
+that points it at the corpus.
 
 `Wasm.Core` depends on nothing in the project. Nothing depends on
 `source/apps/` — the programs are consumers of the library, never a place
@@ -149,23 +159,45 @@ load-bearing, because a host discriminates on them:
 Never collapse them, and never raise a bare `EWasmError` where a specific
 one applies.
 
-One tooling-side subclass sits outside this contract: `Wasm.Wast`
-defines `EWastParseError` (under `EWasmError`) for problems in its own
-`.wast` script text. A script is harness input, not a module, so it is
-not part of what a host discriminates on when decoding modules.
+Two tooling-side subclasses sit outside this contract, both under
+`EWasmError` and neither part of what a host discriminates on when
+decoding modules. `Wasm.Wast` defines `EWastParseError` for problems in
+its own `.wast` script text. And `Wasm.Core` defines `EWasmTextError` (a
+sibling of the four, carrying `Line`/`Column`) for malformed *text-format*
+source, raised by the wat assembler with upstream's canonical prefixes: a
+`.wat` module that will not assemble is a text error, not a bad module.
+`assert_malformed` over a text operand keys on this class where over a
+binary operand it keys on `EWasmDecodeError`.
 
 ## What is shipped today
 
-The decode and validation path, end to end:
+The path from bytes — or from text — to a running module, end to end:
 
 ```text
-bytes ──► TWasmReader ──► DecodeModule ──► TWasmModule
-          (Wasm.Binary)   (Wasm.Decoder)   (Wasm.Module)
-                                                │
-                                                ▼
-                                          ValidateModule ──► TWasmIrModule
-                                          (Wasm.Validator)   (Wasm.Ir)
+text ──► AssembleWat ──┐
+         (Wasm.Wat.*)  │  (harness-side front door; produces bytes only)
+                       ▼
+bytes ─► TWasmReader ─► DecodeModule ─► TWasmModule
+         (Wasm.Binary)  (Wasm.Decoder)  (Wasm.Module)
+                                            │
+                                            ▼
+                                      ValidateModule ─► TWasmIrModule
+                                      (Wasm.Validator)  (Wasm.Ir)
+                                            │
+                                            ▼
+                                      InstantiateModule ─► TWasmInstance
+                                      (Wasm.Runtime.Instantiate)
+                                            │
+                                            ▼
+                                      InterpInvoke ─► results / EWasmTrap
+                                      (Wasm.Interp)
 ```
+
+The text front door is the wat assembler and belongs to the conformance
+harness, not the runtime: it converts `.wat` source to bytes and hands
+them to `DecodeModule` like any other module, so text modules and binary
+modules share one decode/validate/instantiate/execute path from that point
+on. Everything below the `bytes` row is the shipped runtime.
 
 `TWasmReader` is a record over a raw pointer, not a class over a stream:
 every byte of every module passes through it. It bounds-checks each read
@@ -237,9 +269,8 @@ and decode-then-validate reporting the lowered IR.
 
 ### The runtime state below the tier seam
 
-The runtime layer is shipped too, ahead of the tiers that will run on it.
-It is everything the interpreter (Track E) will read but does not execute
-a single instruction itself:
+The runtime layer sits below the tier seam. It is everything the
+interpreter (Track E) reads but that executes no instruction itself:
 
 - **`Wasm.Runtime.Values`** — the 8-byte untagged value slot. A slot
   carries no discriminator; register `i`'s type is
@@ -282,15 +313,30 @@ a single instruction itself:
   the runtime subtyping check behind `ref.test` / `ref.cast` /
   `br_on_cast*`.
 
-What is **not** built is the tier seam itself: no execution tier consumes
-this state yet. The interpreter (Track E) is the next unbuilt layer, and it
-consumes the IR, the store, and the GC's frame-walk contract — nothing
-re-derived and no second read of the binary.
+### The interpreter over the seam
+
+`Wasm.Interp` (with the numeric leaf functions in `Wasm.Interp.Numeric`)
+is the first tier over the seam and the tier of record. It consumes the
+IR, the store, and the GC's frame-walk contract — nothing re-derived and
+no second read of the binary. Its activation stack is explicit, so a
+self-tail-recursive loop runs in bounded Pascal stack (`return_call`
+replaces the top frame in place), and each frame's register file is zeroed
+at entry so the collector never traces a stale slot. It runs inside the
+per-invocation trampoline: a spec trap long-jumps to the trampoline and
+re-raises as `EWasmTrap`, never out of a signal handler. `$FD` vector
+execution is Track G and throwing is Track H; everything else the register
+IR emits dispatches here.
+
+What is **not** built over the seam is the baseline JIT and the AOT
+compiler; both are staged in [roadmap.md](roadmap.md) and will be
+differentially tested against this interpreter.
 
 `wasmspec` is the third shipped program: it runs the `.wast` corpus through
-`Wasm.Wast.Runner`, judging the binary-module subset (decode and
-validation) and skipping what needs a tier. See [testing.md](testing.md)
-for the measured tallies.
+`Wasm.Wast.Runner`, which assembles text modules, decodes, validates,
+instantiates, and executes assertions through the interpreter, skipping the
+vector text staged to Track G and the few edges (host imports, exception
+handling, unlinkable) still ahead. See [testing.md](testing.md) for the
+measured tallies.
 
 ## Related documents
 

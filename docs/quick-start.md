@@ -86,25 +86,31 @@ That one is not a bug in the fixture. Vector (`$FD`) validation is
 deliberately staged to Track G, and the validator says so rather than
 accepting an instruction it has not checked.
 
-The third program, `wasmspec`, runs `.wast` conformance scripts. It judges
-the binary-module subset — `assert_malformed`, `assert_invalid`, and
-top-level `module` — against decode and validation, and skips everything
-that needs an execution tier:
+The third program, `wasmspec`, runs `.wast` conformance scripts. It
+assembles text modules, decodes, validates, instantiates, and *executes*
+the assertions through the interpreter — `assert_return`, `assert_trap`,
+`invoke`, and `assert_exhaustion` — prefix-matching messages and comparing
+results:
 
 ```console
-$ ./build/wasmspec tests/spec/testsuite/binary.wast
-FAIL tests/spec/testsuite/binary.wast:55 assert_malformed got=malformed expected="END opcode expected" actual="unexpected end of section or function: reading byte at offset 3 (need 1 byte(s), 0 left)"
-...
-FILE tests/spec/testsuite/binary.wast pass=124 fail=3 skip=0 staged=0 total=127
-TOTAL files=1 errors=0 pass=124 fail=3 skip=0 staged=0 total=127
+$ ./build/wasmspec tests/spec/testsuite/i32.wast
+FILE tests/spec/testsuite/i32.wast pass=460 fail=0 skip=0 staged=0 total=460
+ROOT pass=460 fail=0 skip=0 staged=0 total=460
+PROPOSALS pass=0 fail=0 skip=0 staged=0 total=0
+TOTAL files=1 errors=0 pass=460 fail=0 skip=0 staged=0 total=460
 ```
 
-A directory argument is walked recursively. See
-[testing.md](testing.md) for what the corpus tallies mean and
-[`tests/spec/README.md`](../tests/spec/README.md) for fetching it.
+A directory argument is walked recursively, and the aggregate splits `ROOT`
+(the 3.0 target) from `PROPOSALS` (post-3.0). Over the whole corpus that is
+`pass=38900 fail=444 skip=26161 staged=1620` across 288 files — vector text
+(Track G) is `staged`, and the failures are dominated by post-3.0
+proposals, not 3.0 regressions. See [testing.md](testing.md) for what the
+tallies mean and [`tests/spec/README.md`](../tests/spec/README.md) for
+fetching the corpus.
 
-Those three commands are the whole shipped surface today — see
-[roadmap.md](roadmap.md) for what comes next and in what order.
+Those three programs are the whole shipped surface today: decode, validate,
+instantiate, and execute, conformance-tested against the upstream corpus.
+See [roadmap.md](roadmap.md) for what comes next and in what order.
 
 For the full command set (formatter, benchmarks, CI gates) see
 [tooling.md](tooling.md).

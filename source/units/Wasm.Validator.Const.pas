@@ -676,8 +676,8 @@ begin
   if Index >= FConst.FuncCount then
     raise EWasmValidationError.CreateFmt(
       '%s: ref.func names function %d, but the function index space '
-      + 'holds %d', [MSG_UNKNOWN_FUNCTION, Int64(Index),
-      Int64(FConst.FuncCount)]);
+      + 'holds %d', [UnknownIndex(MSG_UNKNOWN_FUNCTION, Int64(Index)),
+      Int64(Index), Int64(FConst.FuncCount)]);
 
   TypeIndex := ConstFuncTypeIndex(FConst, Index);
   { Defensive: the module-level walk validates every function's type
@@ -709,8 +709,8 @@ begin
     or (Index >= UInt32(Length(FConst.Globals))) then
     raise EWasmValidationError.CreateFmt(
       '%s: global.get names global %d, but only %d global(s) are in '
-      + 'scope here', [MSG_UNKNOWN_GLOBAL, Int64(Index),
-      Int64(FConst.GlobalLimit)]);
+      + 'scope here', [UnknownIndex(MSG_UNKNOWN_GLOBAL, Int64(Index)),
+      Int64(Index), Int64(FConst.GlobalLimit)]);
 
   Global := FConst.Globals[Index];
   { `appendix/changes-extended-constant-expressions`: GLOBAL.GET is a
@@ -1063,8 +1063,8 @@ begin
   if AFuncIndex >= AConst.FuncCount then
     raise EWasmValidationError.CreateFmt(
       '%s: element segment names function %d, but the function index '
-      + 'space holds %d', [MSG_UNKNOWN_FUNCTION, Int64(AFuncIndex),
-      Int64(AConst.FuncCount)]);
+      + 'space holds %d', [UnknownIndex(MSG_UNKNOWN_FUNCTION,
+      Int64(AFuncIndex)), Int64(AFuncIndex), Int64(AConst.FuncCount)]);
 
   TypeIndex := ConstFuncTypeIndex(AConst, AFuncIndex);
   ATypes.CanonIdOf(TypeIndex);

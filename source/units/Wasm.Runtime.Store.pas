@@ -1057,9 +1057,16 @@ begin
       modules hash and compare equal. Never re-serialise from CanonTypes:
       those carry module-local ids and would defeat the mechanism. }
     Size := GroupMemberCount(AIr.GroupKeys[Group]);
-    if (Size = 0) or
-      (UInt64(First) + UInt64(Size) >
-       UInt64(Length(AIr.TypeIndexToCanon))) then
+    if Size = 0 then
+    begin
+      { An empty `(rec)` is a valid rec group of zero types: `binary-rectype`
+        encodes the members as a list, and a list count of 0 is well-formed.
+        It defines no types, so it interns to nothing and advances no type
+        indices — skip it without allocating or registering a group. }
+      Continue;
+    end;
+    if UInt64(First) + UInt64(Size) >
+      UInt64(Length(AIr.TypeIndexToCanon)) then
       raise EWasmError.Create(
         'internal: rec group sizes do not cover the type index space');
 

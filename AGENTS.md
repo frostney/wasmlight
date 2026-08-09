@@ -108,7 +108,7 @@ lwpt build             # all three programs (Linux, macOS, Windows)
 lwpt test              # co-located unit suites
 ./build/wasmlight inspect <module.wasm>   # decode + report sections and entity counts
 ./build/wasmlight validate <module.wasm>  # decode + validate, report the lowered IR
-./build/wasmspec <script.wast|dir>...     # run .wast conformance scripts (binary subset)
+./build/wasmspec <script.wast|dir>...     # run .wast conformance scripts (assemble, validate, execute)
 ./build/wasmbench                          # component benchmarks (measurement only)
 ```
 
@@ -136,7 +136,7 @@ they still belong in a test.
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `Wasm.Core` (vocabulary + errors), `Wasm.Binary` (bounds-checked reader, LEB128), `Wasm.Module` (decoded model), `Wasm.Decoder` + `Wasm.Decoder.*` (Common/Types/Entities/Segments/Expr — binary → model, all section bodies), `Wasm.Ir` (register IR data structures + disassembler; depends on `Wasm.Core` alone), `Wasm.Validator` (`ValidateModule`: module-shape rules, phase order, IR assembly) + `Wasm.Validator.Types` (type-section validity, canonicalisation, matching), `Wasm.Validator.Const` (constant expressions), `Wasm.Validator.Body` (the fused decode/type-check/emit body walk), `Wasm.Wast` (.wast lexer/parser/classifier), `Wasm.Wast.Runner` (judges the `(module binary ...)` commands against decode+validation, tallies the rest as skipped), and the runtime layer: `Wasm.Runtime.Values` (the untagged value slot + reference encoding), `Wasm.Runtime.Traps` (trap vocabulary, fault handler, per-invocation trampoline), `Wasm.Runtime.Memory` (linear memory + the access chokepoint), `Wasm.Runtime.Store` (engine type table, store, instances), `Wasm.Runtime.Instantiate` (const-expr evaluator + instantiation sequence), `Wasm.Runtime.Gc` (precise non-moving mark-sweep collector) |
+| `source/units/` | Library: `Wasm.Core` (vocabulary + errors), `Wasm.Binary` (bounds-checked reader, LEB128), `Wasm.Module` (decoded model), `Wasm.Decoder` + `Wasm.Decoder.*` (Common/Types/Entities/Segments/Expr — binary → model, all section bodies), `Wasm.Ir` (register IR data structures + disassembler; depends on `Wasm.Core` alone), `Wasm.Validator` (`ValidateModule`: module-shape rules, phase order, IR assembly) + `Wasm.Validator.Types` (type-section validity, canonicalisation, matching), `Wasm.Validator.Const` (constant expressions), `Wasm.Validator.Body` (the fused decode/type-check/emit body walk), the runtime layer: `Wasm.Runtime.Values` (the untagged value slot + reference encoding), `Wasm.Runtime.Traps` (trap vocabulary, fault handler, per-invocation trampoline), `Wasm.Runtime.Memory` (linear memory + the access chokepoint), `Wasm.Runtime.Store` (engine type table, store, instances), `Wasm.Runtime.Instantiate` (const-expr evaluator + instantiation sequence), `Wasm.Runtime.Gc` (precise non-moving mark-sweep collector); the interpreter tier `Wasm.Interp` (explicit-frame dispatch over the IR) + `Wasm.Interp.Numeric` (bit-exact numeric leaf functions); the wat text-format assembler `Wasm.Wat.Numbers` (numeric-literal text → exact bits), `Wasm.Wat.Lexer` (strict classified tokenizer for module text), `Wasm.Wat.Emit` (binary emitter: canonical LEB128, encoders, section backpatching), `Wasm.Wat.Opcodes` (mnemonic → opcode/immediate/alignment table), `Wasm.Wat.Names` (identifier/label resolution, implicit-typeuse dedup), `Wasm.Wat.Assembler` (module text + `(module quote …)` → bytes into the shipped decode/validate path); and the conformance harness `Wasm.Wast` (.wast lexer/parser/classifier), `Wasm.Wast.Values` (assertion argument/result parser + matcher), `Wasm.Wast.Runner` (assembles text modules, decodes, validates, instantiates, and executes assertions through the interpreter) |
 | `source/apps/` | Programs: `wasmlight` (CLI), `wasmbench` (benchmarks), `wasmspec` (.wast conformance harness) |
 | `scripts/` | InstantFPC automation (`stamp-version.pas`) |
 | `tests/fixtures/` | Real toolchain-compiled `.wasm` cross-check corpus (committed; regenerate with `regenerate.sh`) |
@@ -147,18 +147,20 @@ Layering is strictly bottom-up — see
 [docs/architecture.md](docs/architecture.md). What is shipped today is the
 decode layer, the validation layer that emits the IR, the runtime state
 below the tier seam (store, instances, the memory chokepoint, the trap
-path, instantiation, and the precise collector), and the `.wast` runner
-over the binary subset of the corpus; the execution tiers behind the tier
-seam and the host surface are staged in
-[docs/roadmap.md](docs/roadmap.md). Do not document an unbuilt layer as if
-it exists. Two things inside the shipped layer are deliberately staged and
-must not be described as working: `$FD` vector validation is Track G and
-raises a clear "not implemented" error. And the error-message prefixes are
-now split: those reachable through decode and validation are
-corpus-confirmed — Track C's `wasmspec` runs the upstream binary subset
-(`assert_malformed` / `assert_invalid` / top-level `module`) against them —
-while the prefixes that only an execution tier can reach still carry
-`UNCONFIRMED` markers, because nothing runs them yet.
+path, instantiation, and the precise collector), the interpreter tier that
+executes the IR, the wat text-format assembler, and the `.wast` runner that
+assembles, decodes, validates, instantiates, and executes over the whole
+corpus; the baseline JIT and AOT tiers behind the seam and the host surface
+are staged in [docs/roadmap.md](docs/roadmap.md). Do not document an
+unbuilt layer as if it exists. Two things inside the shipped layer are
+deliberately staged and must not be described as working: `$FD` vector
+validation and execution are Track G — the validator raises a clear "not
+implemented" error, the assembler answers `$FD` mnemonics with `unknown
+operator`, and the harness records such modules as `STAGED`. And the
+error-message prefixes: those reachable through decode, validation, the
+assembler, and the interpreter's traps are corpus-confirmed by `wasmspec`,
+while any prefix no shipped path reaches yet still carries an `UNCONFIRMED`
+marker.
 
 ## Testing
 
@@ -168,11 +170,13 @@ while the prefixes that only an execution tier can reach still carry
   assertion, not loaded from fixtures — the defect should be readable in
   the test.
 - The upstream WebAssembly spec testsuite is the external conformance net
-  and is wired up through `build/wasmspec` (Track C's runner over the
-  binary subset — `assert_malformed`, `assert_invalid`, and top-level
-  `module`); execution-tier assertions still skip until a tier lands. See
-  [docs/testing.md](docs/testing.md) for what is judged versus skipped and
-  the measured tallies.
+  and is wired up through `build/wasmspec` (Track C's runner): it assembles
+  text modules, decodes, validates, instantiates, and executes
+  `assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` through
+  the interpreter. What still skips is vector text (staged to Track G),
+  host imports the harness does not provide, exception handling (Track H),
+  and `assert_unlinkable`. See [docs/testing.md](docs/testing.md) for what
+  is judged versus skipped and the measured tallies.
 - Two framework gotchas, both already worked around in the existing
   suites: FPC will not parse a generic call (`Expect<T>(...)`) as the lone
   statement of an `on ... do`, and the runner fails any test that records

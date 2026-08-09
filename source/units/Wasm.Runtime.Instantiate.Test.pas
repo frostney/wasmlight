@@ -108,6 +108,8 @@ type
 
     procedure TestActiveDataOutOfBoundsTraps;
     procedure TestActiveElemOutOfBoundsTraps;
+    procedure TestActiveDataOnImportedMemoryPersistsAfterTrap;
+    procedure TestActiveElemOnImportedTablePersistsAfterTrap;
 
     procedure TestMissingImportIsALinkErrorBeforeAnyMutation;
     procedure TestIncompatibleImportIsALinkErrorBeforeAnyMutation;
@@ -771,6 +773,96 @@ begin
   Expect<Boolean>(RefIsNull(TableGet(FStore.Tables[0], 0))).ToBe(True);
 end;
 
+{ An active segment written to an IMPORTED memory reaches the SHARED store
+  object, and the write PERSISTS after a later segment traps out of bounds —
+  the behaviour linking.wast:556-563 relies on. The runner cannot judge that
+  case yet (it skips `assert_trap (module ...)` as "needs an execution tier"),
+  so it is confirmed here in the layer that owns it: instantiation applies
+  active segments to `MemAddrs[MemIndex]`, which for an import is the supplied
+  address, not a fresh memory. `exec-module` / `aux-rundata`. }
+procedure TRuntimeInstantiateTests
+  .TestActiveDataOnImportedMemoryPersistsAfterTrap;
+var
+  MemAddr: TWasmMemAddr;
+begin
+  { A one-page memory supplied as import "env"."m" — the shared object the
+    module below writes through. }
+  MemAddr := FStore.AddMemory(MakeMemType(MakeLimits(watI32, 1)));
+  SetLength(FImports.Mems, 1);
+  FImports.Mems[0] := MemAddr;
+
+  { import  0  "env"."m" (memory 1)
+    data    0  active memory 0 offset 0     "ab"   (in bounds)
+    data    1  active memory 0 offset 65535 "hi"   (one past the end) }
+  StartModule;
+  Sect(wsImport, [$01,
+    $03, $65, $6E, $76, $01, $6D, $02, $00, $01]);
+  Sect(wsDataCount, [$02]);
+  Sect(wsData, [$02,
+    $00, $41, $00, $0B, $02, $61, $62,
+    $00, $41, $FF, $FF, $03, $0B, $02, $68, $69]);
+  FinishAndValidate;
+
+  Expect<string>(OutcomeOf(MSG_TRAP_MEMORY_OUT_OF_BOUNDS))
+    .ToBe('trap: ' + MSG_TRAP_MEMORY_OUT_OF_BOUNDS);
+
+  { The first segment landed in the IMPORTED memory before the second trapped,
+    and it is still there: no rollback, and the target is the shared object. }
+  Expect<Byte>(MemByte(MemAddr, 0)).ToBe($61);
+  Expect<Byte>(MemByte(MemAddr, 1)).ToBe($62);
+  { The trapping segment wrote nothing — the range check precedes the copy. }
+  Expect<Byte>(MemByte(MemAddr, 65535)).ToBe($00);
+end;
+
+{ The element counterpart of the test above, mirroring linking.wast:397-410:
+  an active element segment applied to an IMPORTED table persists in the
+  shared table after a later, partially-out-of-bounds segment traps. }
+procedure TRuntimeInstantiateTests
+  .TestActiveElemOnImportedTablePersistsAfterTrap;
+var
+  TableAddr: TWasmTableAddr;
+  Instance: TWasmModuleInstance;
+  FuncRef: TWasmRef;
+begin
+  { A 10-entry funcref table supplied as import "env"."t". }
+  TableAddr := FStore.AddTable(
+    MakeTableType(MakeRefType(True, MakeAbsHeapType(wahFunc)),
+      MakeLimits(watI32, 10)), WASM_REF_NULL);
+  SetLength(FImports.Tables, 1);
+  FImports.Tables[0] := TableAddr;
+
+  { type    0  () -> ()
+    import  0  "env"."t" (table 10 funcref)
+    func    0  (type 0)
+    elem    0  active table 0 offset 7 [func 0]        (in bounds)
+    elem    1  active table 0 offset 9 [func 0, func 0] (index 10 is one past)
+    code    0  (nop body) }
+  StartModule;
+  Sect(wsType, [$01, $60, $00, $00]);
+  Sect(wsImport, [$01,
+    $03, $65, $6E, $76, $01, $74, $01, $70, $00, $0A]);
+  Sect(wsFunction, [$01, $00]);
+  Sect(wsElement, [$02,
+    $00, $41, $07, $0B, $01, $00,
+    $00, $41, $09, $0B, $02, $00, $00]);
+  Sect(wsCode, [$01, $02, $00, $0B]);
+  FinishAndValidate;
+
+  Expect<string>(OutcomeOf(MSG_TRAP_TABLE_OUT_OF_BOUNDS))
+    .ToBe('trap: ' + MSG_TRAP_TABLE_OUT_OF_BOUNDS);
+
+  { The instance was published (step 3) before the trap, so its func handle
+    is the reference the first segment stored into the imported table. }
+  ExpectCount('instances', Length(FStore.Instances), 1);
+  Instance := FStore.Instances[0];
+  FuncRef := FStore.Funcs[Instance.FuncAddrs[0]].RefObject;
+
+  { Index 7 was written into the SHARED imported table and persists; the
+    entries the trapping segment never reached stay null. }
+  Expect<Boolean>(TableGet(FStore.Tables[TableAddr], 7) = FuncRef).ToBe(True);
+  Expect<Boolean>(RefIsNull(TableGet(FStore.Tables[TableAddr], 9))).ToBe(True);
+end;
+
 { --- link errors --------------------------------------------------------- }
 
 procedure TRuntimeInstantiateTests
@@ -1105,6 +1197,10 @@ begin
     TestActiveDataOutOfBoundsTraps);
   Test('an out-of-bounds active element segment traps',
     TestActiveElemOutOfBoundsTraps);
+  Test('an active data segment on an imported memory persists after a trap',
+    TestActiveDataOnImportedMemoryPersistsAfterTrap);
+  Test('an active element segment on an imported table persists after a trap',
+    TestActiveElemOnImportedTablePersistsAfterTrap);
 
   Test('a missing import is a link error before any mutation',
     TestMissingImportIsALinkErrorBeforeAnyMutation);

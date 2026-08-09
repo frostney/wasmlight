@@ -7,30 +7,41 @@
   raw trees. This unit turns those trees into verdicts, and now RUNS the
   action and result assertions rather than skipping them.
 
-  WHAT IS JUDGED. Decode (Wasm.Decoder), validation (Wasm.Validator), and
-  execution (Wasm.Interp) are shipped; there is no text-format assembler.
-  So the judged command shapes all need the module in `(module binary ...)`
-  form:
+  WHAT IS JUDGED. Decode (Wasm.Decoder), validation (Wasm.Validator),
+  execution (Wasm.Interp), and now the text-format assembler
+  (Wasm.Wat.Assembler) are shipped. Text `(module ...)` and `(module quote
+  ...)` forms ASSEMBLE to bytes and re-enter the shipped decode -> validate
+  -> instantiate path (design §1), so the judged shapes no longer need
+  `(module binary ...)`:
 
-    - `(module binary ...)` at top level — decode, validate, INSTANTIATE,
-      and run any start function
-    - `(assert_malformed (module binary ...) "...")` — EWasmDecodeError
-    - `(assert_invalid   (module binary ...) "...")` — EWasmValidationError
-    - `(register "name" $id?)` — bind an instance's exports under an import
-      name, for later modules to import
-    - `(invoke "f" args...)` — run an exported function for effect
-    - `(assert_return (invoke/get ...) results...)` — run and COMPARE each
-      result bitwise / by NaN class / by reference identity (Wasm.Wast.Values)
-    - `(assert_trap       (invoke ...) "msg")` — expect an EWasmTrap whose
-      message the expected string is a prefix of
-    - `(assert_exhaustion (invoke ...) "msg")` — the exhaustion trap
+    - `(module ...)` / `(module quote ...)` / `(module binary ...)` at top
+      level — assemble (text/quote), decode, validate, INSTANTIATE, run any
+      start function
+    - `(assert_malformed (module ...) "...")` — a BINARY operand expects
+      EWasmDecodeError; a TEXT/QUOTE operand expects EWasmTextError from the
+      assembler. A decode error on the assembler's OWN output is INV-1
+      violated — reported as `internal`, never scored as malformed (§4)
+    - `(assert_invalid (module ...) "...")` — the module must ASSEMBLE, then
+      EWasmValidationError
+    - `(register "name" $id?)`, `(invoke ...)`, `(assert_return ...)`,
+      `(assert_trap (invoke ...) ...)`, `(assert_exhaustion ...)` — run and
+      compare, now over text modules too (they instantiate like binary ones)
+    - `(assert_trap (module ...) "...")` / `(assert_exhaustion (module ...)
+      "...")` — the INSTANTIATION-trap form. The module is built and
+      instantiated for real: active elem/data segments apply in module
+      order, an out-of-bounds one traps (`exec-instantiation`), and the
+      earlier in-bounds segments PERSIST in the (imported/shared) store for
+      later commands — the rule linking.wast:399-411 documents. A start
+      function is run through the tier, so a trapping start is judged too.
+      The trap message is prefix-matched like an action trap
 
-  Everything else is SKIPPED with a reason, never silently counted as a
-  pass: text/quoted modules (no assembler), assertions whose current module
-  is a text module (no instance), imports the harness cannot satisfy (the
-  host `spectest` module is not provided), and the testsuite-local
-  directives outside the reference grammar (wcUnknown). A skip is an honest
-  "not judged".
+  Still SKIPPED, never silently a pass: `assert_unlinkable` (a pre-check
+  assembles+validates the operand — a false rejection there is a FAIL, §4 —
+  but linkage we cannot yet judge), an `assert_return`/`invoke` whose module
+  never instantiated, imports the harness cannot satisfy (no host `spectest`
+  module), the `_custom` directives outside the reference grammar, and
+  modules the assembler cannot yet build (v128 -> STAGED). A skip is an
+  honest "not judged".
 
   THE PER-SCRIPT LIFECYCLE. One engine and one store back a whole script,
   mirroring the reference interpreter's per-script state. Modules
@@ -68,13 +79,20 @@ uses
   Wasm.Runtime.Values,
   Wasm.Validator,
   Wasm.Wast,
-  Wasm.Wast.Values;
+  Wasm.Wast.Values,
+  Wasm.Wat.Assembler;
 
 const
   { Skip reasons. Public because they are the honest boundary of what the
     harness can judge, and the tests assert on them rather than on prose
-    spelled twice. }
-  WAST_REASON_TEXT_FORMAT = 'text format not yet assembled';
+    spelled twice.
+
+    WAST_REASON_TEXT_FORMAT is gone (design §4, wave 6): text and quote
+    modules now assemble through Wasm.Wat.Assembler and re-enter the shipped
+    decode -> validate -> instantiate path, so a text module is no longer a
+    skip — it is judged, exactly like a binary one. What still skips are the
+    genuinely-unjudgeable cases below (no instance, unresolved host import,
+    linkage we cannot check without more plumbing). }
   WAST_REASON_NEEDS_TIER = 'needs an execution tier';
   WAST_REASON_UNKNOWN_DIRECTIVE = 'directive not in the reference grammar';
   WAST_REASON_NO_MODULE_OPERAND = 'no module operand';
@@ -102,12 +120,17 @@ type
 
   { Which error class a module attempt produced. The hierarchy is
     load-bearing (AGENTS.md): malformed and invalid are different answers.
-    wekOther is anything that is not one of the two — reported as a failure
+    wekText is a TEXT-format syntax error from the assembler — what
+    `assert_malformed` over a text/quote module expects, kept apart from
+    wekDecode so a decode error on the assembler's OWN output can be flagged
+    as an internal bug rather than scored as malformed (INV-1, design §4).
+    wekOther is anything else — reported as a failure (kind `internal`)
     rather than allowed to abort the run. }
   TWastErrorKind = (
     wekNone,
     wekDecode,
     wekValidation,
+    wekText,
     wekOther
   );
 
@@ -269,6 +292,7 @@ begin
     wekNone: Result := 'none';
     wekDecode: Result := 'malformed';
     wekValidation: Result := 'invalid';
+    wekText: Result := 'text';
     wekOther: Result := 'internal';
   else
     Result := '?';
@@ -330,6 +354,92 @@ begin
         Inc(Offset, Size);
       end;
     end;
+end;
+
+{ Re-render a parsed node back to `.wat` SOURCE BYTES the assembler can lex.
+
+  Wasm.Wast does not retain source spans, so a text `(module ...)` operand is
+  reconstructed from its tree. Atoms carry their verbatim source spelling, so
+  they copy through; string bytes are re-ESCAPED as `\hh` for every byte that
+  is not printable ASCII (and for `"`/`\`), which round-trips exactly and keeps
+  the assembler's strict UTF-8 source lexer from tripping over raw data-string
+  bytes. Trivia the script lexer already dropped (comments, annotations) does
+  not come back — harmless for the well-formed text modules that reach this
+  path (top-level and assert_invalid operands). `assert_malformed` never gets
+  here: its operands are `(module quote ...)`, whose exact bytes flow straight
+  to AssembleQuote. }
+procedure RenderNodeInto(const ANode: TWastNode; var ADst: string);
+const
+  HEX = '0123456789abcdef';
+var
+  I: Integer;
+  B: Byte;
+begin
+  case ANode.Kind of
+    wnkAtom:
+      ADst := ADst + ANode.Atom;
+    wnkString:
+      begin
+        ADst := ADst + '"';
+        for I := 0 to High(ANode.Bytes) do
+        begin
+          B := ANode.Bytes[I];
+          if (B >= $20) and (B < $7F) and (B <> Ord('"')) and (B <> Ord('\')) then
+            ADst := ADst + Chr(B)
+          else
+            ADst := ADst + '\' + HEX[(B shr 4) + 1] + HEX[(B and $F) + 1];
+        end;
+        ADst := ADst + '"';
+      end;
+  else
+    begin
+      ADst := ADst + '(';
+      for I := 0 to ANode.Count - 1 do
+      begin
+        if I > 0 then
+          ADst := ADst + ' ';
+        RenderNodeInto(ANode[I], ADst);
+      end;
+      ADst := ADst + ')';
+    end;
+  end;
+end;
+
+function RenderNodeBytes(const ANode: TWastNode): TWasmBytes;
+var
+  S: string;
+  I: Integer;
+begin
+  S := '';
+  RenderNodeInto(ANode, S);
+  SetLength(Result, Length(S));
+  for I := 1 to Length(S) do
+    Result[I - 1] := Byte(Ord(S[I]));
+end;
+
+{ True when a text error names a deliberately-staged vector mnemonic — the
+  assembler answers `$FD` families with `unknown operator <mnemonic>` until
+  Track G (wave 7). That is not a real text error, so a module failing ONLY on
+  it is STAGED, not fail (design §3 taxonomy). Detected on the appended token,
+  which is a vector mnemonic iff it starts with a lane-typed prefix. }
+function IsStagedSimdText(const AMsg: string): Boolean;
+const
+  PREFIX = 'unknown operator ';
+  VEC: array[0..7] of string = (
+    'v128.', 'i8x16.', 'i16x8.', 'i32x4.', 'i64x2.', 'f32x4.', 'f64x2.',
+    'v128');
+var
+  Tok: string;
+  I: Integer;
+begin
+  Result := False;
+  if Copy(AMsg, 1, Length(PREFIX)) <> PREFIX then
+    Exit;
+  Tok := Copy(AMsg, Length(PREFIX) + 1, MaxInt);
+  for I := 0 to High(VEC) do
+    if (Length(Tok) >= Length(VEC[I]))
+      and (Copy(Tok, 1, Length(VEC[I])) = VEC[I]) then
+      Exit(True);
 end;
 
 { The `(module ...)` operand of an assertion, nil when there is none. }
@@ -415,6 +525,131 @@ begin
   finally
     Ir.Free;
   end;
+end;
+
+{ Decode then validate ABYTES that the assembler produced. Same shape as
+  AttemptModule, but a decode error here is INV-1 violated — the assembler's
+  own output must decode — so it is reported as wekOther (`internal`), never
+  as wekDecode, so a mis-assembly that happens to trip a decode rule with a
+  matching message can never be scored as a malformed pass (design §4). }
+function AttemptAssembledModule(const ABytes: TWasmBytes;
+  const AModule: TWasmModule; out AMessage: string): TWastErrorKind;
+var
+  Ir: TWasmIrModule;
+begin
+  Result := wekNone;
+  AMessage := '';
+  Ir := nil;
+  try
+    try
+      DecodeModule(ABytes, AModule);
+      Ir := ValidateModule(AModule, ABytes);
+    except
+      on E: EWasmDecodeError do
+      begin
+        Result := wekOther;
+        AMessage := 'internal: assembler output failed to decode: ' + E.Message;
+      end;
+      on E: EWasmValidationError do
+      begin
+        Result := wekValidation;
+        AMessage := E.Message;
+      end;
+      on E: Exception do
+      begin
+        Result := wekOther;
+        AMessage := 'internal: ' + E.ClassName + ': ' + E.Message;
+      end;
+    end;
+  finally
+    Ir.Free;
+  end;
+end;
+
+type
+  { The outcome of assembling a text/quote operand. }
+  TWatAssembleStatus = (
+    wasOk,         { bytes produced — ABytes filled }
+    wasTextError,  { a real EWasmTextError — ABytes is invalid }
+    wasStaged,     { a staged vector mnemonic (Track G) — not a real error }
+    wasInternal    { the assembler raised something other than a text error }
+  );
+
+{ Assemble a TEXT or QUOTE module operand to binary bytes. A quote operand's
+  payload is the concatenated, escape-decoded string bytes (ModuleBinaryBytes
+  gathers them by node kind), fed to AssembleQuote; a text operand is rendered
+  back to source (RenderNodeBytes) and fed to AssembleWat. Lazy by
+  construction: nothing is assembled until the command executes, and there is
+  no caching — the same quoted text may appear in two commands with opposite
+  expectations (design §5). }
+function AssembleOperand(const ANode: TWastNode; const AForm: TWastModuleForm;
+  out ABytes: TWasmBytes; out AMsg: string): TWatAssembleStatus;
+begin
+  ABytes := nil;
+  AMsg := '';
+  try
+    if AForm = wmfQuote then
+      ABytes := AssembleQuote(ModuleBinaryBytes(ANode))
+    else
+      ABytes := AssembleWat(RenderNodeBytes(ANode));
+    Result := wasOk;
+  except
+    on E: EWasmTextError do
+    begin
+      AMsg := E.Message;
+      if IsStagedSimdText(E.Message) then
+        Result := wasStaged
+      else
+        Result := wasTextError;
+    end;
+    on E: Exception do
+    begin
+      { The assembler contract is that it raises only EWasmTextError; anything
+        else is an internal defect, surfaced as such rather than aborting the
+        run. }
+      AMsg := 'internal: ' + E.ClassName + ': ' + E.Message;
+      Result := wasInternal;
+    end;
+  end;
+end;
+
+{ The full module-operand attempt across all three forms, WITHOUT
+  instantiating: binary decodes directly; text/quote assemble first (a text
+  error becomes wekText), then decode + validate the produced bytes.
+
+  ABlocked is set ONLY when a deliberately-staged vector mnemonic stopped the
+  ASSEMBLER from producing any bytes (Track G): the module cannot be judged at
+  all, so callers record STAGED regardless of the wanted class. A staged
+  message the VALIDATOR raises is a different situation — the module decoded
+  and reached validation — and is NOT flagged here; callers gate that on the
+  wanted class via IsStagedFeatureMessage, so a wrong-class rejection cannot
+  hide behind STAGED (design §4). }
+function AttemptOperand(const AModel: TWasmModule; const AOperand: TWastNode;
+  const AForm: TWastModuleForm; out AMsg: string;
+  out ABlocked: Boolean): TWastErrorKind;
+var
+  Bytes: TWasmBytes;
+begin
+  ABlocked := False;
+  if AForm = wmfBinary then
+  begin
+    Result := AttemptModule(ModuleBinaryBytes(AOperand), AModel, AMsg);
+    Exit;
+  end;
+
+  case AssembleOperand(AOperand, AForm, Bytes, AMsg) of
+    wasStaged:
+      begin
+        ABlocked := True;
+        Exit(wekText);
+      end;
+    wasTextError:
+      Exit(wekText);
+    wasInternal:
+      Exit(wekOther);
+  end;
+
+  Result := AttemptAssembledModule(Bytes, AModel, AMsg);
 end;
 
 { --- per-script runner state --------------------------------------------- }
@@ -857,28 +1092,63 @@ begin
   AResult.Actual := AReason;
 end;
 
-{ Decode, validate, instantiate, and run the start function of a top-level
-  binary module. The IR and bytes are retained so the instance can borrow
-  them for the life of the script. }
-procedure RunModuleCommand(const ARunner: TWastRunner;
-  const ACommand: TWastCommand; var AResult: TWastCommandResult);
+{ Assemble (text/quote), decode, validate, retain, and resolve the imports of
+  a module operand that is expected to BUILD. On success returns True with the
+  retained IR and the retained byte buffer (both borrowed by the instance for
+  the life of the script) and the resolved imports; the caller then
+  instantiates. On any build failure it fills AResult — a fail (text/decode/
+  validation error, INV-1 internal), a staged case (staged validator feature
+  or vector mnemonic), or a skip (imports the harness cannot satisfy) — and
+  returns False. Shared by the top-level `module` command and the
+  `assert_trap (module ...)` arm, so both build a module by exactly the same
+  rules. Never touches ARunner.Current — the caller owns that. }
+function PrepareModule(const ARunner: TWastRunner; const ANode: TWastNode;
+  const AForm: TWastModuleForm; var AResult: TWastCommandResult;
+  out AIr: TWasmIrModule; out ABytes: TWasmBytes;
+  out AImports: TWasmImports): Boolean;
 var
   Bytes: TWasmBytes;
   Ir: TWasmIrModule;
-  Imports: TWasmImports;
-  Inst: TWasmModuleInstance;
-  Why, Id: string;
+  Why, Msg: string;
+  Assembled: Boolean;
 begin
-  { A text/quoted module leaves no instance — clear Current so later actions
-    skip honestly rather than run against a stale module. }
-  ARunner.Current := nil;
-  if ACommand.ModuleForm <> wmfBinary then
-  begin
-    Skipped(AResult, WAST_REASON_TEXT_FORMAT);
-    Exit;
-  end;
+  Result := False;
+  AIr := nil;
 
-  Bytes := ModuleBinaryBytes(ACommand.Node);
+  { Text and quote modules ASSEMBLE first (§4); a well-formed one must
+    assemble, decode, validate, and instantiate cleanly, so a text error here
+    is a real failure — unless it is a staged vector mnemonic. Binary modules
+    skip assembly and decode directly. }
+  Assembled := AForm <> wmfBinary;
+  if Assembled then
+  begin
+    case AssembleOperand(ANode, AForm, Bytes, Msg) of
+      wasStaged:
+        begin
+          AResult.ActualKind := wekText;
+          AResult.Actual := Msg;
+          AResult.Status := wrsStaged;
+          Exit;
+        end;
+      wasTextError:
+        begin
+          AResult.ActualKind := wekText;
+          AResult.Actual := Msg;
+          AResult.Status := wrsFail;
+          Exit;
+        end;
+      wasInternal:
+        begin
+          AResult.ActualKind := wekOther;
+          AResult.Actual := Msg;
+          AResult.Status := wrsFail;
+          Exit;
+        end;
+    end;
+  end
+  else
+    Bytes := ModuleBinaryBytes(ANode);
+
   Ir := nil;
   try
     DecodeModule(Bytes, ARunner.Model);
@@ -886,8 +1156,19 @@ begin
   except
     on E: EWasmDecodeError do
     begin
-      AResult.ActualKind := wekDecode;
-      AResult.Actual := E.Message;
+      if Assembled then
+      begin
+        { INV-1: our own assembler output must decode; a decode error is an
+          internal defect, not a conformance verdict. }
+        AResult.ActualKind := wekOther;
+        AResult.Actual := 'internal: assembler output failed to decode: '
+          + E.Message;
+      end
+      else
+      begin
+        AResult.ActualKind := wekDecode;
+        AResult.Actual := E.Message;
+      end;
       AResult.Status := wrsFail;
       Exit;
     end;
@@ -910,7 +1191,7 @@ begin
     end;
   end;
 
-  if not ResolveImports(ARunner, ARunner.Model, Imports, Why) then
+  if not ResolveImports(ARunner, ARunner.Model, AImports, Why) then
   begin
     Skipped(AResult, Why);
     Ir.Free;
@@ -922,7 +1203,30 @@ begin
   ARunner.FIrs[High(ARunner.FIrs)] := Ir;
   SetLength(ARunner.FBuffers, Length(ARunner.FBuffers) + 1);
   ARunner.FBuffers[High(ARunner.FBuffers)] := Bytes;
-  Bytes := ARunner.FBuffers[High(ARunner.FBuffers)];
+  AIr := Ir;
+  ABytes := ARunner.FBuffers[High(ARunner.FBuffers)];
+  Result := True;
+end;
+
+{ Decode, validate, instantiate, and run the start function of a top-level
+  module. The IR and bytes are retained so the instance can borrow them for
+  the life of the script. }
+procedure RunModuleCommand(const ARunner: TWastRunner;
+  const ACommand: TWastCommand; var AResult: TWastCommandResult);
+var
+  Bytes: TWasmBytes;
+  Ir: TWasmIrModule;
+  Imports: TWasmImports;
+  Inst: TWasmModuleInstance;
+  Id: string;
+begin
+  { A module that fails to build leaves no instance — clear Current so later
+    actions skip honestly rather than run against a stale module. }
+  ARunner.Current := nil;
+
+  if not PrepareModule(ARunner, ACommand.Node, ACommand.ModuleForm, AResult,
+    Ir, Bytes, Imports) then
+    Exit;
 
   try
     Inst := InstantiateModule(ARunner.Store, Ir, @Bytes[0],
@@ -965,8 +1269,10 @@ procedure RunAssertFailure(const ARunner: TWastRunner;
   var AResult: TWastCommandResult);
 var
   Operand: TWastNode;
-  Kind: TWastErrorKind;
+  Form: TWastModuleForm;
+  Kind, Want: TWastErrorKind;
   Msg: string;
+  Staged: Boolean;
 begin
   Operand := FindModuleOperand(ACommand.Node);
   if Operand = nil then
@@ -976,26 +1282,165 @@ begin
   end;
 
   AResult.Expected := ExpectedFailure(ACommand.Node);
+  Form := DetectWastModuleForm(Operand);
 
-  if DetectWastModuleForm(Operand) <> wmfBinary then
+  { The accepted error class depends on the operand form (§4): a `(module
+    binary ...)` is malformed via a DECODE error, a `(module ...)` / `(module
+    quote ...)` via a TEXT error. assert_invalid always wants a validation
+    error — the text module must ASSEMBLE first (a text error there is a real
+    fail, an INV-2 false rejection or a message divergence). }
+  if AWant = wekDecode then
   begin
-    Skipped(AResult, WAST_REASON_TEXT_FORMAT);
-    Exit;
-  end;
+    if Form = wmfBinary then
+      Want := wekDecode
+    else
+      Want := wekText;
+  end
+  else
+    Want := wekValidation;
 
-  Kind := AttemptModule(ModuleBinaryBytes(Operand), ARunner.Model, Msg);
+  Kind := AttemptOperand(ARunner.Model, Operand, Form, Msg, Staged);
   AResult.ActualKind := Kind;
   if Kind = wekNone then
     AResult.Actual := WAST_NO_ERROR
   else
     AResult.Actual := Msg;
 
-  if (Kind = AWant) and WastMessageMatches(AResult.Expected, Msg) then
+  { A vector mnemonic that BLOCKED assembly stages the case whatever the
+    wanted class — the module could not be judged at all, so SIMD noise does
+    not drown the report. Otherwise a wrong-class rejection is a fail (it
+    cannot hide behind STAGED), a validator-staged message of the wanted
+    class stages, and only then does the prefix match decide pass/fail. }
+  if Staged then
+    AResult.Status := wrsStaged
+  else if Kind <> Want then
+    AResult.Status := wrsFail
+  else if IsStagedFeatureMessage(Msg) then
+    AResult.Status := wrsStaged
+  else if WastMessageMatches(AResult.Expected, Msg) then
     AResult.Status := wrsPass
-  else if (Kind = AWant) and IsStagedFeatureMessage(Msg) then
+  else
+    AResult.Status := wrsFail;
+end;
+
+{ `assert_trap (module ...)` / `assert_exhaustion (module ...)`: the module is
+  well-formed and valid, and its INSTANTIATION must trap. We build it (through
+  the shared PrepareModule) and instantiate it for real: active elem/data
+  segments apply in module order, an out-of-bounds one traps
+  (`exec-instantiation`), and — the point of this arm — the earlier in-bounds
+  segments PERSIST in the (imported/shared) store, which a following
+  `assert_return` observes (linking.wast:399-411). A start function is run
+  through the tier, so a trapping start is judged the same way.
+
+  A trap PASSES when the expected string is a prefix of its message
+  (assert_exhaustion's is `call stack exhausted`); a clean build+start where a
+  trap was required FAILS. A well-formed module the harness cannot link is an
+  honest SKIP — not the trap we were asked to judge — matching the top-level
+  module path. }
+procedure RunAssertTrapModule(const ARunner: TWastRunner;
+  const AOperand: TWastNode; var AResult: TWastCommandResult);
+var
+  Ir: TWasmIrModule;
+  Bytes: TWasmBytes;
+  Imports: TWasmImports;
+  Inst: TWasmModuleInstance;
+begin
+  if not PrepareModule(ARunner, AOperand, DetectWastModuleForm(AOperand),
+    AResult, Ir, Bytes, Imports) then
+    Exit;
+
+  try
+    Inst := InstantiateModule(ARunner.Store, Ir, @Bytes[0],
+      NativeUInt(Length(Bytes)), Imports);
+    ARunner.Store.RunPendingStart(Inst);
+  except
+    on E: EWasmLinkError do
+    begin
+      { A well-formed module the harness could not link — not the
+        instantiation trap we were asked to judge. }
+      Skipped(AResult, WAST_REASON_UNRESOLVED_IMPORT + ': ' + E.Message);
+      Exit;
+    end;
+    on E: EWasmTrap do
+    begin
+      { Instantiation trapped, exactly as asserted. Earlier in-bounds
+        segments are already written into the store and persist. Re-establish
+        the frame chain and context cursors after the unwind, as the invoke
+        path does, so a following command runs on clean ground. }
+      ARunner.Store.Heap.ResetFrames;
+      ResetInterpContext(ARunner.Store);
+      AResult.ActualKind := wekNone;
+      AResult.Actual := E.Message;
+      if WastMessageMatches(AResult.Expected, E.Message) then
+        AResult.Status := wrsPass
+      else
+        AResult.Status := wrsFail;
+      Exit;
+    end;
+    on E: EWasmError do
+    begin
+      { A staged feature reached during instantiation stages; anything else is
+        an internal defect surfaced as a fail rather than aborting the run. }
+      ARunner.Store.Heap.ResetFrames;
+      ResetInterpContext(ARunner.Store);
+      AResult.ActualKind := wekOther;
+      AResult.Actual := E.ClassName + ': ' + E.Message;
+      if IsStagedMessage(E.Message) then
+        AResult.Status := wrsStaged
+      else
+        AResult.Status := wrsFail;
+      Exit;
+    end;
+  end;
+
+  { Built and started cleanly where a trap was required. }
+  AResult.ActualKind := wekNone;
+  AResult.Actual := WAST_NO_ERROR;
+  AResult.Status := wrsFail;
+end;
+
+{ `assert_unlinkable` over a MODULE operand: the module is well-formed and
+  valid by construction, so it is assembled, decoded, and validated as a
+  PRE-CHECK (a failure there is a false rejection — INV-2 — or a real decoder/
+  validator bug on a newly-reachable module, and is reported). When the
+  pre-check passes, the command still SKIPS: judging linkage needs plumbing
+  this wave does not add, and a skip stays a skip (§4). }
+procedure RunModulePrecheck(const ARunner: TWastRunner;
+  const AOperand: TWastNode; var AResult: TWastCommandResult);
+var
+  Kind: TWastErrorKind;
+  Msg: string;
+  Staged: Boolean;
+begin
+  Kind := AttemptOperand(ARunner.Model, AOperand,
+    DetectWastModuleForm(AOperand), Msg, Staged);
+  if Kind = wekNone then
+  begin
+    { Assembled, decoded, validated — we simply cannot judge the rest. }
+    Skipped(AResult, WAST_REASON_NEEDS_TIER);
+    Exit;
+  end;
+  AResult.ActualKind := Kind;
+  AResult.Actual := Msg;
+  if Staged or IsStagedFeatureMessage(Msg) then
     AResult.Status := wrsStaged
   else
     AResult.Status := wrsFail;
+end;
+
+procedure RunAssertUnlinkable(const ARunner: TWastRunner;
+  const ACommand: TWastCommand; var AResult: TWastCommandResult);
+var
+  Operand: TWastNode;
+begin
+  Operand := FindModuleOperand(ACommand.Node);
+  if Operand = nil then
+  begin
+    Skipped(AResult, WAST_REASON_NO_MODULE_OPERAND);
+    Exit;
+  end;
+  AResult.Expected := ExpectedFailure(ACommand.Node);
+  RunModulePrecheck(ARunner, Operand, AResult);
 end;
 
 { Resolve the expected reference identity a matcher compares against —
@@ -1139,13 +1584,20 @@ var
 begin
   if (ACommand.Node.Count < 2) or (ACommand.Node[1].Kind <> wnkList) then
   begin
-    { assert_trap over a (module ...) instantiation trap is not in this
-      corpus; only the action form is handled. }
     Skipped(AResult, WAST_REASON_NO_MODULE_OPERAND);
     Exit;
   end;
   Action := ACommand.Node[1];
   AResult.Expected := ExpectedFailure(ACommand.Node);
+
+  { `assert_trap (module ...) "..."` is the instantiation-trap form (active
+    elem/data out of bounds, a trapping start): the module is built and
+    instantiated for real, and its trap is judged. }
+  if Action.HeadAtom = 'module' then
+  begin
+    RunAssertTrapModule(ARunner, Action, AResult);
+    Exit;
+  end;
 
   Act := RunAction(ARunner, Action, HasInstance);
   if not HasInstance then
@@ -1281,10 +1733,7 @@ begin
     wcAssertException:
       Skipped(Result, WAST_REASON_EXCEPTIONS);
     wcAssertUnlinkable:
-      { The corpus spells these with text modules, which cannot be
-        assembled; a binary unlinkable case would need the same import
-        plumbing and is out of scope here. }
-      Skipped(Result, WAST_REASON_TEXT_FORMAT);
+      RunAssertUnlinkable(ARunner, ACommand, Result);
     wcUnknown:
       Skipped(Result, WAST_REASON_UNKNOWN_DIRECTIVE);
   else
@@ -1293,6 +1742,24 @@ begin
 end;
 
 { --- entry points -------------------------------------------------------- }
+
+{ Turn an exception that escaped a single command into a FAIL result for
+  THAT command, so the rest of the file still runs. This is the runner's
+  hard guarantee (Track C Wave 6b): no single command can abort the whole
+  corpus file. The interpreter already converts guest faults to the
+  EWasmError hierarchy at its boundary; this is the belt for anything the
+  layers above it (marshalling, decode, a runner bug) might still leak. }
+function CommandCrashResult(const ACommand: TWastCommand;
+  const AException: Exception): TWastCommandResult;
+begin
+  Result.Kind := ACommand.Kind;
+  Result.Line := ACommand.Node.Line;
+  Result.Status := wrsFail;
+  Result.Expected := '';
+  Result.Actual := 'command raised ' + AException.ClassName + ': ' +
+    AException.Message;
+  Result.ActualKind := wekOther;
+end;
 
 function RunWastScript(const AScript: TWastScript): TWastRunResult;
 var
@@ -1304,7 +1771,12 @@ begin
     Runner := TWastRunner.Create;
     try
       for I := 0 to AScript.Count - 1 do
-        Result.AddResult(ExecuteCommand(Runner, AScript[I]));
+        try
+          Result.AddResult(ExecuteCommand(Runner, AScript[I]));
+        except
+          on E: Exception do
+            Result.AddResult(CommandCrashResult(AScript[I], E));
+        end;
     finally
       Runner.Free;
     end;

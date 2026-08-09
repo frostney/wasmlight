@@ -9,15 +9,16 @@ Component Model. See [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-Pre-0.1, early. What is shipped today is the whole path from bytes to a
-validated, lowered module, plus the runtime state a tier will run on: the
-bounds-checked binary reader with full LEB128 handling, the decoded module
-model, the structural decoder, the validator that emits the register IR,
-and the runtime layer below the tier seam (store, instances, the
-memory-access chokepoint, traps, instantiation, and the precise
-collector). It is driven by `wasmlight inspect` / `wasmlight validate`, and
-`wasmspec` judges the upstream corpus's binary subset against decode and
-validation. The execution tiers and the host surface are staged in
+Pre-0.1, early. What is shipped today is the whole path from bytes — or
+from text — to a running module: the bounds-checked binary reader with
+full LEB128 handling, the decoded module model, the structural decoder, the
+validator that emits the register IR, the runtime layer below the tier seam
+(store, instances, the memory-access chokepoint, traps, instantiation, and
+the precise collector), the interpreter tier that executes the IR, and a
+wat text-format assembler. It is driven by `wasmlight inspect` / `wasmlight
+validate`, and `wasmspec` runs the upstream conformance corpus — assembling
+text modules, validating, instantiating, and executing the assertions. The
+baseline JIT and AOT tiers and the host surface are staged in
 [docs/roadmap.md](docs/roadmap.md) — that file, not this one, is the honest
 picture of what exists.
 
@@ -51,15 +52,20 @@ code                         20          4
 custom "name"                26         11
 ```
 
-`wasmspec` runs the upstream `.wast` conformance corpus over the subset the
-shipped layers can judge — the binary-module `assert_malformed`,
-`assert_invalid`, and top-level `module` cases:
+`wasmspec` runs the upstream `.wast` conformance corpus — assembling text
+modules, validating, instantiating, and executing `assert_return` /
+`assert_trap` / `invoke` through the interpreter:
 
 ```text
 $ ./build/wasmspec tests/spec/testsuite
 ...
-TOTAL files=288 errors=0 pass=1034 fail=35 skip=66050 staged=6 total=67125
+ROOT      pass=38367 fail=88  skip=25239 staged=1620 total=65314
+PROPOSALS pass=533   fail=356 skip=922   staged=0    total=1811
+TOTAL files=288 errors=0 pass=38900 fail=444 skip=26161 staged=1620 total=67125
 ```
+
+`staged` is the vector text awaiting Track G; the failures are dominated by
+post-3.0 proposals outside the pinned 3.0 target, not 3.0 regressions.
 
 For the full command set and every development command, see
 [docs/quick-start.md](docs/quick-start.md) and

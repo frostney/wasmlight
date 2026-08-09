@@ -144,9 +144,13 @@ type
     procedure TestStagedSimdWrongClassReportsFail;
     procedure TestTopLevelBinaryModulePasses;
     procedure TestTopLevelBinaryModuleFailureReported;
-    procedure TestTextModuleSkipped;
-    procedure TestQuotedModuleSkipped;
-    procedure TestTextModuleInsideAssertSkipped;
+    procedure TestTextModuleAssembles;
+    procedure TestQuotedModuleAssembles;
+    procedure TestAssertMalformedTextOperandPasses;
+    procedure TestAssertMalformedTextNotMalformedFails;
+    procedure TestAssertInvalidTextOperandPasses;
+    procedure TestStagedSimdTextModule;
+    procedure TestAssertUnlinkablePrechecksThenSkips;
     procedure TestUnknownDirectiveSkipped;
     procedure TestExecutionCommandsSkipped;
     procedure TestAssertWithoutModuleOperandSkipped;
@@ -169,6 +173,9 @@ type
     procedure TestExternRefIdentityMatches;
     procedure TestExternRefIdentityMismatchFails;
     procedure TestCrossModuleRegisterImport;
+    procedure TestAssertTrapModuleOobSegmentPersists;
+    procedure TestAssertTrapModuleTrappingStartPersists;
+    procedure TestAssertTrapModuleNoTrapReportsFail;
   end;
 
 function TWastRunnerTests.StatusSignature(const ASource: string): string;
@@ -390,38 +397,95 @@ end;
 
 { --- skips: the honest boundary ------------------------------------------ }
 
-procedure TWastRunnerTests.TestTextModuleSkipped;
+procedure TWastRunnerTests.TestTextModuleAssembles;
 var
   Item: TWastCommandResult;
 begin
+  { A well-formed text module now assembles, decodes, validates, and
+    instantiates — no longer a skip. A pass carries no message. }
   Item := FirstResult('(module (func $f (result i32) (i32.const 1)))');
-  Expect<string>(WastStatusName(Item.Status)).ToBe('skip');
-  Expect<string>(Item.Actual).ToBe(WAST_REASON_TEXT_FORMAT);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(Item.Actual).ToBe('');
 end;
 
-procedure TWastRunnerTests.TestQuotedModuleSkipped;
+procedure TWastRunnerTests.TestQuotedModuleAssembles;
 begin
-  { `(module quote ...)` is text too — the payload is source to be parsed,
-    not bytes to be decoded. }
+  { `(module quote ...)` is source too; its payload assembles the same way. }
   Expect<string>(StatusSignature('(module quote "(module)")'))
-    .ToBe('module:skip');
+    .ToBe('module:pass');
 end;
 
-procedure TWastRunnerTests.TestTextModuleInsideAssertSkipped;
+procedure TWastRunnerTests.TestAssertMalformedTextOperandPasses;
 var
   Item: TWastCommandResult;
 begin
-  { The assertion is real, the operand is not assemblable. Skipping is the
-    only honest outcome: counting it as a pass would claim coverage of a
-    case never run, and counting it as a fail would blame the corpus for
-    an absent assembler. }
+  { assert_malformed over a QUOTE operand expects a TEXT error, not a decode
+    error: `0x` is the reserved-token rule (a malformed integer token is
+    `unknown operator`, design §4). The kind is `text`, distinct from
+    `malformed`, so INV-1 stays checkable. }
+  Item := FirstResult(
+    '(assert_malformed (module quote "(func (i32.const 0x))") '
+    + '"unknown operator")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('text');
+  ExpectStartsWith(Item.Actual, 'unknown operator');
+end;
+
+procedure TWastRunnerTests.TestAssertMalformedTextNotMalformedFails;
+var
+  Item: TWastCommandResult;
+begin
+  { A QUOTE operand that assembles cleanly is NOT malformed, however the
+    script labels it — the assertion fails with `(no error raised)`, never a
+    silent pass. }
   Item := FirstResult(
     '(assert_malformed (module quote "(func)") "unexpected token")');
-  Expect<string>(WastStatusName(Item.Status)).ToBe('skip');
-  Expect<string>(Item.Actual).ToBe(WAST_REASON_TEXT_FORMAT);
-  { The expected string is still recorded — the case is skipped, not
-    forgotten. }
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('none');
+  Expect<string>(Item.Actual).ToBe(WAST_NO_ERROR);
+  { The expected string is still recorded. }
   Expect<string>(Item.Expected).ToBe('unexpected token');
+end;
+
+procedure TWastRunnerTests.TestAssertInvalidTextOperandPasses;
+var
+  Item: TWastCommandResult;
+begin
+  { assert_invalid over a text module: it must ASSEMBLE (a func whose body is
+    empty but whose result is i32), then fail VALIDATION as `type mismatch`.
+    The kind is `invalid`, so an assembler that wrongly rejected it as a text
+    error would be caught. }
+  Item := FirstResult('(assert_invalid (module (func (result i32))) '
+    + '"type mismatch")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('invalid');
+  ExpectStartsWith(Item.Actual, 'type mismatch');
+end;
+
+procedure TWastRunnerTests.TestStagedSimdTextModule;
+var
+  Item: TWastCommandResult;
+begin
+  { A text module using a vector mnemonic hits the assembler's `unknown
+    operator v128.const` (Track G), which is STAGED, not a real text error —
+    so SIMD noise cannot drown the report. }
+  Item := FirstResult('(module (func (v128.const i32x4 0 0 0 0) drop))');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('staged');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('text');
+  ExpectStartsWith(Item.Actual, 'unknown operator v128.const');
+end;
+
+procedure TWastRunnerTests.TestAssertUnlinkablePrechecksThenSkips;
+var
+  Item: TWastCommandResult;
+begin
+  { assert_unlinkable pre-checks the operand (assemble + decode + validate),
+    which succeeds for this well-formed module, then skips because linkage is
+    not yet judgeable. A skip stays a skip; the failure path is what is new. }
+  Item := FirstResult(
+    '(assert_unlinkable (module quote "(module)") "unknown import")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('skip');
+  Expect<string>(Item.Actual).ToBe(WAST_REASON_NEEDS_TIER);
 end;
 
 procedure TWastRunnerTests.TestUnknownDirectiveSkipped;
@@ -523,12 +587,15 @@ var
   Run: TWastRunResult;
   Tally: TWastTally;
 begin
+  { A register with no current instance is the skip here: a well-formed
+    text `(module (func))` now PASSES rather than skipping, so the skip has to
+    come from a command that genuinely cannot be judged. }
   Run := RunWastSource(
     '(assert_malformed (module binary ' + MODULE_BAD_MAGIC
       + ') "magic header not detected")' + sLineBreak +
     '(assert_malformed (module binary ' + MODULE_BAD_MAGIC
       + ') "unknown binary version")' + sLineBreak +
-    '(module (func))' + sLineBreak +
+    '(register "m")' + sLineBreak +
     '(assert_invalid (module binary ' + MODULE_SIMD_BODY
       + ') "type mismatch")');
   try
@@ -700,6 +767,84 @@ begin
     .ToBe('module:pass register:pass module:pass assert_return:pass');
 end;
 
+procedure TWastRunnerTests.TestAssertTrapModuleOobSegmentPersists;
+var
+  Run: TWastRunResult;
+begin
+  { The instantiation-trap form, judged for real (exec-instantiation). An
+    importer shares $M's memory; its first active data segment ("abc" at 0)
+    is in bounds and is written, its second (offset 0x10000, past a 1-page
+    memory) is out of bounds and traps. assert_trap PASSES on the trap, and
+    the earlier write PERSISTS: the following assert_return reads 'a' (97)
+    back through $M's own export. Mirrors linking.wast:399-411. }
+  Run := RunWastSource(
+    '(module $M (memory (export "mem") 1)' + sLineBreak
+    + '  (func (export "load") (param i32) (result i32)' + sLineBreak
+    + '    (i32.load8_u (local.get 0))))' + sLineBreak
+    + '(register "M" $M)' + sLineBreak
+    + '(assert_trap' + sLineBreak
+    + '  (module' + sLineBreak
+    + '    (memory (import "M" "mem") 1)' + sLineBreak
+    + '    (data (i32.const 0) "abc")' + sLineBreak
+    + '    (data (i32.const 0x10000) "z"))' + sLineBreak
+    + '  "out of bounds memory access")' + sLineBreak
+    + '(assert_return (invoke $M "load" (i32.const 0)) (i32.const 97))');
+  try
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    ExpectStartsWith(Run[2].Actual, 'out of bounds memory access');
+    { The persisted earlier segment is observable afterwards. }
+    Expect<string>(WastStatusName(Run[3].Status)).ToBe('pass');
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestAssertTrapModuleTrappingStartPersists;
+var
+  Run: TWastRunResult;
+begin
+  { The module instantiates cleanly (its data segment is in bounds and is
+    written into the shared memory), then its START function traps on
+    `unreachable`. The tier runs the start, so the trap is judged; and the
+    data written before the start persists — the store is modified even when
+    the start traps (linking.wast:588-609). }
+  Run := RunWastSource(
+    '(module $S (memory (export "mem") 1)' + sLineBreak
+    + '  (func (export "load") (param i32) (result i32)' + sLineBreak
+    + '    (i32.load8_u (local.get 0))))' + sLineBreak
+    + '(register "S" $S)' + sLineBreak
+    + '(assert_trap' + sLineBreak
+    + '  (module' + sLineBreak
+    + '    (memory (import "S" "mem") 1)' + sLineBreak
+    + '    (data (i32.const 0) "hello")' + sLineBreak
+    + '    (func $main (unreachable))' + sLineBreak
+    + '    (start $main))' + sLineBreak
+    + '  "unreachable")' + sLineBreak
+    + '(assert_return (invoke $S "load" (i32.const 0)) (i32.const 104))');
+  try
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    ExpectStartsWith(Run[2].Actual, 'unreachable');
+    { 'h' = 104 was written by the data segment before the start trapped. }
+    Expect<string>(WastStatusName(Run[3].Status)).ToBe('pass');
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestAssertTrapModuleNoTrapReportsFail;
+var
+  Item: TWastCommandResult;
+begin
+  { A module that instantiates cleanly where the script demanded an
+    instantiation trap. The absence of a trap is the finding, spelled the
+    same way the action-trap path spells it. }
+  Item := FirstResult(
+    '(assert_trap (module (func)) "out of bounds memory access")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  Expect<string>(Item.Expected).ToBe('out of bounds memory access');
+  Expect<string>(Item.Actual).ToBe(WAST_NO_ERROR);
+end;
+
 procedure TWastRunnerTests.SetupTests;
 begin
   Test('assert_malformed passes on a prefix match',
@@ -722,10 +867,18 @@ begin
   Test('top-level binary module passes', TestTopLevelBinaryModulePasses);
   Test('top-level binary module failure is reported',
     TestTopLevelBinaryModuleFailureReported);
-  Test('text module skipped', TestTextModuleSkipped);
-  Test('quoted module skipped', TestQuotedModuleSkipped);
-  Test('text module inside an assert skipped',
-    TestTextModuleInsideAssertSkipped);
+  Test('text module assembles and passes', TestTextModuleAssembles);
+  Test('quoted module assembles and passes', TestQuotedModuleAssembles);
+  Test('assert_malformed over a text operand passes on a text error',
+    TestAssertMalformedTextOperandPasses);
+  Test('assert_malformed over a well-formed text operand fails',
+    TestAssertMalformedTextNotMalformedFails);
+  Test('assert_invalid over a text operand passes on validation',
+    TestAssertInvalidTextOperandPasses);
+  Test('a staged vector mnemonic in a text module is staged',
+    TestStagedSimdTextModule);
+  Test('assert_unlinkable pre-checks the operand then skips',
+    TestAssertUnlinkablePrechecksThenSkips);
   Test('unknown directive skipped', TestUnknownDirectiveSkipped);
   Test('execution commands skipped', TestExecutionCommandsSkipped);
   Test('assert without a module operand skipped',
@@ -757,6 +910,12 @@ begin
     TestExternRefIdentityMismatchFails);
   Test('register binds an instance for cross-module import',
     TestCrossModuleRegisterImport);
+  Test('assert_trap over a module judges an OOB segment and persists earlier',
+    TestAssertTrapModuleOobSegmentPersists);
+  Test('assert_trap over a module judges a trapping start and persists data',
+    TestAssertTrapModuleTrappingStartPersists);
+  Test('assert_trap over a non-trapping module reports a fail',
+    TestAssertTrapModuleNoTrapReportsFail);
 end;
 
 begin

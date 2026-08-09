@@ -98,6 +98,7 @@ type
     procedure TestAlphaEquivalentGroupsShareEngineIds;
     procedure TestDistinctGroupsGetDistinctIds;
     procedure TestReinterningIsIdempotent;
+    procedure TestEmptyRecGroupInternsToNothing;
     procedure TestCrossModuleOutOfGroupRefsInternStructurally;
     procedure TestDisplayTestAgreesWithTheValidator;
     procedure TestEngineMatchingIsCrossModule;
@@ -402,6 +403,29 @@ begin
   ExpectCount('groups after two', FEngine.GroupCount, 2);
   Expect<Boolean>((First[0] = Second[0]) and (First[1] = Second[1]))
     .ToBe(True);
+end;
+
+procedure TRuntimeStoreTests.TestEmptyRecGroupInternsToNothing;
+var
+  Ids: TWasmEngineTypeIds;
+begin
+  { An empty `(rec)` is a valid rec group of zero types: `binary-rectype`
+    encodes the members as a list, and a list count of 0 is well-formed
+    (type-rec.wast opens with one). It must intern to nothing — no engine
+    type, no group, no type-index slot — rather than being rejected as an
+    internal "sizes do not cover the type index space" error. The module is
+    `(rec)` followed by a lone (func), so exactly one engine type results.
+
+      type section: 2 rectype entries
+        [0] 0x4E 0x00        (rec) with zero members
+        [1] 0x60 0x00 0x00   (func) -> singleton rec group }
+  Ids := InternOf(BuildModule([$02, $4E, $00, $60, $00, $00]));
+
+  { Only the func's type index survives; the empty group added nothing. }
+  ExpectCount('type-index space', Length(Ids), 1);
+  ExpectCount('types', FEngine.TypeCount, 1);
+  ExpectCount('groups', FEngine.GroupCount, 1);
+  Expect<Boolean>(FEngine.EngineType(Ids[0]).Kind = wckFunc).ToBe(True);
 end;
 
 procedure TRuntimeStoreTests.TestCrossModuleOutOfGroupRefsInternStructurally;
@@ -1176,6 +1200,8 @@ begin
     TestDistinctGroupsGetDistinctIds);
   Test('re-interning the same module allocates nothing',
     TestReinterningIsIdempotent);
+  Test('an empty rec group interns to nothing',
+    TestEmptyRecGroupInternsToNothing);
   Test('cross-module out-of-group references intern structurally',
     TestCrossModuleOutOfGroupRefsInternStructurally);
   Test('the display test agrees with the validator on every pair',

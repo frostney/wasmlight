@@ -6,11 +6,14 @@
   describes shipped behaviour only; anything not shipped is listed here.
 - **Shipped:** the binary reader, the type vocabulary, the populated
   module model, the full section-body decoder (Track A), the validator
-  and the register IR it emits (Track B, vectors excepted), the `.wast`
-  harness front end and its runner over the corpus's binary subset (Track
-  C, partial), the runtime state and the precise collector (Track D,
-  delivered), and three programs: `wasmlight inspect` / `wasmlight
-  validate` and `wasmspec`.
+  and the register IR it emits (Track B, vectors excepted), the runtime
+  state and the precise collector (Track D), the interpreter tier that
+  executes the IR (Track E), and the conformance harness now substantially
+  complete (Track C): the `.wast` front end, the wat text-format
+  assembler, and a runner that assembles text modules and *executes*
+  `assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` through
+  the interpreter over the whole corpus. Three programs drive it:
+  `wasmlight inspect` / `wasmlight validate` and `wasmspec`.
 - **Garbage collection has landed (Track D).** It was the longest pole by
   structural reach, not by instruction count: it rewrote the type section,
   added a runtime subtyping check, and put a precise collector under the
@@ -27,9 +30,8 @@ Sizing here is anchored on the **counted specification surface**, not on
 measured throughput, because there is nothing to measure yet: the
 repository has no closed issues, no merged pull requests, and no releases.
 A throughput-anchored plan needs merged-PR history and issue-to-merge lead
-time; neither exists. Tracks A, B, and D landing — and Track C in part —
-does not change that: tracks landing outside a pull-request workflow are
-not a rate.
+time; neither exists. Tracks A, B, C, D, and E landing does not change
+that: tracks landing outside a pull-request workflow are not a rate.
 
 That is a real limitation, not a formality. Counts tell you how much
 surface there is, not how fast this project crosses it. **Re-anchor this
@@ -69,20 +71,28 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Engine canonical type table, store, instances, runtime subtyping | `Wasm.Runtime.Store` | `Wasm.Runtime.Store.Test` |
 | Constant-expression evaluation and the instantiation sequence | `Wasm.Runtime.Instantiate` | `Wasm.Runtime.Instantiate.Test` (incl. fixture instantiation) |
 | Precise, non-moving, stop-the-world mark-sweep collector | `Wasm.Runtime.Gc` | `Wasm.Runtime.Gc.Test` |
+| Interpreter tier: explicit-frame dispatch over the register IR, tail-call frame replacement, epoch check, stack maps | `Wasm.Interp` | `Wasm.Interp.Test` |
+| Bit-exact numeric operators (integer, float, conversions, NaN classes) | `Wasm.Interp.Numeric` | `Wasm.Interp.Numeric.Test` |
+| wat numeric-literal parser (integer + hex/dec float text → exact bits) | `Wasm.Wat.Numbers` | `Wasm.Wat.Numbers.Test` |
+| wat strict tokenizer (classified keyword/reserved/id/number/string) | `Wasm.Wat.Lexer` | `Wasm.Wat.Lexer.Test` |
+| Binary emitter: canonical LEB128, type/limits/composite encoders, section backpatching | `Wasm.Wat.Emit` | `Wasm.Wat.Emit.Test` |
+| Mnemonic table: every non-vector opcode, its immediate shape, natural alignment | `Wasm.Wat.Opcodes` | `Wasm.Wat.Opcodes.Test` |
+| Identifier/label resolution across the twelve index contexts, implicit-typeuse dedup | `Wasm.Wat.Names` | `Wasm.Wat.Names.Test` |
+| wat assembler: module text and `(module quote …)` → bytes into DecodeModule → ValidateModule | `Wasm.Wat.Assembler` | `Wasm.Wat.Assembler.Test` |
 | `.wast` lexer, s-expression parser, command classifier | `Wasm.Wast` | `Wasm.Wast.Test` |
-| `.wast` runner: binary subset judged (malformed / invalid / top-level module) | `Wasm.Wast.Runner` | `Wasm.Wast.Runner.Test` + the corpus |
+| `.wast` argument/result value parser and matcher (hex floats, NaN classes, references) | `Wasm.Wast.Values` | `Wasm.Wast.Values.Test` |
+| `.wast` runner: assembles text modules, decodes, validates, instantiates, and *executes* assertions through the interpreter | `Wasm.Wast.Runner` | `Wasm.Wast.Runner.Test` + the corpus |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
-| `wasmspec` (runs the corpus's binary subset) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
+| `wasmspec` (judges the corpus: ~40,900 commands assembled, decoded, validated, and executed) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
 | Decoder and LEB128 benchmarks | `source/apps/wasmbench.pas` | measurement only |
 
-Everything below is **Absent** unless marked otherwise. Tracks A, B, and D
-are delivered; one delivery is partial: Track C's runner judges the
-corpus's binary subset, but the text-format assembler and the
-execution-tier assertions are absent. Track B's caveat stands — it walks
-every non-vector instruction the 3.0 draft defines, with the `$FD` space
-staged to Track G.
+Everything below is **Absent** unless marked otherwise. Tracks A, B, C, D,
+and E are delivered; Track C's one remaining slice is the vector text
+forms the assembler cannot yet build (Track G / Wave 7). Track B's caveat
+stands — it walks every non-vector instruction the 3.0 draft defines, with
+the `$FD` space staged to Track G.
 
 ## The counted backlog
 
@@ -176,39 +186,54 @@ Two honest caveats:
   site. Track C's runner is what settles them — until it runs, every
   message is our best reading and some will change.
 
-### Track C — Conformance harness (needs A) — **runner delivered over the binary subset; wat assembler and execution pending**
+### Track C — Conformance harness (needs A) — **delivered; vector text forms pending (Track G)**
 
-A `.wast` script runner. This is deliberately early: it is the only
+A `.wast` script runner. This was deliberately early: it is the only
 external judge the project has, and every later track's claim of
-correctness routes through it.
+correctness routes through it. It is now substantially complete — the wat
+text-format assembler landed, and with the interpreter (Track E) wired in
+the runner assembles, decodes, validates, instantiates, and *executes*.
 
-Two slices are delivered. `Wasm.Wast` holds the lexer, s-expression
-parser, and top-level command classifier, keeping module payloads as raw
-trees so lazy decoding is preserved by construction. `Wasm.Wast.Runner`
-then assembles each `(module binary ...)` case and runs it through decode
-and validation, judging `assert_malformed`, `assert_invalid`, and
-top-level `module`; `wasmspec` (`source/apps/`) points it at the corpus.
-Over `WebAssembly/testsuite@main` that is `pass=1034 fail=35 staged=6`
-with `errors=0` — 1,075 judged commands (`pass + fail + staged`), the
-`(module binary ...)` cases the runner reached. See [testing.md](testing.md) and
+The pieces. `Wasm.Wast` is the front end — lexer, s-expression parser,
+and top-level command classifier — keeping module payloads as raw trees
+so lazy decoding is preserved by construction, and `Wasm.Wast.Values`
+parses assertion arguments and expected results (hex floats, NaN classes,
+reference matchers). The six `Wasm.Wat.*` units are the assembler that
+lowers module text and `(module quote ...)` to bytes, which re-enter the
+same shipped `DecodeModule → ValidateModule → instantiate → interpret`
+path a binary module takes. `Wasm.Wast.Runner` turns each command into a
+verdict: top-level modules assemble/decode/validate/instantiate,
+`assert_malformed` and `assert_invalid` judge the rejection (text operands
+via `EWasmTextError` from the assembler, binary via `EWasmDecodeError`),
+and `assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` now
+*run* through the interpreter and compare. `wasmspec` (`source/apps/`)
+points it at the corpus.
+
+Over `WebAssembly/testsuite@de54fd27` that is `pass=38900 fail=444
+skip=26161 staged=1620` with `errors=0` across 288 files — the split is
+`ROOT pass=38367 fail=88 staged=1620` and `PROPOSALS pass=533 fail=356`.
+Judged commands (`pass + fail + staged`) rose from **1,075** to
+**~40,900** of the corpus's ~67,000. See [testing.md](testing.md) and
 [`tests/spec/README.md`](../tests/spec/README.md) for the tallies and the
 failure breakdown.
 
-Track B is why this became useful without an execution tier:
-`assert_malformed` (2,208) and `assert_invalid` (3,009) exercise decode
-and validation alone, and running them is what settled the
-decode/validation-reachable `UNCONFIRMED` message prefixes (see Track B).
+The 444 remaining failures are **not** 3.0 regressions. `PROPOSALS`
+accounts for 356 of them — post-3.0 features outside the pinned target
+([ADR-0004](adr/0004-conformance-target-is-the-3-0-draft.md)):
+custom-descriptors, custom-page-sizes, wide-arithmetic, and threads, as
+false rejections (`expected=""`) or wording mismatches. The `ROOT` 88 are
+the legacy exception-handling encodings (`testsuite/legacy/`, out of 3.0
+scope), the pre-existing `binary-leb128` wording divergences carried since
+the binary subset, and a handful of assembler/execution-tier edge cases.
+`staged` (1,620) is the vector text the assembler cannot yet build.
 
-What is still absent is the rest of Track C:
-
-- **The text-format assembler.** `(module ...)` and `(module quote ...)`
-  cases are skipped for want of a `.wat` → bytes assembler, and that is the
-  bulk of the skipped corpus. The design is written up at
-  `.agent/design/wat-assembler.md`, and it is the path to the rest of
-  Track C.
-- **Execution-tier assertions.** `register`, `invoke`, `assert_return`,
-  `assert_trap`, and the rest need a tier (Track E) and are skipped until
-  one exists.
+What remains of Track C is the **vector text forms**: `v128` module text
+routes to `STAGED` (the assembler answers `$FD` mnemonics with `unknown
+operator` until Track G / Wave 7 appends them), and every assertion
+against a module that therefore did not instantiate skips as `no
+instantiated module` — which is the bulk of the 26,161 skips. A small
+residue skips for host imports the harness does not provide, exception
+handling (Track H), and `assert_unlinkable` (linkage is not yet judged).
 
 Requirements the corpus imposes, and where each stands:
 
@@ -216,15 +241,17 @@ Requirements the corpus imposes, and where each stands:
   `(module binary ...)` (1,069) are assembled or decoded at *command
   execution* time, not script-parse time — otherwise `assert_malformed`
   cannot observe the failure it exists to observe.
-- **Prefix-matched failure strings — met for the binary subset.** The
-  reference interpreter checks that the expected string is a *prefix* of
-  the actual message. Our error messages are therefore part of
-  conformance, not just diagnostics.
-- **NaN classes.** `nan:canonical` (3,283) and `nan:arithmetic` (3,391)
-  rule out bitwise float comparison — once `assert_return` is judged.
+- **Prefix-matched failure strings — met.** The reference interpreter
+  checks that the expected string is a *prefix* of the actual message.
+  Our error messages are therefore part of conformance, not just
+  diagnostics — now across text, decode, validation, and trap messages.
+- **NaN classes — met.** `nan:canonical` (3,283) and `nan:arithmetic`
+  (3,391) rule out bitwise float comparison, and `assert_return` now
+  compares against the class rather than a bit pattern.
 - **`(either ...)` results** (32) for implementation-defined relaxed-SIMD
-  outcomes.
-- **Host references**: `(ref.extern n)` (140) and `(ref.host n)`.
+  outcomes — reached once vector execution lands with Track G.
+- **Host references**: `(ref.extern n)` (140) and `(ref.host n)` — the
+  identity matchers are in `Wasm.Wast.Values`.
 - **Testsuite-local directives** `assert_malformed_custom` and
   `assert_invalid_custom` are not in the reference grammar; the runner
   classifies them as unknown and skips them.
@@ -265,19 +292,25 @@ Delivered, unit by unit:
   keeping exactly the flagged registers (`Wasm.Runtime.Gc`).
 
 Verified by the `Wasm.Runtime.*` suites, fixture instantiation, and the
-corpus's binary subset. GC's 31 instructions were always the small part;
+corpus, which now instantiates and runs modules against it. GC's 31
+instructions were always the small part;
 the subsystem around them was the work.
 
-### Track E — Interpreter tier (needs B, D — both done) — **critical-path next step**
+### Track E — Interpreter tier (needs B, D) — **delivered**
 
-The tier of record and the reference the other tiers are differentially
-tested against. With Track D delivered its prerequisites are met, so it is
-the next step on the critical path. It consumes the IR, Track D's store,
-and the GC's frame-walk contract — no re-derived rule, no second read of
-the binary. Carries the epoch check
+The tier of record and the reference the other tiers will be
+differentially tested against. It consumes the IR, Track D's store, and
+the GC's frame-walk contract — no re-derived rule, no second read of the
+binary. `Wasm.Interp` is the dispatch loop and `Wasm.Interp.Numeric` the
+bit-exact numeric leaf functions. The activation stack is explicit — no
+Pascal recursion per wasm call — so `return_call` replaces the top frame
+in place with O(1) stack growth, as the tail-call rule demands. It carries
+the epoch check
 ([ADR-0006](adr/0006-epoch-interruption-not-fuel.md)) and stack-map
 production from the start, because retrofitting either is the expensive
-version.
+version. It runs the corpus's `assert_return` / `assert_trap` /
+`assert_exhaustion` cases through Track C; SIMD (`$FD`) is not executed
+until Track G, and throwing waits on Track H.
 
 ### Track F — Embedding API and WASI preview1 (needs E)
 
@@ -349,9 +382,9 @@ graph LR
   C -.judges.-> H
 ```
 
-The critical path is **A → B → D → E**; A, B, and D are behind it, so E is
-next. Everything expensive that is not on the path — SIMD especially — can
-proceed in parallel.
+The critical path is **A → B → D → E**; all four are behind it, so the
+embedding API and host surface (F) are next on it. Everything expensive
+that is not on the path — SIMD especially — can proceed in parallel.
 
 ## Constraints discovered from the spec
 

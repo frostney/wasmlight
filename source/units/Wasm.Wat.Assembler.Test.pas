@@ -1,0 +1,960 @@
+{ Unit suite for Wasm.Wat.Assembler — the shipped text-format assembler.
+
+  The oracle is the shipped pipeline: assemble text -> DecodeModule -> assert
+  the decoded model, and for well-formed modules assemble -> DecodeModule ->
+  ValidateModule. A text error must never reach the decoder (INV-1), so a
+  well-formed case that decodes proves the assembler produced honest bytes.
+
+  The suite lifts the §7 oracle cases verbatim from the corpus:
+    - func.wast:422-433  — an implicit typeuse appends AFTER the explicit
+      types, and `(type $t)` declared third is still index 0;
+    - func_ptrs.wast:2-4 — explicit types are never deduped;
+    - type-rec.wast:45-61 — an implicit typeuse must NOT reuse a multi-member
+      rec-group member, so the module fails VALIDATION rather than reusing it.
+  Plus the inline import/export abbreviations, elem/data sugar, named+indexed
+  locals, label shadowing (asserted at the emitted `br` depth bytes), a
+  duplicate-identifier text error, a forward reference, and a cross-check that
+  the committed fixtures assemble to the same section shape. }
+program Wasm.Wat.Assembler.Test;
+
+{$I Shared.inc}
+
+uses
+  SysUtils,
+
+  TestingPascalLibrary,
+  Wasm.Core,
+  Wasm.Decoder,
+  Wasm.Ir,
+  Wasm.Module,
+  Wasm.Validator,
+  Wasm.Wat.Assembler;
+
+type
+  TWatAsmTests = class(TTestSuite)
+  private
+    FBytes: TWasmBytes;
+    FModule: TWasmModule;
+    FIr: TWasmIrModule;
+
+    procedure AssembleAndDecode(const AText: string);
+    function ValidateOutcome(const AText: string): string;
+    function AssembleError(const AText: string): string;
+    function FuncSig(const AGroup: TWasmRecType; out AParams,
+      AResults: Integer): Boolean;
+    function BodyHex: string;
+    function BytesToHex(const ABytes: TWasmBytes): string;
+  protected
+    procedure BeforeEach; override;
+    procedure AfterEach; override;
+  public
+    procedure SetupTests; override;
+
+    procedure TestEmptyModule;
+    procedure TestImplicitTypeuseOracle;
+    procedure TestExplicitTypesNeverDeduped;
+    procedure TestRecGroupMemberNotReused;
+    procedure TestInlineImportExport;
+    procedure TestElemAndDataSugar;
+    procedure TestNamedAndIndexedLocals;
+    procedure TestLabelShadowingDepths;
+    procedure TestDuplicateIdentifier;
+    procedure TestForwardReference;
+    procedure TestUnknownOperatorPlaceholder;
+    procedure TestFixturesSectionShape;
+    procedure TestFoldedIfArmOrder;
+    procedure TestMemArgDefaults;
+    procedure TestBroadInstructionRoundTrip;
+    procedure TestGcStructAndArray;
+    procedure TestMismatchingLabel;
+    procedure TestTryTable;
+    procedure TestCallIndirectSelectBrTable;
+    procedure TestInlineSegments;
+    procedure TestRefTestCast;
+    procedure TestForwardTypeReference;
+    procedure TestTypeuseClauseOrder;
+    procedure TestBlockTypeInlineFuncType;
+    procedure TestDataCountFromCode;
+    procedure TestReservedTokenIsUnknownOperator;
+    procedure TestNanPatternsInConst;
+    procedure TestBrOnCastRoundTrip;
+  end;
+
+function StartsWith(const AWhole, APrefix: string): Boolean;
+begin
+  Result := Copy(AWhole, 1, Length(APrefix)) = APrefix;
+end;
+
+procedure TWatAsmTests.BeforeEach;
+begin
+  FModule := TWasmModule.Create;
+  FIr := nil;
+end;
+
+procedure TWatAsmTests.AfterEach;
+begin
+  FreeAndNil(FIr);
+  FreeAndNil(FModule);
+end;
+
+procedure TWatAsmTests.AssembleAndDecode(const AText: string);
+begin
+  FBytes := AssembleWatText(AText);
+  FModule.Clear;
+  DecodeModule(FBytes, FModule);
+end;
+
+function TWatAsmTests.ValidateOutcome(const AText: string): string;
+begin
+  { 'valid' on success; otherwise the failing stage. A decode error on our own
+    output is INV-1 violated and is reported as such rather than swallowed. }
+  Result := 'valid';
+  try
+    FBytes := AssembleWatText(AText);
+  except
+    on E: Exception do
+      Exit('assemble error: ' + E.Message);
+  end;
+  try
+    FModule.Clear;
+    DecodeModule(FBytes, FModule);
+  except
+    on E: EWasmDecodeError do
+      Exit('INV-1 decode error: ' + E.Message);
+  end;
+  try
+    FreeAndNil(FIr);
+    FIr := ValidateModule(FModule, FBytes);
+  except
+    on E: EWasmValidationError do
+      Exit('validation error');
+  end;
+end;
+
+function TWatAsmTests.AssembleError(const AText: string): string;
+begin
+  { A text-format failure is a single unified EWasmTextError (Wasm.Core), so
+    catch exactly that — a decode error from the assembler's own output would
+    be an INV-1 defect and should fail loudly, not be reported as a message.
+    The corpus match is a prefix match anyway. }
+  Result := '';
+  try
+    FBytes := AssembleWatText(AText);
+  except
+    on E: EWasmTextError do
+      Result := E.Message;
+  end;
+end;
+
+function TWatAsmTests.FuncSig(const AGroup: TWasmRecType; out AParams,
+  AResults: Integer): Boolean;
+begin
+  Result := (Length(AGroup.SubTypes) = 1)
+    and (AGroup.SubTypes[0].Comp.Kind = wckFunc);
+  if Result then
+  begin
+    AParams := Length(AGroup.SubTypes[0].Comp.Func.Params);
+    AResults := Length(AGroup.SubTypes[0].Comp.Func.Results);
+  end
+  else
+  begin
+    AParams := -1;
+    AResults := -1;
+  end;
+end;
+
+function TWatAsmTests.BytesToHex(const ABytes: TWasmBytes): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(ABytes) do
+    Result := Result + IntToHex(ABytes[I], 2);
+end;
+
+function TWatAsmTests.BodyHex: string;
+var
+  Entry: TWasmCodeEntry;
+  Slice: TWasmBytes;
+  I: Integer;
+begin
+  Entry := FModule.CodeEntries[0];
+  SetLength(Slice, Entry.Body.Size);
+  for I := 0 to Integer(Entry.Body.Size) - 1 do
+    Slice[I] := FBytes[Integer(Entry.Body.Offset) + I];
+  Result := BytesToHex(Slice);
+end;
+
+{ --- oracle: implicit typeuse ordering (func.wast:422-433) --------------- }
+
+procedure TWatAsmTests.TestEmptyModule;
+begin
+  AssembleAndDecode('(module)');
+  Expect<Integer>(FModule.SectionCount).ToBe(0);
+  { Bare fields (the quote-payload shape) assemble the same. }
+  FBytes := AssembleWatText('');
+  FModule.Clear;
+  DecodeModule(FBytes, FModule);
+  Expect<Integer>(FModule.SectionCount).ToBe(0);
+end;
+
+procedure TWatAsmTests.TestImplicitTypeuseOracle;
+var
+  P, R: Integer;
+begin
+  { func.wast:422-433. $f's implicit (result f64) must land at index 1, AFTER
+    the explicit $t at index 0 — even though $t is declared third. }
+  AssembleAndDecode(
+    '(module' +
+    '  (func $f (result f64) (f64.const 0))' +
+    '  (func $g (param i32))' +
+    '  (type $t (func (param i32)))' +
+    '  (func $i32_void (type 0))' +
+    '  (func $void_f64 (type 1) (f64.const 0)))');
+
+  Expect<Integer>(FModule.TypeCount).ToBe(2);
+  { index 0 = (i32)->() — the explicit $t. }
+  Expect<Boolean>(FuncSig(FModule.Types[0], P, R)).ToBe(True);
+  Expect<Integer>(P).ToBe(1);
+  Expect<Integer>(R).ToBe(0);
+  { index 1 = ()->(f64) — the implicit type from $f, appended after $t. }
+  Expect<Boolean>(FuncSig(FModule.Types[1], P, R)).ToBe(True);
+  Expect<Integer>(P).ToBe(0);
+  Expect<Integer>(R).ToBe(1);
+
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (func $f (result f64) (f64.const 0))' +
+    '  (func $g (param i32))' +
+    '  (type $t (func (param i32)))' +
+    '  (func $i32_void (type 0))' +
+    '  (func $void_f64 (type 1) (f64.const 0)))')).ToBe('valid');
+end;
+
+procedure TWatAsmTests.TestExplicitTypesNeverDeduped;
+begin
+  { func_ptrs.wast:2-4 — three identical explicit void->void types stay
+    distinct at indices 0/1/2. }
+  AssembleAndDecode(
+    '(module (type (func)) (type (func)) (type (func)))');
+  Expect<Integer>(FModule.TypeCount).ToBe(3);
+end;
+
+procedure TWatAsmTests.TestRecGroupMemberNotReused;
+begin
+  { type-rec.wast:45-61 — the implicit type of $f must NOT reuse a member of
+    the two-member rec group, so a THIRD type is appended. The module then
+    fails validation (the `(ref $ft)` global holds a ref of the wrong type),
+    which is exactly the corpus's assert_invalid verdict. }
+  AssembleAndDecode(
+    '(module' +
+    '  (rec (type $ft (func)) (type (func)))' +
+    '  (func $f)' +
+    '  (global (ref $ft) (ref.func $f)))');
+  { Two type-section GROUPS: the 2-member rec group (indices 0,1) plus a fresh
+    single-member group appended for $f's implicit type (index 2). Had the
+    implicit typeuse wrongly reused a rec member, no group would be appended. }
+  Expect<Integer>(FModule.TypeCount).ToBe(2);
+  Expect<Integer>(Length(FModule.Types[0].SubTypes)).ToBe(2);
+  Expect<Integer>(Length(FModule.Types[1].SubTypes)).ToBe(1);
+  { $f's function type is the appended index 2, not the rec member 0/1. }
+  Expect<Int64>(Int64(FModule.FunctionTypeIndices[0])).ToBe(2);
+
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (rec (type $ft (func)) (type (func)))' +
+    '  (func $f)' +
+    '  (global (ref $ft) (ref.func $f)))')).ToBe('validation error');
+end;
+
+{ --- inline import / export abbreviations (§2c.2) ------------------------ }
+
+procedure TWatAsmTests.TestInlineImportExport;
+begin
+  AssembleAndDecode(
+    '(module' +
+    '  (func (export "e") (result i32) (i32.const 7))' +
+    '  (memory (export "m") 1)' +
+    '  (global (import "env" "g") i32))');
+
+  { The inline import lands in the import section. }
+  Expect<Integer>(FModule.ImportCount).ToBe(1);
+  Expect<Integer>(Ord(FModule.Imports[0].Kind)).ToBe(Ord(wxkGlobal));
+  Expect<string>(FModule.Imports[0].ModuleName).ToBe('env');
+  Expect<string>(FModule.Imports[0].Name).ToBe('g');
+
+  { Two inline exports, in entity order: the func then the memory. }
+  Expect<Integer>(FModule.ExportCount).ToBe(2);
+  Expect<string>(FModule.&Exports[0].Name).ToBe('e');
+  Expect<Integer>(Ord(FModule.&Exports[0].Kind)).ToBe(Ord(wxkFunc));
+  Expect<Int64>(Int64(FModule.&Exports[0].Index)).ToBe(0);
+  Expect<string>(FModule.&Exports[1].Name).ToBe('m');
+  Expect<Integer>(Ord(FModule.&Exports[1].Kind)).ToBe(Ord(wxkMem));
+  Expect<Int64>(Int64(FModule.&Exports[1].Index)).ToBe(0);
+
+  Expect<Integer>(FModule.FunctionTypeIndexCount).ToBe(1);
+  Expect<Integer>(FModule.MemoryCount).ToBe(1);
+end;
+
+{ --- elem / data sugar (§2c.5) ------------------------------------------- }
+
+procedure TWatAsmTests.TestElemAndDataSugar;
+begin
+  AssembleAndDecode(
+    '(module' +
+    '  (table 2 funcref)' +
+    '  (func $f)' +
+    '  (elem (i32.const 0) $f $f)' +
+    '  (memory 1)' +
+    '  (data (i32.const 0) "hi")' +
+    '  (data "passive"))');
+
+  Expect<Integer>(FModule.ElementCount).ToBe(1);
+  Expect<Integer>(Ord(FModule.Elements[0].Mode)).ToBe(Ord(wemActive));
+  Expect<Int64>(Int64(FModule.Elements[0].TableIndex)).ToBe(0);
+  Expect<Boolean>(FModule.Elements[0].UsesExprs).ToBe(False);
+  Expect<Integer>(Length(FModule.Elements[0].FuncIndices)).ToBe(2);
+
+  Expect<Integer>(FModule.DataSegmentCount).ToBe(2);
+  Expect<Integer>(Ord(FModule.DataSegments[0].Mode)).ToBe(Ord(wdmActive));
+  Expect<Int64>(Int64(FModule.DataSegments[0].Bytes.Size)).ToBe(2);
+  Expect<Integer>(Ord(FModule.DataSegments[1].Mode)).ToBe(Ord(wdmPassive));
+  Expect<Int64>(Int64(FModule.DataSegments[1].Bytes.Size)).ToBe(7);
+
+  { A data section forces the data count section (§2e). }
+  Expect<Boolean>(FModule.HasDataCount).ToBe(True);
+  Expect<Int64>(Int64(FModule.DataCount)).ToBe(2);
+
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (table 2 funcref)' +
+    '  (func $f)' +
+    '  (elem (i32.const 0) $f $f)' +
+    '  (memory 1)' +
+    '  (data (i32.const 0) "hi")' +
+    '  (data "passive"))')).ToBe('valid');
+end;
+
+{ --- funcs with named and indexed locals -------------------------------- }
+
+procedure TWatAsmTests.TestNamedAndIndexedLocals;
+begin
+  { A named param and a named local, addressed by both name and number in the
+    body. local 0 = $p (param), local 1 = $q (local). }
+  AssembleAndDecode(
+    '(module (func $f (param $p i32) (result i32)' +
+    '  (local $q i32)' +
+    '  local.get $p' +
+    '  local.set $q' +
+    '  local.get 1' +
+    '  local.get 0' +
+    '  i32.add))');
+
+  Expect<Integer>(FModule.CodeEntryCount).ToBe(1);
+  { One local group of one i32 (the param is not a code-section local). }
+  Expect<Integer>(Length(FModule.CodeEntries[0].Locals)).ToBe(1);
+  Expect<Int64>(Int64(FModule.CodeEntries[0].Locals[0].Count)).ToBe(1);
+  Expect<string>(FModule.CodeEntries[0].Locals[0].ValueType.Describe)
+    .ToBe('i32');
+
+  Expect<string>(ValidateOutcome(
+    '(module (func $f (param $p i32) (result i32)' +
+    '  (local $q i32)' +
+    '  local.get $p' +
+    '  local.set $q' +
+    '  local.get 1' +
+    '  local.get 0' +
+    '  i32.add))')).ToBe('valid');
+end;
+
+{ --- label shadowing at the emitted br bytes (§7, labels.wast) ----------- }
+
+procedure TWatAsmTests.TestLabelShadowingDepths;
+begin
+  { Nested blocks re-binding $a. The inner `br $a` must reach the innermost
+    $a (depth 0); after that block pops, `br $a` reaches the outer $a, which
+    now sits below $b (depth 1). An outer-first resolver would emit 2 and 1. }
+  AssembleAndDecode(
+    '(module (func' +
+    '  block $a' +
+    '    block $b' +
+    '      block $a' +
+    '        br $a' +
+    '      end' +
+    '      br $a' +
+    '    end' +
+    '  end))');
+
+  { 02 40 (block $a) 02 40 (block $b) 02 40 (block $a) 0C 00 (br depth 0)' +
+    ' 0B (end) 0C 01 (br depth 1) 0B 0B (ends) 0B (func end). }
+  Expect<string>(BodyHex).ToBe('024002400240' + '0C00' + '0B' + '0C01' +
+    '0B' + '0B' + '0B');
+end;
+
+{ --- duplicate identifier text error ------------------------------------ }
+
+procedure TWatAsmTests.TestDuplicateIdentifier;
+begin
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (func $f) (func $f))'), 'duplicate func'))
+    .ToBe(True);
+  { A struct field clash is `duplicate field`. }
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (type (struct (field $x i32) (field $x i32))))'),
+    'duplicate field')).ToBe(True);
+end;
+
+{ --- forward reference: call a function declared later ------------------- }
+
+procedure TWatAsmTests.TestForwardReference;
+begin
+  AssembleAndDecode('(module (func $a call $b) (func $b))');
+  Expect<Integer>(FModule.FunctionTypeIndexCount).ToBe(2);
+  Expect<string>(ValidateOutcome('(module (func $a call $b) (func $b))'))
+    .ToBe('valid');
+end;
+
+{ --- the unknown-operator path is loud, not silent --------------------- }
+
+procedure TWatAsmTests.TestUnknownOperatorPlaceholder;
+begin
+  { The $FD vector space stays out of scope (Track G): a v128 mnemonic
+    has no row in Wasm.Wat.Opcodes, so it still raises `unknown operator
+    <mnemonic>` rather than mis-assembling — the STAGED marker stays a
+    validator concern, not an assembler excuse. }
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (func v128.const i32x4 0 0 0 0))'),
+    'unknown operator v128.const')).ToBe(True);
+end;
+
+{ --- committed fixtures assemble to the same section shape -------------- }
+
+procedure TWatAsmTests.TestFixturesSectionShape;
+
+  procedure CompareShape(const AName: string);
+  var
+    AsmBytes, RefBytes: TWasmBytes;
+    AsmMod, RefMod: TWasmModule;
+    Base: string;
+  begin
+    Base := 'tests' + PathDelim + 'fixtures' + PathDelim + 'valid'
+      + PathDelim + AName;
+    AsmBytes := AssembleWat(LoadFileBytes(Base + '.wat'));
+    RefBytes := LoadFileBytes(Base + '.wasm');
+    AsmMod := TWasmModule.Create;
+    RefMod := TWasmModule.Create;
+    try
+      DecodeModule(AsmBytes, AsmMod);
+      DecodeModule(RefBytes, RefMod);
+      Expect<Integer>(AsmMod.TypeCount).ToBe(RefMod.TypeCount);
+      Expect<Integer>(AsmMod.ImportCount).ToBe(RefMod.ImportCount);
+      Expect<Integer>(AsmMod.FunctionTypeIndexCount)
+        .ToBe(RefMod.FunctionTypeIndexCount);
+      Expect<Integer>(AsmMod.TableCount).ToBe(RefMod.TableCount);
+      Expect<Integer>(AsmMod.MemoryCount).ToBe(RefMod.MemoryCount);
+      Expect<Integer>(AsmMod.GlobalCount).ToBe(RefMod.GlobalCount);
+      Expect<Integer>(AsmMod.ExportCount).ToBe(RefMod.ExportCount);
+      Expect<Integer>(AsmMod.ElementCount).ToBe(RefMod.ElementCount);
+      Expect<Integer>(AsmMod.DataSegmentCount).ToBe(RefMod.DataSegmentCount);
+    finally
+      AsmMod.Free;
+      RefMod.Free;
+    end;
+  end;
+
+begin
+  CompareShape('minimal');
+  CompareShape('exports');
+  CompareShape('imports');
+end;
+
+{ --- folded-if arm ordering at the byte level (§7, if.wast:19) ----------- }
+
+procedure TWatAsmTests.TestFoldedIfArmOrder;
+begin
+  { if.wast:19 — `(if (result i32) (local.get 0) (then (i32.const 7))
+    (else (i32.const 8)))`. The CONDITION operand must emit BEFORE the `if`
+    opcode, then the then-arm, else, else-arm, end. A resolver that emits the
+    condition after the opcode produces a valid-looking WRONG module that only
+    assert_return would catch — so this is asserted at the exact bytes. }
+  AssembleAndDecode(
+    '(module (func (param i32) (result i32)' +
+    '  (if (result i32) (local.get 0) (then (i32.const 7)) (else (i32.const 8)))))');
+  { 2000 (local.get 0) 04 (if) 7F (result i32) 4107 (then) 05 (else) 4108
+    0B (end-of-if) 0B (func end). BodyHex covers the instruction bytes only,
+    not the leading locals-count byte. }
+  Expect<string>(BodyHex).ToBe('2000' + '04' + '7F' + '4107' + '05' +
+    '4108' + '0B' + '0B');
+end;
+
+{ --- memarg defaults and explicit align/offset (§2c.6) ------------------- }
+
+procedure TWatAsmTests.TestMemArgDefaults;
+
+  function Body(const ALoad: string): string;
+  begin
+    AssembleAndDecode(
+      '(module (memory 1) (func (result i32) i32.const 0 ' + ALoad + '))');
+    Result := BodyHex;
+  end;
+
+begin
+  { i32.load's natural alignment is 4 bytes = log2 2. With neither operand the
+    flags field is that natural log2 and the offset is 0: 28 02 00. (BodyHex is
+    the instruction bytes only, no leading locals-count byte.) }
+  Expect<string>(Body('i32.load')).ToBe('4100' + '28' + '02' + '00' + '0B');
+  { align=1 (log2 0) overrides the natural alignment. }
+  Expect<string>(Body('i32.load align=1'))
+    .ToBe('4100' + '28' + '00' + '00' + '0B');
+  { offset=4 keeps the natural align and sets the u64 offset. }
+  Expect<string>(Body('i32.load offset=4'))
+    .ToBe('4100' + '28' + '02' + '04' + '0B');
+  { both, in either order. }
+  Expect<string>(Body('i32.load offset=8 align=1'))
+    .ToBe('4100' + '28' + '00' + '08' + '0B');
+  Expect<string>(Body('i32.load align=1 offset=8'))
+    .ToBe('4100' + '28' + '00' + '08' + '0B');
+  { align=0 and a non-power-of-two are text errors. }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (memory 1) (func i32.const 0 i32.load align=0 drop))'),
+    'alignment must be a power of two')).ToBe(True);
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (memory 1) (func i32.const 0 i32.load align=3 drop))'),
+    'alignment must be a power of two')).ToBe(True);
+end;
+
+{ --- a broad instruction round-trip that assembles, decodes and validates - }
+
+procedure TWatAsmTests.TestBroadInstructionRoundTrip;
+const
+  Src =
+    '(module' +
+    '  (memory 1)' +
+    '  (func $add (param i32 i32) (result i32)' +
+    '    (i32.add (local.get 0) (local.get 1)))' +
+    '  (func (param i32) (result i32)' +
+    '    (local $acc i32)' +
+    '    (block $a (result i32)' +           { folded block }
+    '      (loop $l (result i32)' +          { folded loop }
+    '        (if (result i32) (local.get 0)' + { folded if }
+    '          (then (i32.const 1))' +
+    '          (else (i32.const 2)))))' +
+    '    (local.set $acc)' +
+    '    block $flat' +                      { flat block }
+    '      local.get 0' +
+    '      br_if $flat' +
+    '    end' +
+    '    i32.const 0' +
+    '    i32.load offset=0' +                { memarg }
+    '    local.get $acc' +
+    '    i32.add))';
+begin
+  AssembleAndDecode(Src);
+  Expect<Integer>(FModule.CodeEntryCount).ToBe(2);
+  Expect<string>(ValidateOutcome(Src)).ToBe('valid');
+end;
+
+{ --- GC struct/array with field-by-name resolution (§3) ------------------ }
+
+procedure TWatAsmTests.TestGcStructAndArray;
+begin
+  { struct.get resolves `$y` against the per-type field namespace of the FIRST
+    operand ($pt, index 0), yielding field ordinal 1. array.new_default/get
+    exercise the $FB type immediates. }
+  AssembleAndDecode(
+    '(module' +
+    '  (type $pt (struct (field $x i32) (field $y i32)))' +
+    '  (type $ai (array (mut i32)))' +
+    '  (func (result i32)' +
+    '    (struct.get $pt $y (struct.new_default $pt)))' +
+    '  (func (result i32)' +
+    '    (array.get $ai (array.new_default $ai (i32.const 3)) (i32.const 0))))');
+  { The first body unfolds to FB 01 00 (struct.new_default $pt) then
+    FB 02 00 01 (struct.get type 0, field ordinal 1 = $y) then 0B. BodyHex is
+    the instruction bytes only. This pins field-by-NAME resolution. }
+  Expect<string>(BodyHex).ToBe('FB0100' + 'FB020001' + '0B');
+
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (type $pt (struct (field $x i32) (field $y i32)))' +
+    '  (type $ai (array (mut i32)))' +
+    '  (func (result i32)' +
+    '    (struct.get $pt $y (struct.new_default $pt)))' +
+    '  (func (result i32)' +
+    '    (array.get $ai (array.new_default $ai (i32.const 3)) (i32.const 0))))'))
+    .ToBe('valid');
+end;
+
+{ --- mismatching label: trailing id must equal the block's id (§7) ------- }
+
+procedure TWatAsmTests.TestMismatchingLabel;
+
+  function Bad(const AFunc: string): Boolean;
+  begin
+    Result := StartsWith(AssembleError(AFunc), 'mismatching label');
+  end;
+
+begin
+  { The 14 corpus one-liners are all of this shape (block.wast:1486-1490,
+    if.wast:1520-1551): a trailing id at `end`/`else` that does not equal the
+    block's id — including an id on an UNLABELLED block. }
+  Expect<Boolean>(Bad('(func block end $l)')).ToBe(True);
+  Expect<Boolean>(Bad('(func block $a end $l)')).ToBe(True);
+  Expect<Boolean>(Bad('(func i32.const 0 if end $l)')).ToBe(True);
+  Expect<Boolean>(Bad('(func i32.const 0 if $a end $l)')).ToBe(True);
+  Expect<Boolean>(Bad('(func i32.const 0 if else $l end)')).ToBe(True);
+  Expect<Boolean>(Bad('(func i32.const 0 if $a else $l end)')).ToBe(True);
+  Expect<Boolean>(Bad('(func i32.const 0 if else end $l)')).ToBe(True);
+  Expect<Boolean>(Bad('(func i32.const 0 if $a else $a end $l)')).ToBe(True);
+  { A matching trailing id is fine. }
+  Expect<string>(ValidateOutcome('(module (func block $a end $a))'))
+    .ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (func i32.const 0 if $a else $a end $a))')).ToBe('valid');
+end;
+
+{ --- try_table with a catch clause resolved in the enclosing scope ------- }
+
+procedure TWatAsmTests.TestTryTable;
+const
+  Src =
+    '(module' +
+    '  (tag $e (param i32))' +
+    '  (func (result i32)' +
+    '    (block $h (result i32)' +
+    '      (try_table (result i32) (catch $e $h)' +
+    '        (i32.const 7)))))';
+begin
+  { The catch clause targets label $h — the enclosing block — which is at
+    depth 0 BEFORE the try_table pushes its own (anonymous) label. }
+  AssembleAndDecode(Src);
+  Expect<Integer>(FModule.TagCount).ToBe(1);
+  Expect<string>(ValidateOutcome(Src)).ToBe('valid');
+end;
+
+{ --- call_indirect typeuse, typed select, br_table --------------------- }
+
+procedure TWatAsmTests.TestCallIndirectSelectBrTable;
+const
+  Src =
+    '(module' +
+    '  (type $ft (func (param i32) (result i32)))' +
+    '  (table 1 funcref)' +
+    '  (func (param i32) (result i32)' +
+    '    (local.get 0) (i32.const 0)' +
+    '    (call_indirect (type $ft)))' +      { typeuse, default table 0 }
+    '  (func (param i32) (result i32)' +
+    '    (select (result i32) (i32.const 1) (i32.const 2) (local.get 0)))' +
+    '  (func (param i32)' +
+    '    (block $a' +
+    '      (block $b' +
+    '        (local.get 0)' +
+    '        (br_table $a $b $a)))))';
+begin
+  AssembleAndDecode(Src);
+  { Two types: $ft (index 0, reused by the two (i32)->(i32) funcs and by the
+    explicit call_indirect (type $ft)), plus the (i32)->() implicit type of the
+    third func's br_table body appended at index 1. }
+  Expect<Integer>(FModule.TypeCount).ToBe(2);
+  Expect<string>(ValidateOutcome(Src)).ToBe('valid');
+  { An inline typeuse structurally equal to $ft interns to the same index 0. }
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (type $ft (func (param i32) (result i32)))' +
+    '  (table 1 funcref)' +
+    '  (func (param i32) (result i32)' +
+    '    (local.get 0) (i32.const 0)' +
+    '    (call_indirect (param i32) (result i32))))')).ToBe('valid');
+end;
+
+{ --- inline in-declaration segments (§2c.5) ----------------------------- }
+
+procedure TWatAsmTests.TestInlineSegments;
+const
+  Src =
+    '(module' +
+    '  (func $f) (func $g)' +
+    '  (table funcref (elem $f $g))' +      { inline table-elem (funcidx list) }
+    '  (memory (data "\aa\bb\cc\dd")))';    { inline memory-data }
+begin
+  AssembleAndDecode(Src);
+  { The table gains min=max=2 and a synthetic active elem segment; the memory
+    min=max=1 (ceil(4/65536)) and a synthetic active data segment. }
+  Expect<Integer>(FModule.TableCount).ToBe(1);
+  Expect<Int64>(Int64(FModule.Tables[0].TableType.Limits.Min)).ToBe(2);
+  Expect<Int64>(Int64(FModule.Tables[0].TableType.Limits.Max)).ToBe(2);
+  Expect<Integer>(FModule.ElementCount).ToBe(1);
+  Expect<Integer>(Ord(FModule.Elements[0].Mode)).ToBe(Ord(wemActive));
+  Expect<Integer>(Length(FModule.Elements[0].FuncIndices)).ToBe(2);
+
+  Expect<Integer>(FModule.MemoryCount).ToBe(1);
+  Expect<Int64>(Int64(FModule.Memories[0].Limits.Min)).ToBe(1);
+  Expect<Integer>(FModule.DataSegmentCount).ToBe(1);
+  Expect<Integer>(Ord(FModule.DataSegments[0].Mode)).ToBe(Ord(wdmActive));
+  Expect<Int64>(Int64(FModule.DataSegments[0].Bytes.Size)).ToBe(4);
+
+  Expect<string>(ValidateOutcome(Src)).ToBe('valid');
+  { The expression-list variant of the inline table-elem also validates. }
+  Expect<string>(ValidateOutcome(
+    '(module (func $f)' +
+    '  (table funcref (elem (ref.func $f) (ref.null func))))')).ToBe('valid');
+end;
+
+{ --- ref.test / ref.cast: the null variant is the +1 subopcode ---------- }
+
+procedure TWatAsmTests.TestRefTestCast;
+begin
+  { ref.test (ref $s) is subopcode 20 (non-null) with a heap-type immediate;
+    ref.test (ref null $s) is 21. ref.cast is 22/23. The +1 is easy to drop,
+    so both spellings are round-tripped and validated. }
+  AssembleAndDecode(
+    '(module' +
+    '  (type $s (struct))' +
+    '  (func (param anyref) (result i32)' +
+    '    (ref.test (ref $s) (local.get 0))))');
+  { FB 14 (20) 00 (heaptype $s) — the non-null variant. }
+  Expect<string>(BodyHex).ToBe('2000' + 'FB14' + '00' + '0B');
+
+  AssembleAndDecode(
+    '(module' +
+    '  (type $s (struct))' +
+    '  (func (param anyref) (result i32)' +
+    '    (ref.test (ref null $s) (local.get 0))))');
+  { FB 15 (21) 00 — the null variant, subopcode + 1. }
+  Expect<string>(BodyHex).ToBe('2000' + 'FB15' + '00' + '0B');
+
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (type $s (struct))' +
+    '  (func (param anyref) (result (ref $s))' +
+    '    (ref.cast (ref $s) (local.get 0))))')).ToBe('valid');
+end;
+
+{ --- forward type references inside type bodies (bug 1) ----------------- }
+
+procedure TWatAsmTests.TestForwardTypeReference;
+begin
+  { A type body may reference a type by name that is defined later, or itself
+    inside its own rec group — the pre-bind pass binds every type id before any
+    body is parsed (type-subtyping.wast:37, type-rec.wast). Before the fix these
+    raised a text `unknown type`; now they assemble and validate. }
+  Expect<string>(ValidateOutcome(
+    '(module (rec (type $r (sub (struct (field (ref $r)))))))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module' +
+    '  (rec (type $a1 (sub (struct (field i32 (ref $a2)))))' +
+    '       (type $a2 (sub (struct (field i64 (ref $a1)))))))')).ToBe('valid');
+  { A numeric typeidx is NEVER range-checked at assembly — a bare out-of-range
+    (type N) defers to the validator (func_ptrs.wast:48), so the module is
+    'validation error', not an assemble error. }
+  Expect<string>(ValidateOutcome('(module (func (type 42)))'))
+    .ToBe('validation error');
+end;
+
+{ --- typeuse clause order + no param ids in instruction typeuses (bug 2) - }
+
+procedure TWatAsmTests.TestTypeuseClauseOrder;
+
+  function Bad(const AMod: string): Boolean;
+  begin
+    Result := StartsWith(AssembleError(AMod), 'unexpected token');
+  end;
+
+begin
+  { Clause order in a typeuse is fixed (type)? (param)* (result)*; any other
+    order is `unexpected token`, and so is a param id in an instruction typeuse
+    which has no locals to name (call_indirect.wast:668-738, block.wast:421-463,
+    func.wast:937-953). }
+  Expect<Boolean>(Bad(
+    '(module (type $s (func (param i32) (result i32))) (table 0 funcref)' +
+    ' (func (result i32) (call_indirect (result i32) (type $s) (param i32)' +
+    ' (i32.const 0) (i32.const 0))))')).ToBe(True);
+  Expect<Boolean>(Bad(
+    '(module (table 0 funcref)' +
+    ' (func (call_indirect (param $x i32) (i32.const 0) (i32.const 0))))'))
+    .ToBe(True);
+  Expect<Boolean>(Bad(
+    '(module (func (i32.const 0) (block (result i32) (param i32))))'))
+    .ToBe(True);
+  Expect<Boolean>(Bad('(module (func (nop) (local i32)))')).ToBe(True);
+  Expect<Boolean>(Bad('(module (func (local i32) (param i32)))')).ToBe(True);
+end;
+
+{ --- inline function type in a blocktype (bug 4) ------------------------- }
+
+procedure TWatAsmTests.TestBlockTypeInlineFuncType;
+
+  function Bad(const AMod: string): Boolean;
+  begin
+    Result := StartsWith(AssembleError(AMod), 'inline function type');
+  end;
+
+begin
+  { A blocktype (type $x) with inline (param)/(result) that disagree with $x is
+    `inline function type`, not a downstream validation `type mismatch`
+    (block.wast:467-494, if.wast:795, loop.wast:584). }
+  Expect<Boolean>(Bad(
+    '(module (type $sig (func))' +
+    ' (func (block (type $sig) (result i32) (i32.const 0)) (unreachable)))'))
+    .ToBe(True);
+  Expect<Boolean>(Bad(
+    '(module (type $sig (func (param i32 i32) (result i32)))' +
+    ' (func (i32.const 0)' +
+    '   (block (type $sig) (param i32) (result i32)) (unreachable)))'))
+    .ToBe(True);
+  { A matching inline declaration is legal (names locals only). }
+  Expect<string>(ValidateOutcome(
+    '(module (type $sig (func (param i32) (result i32)))' +
+    ' (func (result i32) (i32.const 0)' +
+    '   (block (type $sig) (param i32) (result i32))))')).ToBe('valid');
+end;
+
+{ --- data-count section is emitted when a data index occurs in code (bug 3) }
+
+procedure TWatAsmTests.TestDataCountFromCode;
+begin
+  { data.drop / memory.init with NO data segments must still emit the data-count
+    section, or DecodeModule rejects our own output (INV-1; memory_init.wast:189).
+    The count is 0, so the module decodes and the VALIDATOR rejects the index. }
+  Expect<string>(ValidateOutcome(
+    '(module (func (export "t") (data.drop 0)))')).ToBe('validation error');
+  Expect<string>(ValidateOutcome(
+    '(module (memory 1) (func (memory.init 0 (i32.const 0) (i32.const 0)' +
+    ' (i32.const 0))))')).ToBe('validation error');
+  { With a matching data segment it is well-formed. }
+  Expect<string>(ValidateOutcome(
+    '(module (memory 1) (data "x")' +
+    ' (func (memory.init 0 (i32.const 0) (i32.const 0) (i32.const 0))))'))
+    .ToBe('valid');
+end;
+
+{ --- reserved token boundary vs unexpected token (bug 5) ---------------- }
+
+procedure TWatAsmTests.TestReservedTokenIsUnknownOperator;
+
+  function IsUnknownOp(const AMod: string): Boolean;
+  begin
+    Result := StartsWith(AssembleError(AMod), 'unknown operator');
+  end;
+
+begin
+  { A reserved run (a longest-match token that is nothing the grammar names) is
+    `unknown operator` wherever it appears — an operator, a br index, a field
+    head, or a data-segment tail (token.wast:7-299). }
+  Expect<Boolean>(IsUnknownOp('(func br 0drop)')).ToBe(True);
+  Expect<Boolean>(IsUnknownOp(
+    '(func (block $l (i32.const 0) (br_table 0$l)))')).ToBe(True);
+  Expect<Boolean>(IsUnknownOp('(data $l"a")')).ToBe(True);
+  Expect<Boolean>(IsUnknownOp('(data"a")')).ToBe(True);
+  Expect<Boolean>(IsUnknownOp('(func "a"x)')).ToBe(True);
+  { A misplaced but VALID token is `unexpected token`, not `unknown operator`. }
+  Expect<Boolean>(StartsWith(
+    AssembleError('(func (i32.const 0) (block (result i32) (param i32)))'),
+    'unexpected token')).ToBe(True);
+  { A bare-memidx active data segment (the `(memory 0)` abbreviation) is valid
+    and must not be rejected by the tail check. }
+  Expect<string>(ValidateOutcome(
+    '(module (memory 1) (data 0 (i32.const 0) "\10"))')).ToBe('valid');
+end;
+
+{ --- nan:canonical / nan:arithmetic are patterns, not const literals ----- }
+
+procedure TWatAsmTests.TestNanPatternsInConst;
+begin
+  { In a const, the result-match keywords are `unexpected token`, while a
+    malformed nan payload like `nan:1` is `unknown operator`
+    (i64.wast:487-491, const.wast:409-413). }
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (func (result i64) (i64.const nan:arithmetic)))'),
+    'unexpected token')).ToBe(True);
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (func (result i64) (i64.const nan:canonical)))'),
+    'unexpected token')).ToBe(True);
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (func (f32.const nan:1) drop))'),
+    'unknown operator')).ToBe(True);
+end;
+
+{ --- br_on_cast emits the opcode exactly once (INV-1) -------------------- }
+
+procedure TWatAsmTests.TestBrOnCastRoundTrip;
+const
+  Src =
+    '(module' +
+    '  (type $t (struct))' +
+    '  (func (param anyref) (result anyref)' +
+    '    (block $l (result (ref $t))' +
+    '      (br_on_cast $l anyref (ref $t) (local.get 0))' +
+    '      (unreachable))))';
+begin
+  { br_on_cast is a fixed-opcode shape routed through EmitImmediatesBody, so it
+    must NOT re-emit the $FB prefix — doing so made the decoder read the second
+    $FB as the cast-flags byte (`malformed cast flags $FB`, INV-1). }
+  Expect<string>(ValidateOutcome(Src)).ToBe('valid');
+end;
+
+procedure TWatAsmTests.SetupTests;
+begin
+  Test('an empty module (and bare fields) decode to zero sections',
+    TestEmptyModule);
+  Test('implicit typeuse appends after explicit types (func.wast:422)',
+    TestImplicitTypeuseOracle);
+  Test('explicit types are never deduped (func_ptrs.wast:2)',
+    TestExplicitTypesNeverDeduped);
+  Test('implicit typeuse does not reuse a rec-group member (type-rec.wast:45)',
+    TestRecGroupMemberNotReused);
+  Test('inline import/export abbreviations decode to the right entries',
+    TestInlineImportExport);
+  Test('elem and data sugar forms decode correctly',
+    TestElemAndDataSugar);
+  Test('a func with named and indexed locals assembles and validates',
+    TestNamedAndIndexedLocals);
+  Test('label shadowing resolves innermost-first at the br bytes',
+    TestLabelShadowingDepths);
+  Test('a duplicate identifier is a text error',
+    TestDuplicateIdentifier);
+  Test('a forward reference (call a later func) resolves',
+    TestForwardReference);
+  Test('a still-staged vector mnemonic raises unknown operator',
+    TestUnknownOperatorPlaceholder);
+  Test('committed fixtures assemble to the same section shape',
+    TestFixturesSectionShape);
+  Test('folded-if emits the condition before the opcode (if.wast:19)',
+    TestFoldedIfArmOrder);
+  Test('memarg defaults and explicit align/offset encode correctly',
+    TestMemArgDefaults);
+  Test('a broad instruction mix assembles, decodes and validates',
+    TestBroadInstructionRoundTrip);
+  Test('GC struct/array with field-by-name resolution',
+    TestGcStructAndArray);
+  Test('a mismatching trailing block label is a text error',
+    TestMismatchingLabel);
+  Test('try_table with a catch clause resolved in the enclosing scope',
+    TestTryTable);
+  Test('call_indirect typeuse, typed select and br_table',
+    TestCallIndirectSelectBrTable);
+  Test('inline (table (elem …)) and (memory (data …)) desugar to segments',
+    TestInlineSegments);
+  Test('ref.test/ref.cast encode the null variant as the +1 subopcode',
+    TestRefTestCast);
+  Test('a forward/self type reference in a type body resolves (bug 1)',
+    TestForwardTypeReference);
+  Test('typeuse clause order and param-id bans are text errors (bug 2)',
+    TestTypeuseClauseOrder);
+  Test('a blocktype inline decl mismatch is inline function type (bug 4)',
+    TestBlockTypeInlineFuncType);
+  Test('a data index in code emits the data-count section (bug 3)',
+    TestDataCountFromCode);
+  Test('a reserved token is unknown operator, not unexpected token (bug 5)',
+    TestReservedTokenIsUnknownOperator);
+  Test('nan:canonical/nan:arithmetic in a const are unexpected token',
+    TestNanPatternsInConst);
+  Test('br_on_cast emits its opcode once and round-trips (INV-1)',
+    TestBrOnCastRoundTrip);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TWatAsmTests.Create('Wasm.Wat.Assembler'));
+  TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
+end.

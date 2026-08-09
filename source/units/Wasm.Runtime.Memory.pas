@@ -126,17 +126,17 @@ const
     where index and offset could otherwise reach past the reservation
     together.
 
-    NOTE the runtime does NOT fold on `AOffset <= WASM_STATIC_OFFSET_FOLD`
-    alone: that was the H1 bug. The access WIDTH matters. With the maximum
-    i32 index (2^32-1) and an offset exactly equal to the guard, an 8- or
-    16-byte access reaches up to 15 bytes past a 4 GiB + guard reservation
-    — a wild access OUTSIDE every mapping, where a fault is not ours to
-    claim. MemCheck therefore folds only while
-    `AOffset <= AMem.GuardBytes - ASize` (the per-instance guard, not this
-    constant — fix 2), which keeps every folded access inside the
-    reservation. This constant remains the human-readable boundary and the
-    value tests use to construct an offset that is guaranteed to be
-    checked. }
+    NOTE as of Track C Wave 6b the helper MemCheck no longer folds at all:
+    it does a full-precision explicit check on every strategy (see MemCheck
+    for why the guard-page fold was deferred to a future JIT tier). This
+    constant, the per-instance GuardBytes field, and the guard reservation
+    survive as the sizing and latent capability that a JIT-emitted inline
+    no-check access will use; it remains the human-readable boundary and
+    the value tests use to construct an offset well past a one-page
+    memory. The former H1 bug — a wide access at the maximum i32 index and
+    an offset equal to the guard reaching past the reservation — cannot
+    recur through this helper, because the explicit check now precedes
+    every dereference. }
   WASM_STATIC_OFFSET_FOLD = WASM_GUARD_BYTES;
 
 type
@@ -318,51 +318,44 @@ end;
 procedure MemCheck(var AMem: TWasmMemoryInst;
   const AIndex, AOffset, ASize: UInt64); inline;
 begin
-  case AMem.Strategy of
-    wmsGuardPages:
-      begin
-        {$IFNDEF PRODUCTION}
-        { The whole no-check argument rests on the index being an i32
-          index the caller widened. A wider one would compute an address
-          outside the reservation, where a fault is not ours to claim. }
-        Assert(AIndex <= UInt64($FFFFFFFF),
-          'guard-page memory reached with a 64-bit index');
-        {$ENDIF}
-        { No check at all while index, offset AND the access width
-          together stay inside the reservation: an OOB access then lands
-          in the PROT_NONE guard and faults into the handler. Once the
-          offset plus the access width can reach past the guard region the
-          access takes the full-precision path — otherwise the top of a
-          wide access at the maximum i32 index escapes the reservation
-          (H1). The threshold is `GuardBytes - ASize` (overflow-safe form
-          of `AOffset + ASize > GuardBytes`); ASize <= 16 <= GuardBytes so
-          the subtraction never underflows. }
-        if AOffset > AMem.GuardBytes - ASize then
-          if not MemInBounds(AMem.ByteSize, AIndex, AOffset, ASize) then
-            TrapNow(wtkMemoryOutOfBounds);
-      end;
-    wmsGuardAssisted:
-      if AOffset <= AMem.GuardBytes - ASize then
-      begin
-        { One offset-INDEPENDENT compare, deduplicable across many
-          accesses through the same base; the guard absorbs offset and
-          width. Folding on the SAME `GuardBytes - ASize` boundary the
-          guard-page arm uses keeps a folded access (index < ByteSize,
-          offset+width <= guard) inside ByteSize + guard = the
-          reservation. }
-        if AIndex >= AMem.ByteSize then
-          TrapNow(wtkMemoryOutOfBounds);
-      end
-      else if not MemInBounds(AMem.ByteSize, AIndex, AOffset, ASize) then
-        TrapNow(wtkMemoryOutOfBounds);
-    wmsBoundsChecked:
-      { The comparison is unsigned and in UInt64, so an i64 index above
-        2^32-1 on a 32-bit host is larger than any allocatable ByteSize
-        and traps here without a separate index-width reduction — the
-        reduction ADR-0013 describes is subsumed by this compare (B4). }
-      if not MemInBounds(AMem.ByteSize, AIndex, AOffset, ASize) then
-        TrapNow(wtkMemoryOutOfBounds);
-  end;
+  { Track C Wave 6b — the chokepoint's helper path is robust by EXPLICIT
+    full-precision CHECK on every strategy and never hands back or
+    dereferences an out-of-bounds address. The interpreter (the tier of
+    record) reaches memory only through MemAddress / MemRange / MemCheck,
+    so an out-of-bounds guest access is a clean TrapNow -> trampoline
+    EWasmTrap that never depends on MMU fault delivery.
+
+    Why the guard-page NO-CHECK fold was removed from this helper:
+    in-process guard-page fault delivery proved unreliable. The FIRST
+    SIGSEGV raised in a fresh process surfaces through the FPC RTL as
+    EStackOverflow instead of reaching our handler -> trampoline (it
+    aborted a whole corpus file, address.wast, on `i32.load8_u offset=1`
+    at index 0xFFFFFFFF); a forked child that INHERITS a warmed process
+    traps cleanly, which is why the forked-child test passed while the
+    live runner did not. Relying on that path for the interpreter is
+    exactly the fragility ADR-0009's trampoline exists to remove, so the
+    fold is deferred to a future JIT tier (Track I) that emits inline
+    accesses and can first prove signal->trampoline delivery robust
+    in-process. The guard-page reservation and the fault handler stay
+    mapped and installed as that latent capability; this helper no longer
+    uses them.
+
+    Observational identity is preserved and strengthened: every strategy
+    now raises the same trap, with the same message, at the same access
+    (ADR-0005, ADR-0010). The comparison is unsigned and in UInt64, so an
+    i64 index above 2^32-1 on a 32-bit host already exceeds any allocatable
+    ByteSize and traps here — the index-width reduction ADR-0013 describes
+    is subsumed by this one compare (B4). }
+  {$IFNDEF PRODUCTION}
+  { The guard-page reservation still assumes an i32-width index the caller
+    widened; a wider one would name an address outside it. Kept as a debug
+    invariant, though the explicit check below no longer relies on it. }
+  if AMem.Strategy = wmsGuardPages then
+    Assert(AIndex <= UInt64($FFFFFFFF),
+      'guard-page memory reached with a 64-bit index');
+  {$ENDIF}
+  if not MemInBounds(AMem.ByteSize, AIndex, AOffset, ASize) then
+    TrapNow(wtkMemoryOutOfBounds);
 end;
 
 function MemAddress(var AMem: TWasmMemoryInst;

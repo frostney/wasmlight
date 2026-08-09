@@ -66,6 +66,7 @@ type
     function ValidateAt(const AIndex: Integer): TWasmIrFunction;
     procedure ExpectIr(const ADescription, AExpected: string);
     procedure ExpectInvalid(const ADescription, APrefix: string);
+    procedure ExpectAccepted(const ADescription: string);
     procedure ExpectMalformed(const ADescription, APrefix: string);
     function Outcome(const AMessage, APrefix: string): string;
   protected
@@ -146,6 +147,7 @@ type
     procedure TestMemoryCopy;
     procedure TestMemoryFill;
     procedure TestAlignmentTooLarge;
+    procedure TestLoadOffsetOutOfRange;
     procedure TestUnknownMemory;
     procedure TestMemoryInitNeedsDataCount;
     procedure TestMemoryInitWithDataCount;
@@ -373,6 +375,24 @@ begin
 
   Expect<string>(ADescription + ' -> ' + Got)
     .ToBe(ADescription + ' -> invalid: ' + APrefix);
+end;
+
+procedure TValidatorBodyTests.ExpectAccepted(const ADescription: string);
+var
+  Got: string;
+begin
+  Got := 'ACCEPTED';
+  try
+    ValidateAt(0);
+  except
+    on E: EWasmValidationError do
+      Got := 'invalid: ' + E.Message;
+    on E: EWasmDecodeError do
+      Got := 'malformed: ' + E.Message;
+  end;
+
+  Expect<string>(ADescription + ' -> ' + Got)
+    .ToBe(ADescription + ' -> ACCEPTED');
 end;
 
 procedure TValidatorBodyTests.ExpectMalformed(const ADescription,
@@ -1003,8 +1023,10 @@ begin
       B([$02, $40, $02, $7F, $41, $07, $20, $00, $0E, $01, $01, $00,
          $0B, $1A, $0B, $20, $00, $0B])));
 
+  { Upstream folds a br_table label-arity divergence into `type
+    mismatch`, not a distinct arity prefix (br_table.wast). }
   ExpectInvalid('br_table targets of different arity',
-    MSG_INVALID_RESULT_ARITY);
+    MSG_TYPE_MISMATCH);
 end;
 
 { The binary grammar admits any count of types after $1C;
@@ -1212,7 +1234,7 @@ begin
   S.CodeSec := Code1(B([$00]), B([$41, $00, $24, $00, $0B]));
   BuildAll(S);
 
-  ExpectInvalid('global.set on a const global', MSG_GLOBAL_IS_IMMUTABLE);
+  ExpectInvalid('global.set on a const global', MSG_IMMUTABLE_GLOBAL);
 end;
 
 procedure TValidatorBodyTests.TestUnknownGlobal;
@@ -1407,6 +1429,53 @@ begin
   ExpectInvalid('i32.load with alignment 2^3', MSG_ALIGNMENT_TOO_LARGE);
 end;
 
+{ `valid-memarg` classifies a memory argument by the memory's address type,
+  so the static offset must fit it: on an i32 memory offset < 2^32, while a
+  memory64 admits the full u64. address.wast:213 asserts the prefix "offset
+  out of range" for offset=2^32 on `(memory 1)`. The offset is a u64 in the
+  binary memarg, so the bound is a VALIDATION rule against the address type,
+  not a decode side condition.
+
+  i32.load = 0x28; memarg = one align byte then a u64 LEB offset. }
+procedure TValidatorBodyTests.TestLoadOffsetOutOfRange;
+var
+  S: TModuleSections;
+begin
+  { offset 2^32 on an i32 memory is one past what the address type can hold,
+    so it is INVALID. LEB128(0x1_0000_0000) = 80 80 80 80 10. }
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $00, $00]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $00, $01]);
+  S.CodeSec := Code1(B([$00]),
+    B([$41, $00, $28, $02, $80, $80, $80, $80, $10, $1A, $0B]));
+  BuildAll(S);
+  ExpectInvalid('offset 2^32 on an i32 memory', MSG_OFFSET_OUT_OF_RANGE);
+
+  { offset 2^32-1 is the largest that fits an i32 address type -> accepted.
+    LEB128(0xFFFF_FFFF) = FF FF FF FF 0F. }
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $00, $00]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $00, $01]);
+  S.CodeSec := Code1(B([$00]),
+    B([$41, $00, $28, $02, $FF, $FF, $FF, $FF, $0F, $1A, $0B]));
+  BuildAll(S);
+  ExpectAccepted('offset 2^32-1 on an i32 memory');
+
+  { the SAME 2^32 offset on an i64 (memory64) memory -> accepted: the offset
+    fits a 64-bit address type. Limits flag 0x04 selects i64, and the address
+    operand is then i64 (i64.const 0 = 0x42 0x00). }
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $00, $00]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $04, $01]);
+  S.CodeSec := Code1(B([$00]),
+    B([$42, $00, $28, $02, $80, $80, $80, $80, $10, $1A, $0B]));
+  BuildAll(S);
+  ExpectAccepted('offset 2^32 on an i64 memory');
+end;
+
 procedure TValidatorBodyTests.TestUnknownMemory;
 begin
   Build(B([$01, $60, $00, $00]), B([$01, $00]), nil,
@@ -1585,7 +1654,7 @@ begin
   Build(B([$02, $60, $00, $00, $5F, $01, $7F, $00]), B([$01, $00]), nil,
     Code1(B([$00]), B([$D0, $01, $41, $00, $FB, $05, $01, $00, $0B])));
 
-  ExpectInvalid('struct.set on a const field', MSG_TYPE_MISMATCH);
+  ExpectInvalid('struct.set on a const field', MSG_IMMUTABLE_FIELD);
 end;
 
 { `error_if(not is_struct(t))`: the kind check is part of every struct
@@ -1936,6 +2005,8 @@ begin
   Test('memory.fill takes an i32 byte value', TestMemoryFill);
   Test('an alignment larger than natural is rejected',
     TestAlignmentTooLarge);
+  Test('a memarg offset past the address type is out of range',
+    TestLoadOffsetOutOfRange);
   Test('an out-of-range memory index is unknown', TestUnknownMemory);
   Test('memory.init without a data count section is malformed',
     TestMemoryInitNeedsDataCount);

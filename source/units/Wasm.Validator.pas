@@ -872,7 +872,7 @@ begin
     if Seg.Mode = wemActive then
     begin
       if Seg.TableIndex >= UInt32(Length(FSpaces.Tables)) then
-        ValErr(MSG_UNKNOWN_TABLE,
+        ValErr(UnknownIndex(MSG_UNKNOWN_TABLE, Seg.TableIndex),
           Format('%s targets table %u, but only %d table(s) exist',
             [What, Seg.TableIndex, Length(FSpaces.Tables)]));
       Table := FSpaces.Tables[Seg.TableIndex];
@@ -944,7 +944,7 @@ begin
     Exit;
 
   if FModule.StartFuncIndex >= UInt32(Length(FSpaces.FuncTypes)) then
-    ValErr(MSG_UNKNOWN_FUNCTION,
+    ValErr(UnknownIndex(MSG_UNKNOWN_FUNCTION, FModule.StartFuncIndex),
       Format('start function %u, but only %d function(s) exist',
         [FModule.StartFuncIndex, Length(FSpaces.FuncTypes)]));
 
@@ -978,13 +978,13 @@ begin
       wxkFunc:
         begin
           Limit := Length(FSpaces.FuncTypes);
-          Prefix := MSG_UNKNOWN_FUNCTION;
+          Prefix := UnknownIndex(MSG_UNKNOWN_FUNCTION, Exp.Index);
           Space := 'function';
         end;
       wxkTable:
         begin
           Limit := Length(FSpaces.Tables);
-          Prefix := MSG_UNKNOWN_TABLE;
+          Prefix := UnknownIndex(MSG_UNKNOWN_TABLE, Exp.Index);
           Space := 'table';
         end;
       wxkMem:
@@ -996,12 +996,12 @@ begin
       wxkGlobal:
         begin
           Limit := Length(FSpaces.Globals);
-          Prefix := MSG_UNKNOWN_GLOBAL;
+          Prefix := UnknownIndex(MSG_UNKNOWN_GLOBAL, Exp.Index);
           Space := 'global';
         end;
     else
       Limit := Length(FSpaces.Tags);
-      Prefix := MSG_UNKNOWN_TAG;
+      Prefix := UnknownIndex(MSG_UNKNOWN_TAG, Exp.Index);
       Space := 'tag';
     end;
 

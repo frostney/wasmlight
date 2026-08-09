@@ -257,13 +257,22 @@ begin
   WriteLn('only when nothing failed and every script could be read and parsed.');
 end;
 
+{ The corpus keeps its proposal corpora under a `proposals/` directory; the
+  3.0-draft root (ADR-0004's conformance target) is everything else. Splitting
+  the tally on that path segment keeps post-3.0 proposal noise from being read
+  as core-conformance movement. }
+function IsProposalScript(const APath: string): Boolean;
+begin
+  Result := Pos(PathDelim + 'proposals' + PathDelim, APath) > 0;
+end;
+
 var
   Options: TOptionList;
   VerboseOpt, FailuresOnlyOpt, HelpOpt: TFlagOption;
   Positionals, Scripts: TStringList;
   Verbose, FailuresOnly: Boolean;
   ShowPass, ShowSkip, ShowStaged, ShowFileLine: Boolean;
-  Total, FileTally: TWastTally;
+  Total, Root, Proposals, FileTally: TWastTally;
   Errors, I: Integer;
 begin
   Options := TOptionList.Create;
@@ -326,13 +335,23 @@ begin
     Scripts.Sort;
 
     Total.Clear;
+    Root.Clear;
+    Proposals.Clear;
     for I := 0 to Scripts.Count - 1 do
     begin
       FileTally := RunOne(Scripts[I], ShowPass, ShowSkip, ShowStaged,
         ShowFileLine, Errors);
       Total.Add(FileTally);
+      if IsProposalScript(Scripts[I]) then
+        Proposals.Add(FileTally)
+      else
+        Root.Add(FileTally);
     end;
 
+    { The 3.0-draft root and the proposal corpora split out, so a run reports
+      core-conformance movement apart from post-3.0 proposal coverage. }
+    WriteLn('ROOT ', TallyText(Root));
+    WriteLn('PROPOSALS ', TallyText(Proposals));
     WriteLn('TOTAL files=', Scripts.Count, ' errors=', Errors, ' ',
       TallyText(Total));
 

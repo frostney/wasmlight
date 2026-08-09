@@ -795,7 +795,17 @@ begin
     wvcRefNull:
       Result := RefIsNull(AActual.Ref);
     wvcRefExtern, wvcRefHost:
-      Result := (not RefIsNull(AActual.Ref)) and (AActual.Ref = AExpectedRef);
+      { A specific host box when N is given (ref.extern N / ref.host N),
+        otherwise any non-null externref (the corpus's bare `(ref.extern)`).
+        Mirrors the bare-`(ref.func)` any-non-null fallback below and keys on
+        the same signal: the runner mints a non-null identity only for the
+        N form (a boxed host value is never WASM_REF_NULL) and leaves a bare
+        matcher's AExpectedRef null. Without the fallback a correct non-null
+        externref is judged a mismatch against `AActual.Ref = WASM_REF_NULL`. }
+      if AExpectedRef <> WASM_REF_NULL then
+        Result := AActual.Ref = AExpectedRef
+      else
+        Result := not RefIsNull(AActual.Ref);
     wvcRefFunc:
       { A specific function's handle when known, otherwise any non-null
         funcref (the corpus's bare `(ref.func)`). }
