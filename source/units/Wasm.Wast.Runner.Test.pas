@@ -55,6 +55,67 @@ const
   MODULE_SIMD_BODY = '"\00asm\01\00\00\00\01\04\01\60\00\00\03\02\01\00'
     + '\0a\08\01\06\00\fd\00\00\00\0b"';
 
+  { A hand-assembled binary module that actually runs, for the execution
+    tests. Three func types (()->i32, ()->f32, ()->f64) and exports:
+      "seven"   () -> i32   = i32.const 7
+      "qnan"    () -> f32   = f32.sqrt (f32.const -1)  → an arithmetic NaN
+      "divz"    () -> i32   = 1 / 0                     → traps
+      "onehalf" () -> f64   = f64.const 0.5
+      "g"       global i32  = 42
+    Spelled as literal bytes for the same reason the malformed cases are:
+    the module under test is readable next to the assertion. }
+  MODULE_NUMERIC =
+    '(module binary '
+    + '"\00\61\73\6d\01\00\00\00"'
+    + '"\01\0d\03\60\00\01\7f\60\00\01\7d\60\00\01\7c"'
+    + '"\03\05\04\00\01\00\02"'
+    + '"\06\06\01\7f\00\41\2a\0b"'
+    + '"\07\25\05\05\73\65\76\65\6e\00\00\04\71\6e\61\6e\00\01\04'
+    + '\64\69\76\7a\00\02\07\6f\6e\65\68\61\6c\66\00\03\01\67\03\00"'
+    + '"\0a\23\04\04\00\41\07\0b\08\00\43\00\00\80\bf\91\0b\07\00'
+    + '\41\01\41\00\6d\0b\0b\00\44\00\00\00\00\00\00\e0\3f\0b"'
+    + ')';
+
+  { An identity function over externref: "id" (externref) -> externref =
+    local.get 0. Exercises reference-identity marshaling both ways. }
+  MODULE_EXTERN_ID =
+    '(module binary '
+    + '"\00\61\73\6d\01\00\00\00"'
+    + '"\01\06\01\60\01\6f\01\6f"'
+    + '"\03\02\01\00"'
+    + '"\07\06\01\02\69\64\00\00"'
+    + '"\0a\06\01\04\00\20\00\0b"'
+    + ')';
+
+  { Non-tail self-recursion: "rec" () -> i32 = rec() + 0. Runs the depth
+    cap into `call stack exhausted`. }
+  MODULE_RECURSE =
+    '(module binary '
+    + '"\00\61\73\6d\01\00\00\00"'
+    + '"\01\05\01\60\00\01\7f"'
+    + '"\03\02\01\00"'
+    + '"\07\07\01\03\72\65\63\00\00"'
+    + '"\0a\09\01\07\00\10\00\41\00\6a\0b"'
+    + ')';
+
+  { An exporter (func "get5" () -> i32 = 5) and, after `(register "M")`, an
+    importer that imports M."get5" and re-exports it as "f". }
+  MODULE_EXPORTER =
+    '(module binary '
+    + '"\00\61\73\6d\01\00\00\00"'
+    + '"\01\05\01\60\00\01\7f"'
+    + '"\03\02\01\00"'
+    + '"\07\08\01\04\67\65\74\35\00\00"'
+    + '"\0a\06\01\04\00\41\05\0b"'
+    + ')';
+  MODULE_IMPORTER =
+    '(module binary '
+    + '"\00\61\73\6d\01\00\00\00"'
+    + '"\01\05\01\60\00\01\7f"'
+    + '"\02\0a\01\01\4d\04\67\65\74\35\00\00"'
+    + '"\07\05\01\01\66\00\00"'
+    + ')';
+
 type
   TWastRunnerTests = class(TTestSuite)
   private
@@ -95,6 +156,19 @@ type
     procedure TestTallyCountsEveryStatus;
     procedure TestPrefixMatchRule;
     procedure TestScriptParseErrorRaises;
+
+    { execution (Track E) }
+    procedure TestAssertReturnPasses;
+    procedure TestAssertReturnMismatchFails;
+    procedure TestAssertReturnFloatAndNanClasses;
+    procedure TestAssertTrapPasses;
+    procedure TestAssertTrapWrongMessageFails;
+    procedure TestInvokeActionPasses;
+    procedure TestGetExportedGlobal;
+    procedure TestAssertExhaustion;
+    procedure TestExternRefIdentityMatches;
+    procedure TestExternRefIdentityMismatchFails;
+    procedure TestCrossModuleRegisterImport;
   end;
 
 function TWastRunnerTests.StatusSignature(const ASource: string): string;
@@ -365,9 +439,10 @@ end;
 
 procedure TWastRunnerTests.TestExecutionCommandsSkipped;
 begin
-  { Everything that needs instantiation or a tier. All skipped with the
-    same reason, and the day a tier lands this assertion is what changes
-    first. }
+  { With a tier landed but NO module instantiated in the script, every
+    action/assertion still skips — there is nothing to run it against. The
+    reasons now name the real gap (no instance, text-only, exceptions)
+    rather than a blanket "needs a tier". }
   Expect<string>(StatusSignature(
     '(register "m")' + sLineBreak +
     '(invoke "f" (i32.const 1))' + sLineBreak +
@@ -380,8 +455,9 @@ begin
     .ToBe('register:skip invoke:skip assert_return:skip assert_trap:skip '
       + 'assert_unlinkable:skip assert_exhaustion:skip assert_exception:skip');
 
+  { No module precedes it, so there is no current instance to register. }
   Expect<string>(FirstResult('(register "m")').Actual)
-    .ToBe(WAST_REASON_NEEDS_TIER);
+    .ToBe(WAST_REASON_NO_INSTANCE);
 end;
 
 procedure TWastRunnerTests.TestAssertWithoutModuleOperandSkipped;
@@ -506,6 +582,124 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+{ --- execution ----------------------------------------------------------- }
+
+procedure TWastRunnerTests.TestAssertReturnPasses;
+var
+  Item: TWastCommandResult;
+begin
+  Item := ResultAt(MODULE_NUMERIC + sLineBreak
+    + '(assert_return (invoke "seven") (i32.const 7))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestAssertReturnMismatchFails;
+var
+  Item: TWastCommandResult;
+begin
+  { The wrong expected value: the runner records the produced hex so the
+    divergence is legible. }
+  Item := ResultAt(MODULE_NUMERIC + sLineBreak
+    + '(assert_return (invoke "seven") (i32.const 8))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  ExpectStartsWith(Item.Actual, '0x00000007');
+end;
+
+procedure TWastRunnerTests.TestAssertReturnFloatAndNanClasses;
+begin
+  { An exact f64, plus the same arithmetic NaN accepted by BOTH NaN
+    classes (the interpreter emits canonical, §3.2). }
+  Expect<string>(StatusSignature(MODULE_NUMERIC + sLineBreak
+    + '(assert_return (invoke "onehalf") (f64.const 0.5))' + sLineBreak
+    + '(assert_return (invoke "qnan") (f32.const nan:arithmetic))' + sLineBreak
+    + '(assert_return (invoke "qnan") (f32.const nan:canonical))'))
+    .ToBe('module:pass assert_return:pass assert_return:pass '
+      + 'assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestAssertTrapPasses;
+var
+  Item: TWastCommandResult;
+begin
+  Item := ResultAt(MODULE_NUMERIC + sLineBreak
+    + '(assert_trap (invoke "divz") "integer divide by zero")', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestAssertTrapWrongMessageFails;
+var
+  Item: TWastCommandResult;
+begin
+  { A real trap, but not the message the script demanded — a fail that
+    keeps both strings, exactly as the malformed/invalid prefix fails do. }
+  Item := ResultAt(MODULE_NUMERIC + sLineBreak
+    + '(assert_trap (invoke "divz") "unreachable")', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  Expect<string>(Item.Expected).ToBe('unreachable');
+  ExpectStartsWith(Item.Actual, 'integer divide by zero');
+end;
+
+procedure TWastRunnerTests.TestInvokeActionPasses;
+var
+  Item: TWastCommandResult;
+begin
+  { A bare invoke runs for effect and is expected to succeed. }
+  Item := ResultAt(MODULE_NUMERIC + sLineBreak + '(invoke "seven")', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestGetExportedGlobal;
+var
+  Item: TWastCommandResult;
+begin
+  Item := ResultAt(MODULE_NUMERIC + sLineBreak
+    + '(assert_return (get "g") (i32.const 42))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestAssertExhaustion;
+var
+  Item: TWastCommandResult;
+begin
+  { Non-tail self-recursion trips the depth cap; the non-recursive
+    interpreter reports it as `call stack exhausted`. }
+  Item := ResultAt(MODULE_RECURSE + sLineBreak
+    + '(assert_exhaustion (invoke "rec") "call stack exhausted")', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestExternRefIdentityMatches;
+begin
+  { The same identity in and out, and null-in null-out. }
+  Expect<string>(StatusSignature(MODULE_EXTERN_ID + sLineBreak
+    + '(assert_return (invoke "id" (ref.extern 1)) (ref.extern 1))' + sLineBreak
+    + '(assert_return (invoke "id" (ref.null extern)) (ref.null extern))'))
+    .ToBe('module:pass assert_return:pass assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestExternRefIdentityMismatchFails;
+var
+  Item: TWastCommandResult;
+begin
+  { Passing identity 2 but expecting identity 1 — reference comparison is
+    by identity, so this diverges. }
+  Item := ResultAt(MODULE_EXTERN_ID + sLineBreak
+    + '(assert_return (invoke "id" (ref.extern 2)) (ref.extern 1))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+end;
+
+procedure TWastRunnerTests.TestCrossModuleRegisterImport;
+begin
+  { An exporter registered under "M", then an importer that imports
+    M."get5" and re-exports it — the whole point of the per-script
+    registry. }
+  Expect<string>(StatusSignature(MODULE_EXPORTER + sLineBreak
+    + '(register "M")' + sLineBreak
+    + MODULE_IMPORTER + sLineBreak
+    + '(assert_return (invoke "f") (i32.const 5))'))
+    .ToBe('module:pass register:pass module:pass assert_return:pass');
+end;
+
 procedure TWastRunnerTests.SetupTests;
 begin
   Test('assert_malformed passes on a prefix match',
@@ -543,6 +737,26 @@ begin
   Test('tally counts every status', TestTallyCountsEveryStatus);
   Test('prefix match rule', TestPrefixMatchRule);
   Test('script parse error raises', TestScriptParseErrorRaises);
+
+  Test('assert_return passes on a matching result',
+    TestAssertReturnPasses);
+  Test('assert_return reports a fail on a mismatch',
+    TestAssertReturnMismatchFails);
+  Test('assert_return matches exact float and NaN classes',
+    TestAssertReturnFloatAndNanClasses);
+  Test('assert_trap passes on the expected trap', TestAssertTrapPasses);
+  Test('assert_trap reports a fail on the wrong message',
+    TestAssertTrapWrongMessageFails);
+  Test('bare invoke action passes', TestInvokeActionPasses);
+  Test('assert_return reads an exported global', TestGetExportedGlobal);
+  Test('assert_exhaustion passes on deep recursion',
+    TestAssertExhaustion);
+  Test('assert_return matches externref identity',
+    TestExternRefIdentityMatches);
+  Test('assert_return reports a fail on externref mismatch',
+    TestExternRefIdentityMismatchFails);
+  Test('register binds an instance for cross-module import',
+    TestCrossModuleRegisterImport);
 end;
 
 begin

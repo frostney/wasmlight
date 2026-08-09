@@ -94,6 +94,12 @@ type
     procedure TestArrayIndexOutOfBoundsTraps;
     procedure TestDefaultsAreCheckedNotInvented;
 
+    procedure TestArrayCopyMovesForwardAndBackwardWithoutClobbering;
+    procedure TestArrayCopyBoundsTrapOnEitherSide;
+    procedure TestArrayCopyReferenceElementsSurviveThroughTheDestination;
+    procedure TestArrayInitFromDataCopiesBytesAndTrapsBothBounds;
+    procedure TestArrayInitFromElemCopiesRefsAndTrapsBothBounds;
+
     procedure TestCollectingWithNothingLiveReclaimsEverything;
     procedure TestReclaimedBytesAreReused;
     procedure TestAHostRootKeepsAnObjectAliveAndReleasingItDoesNot;
@@ -481,8 +487,11 @@ var
   Arr: TWasmRef;
   Caught: string;
 begin
-  { `null reference` is CONFIRMED for struct.get and extends to the rest
-    of the aggregate accessors by symmetry. }
+  { O-5: the null message is TYPE-SPECIFIC now, not the bare
+    'null reference'. struct.get/get_s/get_u/set/fieldcount/setdefaults on a
+    null all spell 'null structure reference' (corpus struct.wast:155-156);
+    the bare message is reserved for ref.as_non_null / ref.cast-to-non-null,
+    which the interpreter/Store raise, not these accessors. }
   Caught := 'no trap';
   try
     FHeap.StructGet(WASM_REF_NULL, 0);
@@ -492,7 +501,7 @@ begin
       Caught := E.Message;
     end;
   end;
-  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_REFERENCE);
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_STRUCT_REFERENCE);
 
   Caught := 'no trap';
   try
@@ -503,8 +512,32 @@ begin
       Caught := E.Message;
     end;
   end;
-  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_REFERENCE);
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_STRUCT_REFERENCE);
 
+  Caught := 'no trap';
+  try
+    FHeap.StructFieldCount(WASM_REF_NULL);
+  except
+    on E: EWasmTrap do
+    begin
+      Caught := E.Message;
+    end;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_STRUCT_REFERENCE);
+
+  Caught := 'no trap';
+  try
+    FHeap.StructSetDefaults(WASM_REF_NULL);
+  except
+    on E: EWasmTrap do
+    begin
+      Caught := E.Message;
+    end;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_STRUCT_REFERENCE);
+
+  { array.get/get_s/get_u/set/len/fill/copy/init_* on a null all spell
+    'null array reference' (corpus array.wast:342-343 et al.). }
   Caught := 'no trap';
   try
     FHeap.ArrayLength(WASM_REF_NULL);
@@ -514,7 +547,40 @@ begin
       Caught := E.Message;
     end;
   end;
-  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_REFERENCE);
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArrayGet(WASM_REF_NULL, 0);
+  except
+    on E: EWasmTrap do
+    begin
+      Caught := E.Message;
+    end;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArraySet(WASM_REF_NULL, 0, MakeValueI32(1));
+  except
+    on E: EWasmTrap do
+    begin
+      Caught := E.Message;
+    end;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArrayFill(WASM_REF_NULL, 0, 0, MakeValueI32(1));
+  except
+    on E: EWasmTrap do
+    begin
+      Caught := E.Message;
+    end;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
 
   { And a live array is unaffected by any of that. }
   Arr := FHeap.AllocArray(TY_I32_ARRAY, 1);
@@ -587,6 +653,283 @@ begin
   end;
   Expect<string>(Caught)
     .ToBe(Format(MSG_GC_STRUCT_FIELD_NO_DEFAULT, [0]));
+end;
+
+{ --- bulk array ops (O-6/O-8) -------------------------------------------- }
+
+procedure TRuntimeGcTests.
+  TestArrayCopyMovesForwardAndBackwardWithoutClobbering;
+var
+  Arr: TWasmRef;
+  Other: TWasmRef;
+  Index: Integer;
+begin
+  { exec-array.copy, memmove semantics. Overlap within one array is the
+    case a plain forward loop gets wrong; the two directions below fail
+    differently if the direction choice is dropped. }
+
+  { Backward case: destIdx > srcIdx. arr = [0..5]; copy 3 from 0 to 2.
+    Correct memmove => [0,1,0,1,2,5]; a forward loop clobbers => the 5th
+    element reads a value already overwritten. }
+  Arr := FHeap.AllocArray(TY_I32_ARRAY, 6);
+  for Index := 0 to 5 do
+    FHeap.ArraySet(Arr, UInt32(Index), MakeValueI32(Index));
+  FHeap.ArrayCopy(Arr, 2, Arr, 0, 3);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 0).I32).ToBe(0);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 1).I32).ToBe(1);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 2).I32).ToBe(0);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 3).I32).ToBe(1);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 4).I32).ToBe(2);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 5).I32).ToBe(5);
+
+  { Forward case: destIdx < srcIdx. arr = [0..5]; copy 3 from 2 to 0.
+    Correct memmove => [2,3,4,3,4,5]. }
+  Arr := FHeap.AllocArray(TY_I32_ARRAY, 6);
+  for Index := 0 to 5 do
+    FHeap.ArraySet(Arr, UInt32(Index), MakeValueI32(Index));
+  FHeap.ArrayCopy(Arr, 0, Arr, 2, 3);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 0).I32).ToBe(2);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 1).I32).ToBe(3);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 2).I32).ToBe(4);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 3).I32).ToBe(3);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 4).I32).ToBe(4);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 5).I32).ToBe(5);
+
+  { Between two distinct arrays: no overlap, a straight copy. }
+  Arr := FHeap.AllocArray(TY_I32_ARRAY, 3);
+  Other := FHeap.AllocArray(TY_I32_ARRAY, 3);
+  FHeap.ArraySet(Other, 0, MakeValueI32(7));
+  FHeap.ArraySet(Other, 1, MakeValueI32(8));
+  FHeap.ArraySet(Other, 2, MakeValueI32(9));
+  FHeap.ArrayCopy(Arr, 0, Other, 0, 3);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 0).I32).ToBe(7);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 2).I32).ToBe(9);
+
+  { A zero count at exactly the length is in bounds and copies nothing. }
+  FHeap.ArrayCopy(Arr, 3, Other, 3, 0);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 0).I32).ToBe(7);
+end;
+
+procedure TRuntimeGcTests.TestArrayCopyBoundsTrapOnEitherSide;
+var
+  Dest: TWasmRef;
+  Src: TWasmRef;
+  Caught: string;
+begin
+  { Both sides trap 'out of bounds array access' (corpus
+    array_copy.wast:101-106). A count of zero with an index past the end
+    still traps, and a null on either side traps 'null array reference'. }
+  Dest := FHeap.AllocArray(TY_I32_ARRAY, 4);
+  Src := FHeap.AllocArray(TY_I32_ARRAY, 4);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArrayCopy(Dest, 3, Src, 0, 2);   { dest 3+2 > 4 }
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_ARRAY_OUT_OF_BOUNDS);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArrayCopy(Dest, 0, Src, 3, 2);   { src 3+2 > 4 }
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_ARRAY_OUT_OF_BOUNDS);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArrayCopy(WASM_REF_NULL, 0, Src, 0, 1);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
+
+  Caught := 'no trap';
+  try
+    FHeap.ArrayCopy(Dest, 0, WASM_REF_NULL, 0, 1);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
+end;
+
+procedure TRuntimeGcTests.
+  TestArrayCopyReferenceElementsSurviveThroughTheDestination;
+var
+  Dest: TWasmRef;
+  Src: TWasmRef;
+  Target: TWasmRef;
+  DestRoot: TWasmRootHandle;
+begin
+  { The reference-element path: array.copy stores refs through the
+    barriered WriteField, so a copied reference is a real edge — the
+    referent must survive a collection when only the DESTINATION array is
+    rooted and the source is dropped. (The v1 barrier is an empty inline
+    no-op; tracing is driven by the layout regardless, so this proves the
+    ref STORE is correct, which is what the barrier site guards.) }
+  Target := FHeap.AllocStruct(TY_BASE);
+  FHeap.StructSet(Target, 0, MakeValueI32(1234));
+
+  Src := FHeap.AllocArray(TY_REF_ARRAY, 2);
+  FHeap.ArraySet(Src, 1, MakeValueRef(Target));
+
+  Dest := FHeap.AllocArray(TY_REF_ARRAY, 2);
+  FHeap.ArrayCopy(Dest, 0, Src, 0, 2);
+  Expect<Boolean>(FHeap.ArrayGet(Dest, 1).Ref = Target).ToBe(True);
+  Expect<Boolean>(RefIsNull(FHeap.ArrayGet(Dest, 0).Ref)).ToBe(True);
+
+  { Root only the destination; Src and Target are otherwise unreachable. }
+  DestRoot := FHeap.RootRegister(Dest);
+  FHeap.Collect;
+
+  { Dest survived (it is a root); Target survived THROUGH the copied
+    reference; Src was collected. }
+  Expect<Boolean>(FHeap.ArrayGet(FHeap.RootGet(DestRoot), 1).Ref = Target)
+    .ToBe(True);
+  Expect<Int32>(FHeap.StructGet(Target, 0).I32).ToBe(1234);
+  FHeap.RootRelease(DestRoot);
+end;
+
+procedure TRuntimeGcTests.
+  TestArrayInitFromDataCopiesBytesAndTrapsBothBounds;
+var
+  Arr: TWasmRef;
+  PackedArr: TWasmRef;
+  Bytes: array[0..11] of Byte;
+  Index: Integer;
+  Caught: string;
+begin
+  { exec-array.init_data. A width-sized little-endian copy from a data
+    span into a numeric/packed-element array. Three i32s little-endian:
+    1, 2, 0x04030201. }
+  for Index := 0 to 11 do
+    Bytes[Index] := 0;
+  Bytes[0] := 1;
+  Bytes[4] := 2;
+  Bytes[8] := 1; Bytes[9] := 2; Bytes[10] := 3; Bytes[11] := 4;
+
+  Arr := FHeap.AllocArray(TY_I32_ARRAY, 4);
+  FHeap.ArrayInitFromData(Arr, 1, @Bytes[0], Length(Bytes), 0, 3);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 0).I32).ToBe(0);      { untouched }
+  Expect<Int32>(FHeap.ArrayGet(Arr, 1).I32).ToBe(1);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 2).I32).ToBe(2);
+  Expect<Int32>(FHeap.ArrayGet(Arr, 3).I32)
+    .ToBe(Int32($04030201));
+
+  { Packed element width honoured: an i8 array reads one byte per element,
+    starting at a non-zero byte offset. }
+  PackedArr := FHeap.AllocArray(TY_I8_ARRAY, 4);
+  FHeap.ArrayInitFromData(PackedArr, 0, @Bytes[8], 4, 1, 3);
+  Expect<UInt32>(FHeap.ArrayGetUnsigned(PackedArr, 0)).ToBe(UInt32(2));
+  Expect<UInt32>(FHeap.ArrayGetUnsigned(PackedArr, 1)).ToBe(UInt32(3));
+  Expect<UInt32>(FHeap.ArrayGetUnsigned(PackedArr, 2)).ToBe(UInt32(4));
+
+  { Dest bound trap: array side is 'out of bounds array access'. }
+  Caught := 'no trap';
+  try
+    FHeap.ArrayInitFromData(Arr, 3, @Bytes[0], Length(Bytes), 0, 2);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_ARRAY_OUT_OF_BOUNDS);
+
+  { Source byte bound trap: the data side is 'out of bounds memory access'
+    (corpus array_init_data.wast:72). 3 i32s = 12 bytes; offset 4 leaves
+    only 8. }
+  Caught := 'no trap';
+  try
+    FHeap.ArrayInitFromData(Arr, 0, @Bytes[0], Length(Bytes), 4, 3);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_MEMORY_OUT_OF_BOUNDS);
+
+  { A null destination is an array null. }
+  Caught := 'no trap';
+  try
+    FHeap.ArrayInitFromData(WASM_REF_NULL, 0, @Bytes[0], Length(Bytes), 0, 1);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
+end;
+
+procedure TRuntimeGcTests.
+  TestArrayInitFromElemCopiesRefsAndTrapsBothBounds;
+var
+  Dest: TWasmRef;
+  A0: TWasmRef;
+  A1: TWasmRef;
+  Src: array[0..2] of TWasmRef;
+  Caught: string;
+  Root: TWasmRootHandle;
+begin
+  { exec-array.init_elem. Copy references from an element segment's Refs
+    into a reference-element array, barriered. }
+  A0 := FHeap.AllocStruct(TY_BASE);
+  A1 := FHeap.AllocStruct(TY_BASE);
+  FHeap.StructSet(A0, 0, MakeValueI32(100));
+  FHeap.StructSet(A1, 0, MakeValueI32(200));
+  Src[0] := A0;
+  Src[1] := A1;
+  Src[2] := WASM_REF_NULL;
+
+  Dest := FHeap.AllocArray(TY_REF_ARRAY, 4);
+  { Copy 2 refs from source element 1 into dest element 2. }
+  FHeap.ArrayInitFromElem(Dest, 2, Src, 1, 2);
+  Expect<Boolean>(FHeap.ArrayGet(Dest, 2).Ref = A1).ToBe(True);
+  Expect<Boolean>(RefIsNull(FHeap.ArrayGet(Dest, 3).Ref)).ToBe(True);
+  Expect<Boolean>(RefIsNull(FHeap.ArrayGet(Dest, 0).Ref)).ToBe(True);
+
+  { The stored reference is a real edge: root the dest, drop the source,
+    collect — A1 survives through the array. }
+  Root := FHeap.RootRegister(Dest);
+  Src[0] := WASM_REF_NULL;
+  Src[1] := WASM_REF_NULL;
+  FHeap.Collect;
+  Expect<Int32>(FHeap.StructGet(FHeap.ArrayGet(Dest, 2).Ref, 0).I32)
+    .ToBe(200);
+  FHeap.RootRelease(Root);
+
+  { Dest bound trap: 'out of bounds array access'. }
+  Caught := 'no trap';
+  try
+    FHeap.ArrayInitFromElem(Dest, 3, Src, 0, 2);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_ARRAY_OUT_OF_BOUNDS);
+
+  { Source bound trap: the element side is 'out of bounds table access'
+    (corpus array_init_elem.wast:89). Source has 3 entries. }
+  Caught := 'no trap';
+  try
+    FHeap.ArrayInitFromElem(Dest, 0, Src, 2, 2);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_TABLE_OUT_OF_BOUNDS);
+
+  { A null destination is an array null. }
+  Caught := 'no trap';
+  try
+    FHeap.ArrayInitFromElem(WASM_REF_NULL, 0, Src, 0, 1);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_NULL_ARRAY_REFERENCE);
 end;
 
 { --- collection ---------------------------------------------------------- }
@@ -1202,6 +1545,17 @@ begin
     TestArrayIndexOutOfBoundsTraps);
   Test('defaults are checked against aux-default, not invented',
     TestDefaultsAreCheckedNotInvented);
+
+  Test('array.copy is overlap-safe forward and backward',
+    TestArrayCopyMovesForwardAndBackwardWithoutClobbering);
+  Test('array.copy traps out of bounds on either side',
+    TestArrayCopyBoundsTrapOnEitherSide);
+  Test('array.copy preserves reference elements through the destination',
+    TestArrayCopyReferenceElementsSurviveThroughTheDestination);
+  Test('array.init_data copies packed bytes and traps both bounds',
+    TestArrayInitFromDataCopiesBytesAndTrapsBothBounds);
+  Test('array.init_elem copies references and traps both bounds',
+    TestArrayInitFromElemCopiesRefsAndTrapsBothBounds);
 
   Test('collecting with nothing live reclaims everything',
     TestCollectingWithNothingLiveReclaimsEverything);

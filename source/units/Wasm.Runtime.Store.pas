@@ -458,6 +458,26 @@ type
 
     TierInvoke: TWasmTierInvokeProc;
 
+    { The tier's per-store execution context (O-10). Opaque here, exactly
+      like TierInvoke: nil until Track E's RegisterInterpreter sets it, and
+      never interpreted by Track D. The interpreter's TWasmInterpContext —
+      the two fixed value-stack / activation reservations (interp-spec §1.1,
+      §7.3) — lives behind this pointer, so the store owns the context's
+      lifetime with NO external map keyed by store.
+
+      RegisterInterpreter(Store) sets all THREE together —
+      TierInvoke (the dispatch entry), TierContext (this pointer), and
+      TierContextFree (the teardown hook below) — and TWasmStore.Destroy
+      frees the context by calling TierContextFree(TierContext). }
+    TierContext: Pointer;
+    { The teardown hook for TierContext (O-10). A plain procedure var, not a
+      method or closure (managed state a trap unwind cannot tolerate — the
+      TRAP-1 discipline in Wasm.Runtime.Traps). nil-safe: Destroy calls it
+      only when BOTH TierContext and TierContextFree are set. Set by
+      RegisterInterpreter alongside TierInvoke/TierContext; it frees the two
+      GetMem reservations the context owns and then the context record. }
+    TierContextFree: procedure(AContext: Pointer);
+
     constructor Create(const AEngine: TWasmEngine);
     destructor Destroy; override;
 
@@ -502,6 +522,13 @@ type
       only size/limit metadata, never Base. }
     function MemMatchesImport(const AAddr: TWasmMemAddr;
       const ADeclared: TWasmMemType): Boolean;
+    { memory.size / memory.grow surface for a tier (interp-spec §3.7). Neither
+      exposes Base. MemoryPages reports the current size in pages; MemoryGrow
+      wraps Wasm.Runtime.Memory.MemoryGrow and returns the previous size in
+      pages or -1 (`exec-memory.grow` can_trap:false — growth fails, it does
+      not trap, and it never runs the collector). }
+    function MemoryPages(const AAddr: TWasmMemAddr): UInt64;
+    function MemoryGrow(const AAddr: TWasmMemAddr; const ADelta: UInt64): Int64;
     { --- table mutation, barriered (A6) -------------------------------
       A table is a ROOT ARRAY, so every reference store into one is a
       write-barrier site the GC contract names (Wasm.Runtime.Gc's
@@ -518,12 +545,32 @@ type
       const AIndex, ACount: UInt64; const ARef: TWasmRef);
     function TableGrow(const AAddr: TWasmTableAddr; const ADelta: UInt64;
       const AInit: TWasmRef): Int64;
-    { table.init / active-elem application: copy ACount refs from an element
-      instance's Refs (from ASrc) into table AAddr at ADstOffset, barriered.
+    { table.init / active-elem application: copy refs from an element
+      instance's Refs (ASrc) into table AAddr at ADstOffset, barriered.
       Traps `out of bounds table access` unless the whole destination range
-      is in bounds — the range check precedes any write. }
+      is in bounds — the range check precedes any write.
+
+      The WHOLE-array form (instantiation's active-segment application) and
+      the SLICED form (O-2, the interpreter's table.init needs a src slice)
+      overload one name. The sliced form range-checks BOTH sides: the
+      destination against the table, and [ASrcOffset, ASrcOffset+ACount)
+      against the element instance's length — a dropped segment reads as
+      empty, so any non-empty slice of it traps `out of bounds table
+      access` (exec-table.init; corpus table_init.wast). }
     procedure TableInitFromElem(const AAddr: TWasmTableAddr;
-      const ADstOffset: UInt64; const ASrc: array of TWasmRef);
+      const ADstOffset: UInt64; const ASrc: array of TWasmRef); overload;
+    procedure TableInitFromElem(const AAddr: TWasmTableAddr;
+      const ADstOffset: UInt64; const ASrc: array of TWasmRef;
+      const ASrcOffset, ACount: UInt64); overload;
+    { table.copy: copy ACount refs from table ASrcAddr at ASrcIdx into table
+      ADestAddr at ADstIdx, barriered and overlap-safe (memmove semantics
+      when the two addresses name the same table). Range-checks BOTH tables
+      before any write, trapping `out of bounds table access`
+      (exec-table.copy; corpus table_copy.wast). The store owns the barrier
+      site (O-2). }
+    procedure TableCopy(const ADestAddr: TWasmTableAddr; const ADstIdx: UInt64;
+      const ASrcAddr: TWasmTableAddr; const ASrcIdx: UInt64;
+      const ACount: UInt64);
     { AGlobalType must already be in ENGINE space. }
     function AddGlobal(const AGlobalType: TWasmGlobalType;
       const AValue: TWasmValue): TWasmGlobalAddr;
@@ -1439,6 +1486,18 @@ destructor TWasmStore.Destroy;
 var
   Index: Integer;
 begin
+  { O-10: free the tier's execution context before anything else. The store
+    owns its lifetime — RegisterInterpreter set TierContext/TierContextFree
+    together, and this hook releases the context's GetMem reservations. Guard
+    on BOTH being set so a store with no tier (or only TierInvoke) frees
+    nothing. Done first, while the store is still whole, so the hook may read
+    it if it ever needs to. }
+  if Assigned(TierContextFree) and (TierContext <> nil) then
+  begin
+    TierContextFree(TierContext);
+    TierContext := nil;
+  end;
+
   for Index := 0 to High(Instances) do
     Instances[Index].Free;
   Instances := nil;
@@ -1598,6 +1657,21 @@ begin
   Result := MatchMemImport(FMemories[AAddr], ADeclared);
 end;
 
+function TWasmStore.MemoryPages(const AAddr: TWasmMemAddr): UInt64;
+begin
+  CheckMemAddr(AAddr, Length(FMemories));
+  Result := FMemories[AAddr].Pages;
+end;
+
+function TWasmStore.MemoryGrow(const AAddr: TWasmMemAddr;
+  const ADelta: UInt64): Int64;
+begin
+  CheckMemAddr(AAddr, Length(FMemories));
+  { Qualified so the call reaches Wasm.Runtime.Memory's free function rather
+    than recursing into this method. Growth never runs the collector. }
+  Result := Wasm.Runtime.Memory.MemoryGrow(FMemories[AAddr], ADelta);
+end;
+
 { --- table mutation, barriered (A6) -------------------------------------- }
 
 procedure TWasmStore.TableSet(const AAddr: TWasmTableAddr;
@@ -1692,6 +1766,71 @@ begin
   begin
     FHeap.WriteBarrier(WASM_REF_NULL, ASrc[Cursor]);
     Tables[AAddr].Elems[ADstOffset + Cursor] := ASrc[Cursor];
+    Inc(Cursor);
+  end;
+end;
+
+procedure TWasmStore.TableInitFromElem(const AAddr: TWasmTableAddr;
+  const ADstOffset: UInt64; const ASrc: array of TWasmRef;
+  const ASrcOffset, ACount: UInt64);
+var
+  Cursor: UInt64;
+  SrcLen: UInt64;
+begin
+  { O-2 sliced form (the interpreter's table.init). BOTH sides are checked
+    before any write, so a trapping table.init writes nothing. }
+  if AAddr >= UInt32(Length(Tables)) then
+    raise EWasmError.CreateFmt('internal: no table %u', [AAddr]);
+  { Source range against the element instance's length; subtracting form so
+    a large offset on a long slice cannot wrap. A dropped segment has
+    Length 0, so any non-empty slice traps. Same message as the dest side. }
+  SrcLen := UInt64(Length(ASrc));
+  if (ASrcOffset > SrcLen) or (ACount > SrcLen - ASrcOffset) then
+    TrapNow(wtkTableOutOfBounds);
+  TableCheckRange(Tables[AAddr], ADstOffset, ACount);
+  Cursor := 0;
+  while Cursor < ACount do
+  begin
+    FHeap.WriteBarrier(WASM_REF_NULL, ASrc[ASrcOffset + Cursor]);
+    Tables[AAddr].Elems[ADstOffset + Cursor] := ASrc[ASrcOffset + Cursor];
+    Inc(Cursor);
+  end;
+end;
+
+procedure TWasmStore.TableCopy(const ADestAddr: TWasmTableAddr;
+  const ADstIdx: UInt64; const ASrcAddr: TWasmTableAddr;
+  const ASrcIdx: UInt64; const ACount: UInt64);
+var
+  Cursor: UInt64;
+  Slot: UInt64;
+  Backward: Boolean;
+  Ref: TWasmRef;
+begin
+  if ADestAddr >= UInt32(Length(Tables)) then
+    raise EWasmError.CreateFmt('internal: no table %u', [ADestAddr]);
+  if ASrcAddr >= UInt32(Length(Tables)) then
+    raise EWasmError.CreateFmt('internal: no table %u', [ASrcAddr]);
+  { BOTH ranges checked before any write, trapping 'out of bounds table
+    access' (exec-table.copy). The range check precedes the copy so a
+    trapping table.copy leaves the destination untouched. }
+  TableCheckRange(Tables[ADestAddr], ADstIdx, ACount);
+  TableCheckRange(Tables[ASrcAddr], ASrcIdx, ACount);
+
+  { memmove semantics: only the SAME table can overlap, and then a forward
+    copy clobbers not-yet-read source slots when the destination is higher,
+    so copy backward in exactly that case. }
+  Backward := (ADestAddr = ASrcAddr) and (ADstIdx > ASrcIdx);
+  Cursor := 0;
+  while Cursor < ACount do
+  begin
+    if Backward then
+      Slot := ACount - 1 - Cursor
+    else
+      Slot := Cursor;
+    Ref := Tables[ASrcAddr].Elems[ASrcIdx + Slot];
+    { Root-array store: barrier at every reference store (empty in v1). }
+    FHeap.WriteBarrier(WASM_REF_NULL, Ref);
+    Tables[ADestAddr].Elems[ADstIdx + Slot] := Ref;
     Inc(Cursor);
   end;
 end;

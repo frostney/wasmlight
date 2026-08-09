@@ -520,6 +520,49 @@ type
     procedure ArrayFill(const ARef: TWasmRef;
       const AOffset, ACount: UInt32; const AValue: TWasmValue); overload;
 
+    { --- bulk array ops the interpreter's array.copy/init_* need (O-6/O-8) --
+      Each reads the layout(s) ONCE, honours packed element widths, and calls
+      WriteBarrier at every reference-element store. Trap kinds/messages are
+      corpus-CONFIRMED (the pinned server reports the whole 3.0 array family
+      can_trap:false, a gap in the served data) — see the anchor and corpus
+      line at each implementation. }
+
+    { array.copy (exec-array.copy). Copy ACount elements from ASrc[ASrcIdx..]
+      into ADest[ADestIdx..]. Element-type-compatible by validation, so the
+      widths match. Overlap-safe (memmove semantics) when source and
+      destination are the SAME array. A null on EITHER side traps
+      'null array reference'; either range out of bounds traps
+      'out of bounds array access' (corpus array_copy.wast:97-98, 101-106).
+      Barriered per reference element. }
+    procedure ArrayCopy(const ADest: TWasmRef; const ADestIdx: UInt32;
+      const ASrc: TWasmRef; const ASrcIdx: UInt32; const ACount: UInt32);
+
+    { array.init_data (exec-array.init_data). Copy ACount elements from a
+      passive/active data segment's bytes (ADataBytes, ADataSize, borrowed —
+      Gc sits below Wasm.Runtime.Store so the caller passes the raw span, not
+      a TWasmDataInst) starting at BYTE offset ADataByteOffset into a
+      numeric/packed-element array. ADataByteOffset is a byte offset; each
+      element is the array element's storage width. A null dest traps
+      'null array reference'; the DEST range out of bounds traps
+      'out of bounds array access'; the DATA source byte range out of bounds
+      traps 'out of bounds memory access' (corpus array_init_data.wast:68,
+      71-72). No barrier — array.init_data's element type is never a
+      reference (the validator guarantees it). }
+    procedure ArrayInitFromData(const ADest: TWasmRef; const ADestIdx: UInt32;
+      const ADataBytes: PByte; const ADataSize: NativeUInt;
+      const ADataByteOffset: UInt64; const ACount: UInt32);
+
+    { array.init_elem (exec-array.init_elem). Copy ACount references from an
+      element segment's Refs (ASrc, borrowed) starting at element index
+      ASrcOffset into a reference-element array. A null dest traps
+      'null array reference'; the DEST range out of bounds traps
+      'out of bounds array access'; the ELEM source range out of bounds traps
+      'out of bounds table access' (corpus array_init_elem.wast:85, 88-89).
+      Barriered per element. }
+    procedure ArrayInitFromElem(const ADest: TWasmRef; const ADestIdx: UInt32;
+      const ASrc: array of TWasmRef; const ASrcOffset: UInt32;
+      const ACount: UInt32);
+
     function ExnTagAddr(const ARef: TWasmRef): UInt32;
     function ExnArgCount(const ARef: TWasmRef): UInt32;
     function ExnArg(const ARef: TWasmRef; const AIndex: UInt32): TWasmValue;
@@ -1397,8 +1440,11 @@ function TWasmGcHeap.StructField(const ARef: TWasmRef;
 var
   Layout: PWasmGcLayout;
 begin
+  { O-5: struct.get/get_s/get_u/set on a null ref trap the TYPE-SPECIFIC
+    kind (corpus struct.wast:155-156, 'null structure reference'), not the
+    bare wtkNullReference the ref.as_non_null path uses. }
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullStructReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckStruct then
     raise EWasmError.Create('internal: not a struct instance');
@@ -1412,7 +1458,7 @@ end;
 function TWasmGcHeap.StructFieldCount(const ARef: TWasmRef): UInt32;
 begin
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullStructReference);
   Result := UInt32(Length(LayoutOf(ARef)^.Fields));
 end;
 
@@ -1468,7 +1514,7 @@ var
   Value: TWasmValue;
 begin
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullStructReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckStruct then
     raise EWasmError.Create('internal: not a struct instance');
@@ -1488,8 +1534,11 @@ end;
 
 function TWasmGcHeap.ArrayLength(const ARef: TWasmRef): UInt32;
 begin
+  { O-5: array.get/get_s/get_u/set/len/fill/copy/init_* on a null ref trap
+    'null array reference' (corpus array.wast:342-343, array_len.* etc.),
+    not the bare wtkNullReference. }
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullArrayReference);
   Result := UInt32(PWasmU64(PByte(RefToPointer(ARef)) +
     WASM_ARRAY_LENGTH_OFFSET)^);
 end;
@@ -1500,7 +1549,7 @@ var
   Layout: PWasmGcLayout;
 begin
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
     raise EWasmError.Create('internal: not an array instance');
@@ -1570,7 +1619,7 @@ begin
     when array.fill and array.new_default routed each element through
     ArraySet (null check + kind check + bounds + layout, per element). }
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
     raise EWasmError.Create('internal: not an array instance');
@@ -1616,7 +1665,7 @@ var
   Value: TWasmValue;
 begin
   if RefIsNull(ARef) then
-    TrapNow(wtkNullReference);
+    TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
     raise EWasmError.Create('internal: not an array instance');
@@ -1627,6 +1676,193 @@ begin
     raise EWasmError.Create(MSG_GC_ARRAY_ELEM_NO_DEFAULT);
   Value.Bits := 0;
   FillRange(ARef, 0, ArrayLength(ARef), Value);
+end;
+
+procedure TWasmGcHeap.ArrayCopy(const ADest: TWasmRef;
+  const ADestIdx: UInt32; const ASrc: TWasmRef; const ASrcIdx: UInt32;
+  const ACount: UInt32);
+var
+  DestLayout: PWasmGcLayout;
+  SrcLayout: PWasmGcLayout;
+  DestBase: PByte;
+  SrcBase: PByte;
+  DestLen: UInt32;
+  SrcLen: UInt32;
+  DestField: TWasmGcField;
+  SrcField: TWasmGcField;
+  Value: TWasmValue;
+  Cursor: UInt32;
+  Slot: UInt32;
+  Backward: Boolean;
+begin
+  { exec-array.copy. Null on EITHER side traps 'null array reference' (both
+    corpus lines spell the same message), checked before the ranges. }
+  if RefIsNull(ADest) then
+    TrapNow(wtkNullArrayReference);
+  if RefIsNull(ASrc) then
+    TrapNow(wtkNullArrayReference);
+  DestLayout := LayoutOf(ADest);
+  if DestLayout^.Kind <> wckArray then
+    raise EWasmError.Create(
+      'internal: array.copy destination is not an array');
+  SrcLayout := LayoutOf(ASrc);
+  if SrcLayout^.Kind <> wckArray then
+    raise EWasmError.Create('internal: array.copy source is not an array');
+
+  DestBase := PByte(RefToPointer(ADest));
+  SrcBase := PByte(RefToPointer(ASrc));
+  DestLen := UInt32(PWasmU64(DestBase + WASM_ARRAY_LENGTH_OFFSET)^);
+  SrcLen := UInt32(PWasmU64(SrcBase + WASM_ARRAY_LENGTH_OFFSET)^);
+
+  { Both ranges 'out of bounds array access'; overflow-safe subtracting
+    form so a large index cannot wrap into range. Dest range then source
+    range — either spells the same message. }
+  if (ADestIdx > DestLen) or (ACount > DestLen - ADestIdx) then
+    TrapNow(wtkArrayOutOfBounds);
+  if (ASrcIdx > SrcLen) or (ACount > SrcLen - ASrcIdx) then
+    TrapNow(wtkArrayOutOfBounds);
+
+  { Layout read ONCE for each side; the element field widths match by
+    validation (element-type compatibility). }
+  DestField := DestLayout^.Elem;
+  SrcField := SrcLayout^.Elem;
+
+  { memmove semantics: only the SAME array can overlap, and a forward copy
+    then clobbers not-yet-read source elements when the destination is
+    higher, so copy backward in exactly that case. }
+  Backward := (DestBase = SrcBase) and (ADestIdx > ASrcIdx);
+
+  Cursor := 0;
+  while Cursor < ACount do
+  begin
+    if Backward then
+      Slot := ACount - 1 - Cursor
+    else
+      Slot := Cursor;
+    SrcField.Offset := SrcLayout^.Elem.Offset +
+      (ASrcIdx + Slot) * SrcLayout^.Elem.Width;
+    DestField.Offset := DestLayout^.Elem.Offset +
+      (ADestIdx + Slot) * DestLayout^.Elem.Width;
+    Value := ReadField(SrcBase, SrcField);
+    WriteField(DestBase, DestField, Value);
+    { Barriered per reference element (empty in v1; the site is the point). }
+    if DestField.IsRef then
+      WriteBarrier(ADest, TWasmRef(Value.Bits));
+    Inc(Cursor);
+  end;
+end;
+
+procedure TWasmGcHeap.ArrayInitFromData(const ADest: TWasmRef;
+  const ADestIdx: UInt32; const ADataBytes: PByte; const ADataSize: NativeUInt;
+  const ADataByteOffset: UInt64; const ACount: UInt32);
+var
+  Layout: PWasmGcLayout;
+  Base: PByte;
+  DestLen: UInt32;
+  ElemOffset: UInt32;
+  ElemWidth: UInt32;
+  SrcEnd: UInt64;
+  Cursor: UInt32;
+  Src: PByte;
+  Dst: PByte;
+begin
+  { exec-array.init_data. Null, then the DEST (array) range, then the DATA
+    (memory) range — the spec checks the array bound before the data bound. }
+  if RefIsNull(ADest) then
+    TrapNow(wtkNullArrayReference);
+  Layout := LayoutOf(ADest);
+  if Layout^.Kind <> wckArray then
+    raise EWasmError.Create(
+      'internal: array.init_data target is not an array');
+  { array.init_data's element type is numeric or packed, never a reference
+    (the validator guarantees it), so no write barrier is owed. }
+  if Layout^.Elem.IsRef then
+    raise EWasmError.Create(
+      'internal: array.init_data on a reference-element array');
+
+  Base := PByte(RefToPointer(ADest));
+  DestLen := UInt32(PWasmU64(Base + WASM_ARRAY_LENGTH_OFFSET)^);
+  if (ADestIdx > DestLen) or (ACount > DestLen - ADestIdx) then
+    TrapNow(wtkArrayOutOfBounds);
+
+  ElemOffset := Layout^.Elem.Offset;
+  ElemWidth := Layout^.Elem.Width;
+  { A v128 element is a valid TYPE whose storage is staged (Track G),
+    exactly as ReadField/WriteField treat width 16. }
+  if (ElemWidth <> 1) and (ElemWidth <> 2) and (ElemWidth <> 4) and
+    (ElemWidth <> 8) then
+    raise EWasmError.Create(MSG_GC_VEC_STORAGE_STAGED);
+
+  { Byte bound on the data side, in u64 so offset+count cannot wrap. The
+    DATA side is a memory-style bound: 'out of bounds memory access'
+    (corpus array_init_data.wast:72). }
+  SrcEnd := ADataByteOffset + UInt64(ACount) * UInt64(ElemWidth);
+  if SrcEnd > UInt64(ADataSize) then
+    TrapNow(wtkMemoryOutOfBounds);
+
+  { A width-sized little-endian byte copy per element: the data segment
+    image and packed/numeric element storage are both LE byte arrays, so
+    Move reproduces the typed load+store WriteField would perform, and
+    honours the packed element width. }
+  Cursor := 0;
+  while Cursor < ACount do
+  begin
+    Src := ADataBytes + NativeUInt(ADataByteOffset) +
+      NativeUInt(Cursor) * NativeUInt(ElemWidth);
+    Dst := Base + ElemOffset + (ADestIdx + Cursor) * ElemWidth;
+    Move(Src^, Dst^, ElemWidth);
+    Inc(Cursor);
+  end;
+end;
+
+procedure TWasmGcHeap.ArrayInitFromElem(const ADest: TWasmRef;
+  const ADestIdx: UInt32; const ASrc: array of TWasmRef;
+  const ASrcOffset: UInt32; const ACount: UInt32);
+var
+  Layout: PWasmGcLayout;
+  Base: PByte;
+  DestLen: UInt32;
+  SrcLen: UInt32;
+  ElemOffset: UInt32;
+  ElemWidth: UInt32;
+  Cursor: UInt32;
+  Ref: TWasmRef;
+begin
+  { exec-array.init_elem. Null, then the DEST (array) range, then the ELEM
+    (table-shaped) source range. }
+  if RefIsNull(ADest) then
+    TrapNow(wtkNullArrayReference);
+  Layout := LayoutOf(ADest);
+  if Layout^.Kind <> wckArray then
+    raise EWasmError.Create(
+      'internal: array.init_elem target is not an array');
+  if not Layout^.Elem.IsRef then
+    raise EWasmError.Create(
+      'internal: array.init_elem on a non-reference-element array');
+
+  Base := PByte(RefToPointer(ADest));
+  DestLen := UInt32(PWasmU64(Base + WASM_ARRAY_LENGTH_OFFSET)^);
+  if (ADestIdx > DestLen) or (ACount > DestLen - ADestIdx) then
+    TrapNow(wtkArrayOutOfBounds);
+
+  { The source is the element segment's references; a range past its length
+    traps 'out of bounds table access' (corpus array_init_elem.wast:89). A
+    dropped segment reads as empty (Length 0). }
+  SrcLen := UInt32(Length(ASrc));
+  if (ASrcOffset > SrcLen) or (ACount > SrcLen - ASrcOffset) then
+    TrapNow(wtkTableOutOfBounds);
+
+  ElemOffset := Layout^.Elem.Offset;
+  ElemWidth := Layout^.Elem.Width;
+  Cursor := 0;
+  while Cursor < ACount do
+  begin
+    Ref := ASrc[ASrcOffset + Cursor];
+    PWasmRef(Base + ElemOffset + (ADestIdx + Cursor) * ElemWidth)^ := Ref;
+    { Barriered per reference element. }
+    WriteBarrier(ADest, Ref);
+    Inc(Cursor);
+  end;
 end;
 
 function TWasmGcHeap.ExnTagAddr(const ARef: TWasmRef): UInt32;

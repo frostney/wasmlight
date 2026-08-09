@@ -120,6 +120,9 @@ type
     procedure TestTableBoundsAreExact;
     procedure TestTableRangeChecksDoNotWrap;
     procedure TestTableGrowRespectsTheMaximum;
+    procedure TestTableCopyIsOverlapSafeAndTrapsBothSides;
+    procedure TestTableInitFromElemSliceTrapsBothSides;
+    procedure TestTierContextIsFreedOnStoreTeardown;
     procedure TestFuncRefHandlesAreAlignedAndStable;
     procedure TestFuncRefHandlesComeFromTheCollector;
     procedure TestRuntimeCastIsCrossModule;
@@ -189,6 +192,21 @@ begin
   Ir.Free;
   Module.Free;
   inherited Destroy;
+end;
+
+{ --- O-10 teardown sentinel ---------------------------------------------
+  Evidence that TWasmStore.Destroy invokes TierContextFree with the exact
+  TierContext pointer. A file-level procedure and file-level variables
+  because TierContextFree is a plain procedure var — a method or closure is
+  managed state the store's teardown path must not carry. }
+var
+  GTierFreeCount: Integer;
+  GTierFreedContext: Pointer;
+
+procedure RecordTierContextFree(AContext: Pointer);
+begin
+  Inc(GTierFreeCount);
+  GTierFreedContext := AContext;
 end;
 
 { --- fixture ------------------------------------------------------------- }
@@ -774,6 +792,147 @@ begin
   Expect<Boolean>(TableSize(FStore.Tables[Addr]) = 2).ToBe(True);
 end;
 
+{ --- barriered table bulk ops (O-2) -------------------------------------- }
+
+procedure TRuntimeStoreTests.TestTableCopyIsOverlapSafeAndTrapsBothSides;
+var
+  Addr: TWasmTableAddr;
+  Other: TWasmTableAddr;
+  Index: Integer;
+  Caught: string;
+begin
+  { exec-table.copy through the store's barriered method. Overlap within one
+    table is memmove; between two tables it is a straight copy. Both ranges
+    trap 'out of bounds table access' (corpus table_copy.wast). }
+  Addr := FStore.AddTable(MakeTableType(
+    MakeRefType(True, MakeAbsHeapType(wahAny)),
+    MakeLimits(watI32, 6)), WASM_REF_NULL);
+  for Index := 0 to 5 do
+    FStore.TableSet(Addr, UInt64(Index), MakeI31Ref(Index));
+
+  { Backward overlap: dstIdx > srcIdx. Copy 3 from 0 into 2 => slots 2,3,4
+    become 0,1,2. A forward loop would clobber slot 4 by reading an
+    already-written slot. }
+  FStore.TableCopy(Addr, 2, Addr, 0, 3);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 0))).ToBe(0);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 1))).ToBe(1);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 2))).ToBe(0);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 3))).ToBe(1);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 4))).ToBe(2);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 5))).ToBe(5);
+
+  { Distinct tables: no overlap. Copies the current [0,1,0] prefix. }
+  Other := FStore.AddTable(MakeTableType(
+    MakeRefType(True, MakeAbsHeapType(wahAny)),
+    MakeLimits(watI32, 3)), WASM_REF_NULL);
+  FStore.TableCopy(Other, 0, Addr, 0, 3);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Other], 0))).ToBe(0);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Other], 1))).ToBe(1);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Other], 2))).ToBe(0);
+
+  { A zero count at exactly the size is in bounds and copies nothing. }
+  FStore.TableCopy(Addr, 6, Addr, 6, 0);
+
+  { Dest range out of bounds. }
+  Caught := 'no trap';
+  try
+    FStore.TableCopy(Addr, 4, Addr, 0, 3);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_TABLE_OUT_OF_BOUNDS);
+
+  { Source range out of bounds. }
+  Caught := 'no trap';
+  try
+    FStore.TableCopy(Addr, 0, Addr, 4, 3);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_TABLE_OUT_OF_BOUNDS);
+end;
+
+procedure TRuntimeStoreTests.TestTableInitFromElemSliceTrapsBothSides;
+var
+  Addr: TWasmTableAddr;
+  Src: array[0..3] of TWasmRef;
+  Index: Integer;
+  Caught: string;
+begin
+  { O-2 sliced form. Both sides checked before any write; a trapping
+    table.init writes nothing. }
+  Addr := FStore.AddTable(MakeTableType(
+    MakeRefType(True, MakeAbsHeapType(wahAny)),
+    MakeLimits(watI32, 5)), WASM_REF_NULL);
+  for Index := 0 to 3 do
+    Src[Index] := MakeI31Ref(10 + Index);
+
+  { Copy 2 refs from source element 1 into table offset 2. }
+  FStore.TableInitFromElem(Addr, 2, Src, 1, 2);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 2))).ToBe(11);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 3))).ToBe(12);
+  Expect<Boolean>(RefIsNull(TableGet(FStore.Tables[Addr], 0))).ToBe(True);
+
+  { Destination range out of bounds. }
+  Caught := 'no trap';
+  try
+    FStore.TableInitFromElem(Addr, 4, Src, 0, 2);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_TABLE_OUT_OF_BOUNDS);
+
+  { Source range out of bounds: 4 entries, offset 3 + count 2 > 4. }
+  Caught := 'no trap';
+  try
+    FStore.TableInitFromElem(Addr, 0, Src, 3, 2);
+  except
+    on E: EWasmTrap do
+      Caught := E.Message;
+  end;
+  Expect<string>(Caught).ToBe(MSG_TRAP_TABLE_OUT_OF_BOUNDS);
+
+  { The whole-array overload the instantiator uses is undisturbed. }
+  FStore.TableInitFromElem(Addr, 0, Src);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 0))).ToBe(10);
+  Expect<Int32>(I31GetSigned(TableGet(FStore.Tables[Addr], 3))).ToBe(13);
+end;
+
+procedure TRuntimeStoreTests.TestTierContextIsFreedOnStoreTeardown;
+var
+  S: TWasmStore;
+  Ctx: Pointer;
+begin
+  { O-10: the store owns the tier context's lifetime. RegisterInterpreter
+    sets TierInvoke/TierContext/TierContextFree together, and Destroy frees
+    the context via TierContextFree(TierContext) with no external map. }
+  GTierFreeCount := 0;
+  GTierFreedContext := nil;
+
+  { A sentinel pointer standing in for TWasmInterpContext; the hook records
+    it rather than freeing, so the test owns the allocation. }
+  Ctx := GetMem(16);
+  S := TWasmStore.Create(FEngine);
+  S.TierContext := Ctx;
+  S.TierContextFree := @RecordTierContextFree;
+  S.Free;
+
+  Expect<Integer>(GTierFreeCount).ToBe(1);
+  Expect<Boolean>(GTierFreedContext = Ctx).ToBe(True);
+  FreeMem(Ctx);
+
+  { The guard is on BOTH fields: a store with the hook but a nil context
+    must not call through (nor the reverse). }
+  GTierFreeCount := 0;
+  S := TWasmStore.Create(FEngine);
+  S.TierContextFree := @RecordTierContextFree;   { TierContext stays nil }
+  S.Free;
+  Expect<Integer>(GTierFreeCount).ToBe(0);
+end;
+
 { --- handles, trampoline, thread ----------------------------------------- }
 
 procedure TRuntimeStoreTests.TestFuncRefHandlesAreAlignedAndStable;
@@ -1056,6 +1215,12 @@ begin
     TestTableRangeChecksDoNotWrap);
   Test('table.grow respects the maximum and returns -1',
     TestTableGrowRespectsTheMaximum);
+  Test('table.copy is overlap-safe and traps out of bounds both sides',
+    TestTableCopyIsOverlapSafeAndTrapsBothSides);
+  Test('table.init from an element slice traps out of bounds both sides',
+    TestTableInitFromElemSliceTrapsBothSides);
+  Test('the tier context is freed on store teardown',
+    TestTierContextIsFreedOnStoreTeardown);
   Test('funcref handles are aligned, stable and distinct',
     TestFuncRefHandlesAreAlignedAndStable);
   Test('funcref handles are collector objects the store keeps rooted',

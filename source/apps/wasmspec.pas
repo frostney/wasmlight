@@ -6,12 +6,16 @@
   Wasm.Wast.Runner judges the commands it can judge, and everything here
   is argument handling and reporting.
 
-  WHAT A RUN MEANS TODAY. There is no execution tier and no text-format
-  assembler, so only `(module binary ...)` cases — top level,
-  `assert_malformed`, and `assert_invalid` — get a real verdict. The rest
-  are counted as SKIPPED with a reason. That is deliberate and it is why
-  the skip column is never folded into the totals: a report from this
-  program must not read as more conformance than was actually measured.
+  WHAT A RUN MEANS TODAY. The interpreter tier is wired in (Track E), so
+  `(module binary ...)` cases now decode, validate, INSTANTIATE, and run:
+  top-level modules, `assert_malformed`/`assert_invalid`, and the action
+  and result assertions (`assert_return`, `assert_trap`,
+  `assert_exhaustion`, `invoke`, `register`, `get`). There is still no
+  text-format assembler, so the overwhelming majority of the corpus — which
+  spells its modules in the text format — is SKIPPED with a reason until
+  that lands (Track C). The skip column is never folded into the totals: a
+  report from this program must not read as more conformance than was
+  actually measured.
 
   OUTPUT IS ONE LINE PER FACT, on stdout, in a fixed leading-token shape
   (`FAIL`, `STAGED`, `SKIP`, `PASS`, `FILE`, `TOTAL`, `ERROR`) so a run
@@ -247,10 +251,10 @@ begin
   Write(GenerateHelpText(TOOL_NAME, '[options] <script.wast|directory>...',
     AOptions));
   WriteLn;
-  WriteLn('Only (module binary ...) cases are judged today: assert_malformed,');
-  WriteLn('assert_invalid, and top-level modules. Everything else is reported as');
-  WriteLn('SKIP with a reason. Exit code is 0 only when nothing failed and every');
-  WriteLn('script could be read and parsed.');
+  WriteLn('Only (module binary ...) cases are judged: modules decode, validate,');
+  WriteLn('and run (assert_return/assert_trap/assert_exhaustion/invoke). Text-format');
+  WriteLn('modules still need the assembler and are reported as SKIP. Exit code is 0');
+  WriteLn('only when nothing failed and every script could be read and parsed.');
 end;
 
 var
