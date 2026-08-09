@@ -302,6 +302,12 @@ type
     falls out of addresses-being-indices and is the spec's model. }
   TWasmGlobalInst = record
     Value: TWasmValue;
+    { Used iff GlobalType's value type is wvkVec (simd-spec §1.7). A
+      dedicated 16-byte cell rather than a two-slot pair keeps every scalar
+      global accessor branch-free; the vector path has its own IR ops
+      (iroGlobalGetVec / iroGlobalSetVec). A v128 is never a reference, so
+      this never participates in the root scan. }
+    Vec: TWasmV128;
     GlobalType: TWasmGlobalType;
   end;
 
@@ -574,6 +580,10 @@ type
     { AGlobalType must already be in ENGINE space. }
     function AddGlobal(const AGlobalType: TWasmGlobalType;
       const AValue: TWasmValue): TWasmGlobalAddr;
+    { A v128 global: the 16-byte initial value goes to the Vec cell. A
+      vector is never a reference, so this never joins the root list. }
+    function AddGlobalVec(const AGlobalType: TWasmGlobalType;
+      const AVec: TWasmV128): TWasmGlobalAddr;
     function AddTag(const ATypeId: TWasmEngineTypeId): TWasmTagAddr;
     function AddElem(const ARefType: TWasmRefType): TWasmElemAddr;
     function AddData(const AData: PByte;
@@ -1859,6 +1869,17 @@ begin
     FRefGlobals[FRefGlobalCount] := Result;
     Inc(FRefGlobalCount);
   end;
+end;
+
+function TWasmStore.AddGlobalVec(const AGlobalType: TWasmGlobalType;
+  const AVec: TWasmV128): TWasmGlobalAddr;
+begin
+  Result := TWasmGlobalAddr(Length(Globals));
+  SetLength(Globals, Length(Globals) + 1);
+  Globals[Result].GlobalType := AGlobalType;
+  Globals[Result].Value.Bits := 0;
+  Globals[Result].Vec := AVec;
+  { A v128 is never a reference: nothing to register as a root. }
 end;
 
 function TWasmStore.AddTag(

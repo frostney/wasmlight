@@ -130,18 +130,6 @@ const
   MSG_GC_ARRAY_ELEM_NO_DEFAULT =
     'internal: the array element type has no default value';
 
-  { A v128 struct field or array element is a valid TYPE (the validator
-    admits vector storage types; only the $FD instruction space is staged),
-    so a valid module can reach a v128 field at run time through
-    struct.new_default / array.new_default (the zero vector default) or a
-    struct.get / array.get whose v128 result is dropped. That is a staged-
-    SIMD gap (Track G), NOT a bare 'internal:' engine bug (B15). This string
-    mirrors Wasm.Validator.Types.MSG_SIMD_NOT_IMPLEMENTED verbatim — that
-    unit sits above this one, so the constant is duplicated deliberately —
-    so the message a module sees for staged SIMD is the same wherever it is
-    hit. }
-  MSG_GC_VEC_STORAGE_STAGED = 'SIMD validation is not implemented';
-
   { Object layouts, by kind. Every one starts with the header word and
     every total is rounded up to 8.
 
@@ -498,6 +486,14 @@ type
       const AField: UInt32): UInt32;
     procedure StructSet(const ARef: TWasmRef; const AField: UInt32;
       const AValue: TWasmValue);
+    { struct.get / struct.set on a v128 field (simd-spec §7). The field is
+      never packed and never a reference, so there is no get_s/get_u split
+      and no write barrier; the value is a 16-byte copy through
+      ReadFieldV128 / WriteFieldV128. }
+    procedure StructGetVec(const ARef: TWasmRef; const AField: UInt32;
+      const ADest: PWasmV128);
+    procedure StructSetVec(const ARef: TWasmRef; const AField: UInt32;
+      const ASrc: PWasmV128);
 
     function ArrayLength(const ARef: TWasmRef): UInt32;
     function ArrayGet(const ARef: TWasmRef;
@@ -508,6 +504,14 @@ type
       const AIndex: UInt32): UInt32;
     procedure ArraySet(const ARef: TWasmRef; const AIndex: UInt32;
       const AValue: TWasmValue);
+    { array.get / array.set on a v128 element, and array.fill's RANGE form
+      with a v128 value (simd-spec §7). 16-byte copies, no barrier. }
+    procedure ArrayGetVec(const ARef: TWasmRef; const AIndex: UInt32;
+      const ADest: PWasmV128);
+    procedure ArraySetVec(const ARef: TWasmRef; const AIndex: UInt32;
+      const ASrc: PWasmV128);
+    procedure ArrayFillVec(const ARef: TWasmRef;
+      const AOffset, ACount: UInt32; const ASrc: PWasmV128);
     { Whole-array fill (array.new's initialiser). Kept as the two-argument
       form so existing callers are undisturbed; both overloads read layout,
       element field and length ONCE and store in place, rather than routing
@@ -1395,9 +1399,26 @@ begin
     2: Result.Bits := UInt64(PWasmU16(ABase + AField.Offset)^);
     4: Result.Bits := UInt64(PWasmU32(ABase + AField.Offset)^);
     8: Result.Bits := PWasmU64(ABase + AField.Offset)^;
-  else
-    raise EWasmError.Create(MSG_GC_VEC_STORAGE_STAGED);
+    { Width 16 (v128) does not have an 8-byte scalar view: a v128 field is
+      read only through ReadFieldV128, driven by the iroStructGetVec /
+      iroArrayGetVec ops. The scalar path never asks for a v128 value —
+      struct.new_default / array.new_default zero the whole cell before any
+      field write, and that zero IS the vector default (simd-spec §7). }
   end;
+end;
+
+{ A 16-byte copy at the field's offset (simd-spec §7). A v128 is never
+  packed, never a reference: no truncation, no sign-extension, no barrier. }
+procedure ReadFieldV128(const ABase: PByte; const AField: TWasmGcField;
+  const ADest: PWasmV128);
+begin
+  Move((ABase + AField.Offset)^, ADest^, 16);
+end;
+
+procedure WriteFieldV128(const ABase: PByte; const AField: TWasmGcField;
+  const ASrc: PWasmV128);
+begin
+  Move(ASrc^, (ABase + AField.Offset)^, 16);
 end;
 
 procedure WriteField(const ABase: PByte; const AField: TWasmGcField;
@@ -1415,8 +1436,10 @@ begin
     2: PWasmU16(ABase + AField.Offset)^ := Word(AValue.Bits);
     4: PWasmU32(ABase + AField.Offset)^ := UInt32(AValue.Bits);
     8: PWasmU64(ABase + AField.Offset)^ := AValue.Bits;
-  else
-    raise EWasmError.Create(MSG_GC_VEC_STORAGE_STAGED);
+    { Width 16 (v128) is written only through WriteFieldV128 (the *Vec IR
+      ops). The one scalar caller that names a v128 field is the
+      new_default zeroing loop, and a v128's default is the zero the cell
+      already holds — so the fall-through no-op is correct (simd-spec §7). }
   end;
 end;
 
@@ -1505,6 +1528,18 @@ begin
   WriteField(PByte(RefToPointer(ARef)), Field, AValue);
   if Field.IsRef then
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
+end;
+
+procedure TWasmGcHeap.StructGetVec(const ARef: TWasmRef; const AField: UInt32;
+  const ADest: PWasmV128);
+begin
+  ReadFieldV128(PByte(RefToPointer(ARef)), StructField(ARef, AField), ADest);
+end;
+
+procedure TWasmGcHeap.StructSetVec(const ARef: TWasmRef; const AField: UInt32;
+  const ASrc: PWasmV128);
+begin
+  WriteFieldV128(PByte(RefToPointer(ARef)), StructField(ARef, AField), ASrc);
 end;
 
 procedure TWasmGcHeap.StructSetDefaults(const ARef: TWasmRef);
@@ -1601,6 +1636,50 @@ begin
   WriteField(PByte(RefToPointer(ARef)), Field, AValue);
   if Field.IsRef then
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
+end;
+
+procedure TWasmGcHeap.ArrayGetVec(const ARef: TWasmRef; const AIndex: UInt32;
+  const ADest: PWasmV128);
+begin
+  ReadFieldV128(PByte(RefToPointer(ARef)), ArrayElement(ARef, AIndex), ADest);
+end;
+
+procedure TWasmGcHeap.ArraySetVec(const ARef: TWasmRef; const AIndex: UInt32;
+  const ASrc: PWasmV128);
+begin
+  WriteFieldV128(PByte(RefToPointer(ARef)), ArrayElement(ARef, AIndex), ASrc);
+end;
+
+{ The v128 twin of FillRange: layout, base and length read ONCE, the range
+  checked overflow-safe, each element a 16-byte store. No barrier — a v128
+  element is never a reference (simd-spec §7). }
+procedure TWasmGcHeap.ArrayFillVec(const ARef: TWasmRef;
+  const AOffset, ACount: UInt32; const ASrc: PWasmV128);
+var
+  Layout: PWasmGcLayout;
+  Base: PByte;
+  Field: TWasmGcField;
+  ElemOffset, ElemWidth, Len, Cursor: UInt32;
+begin
+  if RefIsNull(ARef) then
+    TrapNow(wtkNullArrayReference);
+  Layout := LayoutOf(ARef);
+  if Layout^.Kind <> wckArray then
+    raise EWasmError.Create('internal: not an array instance');
+  Base := PByte(RefToPointer(ARef));
+  Len := UInt32(PWasmU64(Base + WASM_ARRAY_LENGTH_OFFSET)^);
+  if (AOffset > Len) or (ACount > Len - AOffset) then
+    TrapNow(wtkArrayOutOfBounds);
+  Field := Layout^.Elem;
+  ElemOffset := Layout^.Elem.Offset;
+  ElemWidth := Layout^.Elem.Width;
+  Cursor := 0;
+  while Cursor < ACount do
+  begin
+    Field.Offset := ElemOffset + (AOffset + Cursor) * ElemWidth;
+    WriteFieldV128(Base, Field, ASrc);
+    Inc(Cursor);
+  end;
 end;
 
 procedure TWasmGcHeap.FillRange(const ARef: TWasmRef;
@@ -1787,11 +1866,10 @@ begin
 
   ElemOffset := Layout^.Elem.Offset;
   ElemWidth := Layout^.Elem.Width;
-  { A v128 element is a valid TYPE whose storage is staged (Track G),
-    exactly as ReadField/WriteField treat width 16. }
-  if (ElemWidth <> 1) and (ElemWidth <> 2) and (ElemWidth <> 4) and
-    (ElemWidth <> 8) then
-    raise EWasmError.Create(MSG_GC_VEC_STORAGE_STAGED);
+  { The width-sized Move below reproduces a typed store for every element
+    width the layout can produce, width 16 (a v128 element) included: the
+    data image and the element storage are both little-endian byte arrays
+    (simd-spec §7). }
 
   { Byte bound on the data side, in u64 so offset+count cannot wrap. The
     DATA side is a memory-style bound: 'out of bounds memory access'

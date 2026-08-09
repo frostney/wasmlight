@@ -48,6 +48,10 @@ type
     procedure TestSafepointClassification;
     procedure TestReferenceRegisterBitset;
     procedure TestFormatVersionIsStamped;
+    procedure TestVectorRegisterAllocation;
+    procedure TestVectorAuxRoundTrips;
+    procedure TestV128LaneAccess;
+    procedure TestDescribeVectorForms;
 
     procedure TestDescribeArithmeticAndConstants;
     procedure TestDescribeBranchesAndSafepoint;
@@ -92,13 +96,13 @@ end;
 
 procedure TIrTests.TestEnumIsDenseAndComplete;
 begin
-  { 241 non-vector instructions in the pinned 3.0 draft, minus 11 that
-    vanish at lowering and 3 that collapse into an existing member, plus 4
-    IR-only ops. }
+  { 231 non-vector members (the pre-SIMD count), plus Track G's 256 wasm
+    vector ops (234 vec + 22 memory-category v128.* = 256, verified against
+    the pinned registry) and 9 IR-only vector ops. 231 + 256 + 9 = 496. }
   Expect<Integer>(Ord(Low(TWasmIrOp))).ToBe(0);
-  Expect<Integer>(Ord(High(TWasmIrOp)) + 1).ToBe(231);
-  { Two bytes by the PACKENUM 2 directive, which is what keeps
-    TWasmIrInstr at 24. }
+  Expect<Integer>(Ord(High(TWasmIrOp)) + 1).ToBe(496);
+  { Still two bytes by the PACKENUM 2 directive (495 < 65536), which is what
+    keeps TWasmIrInstr at 24. }
   Expect<Integer>(SizeOf(TWasmIrOp)).ToBe(2);
 end;
 
@@ -129,6 +133,31 @@ begin
     carried in AuxRefTypes. }
   Expect<Integer>(Ord(iroGlobalGet) - Ord(iroSelect)).ToBe(1);
   Expect<Integer>(Ord(iroRefCast) - Ord(iroRefTest)).ToBe(1);
+
+  { --- vector block: appended after i31, in subopcode order (Track G) --- }
+
+  { The block leads at 231 (right after iroI31GetU = 230) with $FD 0, and
+    the first IR-only vector op follows the last wasm one. }
+  Expect<Integer>(Ord(iroV128Load)).ToBe(231);
+  Expect<Integer>(Ord(iroV128Const)).ToBe(243);      { $FD 12 }
+  Expect<Integer>(Ord(iroI8x16Shuffle)).ToBe(244);   { $FD 13 }
+  Expect<Integer>(Ord(iroV128Bitselect)).ToBe(313);  { $FD 82 }
+  Expect<Integer>(Ord(iroV128Load8Lane)).ToBe(315);  { $FD 84 }
+  { The last wasm vector op is $FD 275, and the 9 IR-only ops follow it. }
+  Expect<Integer>(Ord(iroI32x4RelaxedDotI8x16I7x16AddS)).ToBe(486);
+  Expect<Integer>(Ord(iroMoveVec)).ToBe(487);
+  Expect<Integer>(Ord(iroArrayFillVec)).ToBe(495);
+
+  { Contiguity across the gap-skips: subopcodes < 154 are dense, so the
+    ordinal delta equals the subopcode delta up to there. }
+  Expect<Integer>(Ord(iroV128Store) - Ord(iroV128Load)).ToBe(11);
+  Expect<Integer>(Ord(iroV128AnyTrue) - Ord(iroV128Load)).ToBe(83);
+  { i16x8.avgr_u is $FD 155 (154 is unassigned), one past i16x8.max_u
+    ($FD 153) — a one-step ordinal move across a skipped subopcode. }
+  Expect<Integer>(Ord(iroI16x8AvgrU) - Ord(iroI16x8MaxU)).ToBe(1);
+  { i32x4.all_true is $FD 163 (162 unassigned), one past i32x4.neg
+    ($FD 161). }
+  Expect<Integer>(Ord(iroI32x4AllTrue) - Ord(iroI32x4Neg)).ToBe(1);
 end;
 
 procedure TIrTests.TestOpInfoIsTotal;
@@ -227,6 +256,70 @@ begin
   Expect<Boolean>(IR_OP_INFO[iroThrow].ImmKind = ifkTagIndex).ToBe(True);
   Expect<Boolean>(IR_OP_INFO[iroRefFunc].ImmKind = ifkFuncIndex).ToBe(True);
   Expect<Boolean>(IR_OP_INFO[iroStructGet].ImmKind = ifkPacked).ToBe(True);
+
+  { --- vector families (Track G) -------------------------------------- }
+
+  { The 16-byte immediates ride in an aux block. }
+  Expect<Boolean>(IR_OP_INFO[iroV128Const].ImmKind = ifkAuxIndex).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Const].AKind = ifkUnused).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16Shuffle].ImmKind = ifkAuxIndex)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16Shuffle].BKind = ifkSrcReg).ToBe(True);
+
+  { The lane index is a plain immediate; extract has no B, replace does. }
+  Expect<Boolean>(IR_OP_INFO[iroI8x16ExtractLaneS].ImmKind = ifkImmValue)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16ExtractLaneS].BKind = ifkUnused)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16ReplaceLane].BKind = ifkSrcReg)
+    .ToBe(True);
+
+  { A whole-vector load mirrors a scalar load; the store keeps its value in
+    Dest so A stays the address and B the memory index. }
+  Expect<Boolean>(IR_OP_INFO[iroV128Load].DestKind = ifkDestReg).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Load].BKind = ifkMemIndex).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Store].DestKind = ifkSrcReg).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Store].BKind = ifkMemIndex).ToBe(True);
+
+  { A lane load/store carries its memarg+lane in an aux block; the load's B
+    is the source vector, the store's B is unused. }
+  Expect<Boolean>(IR_OP_INFO[iroV128Load8Lane].ImmKind = ifkAuxIndex)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Load8Lane].BKind = ifkSrcReg).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Store8Lane].DestKind = ifkSrcReg)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroV128Store8Lane].BKind = ifkUnused).ToBe(True);
+
+  { ifkSrcRegImm — the third source register of a ternary vector op. All
+    ten wasm ternaries carry it, plus the IR-only iroSelectVec. A plain
+    binary vector op does NOT. }
+  Expect<Boolean>(IR_OP_INFO[iroV128Bitselect].ImmKind = ifkSrcRegImm)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16RelaxedLaneselect].ImmKind
+    = ifkSrcRegImm).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroF32x4RelaxedMadd].ImmKind = ifkSrcRegImm)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI32x4RelaxedDotI8x16I7x16AddS].ImmKind
+    = ifkSrcRegImm).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroSelectVec].ImmKind = ifkSrcRegImm)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16Add].ImmKind = ifkUnused).ToBe(True);
+
+  { A relaxed op with a lane-select-free signature (min/max, swizzle,
+    q15mulr, the two-operand dot) is a plain binary, not a ternary. }
+  Expect<Boolean>(IR_OP_INFO[iroF32x4RelaxedMin].ImmKind = ifkUnused)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI8x16RelaxedSwizzle].BKind = ifkSrcReg)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroI16x8RelaxedDotI8x16I7x16S].ImmKind
+    = ifkUnused).ToBe(True);
+
+  { The IR-only *Vec ops mirror their scalar twins' field kinds. }
+  Expect<Boolean>(IR_OP_INFO[iroMoveVec].DestKind = ifkDestReg).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroGlobalGetVec].ImmKind = ifkGlobalIndex)
+    .ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroStructGetVec].ImmKind = ifkPacked).ToBe(True);
+  Expect<Boolean>(IR_OP_INFO[iroArrayFillVec].AKind = ifkAuxIndex).ToBe(True);
 end;
 
 procedure TIrTests.TestInstructionRecordLayout;
@@ -531,7 +624,7 @@ procedure TIrTests.TestFormatVersionIsStamped;
 var
   IrModule: TWasmIrModule;
 begin
-  Expect<Integer>(IR_FORMAT_VERSION).ToBe(1);
+  Expect<Integer>(IR_FORMAT_VERSION).ToBe(2);
   IrModule := TWasmIrModule.Create;
   try
     { ADR-0007's artifact-rejection rule reads this field, so it must be
@@ -541,6 +634,162 @@ begin
   finally
     IrModule.Free;
   end;
+end;
+
+{ --- vector foundation (Track G) ----------------------------------------- }
+
+procedure TIrTests.TestVectorRegisterAllocation;
+var
+  RegTypes: TWasmIrRegTypes;
+  RegCount: Integer;
+  R0, RVec, RRef, RVec2: UInt32;
+  Fn: TWasmIrFunction;
+begin
+  { The two-slot rule (SIMD design §1.3-§1.5): a v128 occupies two adjacent
+    slots and its low slot is always EVEN, so IrAllocReg pads when the next
+    free slot is odd. }
+  RegTypes := nil;
+  RegCount := 0;
+
+  R0 := IrAllocReg(RegTypes, RegCount, MakeNumValueType(wntI32));
+  Expect<Int64>(Int64(R0)).ToBe(0);
+
+  { Slot 1 is odd, so the v128 pads it and lands the pair at 2 and 3. }
+  RVec := IrAllocReg(RegTypes, RegCount, MakeVecValueType);
+  Expect<Int64>(Int64(RVec)).ToBe(2);
+  Expect<Boolean>((RVec and 1) = 0).ToBe(True);
+  Expect<Integer>(RegCount).ToBe(4);
+  Expect<Boolean>(RegTypes[2].Kind = wvkVec).ToBe(True);
+  Expect<Boolean>(RegTypes[3].Kind = wvkVec).ToBe(True);
+  { The pad slot is a non-reference filler, never a v128 or a ref. }
+  Expect<Boolean>(RegTypes[1].Kind = wvkVec).ToBe(False);
+  Expect<Boolean>(RegTypes[1].Kind = wvkRef).ToBe(False);
+
+  { A reference after the v128 takes the very next slot (4). }
+  RRef := IrAllocReg(RegTypes, RegCount,
+    MakeRefValueType(MakeRefType(True, MakeAbsHeapType(wahFunc))));
+  Expect<Int64>(Int64(RRef)).ToBe(4);
+  Expect<Integer>(RegCount).ToBe(5);
+
+  { Slot 5 is odd, so a second v128 pads it and lands at 6 and 7. }
+  RVec2 := IrAllocReg(RegTypes, RegCount, MakeVecValueType);
+  Expect<Int64>(Int64(RVec2)).ToBe(6);
+  Expect<Integer>(RegCount).ToBe(8);
+
+  { THE GC FRAME-WALK INVARIANT (ADR-0011), the reason the alignment exists:
+    RefRegBits is indexed by SLOT, both slots of every v128 are clear, and
+    the ref register's own bit is set — so G5's collector scans the ref and
+    skips the vector halves. }
+  IrTrimRegTypes(RegTypes, RegCount);
+  Fn.RegTypes := RegTypes;
+  Fn.RegisterCount := UInt32(RegCount);
+  IrComputeRefRegBits(Fn);
+
+  Expect<Boolean>(IrRegIsRef(Fn, 0)).ToBe(False);   { i32 }
+  Expect<Boolean>(IrRegIsRef(Fn, 1)).ToBe(False);   { pad }
+  Expect<Boolean>(IrRegIsRef(Fn, 2)).ToBe(False);   { v128 low }
+  Expect<Boolean>(IrRegIsRef(Fn, 3)).ToBe(False);   { v128 high }
+  Expect<Boolean>(IrRegIsRef(Fn, 4)).ToBe(True);    { the reference }
+  Expect<Boolean>(IrRegIsRef(Fn, 6)).ToBe(False);   { v128 low }
+  Expect<Boolean>(IrRegIsRef(Fn, 7)).ToBe(False);   { v128 high }
+end;
+
+procedure TIrTests.TestVectorAuxRoundTrips;
+var
+  Aux: TWasmIrAuxU32;
+  AuxCount: Integer;
+  V, VBack: TWasmV128;
+  Block: UInt32;
+  MemIdx, Lane: UInt32;
+  Offset: UInt64;
+  I: Integer;
+begin
+  { A v128 immediate is a length-4 aux block holding the 16 bytes verbatim
+    (SIMD design §2.2) — read back with a single Move, byte for byte. }
+  for I := 0 to 15 do
+    V.B[I] := Byte(I);                    { 00 01 ... 0f }
+  Aux := nil;
+  Block := IrAppendAuxV128(Aux, V);
+  Expect<Int64>(Int64(Block)).ToBe(0);
+  Expect<Integer>(Length(Aux)).ToBe(5);   { count word + 4 data words }
+  Expect<Int64>(Int64(IrAuxBlockCount(Aux, Block))).ToBe(4);
+
+  IrAuxReadV128(Aux, Block, VBack);
+  for I := 0 to 15 do
+    Expect<Int64>(Int64(VBack.B[I])).ToBe(Int64(I));
+
+  { The growing form produces the same layout, appended after the first. }
+  AuxCount := Length(Aux);
+  V.U64[0] := UInt64($1122334455667788);
+  V.U64[1] := UInt64($99AABBCCDDEEFF00);
+  Block := IrAppendAuxV128Growing(Aux, AuxCount, V);
+  Expect<Int64>(Int64(Block)).ToBe(5);
+  IrTrimAux(Aux, AuxCount);
+  IrAuxReadV128(Aux, Block, VBack);
+  Expect<Int64>(Int64(VBack.U64[0])).ToBe(Int64($1122334455667788));
+  Expect<Int64>(Int64(VBack.U64[1])).ToBe(Int64(UInt64($99AABBCCDDEEFF00)));
+
+  { A missing block reads as the zero vector rather than raising. }
+  IrAuxReadV128(Aux, IR_NO_AUX, VBack);
+  Expect<Int64>(Int64(VBack.U64[0])).ToBe(0);
+  Expect<Int64>(Int64(VBack.U64[1])).ToBe(0);
+
+  { The lane memarg block: [mem, offsetLo, offsetHi, lane], offset a full
+    u64 (SIMD design §2.3) so an i64 memory's offset survives. }
+  Aux := nil;
+  Block := IrAppendAuxLaneMemArg(Aux, 1, UInt64($100000002), 5);
+  Expect<Int64>(Int64(IrAuxBlockCount(Aux, Block))).ToBe(4);
+  IrAuxReadLaneMemArg(Aux, Block, MemIdx, Offset, Lane);
+  Expect<Int64>(Int64(MemIdx)).ToBe(1);
+  Expect<Int64>(Int64(Offset)).ToBe(Int64($100000002));
+  Expect<Int64>(Int64(Lane)).ToBe(5);
+end;
+
+procedure TIrTests.TestV128LaneAccess;
+var
+  V: TWasmV128;
+  I: Integer;
+begin
+  { The record is exactly 16 bytes — the whole two-slot design rests on it. }
+  Expect<Integer>(SizeOf(TWasmV128)).ToBe(16);
+
+  { Write bytes, read the wider lane views. The union is HOST-order, so a
+    byte-to-word reinterpretation is endianness-sensitive; assert for the
+    build's actual endianness. }
+  for I := 0 to 15 do
+    V.B[I] := Byte(I);
+{$IFDEF ENDIAN_LITTLE}
+  Expect<Int64>(Int64(V.U32[0])).ToBe(Int64($03020100));
+  Expect<Int64>(Int64(V.U32[3])).ToBe(Int64($0F0E0D0C));
+  Expect<Int64>(Int64(V.U64[1])).ToBe(Int64($0F0E0D0C0B0A0908));
+{$ELSE}
+  Expect<Int64>(Int64(V.U32[0])).ToBe(Int64($00010203));
+  Expect<Int64>(Int64(V.U32[3])).ToBe(Int64($0C0D0E0F));
+  Expect<Int64>(Int64(V.U64[1])).ToBe(Int64($08090A0B0C0D0E0F));
+{$ENDIF}
+
+  { Write the wider lanes, read the bytes back — same host-order rule, in
+    reverse. }
+  V.U64[0] := UInt64($1122334455667788);
+  V.U64[1] := UInt64($99AABBCCDDEEFF00);
+{$IFDEF ENDIAN_LITTLE}
+  Expect<Int64>(Int64(V.B[0])).ToBe(Int64($88));
+  Expect<Int64>(Int64(V.B[7])).ToBe(Int64($11));
+  Expect<Int64>(Int64(V.B[8])).ToBe(Int64($00));
+  Expect<Int64>(Int64(V.B[15])).ToBe(Int64($99));
+{$ELSE}
+  Expect<Int64>(Int64(V.B[0])).ToBe(Int64($11));
+  Expect<Int64>(Int64(V.B[7])).ToBe(Int64($88));
+  Expect<Int64>(Int64(V.B[8])).ToBe(Int64($99));
+  Expect<Int64>(Int64(V.B[15])).ToBe(Int64($00));
+{$ENDIF}
+
+  { The float lane views alias the same storage and round-trip a value
+    regardless of endianness. }
+  V.F64[0] := 1.0;
+  Expect<Boolean>(V.F64[0] = 1.0).ToBe(True);
+  V.F32[2] := 2.0;
+  Expect<Boolean>(V.F32[2] = 2.0).ToBe(True);
 end;
 
 { --- the disassembler, one test per operand family ----------------------- }
@@ -820,6 +1069,65 @@ begin
     .ToBe('0000  i32.const              r0 <- 42');
 end;
 
+procedure TIrTests.TestDescribeVectorForms;
+var
+  Fn: TWasmIrFunction;
+  V: TWasmV128;
+  ConstBlk, ShufBlk, LaneBlk: UInt32;
+  I: Integer;
+
+  function VLine(const AIdx: Integer; const AOp: TWasmIrOp;
+    const AOperands: string): string;
+  begin
+    { Rebuild the index/mnemonic/padding the way IrDescribeAt does, so only
+      the OPERAND rendering — the thing under test — is a literal. }
+    Result := TrimRight(Format('%.4d  %-22s %s',
+      [AIdx, IrOpMnemonic(AOp), AOperands]));
+  end;
+
+begin
+  { const and shuffle both take a 16-byte aux immediate; use 00..0f for
+    both, so the const hex and the shuffle mask read the same source. }
+  for I := 0 to 15 do
+    V.B[I] := Byte(I);
+  ConstBlk := IrAppendAuxV128(Fn.AuxU32, V);
+  ShufBlk := IrAppendAuxV128(Fn.AuxU32, V);
+  { A lane memarg: mem 0, static offset 8, lane 5. }
+  LaneBlk := IrAppendAuxLaneMemArg(Fn.AuxU32, 0, 8, 5);
+
+  SetCode(Fn, [
+    MakeIrInstr(iroV128Const, 4, IR_NO_REG, IR_NO_REG, Int64(ConstBlk)),
+    MakeIrInstr(iroI8x16Shuffle, 6, 2, 4, Int64(ShufBlk)),
+    MakeIrInstr(iroI8x16ExtractLaneS, 7, 6, IR_NO_REG, 3),
+    MakeIrInstr(iroI8x16ReplaceLane, 8, 6, 7, 3),
+    MakeIrInstr(iroV128Bitselect, 9, 2, 4, 6),
+    MakeIrInstr(iroV128Load, 10, 3, 0, 8),
+    MakeIrInstr(iroV128Store, 10, 3, 0, 8),
+    MakeIrInstr(iroV128Load8Lane, 11, 3, 10, Int64(LaneBlk)),
+    MakeIrInstr(iroV128Store8Lane, 10, 3, IR_NO_REG, Int64(LaneBlk)),
+    MakeIrInstr(iroMoveVec, 12, 9, IR_NO_REG, 0)
+  ]);
+
+  { The five special shapes, the whole-vector load/store, and the IR-only
+    move.v128 — exactly the SIMD design §2.6 listing. `v128:` renders the 16
+    bytes in memory order, `lanes[…]` the decimal shuffle mask, a ternary's
+    third source after `?`, and a lane op's [addr + offset] mem/lane. }
+  ExpectListing(Fn, [
+    VLine(0, iroV128Const,
+      'r4 <- v128:000102030405060708090a0b0c0d0e0f'),
+    VLine(1, iroI8x16Shuffle,
+      'r6 <- r2, r4 lanes[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]'),
+    VLine(2, iroI8x16ExtractLaneS, 'r7 <- r6 lane=3'),
+    VLine(3, iroI8x16ReplaceLane, 'r8 <- r6, r7 lane=3'),
+    VLine(4, iroV128Bitselect, 'r9 <- r2, r4 ? r6'),
+    VLine(5, iroV128Load, 'r10 <- [r3 + 8] mem=0'),
+    VLine(6, iroV128Store, '[r3 + 8] <- r10 mem=0'),
+    VLine(7, iroV128Load8Lane, 'r11 <- [r3 + 8] mem=0 lane=5, r10'),
+    VLine(8, iroV128Store8Lane, '[r3 + 8] <- r10 mem=0 lane=5'),
+    VLine(9, iroMoveVec, 'r12 <- r9')
+  ]);
+end;
+
 procedure TIrTests.SetupTests;
 begin
   Test('IR op enum is dense and complete', TestEnumIsDenseAndComplete);
@@ -844,6 +1152,12 @@ begin
     TestReferenceRegisterBitset);
   Test('IR_FORMAT_VERSION is stamped on the module',
     TestFormatVersionIsStamped);
+  Test('vector registers take two even-aligned non-ref slots',
+    TestVectorRegisterAllocation);
+  Test('vector aux blocks round-trip (v128 immediate and lane memarg)',
+    TestVectorAuxRoundTrips);
+  Test('v128 lane views alias one 16-byte record',
+    TestV128LaneAccess);
 
   Test('describe: arithmetic and constants',
     TestDescribeArithmeticAndConstants);
@@ -861,6 +1175,7 @@ begin
     TestDescribeSentinelsAndSingleInstruction);
   Test('describe: empty aux blocks', TestDescribeEmptyAuxBlocks);
   Test('describe: init expression', TestDescribeInitExpression);
+  Test('describe: vector operand forms', TestDescribeVectorForms);
 end;
 
 begin

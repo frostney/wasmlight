@@ -39,9 +39,11 @@ uses
 const
   { Bumped whenever the instruction encoding, the enum's ordinals, or the
     aux-array conventions change. ADR-0007's artifact-rejection rule reads
-    this and refuses anything that does not match. Track G's SIMD ops are
-    APPENDED to TWasmIrOp and will bump this to 2. }
-  IR_FORMAT_VERSION = 1;
+    this and refuses anything that does not match. Track G (SIMD) APPENDED
+    256 wasm vector ops plus 9 IR-only vector ops to TWasmIrOp and added the
+    ifkSrcRegImm field kind, so this went 1 -> 2. The bump is free today:
+    there is no AOT artifact cache until Track J, so nothing is rejected. }
+  IR_FORMAT_VERSION = 2;
 
   { "This field names no register" / "no aux block". Distinct constants
     with the same value because they are read in different contexts and a
@@ -355,7 +357,331 @@ type
     { --- i31 --------------------------------------------------------- }
     iroRefI31,                  { 0xFB 28 - allocation safepoint }
     iroI31GetS,                 { 0xFB 29 }
-    iroI31GetU                  { 0xFB 30 }
+    iroI31GetU,                 { 0xFB 30 }
+
+    { === vector / SIMD ($FD prefix) ===================================
+
+      Track G. These break the "grouped in wasm opcode order" convention
+      that holds above: SIMD sits AFTER i31 rather than interleaved by
+      opcode, because it was appended whole (ir-spec.md §1.5 pre-authorised
+      this, and DENSE ordinals matter more than opcode grouping). Within
+      the block, members are in SUBOPCODE order 0..275, skipping the 20
+      unassigned subopcodes, exactly as Appendix A of the SIMD design doc
+      lists them. Comments give the $FD subopcode. None of these can be a
+      reference, so none is a safepoint and none affects RefRegBits.
+
+      Verified against wasm-mcp 0.2.16, spec/main
+      d7b37e4170d8315f2f1283aed4e8076591a9a333: instruction_list
+      category=vec (234) + category=memory prefix=v128. (22) = 256. }
+
+    { --- memory: whole / packed / splat loads, store — memarg (0..11) - }
+    iroV128Load,                { $FD 0 }
+    iroV128Load8x8S,            { $FD 1 }
+    iroV128Load8x8U,            { $FD 2 }
+    iroV128Load16x4S,           { $FD 3 }
+    iroV128Load16x4U,           { $FD 4 }
+    iroV128Load32x2S,           { $FD 5 }
+    iroV128Load32x2U,           { $FD 6 }
+    iroV128Load8Splat,          { $FD 7 }
+    iroV128Load16Splat,         { $FD 8 }
+    iroV128Load32Splat,         { $FD 9 }
+    iroV128Load64Splat,         { $FD 10 }
+    iroV128Store,               { $FD 11 }
+
+    { --- const and shuffle — 16-byte immediate (12..13) --------------- }
+    iroV128Const,               { $FD 12 }
+    iroI8x16Shuffle,            { $FD 13 }
+
+    { --- swizzle and splat (14..20) ---------------------------------- }
+    iroI8x16Swizzle,            { $FD 14 }
+    iroI8x16Splat,              { $FD 15 }
+    iroI16x8Splat,              { $FD 16 }
+    iroI32x4Splat,              { $FD 17 }
+    iroI64x2Splat,              { $FD 18 }
+    iroF32x4Splat,              { $FD 19 }
+    iroF64x2Splat,              { $FD 20 }
+
+    { --- lane access — one laneidx byte (21..34) --------------------- }
+    iroI8x16ExtractLaneS,       { $FD 21 }
+    iroI8x16ExtractLaneU,       { $FD 22 }
+    iroI8x16ReplaceLane,        { $FD 23 }
+    iroI16x8ExtractLaneS,       { $FD 24 }
+    iroI16x8ExtractLaneU,       { $FD 25 }
+    iroI16x8ReplaceLane,        { $FD 26 }
+    iroI32x4ExtractLane,        { $FD 27 }
+    iroI32x4ReplaceLane,        { $FD 28 }
+    iroI64x2ExtractLane,        { $FD 29 }
+    iroI64x2ReplaceLane,        { $FD 30 }
+    iroF32x4ExtractLane,        { $FD 31 }
+    iroF32x4ReplaceLane,        { $FD 32 }
+    iroF64x2ExtractLane,        { $FD 33 }
+    iroF64x2ReplaceLane,        { $FD 34 }
+
+    { --- comparisons (35..76) ---------------------------------------- }
+    iroI8x16Eq,                 { $FD 35 }
+    iroI8x16Ne,                 { $FD 36 }
+    iroI8x16LtS,                { $FD 37 }
+    iroI8x16LtU,                { $FD 38 }
+    iroI8x16GtS,                { $FD 39 }
+    iroI8x16GtU,                { $FD 40 }
+    iroI8x16LeS,                { $FD 41 }
+    iroI8x16LeU,                { $FD 42 }
+    iroI8x16GeS,                { $FD 43 }
+    iroI8x16GeU,                { $FD 44 }
+    iroI16x8Eq,                 { $FD 45 }
+    iroI16x8Ne,                 { $FD 46 }
+    iroI16x8LtS,                { $FD 47 }
+    iroI16x8LtU,                { $FD 48 }
+    iroI16x8GtS,                { $FD 49 }
+    iroI16x8GtU,                { $FD 50 }
+    iroI16x8LeS,                { $FD 51 }
+    iroI16x8LeU,                { $FD 52 }
+    iroI16x8GeS,                { $FD 53 }
+    iroI16x8GeU,                { $FD 54 }
+    iroI32x4Eq,                 { $FD 55 }
+    iroI32x4Ne,                 { $FD 56 }
+    iroI32x4LtS,                { $FD 57 }
+    iroI32x4LtU,                { $FD 58 }
+    iroI32x4GtS,                { $FD 59 }
+    iroI32x4GtU,                { $FD 60 }
+    iroI32x4LeS,                { $FD 61 }
+    iroI32x4LeU,                { $FD 62 }
+    iroI32x4GeS,                { $FD 63 }
+    iroI32x4GeU,                { $FD 64 }
+    iroF32x4Eq,                 { $FD 65 }
+    iroF32x4Ne,                 { $FD 66 }
+    iroF32x4Lt,                 { $FD 67 }
+    iroF32x4Gt,                 { $FD 68 }
+    iroF32x4Le,                 { $FD 69 }
+    iroF32x4Ge,                 { $FD 70 }
+    iroF64x2Eq,                 { $FD 71 }
+    iroF64x2Ne,                 { $FD 72 }
+    iroF64x2Lt,                 { $FD 73 }
+    iroF64x2Gt,                 { $FD 74 }
+    iroF64x2Le,                 { $FD 75 }
+    iroF64x2Ge,                 { $FD 76 }
+
+    { --- bitwise and the whole-vector test (77..83) ------------------ }
+    iroV128Not,                 { $FD 77 }
+    iroV128And,                 { $FD 78 }
+    iroV128Andnot,              { $FD 79 }
+    iroV128Or,                  { $FD 80 }
+    iroV128Xor,                 { $FD 81 }
+    iroV128Bitselect,           { $FD 82 - ternary, ifkSrcRegImm }
+    iroV128AnyTrue,             { $FD 83 }
+
+    { --- memory: lane and zero — memarg + laneidx / memarg (84..93) -- }
+    iroV128Load8Lane,           { $FD 84 }
+    iroV128Load16Lane,          { $FD 85 }
+    iroV128Load32Lane,          { $FD 86 }
+    iroV128Load64Lane,          { $FD 87 }
+    iroV128Store8Lane,          { $FD 88 }
+    iroV128Store16Lane,         { $FD 89 }
+    iroV128Store32Lane,         { $FD 90 }
+    iroV128Store64Lane,         { $FD 91 }
+    iroV128Load32Zero,          { $FD 92 }
+    iroV128Load64Zero,          { $FD 93 }
+
+    { --- float conversions (94..95) ---------------------------------- }
+    iroF32x4DemoteF64x2Zero,    { $FD 94 }
+    iroF64x2PromoteLowF32x4,    { $FD 95 }
+
+    { --- i8x16 unary, narrow, f32x4 rounding, i8x16 arith (96..127) -- }
+    iroI8x16Abs,                { $FD 96 }
+    iroI8x16Neg,                { $FD 97 }
+    iroI8x16Popcnt,             { $FD 98 }
+    iroI8x16AllTrue,            { $FD 99 }
+    iroI8x16Bitmask,            { $FD 100 }
+    iroI8x16NarrowI16x8S,       { $FD 101 }
+    iroI8x16NarrowI16x8U,       { $FD 102 }
+    iroF32x4Ceil,               { $FD 103 }
+    iroF32x4Floor,              { $FD 104 }
+    iroF32x4Trunc,              { $FD 105 }
+    iroF32x4Nearest,            { $FD 106 }
+    iroI8x16Shl,                { $FD 107 }
+    iroI8x16ShrS,               { $FD 108 }
+    iroI8x16ShrU,               { $FD 109 }
+    iroI8x16Add,                { $FD 110 }
+    iroI8x16AddSatS,            { $FD 111 }
+    iroI8x16AddSatU,            { $FD 112 }
+    iroI8x16Sub,                { $FD 113 }
+    iroI8x16SubSatS,            { $FD 114 }
+    iroI8x16SubSatU,            { $FD 115 }
+    iroF64x2Ceil,               { $FD 116 }
+    iroF64x2Floor,              { $FD 117 }
+    iroI8x16MinS,               { $FD 118 }
+    iroI8x16MinU,               { $FD 119 }
+    iroI8x16MaxS,               { $FD 120 }
+    iroI8x16MaxU,               { $FD 121 }
+    iroF64x2Trunc,              { $FD 122 }
+    iroI8x16AvgrU,              { $FD 123 }
+    iroI16x8ExtaddPairwiseI8x16S, { $FD 124 }
+    iroI16x8ExtaddPairwiseI8x16U, { $FD 125 }
+    iroI32x4ExtaddPairwiseI16x8S, { $FD 126 }
+    iroI32x4ExtaddPairwiseI16x8U, { $FD 127 }
+
+    { --- i16x8 (128..159; 154 unassigned) ---------------------------- }
+    iroI16x8Abs,                { $FD 128 }
+    iroI16x8Neg,                { $FD 129 }
+    iroI16x8Q15mulrSatS,        { $FD 130 }
+    iroI16x8AllTrue,            { $FD 131 }
+    iroI16x8Bitmask,            { $FD 132 }
+    iroI16x8NarrowI32x4S,       { $FD 133 }
+    iroI16x8NarrowI32x4U,       { $FD 134 }
+    iroI16x8ExtendLowI8x16S,    { $FD 135 }
+    iroI16x8ExtendHighI8x16S,   { $FD 136 }
+    iroI16x8ExtendLowI8x16U,    { $FD 137 }
+    iroI16x8ExtendHighI8x16U,   { $FD 138 }
+    iroI16x8Shl,                { $FD 139 }
+    iroI16x8ShrS,               { $FD 140 }
+    iroI16x8ShrU,               { $FD 141 }
+    iroI16x8Add,                { $FD 142 }
+    iroI16x8AddSatS,            { $FD 143 }
+    iroI16x8AddSatU,            { $FD 144 }
+    iroI16x8Sub,                { $FD 145 }
+    iroI16x8SubSatS,            { $FD 146 }
+    iroI16x8SubSatU,            { $FD 147 }
+    iroF64x2Nearest,            { $FD 148 }
+    iroI16x8Mul,                { $FD 149 }
+    iroI16x8MinS,               { $FD 150 }
+    iroI16x8MinU,               { $FD 151 }
+    iroI16x8MaxS,               { $FD 152 }
+    iroI16x8MaxU,               { $FD 153 }
+    iroI16x8AvgrU,              { $FD 155 (154 unassigned) }
+    iroI16x8ExtmulLowI8x16S,    { $FD 156 }
+    iroI16x8ExtmulHighI8x16S,   { $FD 157 }
+    iroI16x8ExtmulLowI8x16U,    { $FD 158 }
+    iroI16x8ExtmulHighI8x16U,   { $FD 159 }
+
+    { --- i32x4 (160..191; 162,165,166,175,176,178..180,187 unassigned) }
+    iroI32x4Abs,                { $FD 160 }
+    iroI32x4Neg,                { $FD 161 }
+    iroI32x4AllTrue,            { $FD 163 (162 unassigned) }
+    iroI32x4Bitmask,            { $FD 164 }
+    iroI32x4ExtendLowI16x8S,    { $FD 167 (165,166 unassigned) }
+    iroI32x4ExtendHighI16x8S,   { $FD 168 }
+    iroI32x4ExtendLowI16x8U,    { $FD 169 }
+    iroI32x4ExtendHighI16x8U,   { $FD 170 }
+    iroI32x4Shl,                { $FD 171 }
+    iroI32x4ShrS,               { $FD 172 }
+    iroI32x4ShrU,               { $FD 173 }
+    iroI32x4Add,                { $FD 174 }
+    iroI32x4Sub,                { $FD 177 (175,176 unassigned) }
+    iroI32x4Mul,                { $FD 181 (178..180 unassigned) }
+    iroI32x4MinS,               { $FD 182 }
+    iroI32x4MinU,               { $FD 183 }
+    iroI32x4MaxS,               { $FD 184 }
+    iroI32x4MaxU,               { $FD 185 }
+    iroI32x4DotI16x8S,          { $FD 186 }
+    iroI32x4ExtmulLowI16x8S,    { $FD 188 (187 unassigned) }
+    iroI32x4ExtmulHighI16x8S,   { $FD 189 }
+    iroI32x4ExtmulLowI16x8U,    { $FD 190 }
+    iroI32x4ExtmulHighI16x8U,   { $FD 191 }
+
+    { --- i64x2 (192..223; 194,197,198,207,208,210..212 unassigned) --- }
+    iroI64x2Abs,                { $FD 192 }
+    iroI64x2Neg,                { $FD 193 }
+    iroI64x2AllTrue,            { $FD 195 (194 unassigned) }
+    iroI64x2Bitmask,            { $FD 196 }
+    iroI64x2ExtendLowI32x4S,    { $FD 199 (197,198 unassigned) }
+    iroI64x2ExtendHighI32x4S,   { $FD 200 }
+    iroI64x2ExtendLowI32x4U,    { $FD 201 }
+    iroI64x2ExtendHighI32x4U,   { $FD 202 }
+    iroI64x2Shl,                { $FD 203 }
+    iroI64x2ShrS,               { $FD 204 }
+    iroI64x2ShrU,               { $FD 205 }
+    iroI64x2Add,                { $FD 206 }
+    iroI64x2Sub,                { $FD 209 (207,208 unassigned) }
+    iroI64x2Mul,                { $FD 213 (210..212 unassigned) }
+    iroI64x2Eq,                 { $FD 214 }
+    iroI64x2Ne,                 { $FD 215 }
+    iroI64x2LtS,                { $FD 216 }
+    iroI64x2GtS,                { $FD 217 }
+    iroI64x2LeS,                { $FD 218 }
+    iroI64x2GeS,                { $FD 219 (no unsigned i64x2 compares) }
+    iroI64x2ExtmulLowI32x4S,    { $FD 220 }
+    iroI64x2ExtmulHighI32x4S,   { $FD 221 }
+    iroI64x2ExtmulLowI32x4U,    { $FD 222 }
+    iroI64x2ExtmulHighI32x4U,   { $FD 223 }
+
+    { --- f32x4 / f64x2 arithmetic (224..247; 226,238 unassigned) ----- }
+    iroF32x4Abs,                { $FD 224 }
+    iroF32x4Neg,                { $FD 225 }
+    iroF32x4Sqrt,               { $FD 227 (226 unassigned) }
+    iroF32x4Add,                { $FD 228 }
+    iroF32x4Sub,                { $FD 229 }
+    iroF32x4Mul,                { $FD 230 }
+    iroF32x4Div,                { $FD 231 }
+    iroF32x4Min,                { $FD 232 }
+    iroF32x4Max,                { $FD 233 }
+    iroF32x4Pmin,               { $FD 234 }
+    iroF32x4Pmax,               { $FD 235 }
+    iroF64x2Abs,                { $FD 236 }
+    iroF64x2Neg,                { $FD 237 }
+    iroF64x2Sqrt,               { $FD 239 (238 unassigned) }
+    iroF64x2Add,                { $FD 240 }
+    iroF64x2Sub,                { $FD 241 }
+    iroF64x2Mul,                { $FD 242 }
+    iroF64x2Div,                { $FD 243 }
+    iroF64x2Min,                { $FD 244 }
+    iroF64x2Max,                { $FD 245 }
+    iroF64x2Pmin,               { $FD 246 }
+    iroF64x2Pmax,               { $FD 247 }
+
+    { --- conversions (248..255) -------------------------------------- }
+    iroI32x4TruncSatF32x4S,     { $FD 248 }
+    iroI32x4TruncSatF32x4U,     { $FD 249 }
+    iroF32x4ConvertI32x4S,      { $FD 250 }
+    iroF32x4ConvertI32x4U,      { $FD 251 }
+    iroI32x4TruncSatF64x2SZero, { $FD 252 }
+    iroI32x4TruncSatF64x2UZero, { $FD 253 }
+    iroF64x2ConvertLowI32x4S,   { $FD 254 }
+    iroF64x2ConvertLowI32x4U,   { $FD 255 }
+
+    { --- relaxed SIMD — the 20 3.0 additions (256..275) --------------
+
+      NOTE: the pinned registry names the f64x2 relaxed-trunc ops
+      i32x4.relaxed_trunc_f64x2_s / _u — WITHOUT the _zero suffix the
+      non-relaxed trunc_sat forms carry. The SIMD design doc's Appendix A
+      wrote them with _zero; the registry is the tiebreaker for the verbatim
+      mnemonic (they still fill lanes 2..3 with zero at run time). }
+    iroI8x16RelaxedSwizzle,     { $FD 256 }
+    iroI32x4RelaxedTruncF32x4S, { $FD 257 }
+    iroI32x4RelaxedTruncF32x4U, { $FD 258 }
+    iroI32x4RelaxedTruncF64x2S, { $FD 259 }
+    iroI32x4RelaxedTruncF64x2U, { $FD 260 }
+    iroF32x4RelaxedMadd,        { $FD 261 - ternary, ifkSrcRegImm }
+    iroF32x4RelaxedNmadd,       { $FD 262 - ternary, ifkSrcRegImm }
+    iroF64x2RelaxedMadd,        { $FD 263 - ternary, ifkSrcRegImm }
+    iroF64x2RelaxedNmadd,       { $FD 264 - ternary, ifkSrcRegImm }
+    iroI8x16RelaxedLaneselect,  { $FD 265 - ternary, ifkSrcRegImm }
+    iroI16x8RelaxedLaneselect,  { $FD 266 - ternary, ifkSrcRegImm }
+    iroI32x4RelaxedLaneselect,  { $FD 267 - ternary, ifkSrcRegImm }
+    iroI64x2RelaxedLaneselect,  { $FD 268 - ternary, ifkSrcRegImm }
+    iroF32x4RelaxedMin,         { $FD 269 }
+    iroF32x4RelaxedMax,         { $FD 270 }
+    iroF64x2RelaxedMin,         { $FD 271 }
+    iroF64x2RelaxedMax,         { $FD 272 }
+    iroI16x8RelaxedQ15mulrS,    { $FD 273 }
+    iroI16x8RelaxedDotI8x16I7x16S,      { $FD 274 }
+    iroI32x4RelaxedDotI8x16I7x16AddS,   { $FD 275 - ternary, ifkSrcRegImm }
+
+    { === IR-only vector ops (no wasm opcode) ==========================
+
+      Emitted by the validator so the interpreter never asks "is this
+      register 8 or 16 bytes wide?" at run time (SIMD design §2.4): where a
+      width is knowable statically, a *Vec variant is emitted; where the GC
+      layout record is in hand (struct.new, array.new_fixed, array.copy) the
+      existing op branches on TWasmGcField.IsVec and no new op is added. }
+    iroMoveVec,                 { Dest <- A, 16 bytes }
+    iroSelectVec,               { Dest <- A, B ? cond(Imm), 16 bytes }
+    iroGlobalGetVec,            { a v128 global }
+    iroGlobalSetVec,            { a v128 global }
+    iroStructGetVec,            { a v128 field }
+    iroStructSetVec,            { a v128 field }
+    iroArrayGetVec,             { a v128 element }
+    iroArraySetVec,             { a v128 element }
+    iroArrayFillVec             { array.fill with a v128 value }
   );
 {$POP}
 
@@ -401,7 +727,16 @@ type
       is reached through ifkPacked and IrPackedNames. }
     ifkFlags,         { bit field (iroJump only) }
     ifkImmValue,      { a literal value / bit pattern }
-    ifkPacked         { two u32 indices packed into Imm — see IrPack }
+    ifkPacked,        { two u32 indices packed into Imm — see IrPack }
+    { A source REGISTER number carried in Imm. Distinct from ifkSrcReg
+      (which names a register in a Dest/A/B field) so a register-renumbering
+      pass rewrites Imm too. Introduced by Track G for the ten ternary
+      vector ops — v128.bitselect, the four *.relaxed_laneselect, the four
+      f*.relaxed_madd/nmadd, and i32x4.relaxed_dot_i8x16_i7x16_add_s — plus
+      the IR-only iroSelectVec, all of which need a third source register
+      that will not fit Dest/A/B. Appended LAST so no existing kind's
+      ordinal moves. Describe renders it r<n>. }
+    ifkSrcRegImm
   );
 
   TWasmIrOpInfo = record
@@ -927,7 +1262,583 @@ const
     (Mnemonic: 'i31.get_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
       BKind: ifkUnused; ImmKind: ifkUnused),
     (Mnemonic: 'i31.get_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
-      BKind: ifkUnused; ImmKind: ifkUnused)
+      BKind: ifkUnused; ImmKind: ifkUnused),
+
+    { === vector / SIMD ($FD prefix) — see the enum for ordering ======= }
+
+    { --- memory: whole / packed / splat loads, store (0..11) ---------- }
+    (Mnemonic: 'v128.load'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load8x8_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load8x8_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load16x4_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load16x4_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load32x2_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load32x2_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load8_splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load16_splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load32_splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load64_splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.store'; DestKind: ifkSrcReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+
+    { --- const and shuffle — 16-byte immediate in an aux block (12..13) }
+    (Mnemonic: 'v128.const'; DestKind: ifkDestReg; AKind: ifkUnused;
+      BKind: ifkUnused; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'i8x16.shuffle'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkAuxIndex),
+
+    { --- swizzle and splat (14..20) ---------------------------------- }
+    (Mnemonic: 'i8x16.swizzle'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.splat'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+
+    { --- lane access — the lane index in Imm (21..34) ---------------- }
+    (Mnemonic: 'i8x16.extract_lane_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'i8x16.extract_lane_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'i8x16.replace_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkImmValue),
+    (Mnemonic: 'i16x8.extract_lane_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'i16x8.extract_lane_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'i16x8.replace_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkImmValue),
+    (Mnemonic: 'i32x4.extract_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'i32x4.replace_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkImmValue),
+    (Mnemonic: 'i64x2.extract_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'i64x2.replace_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkImmValue),
+    (Mnemonic: 'f32x4.extract_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'f32x4.replace_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkImmValue),
+    (Mnemonic: 'f64x2.extract_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkImmValue),
+    (Mnemonic: 'f64x2.replace_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkImmValue),
+
+    { --- comparisons (35..76) — binary v128,v128 -> v128 ------------- }
+    (Mnemonic: 'i8x16.eq'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.ne'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.lt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.lt_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.gt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.gt_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.le_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.le_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.ge_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.ge_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.eq'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.ne'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.lt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.lt_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.gt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.gt_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.le_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.le_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.ge_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.ge_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.eq'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.ne'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.lt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.lt_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.gt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.gt_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.le_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.le_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.ge_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.ge_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.eq'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.ne'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.lt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.gt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.le'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.ge'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.eq'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.ne'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.lt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.gt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.le'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.ge'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+
+    { --- bitwise and the whole-vector test (77..83) ------------------ }
+    (Mnemonic: 'v128.not'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'v128.and'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'v128.andnot'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'v128.or'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'v128.xor'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'v128.bitselect'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'v128.any_true'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+
+    { --- memory: lane and zero (84..93) ------------------------------
+
+      A *_lane needs six values (dest, addr, source vector, mem index, u64
+      offset, lane) and the record has four fields, so a load*_lane / a
+      store*_lane carries a 4-word aux block [MemIdx, OffsetLo, OffsetHi,
+      LaneIdx] in Imm — see IrAppendAuxLaneMemArg. B holds the source
+      vector for a load (whose Dest is the result), and is unused for a
+      store (whose Dest holds the value being stored). }
+    (Mnemonic: 'v128.load8_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.load16_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.load32_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.load64_lane'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.store8_lane'; DestKind: ifkSrcReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.store16_lane'; DestKind: ifkSrcReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.store32_lane'; DestKind: ifkSrcReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.store64_lane'; DestKind: ifkSrcReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkAuxIndex),
+    (Mnemonic: 'v128.load32_zero'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+    (Mnemonic: 'v128.load64_zero'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkMemIndex; ImmKind: ifkImmValue),
+
+    { --- float conversions (94..95) — unary -------------------------- }
+    (Mnemonic: 'f32x4.demote_f64x2_zero'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.promote_low_f32x4'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+
+    { --- i8x16 unary/narrow, f32x4 rounding, i8x16 arith (96..127) --- }
+    (Mnemonic: 'i8x16.abs'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.neg'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.popcnt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.all_true'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.bitmask'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.narrow_i16x8_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.narrow_i16x8_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.ceil'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.floor'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.trunc'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.nearest'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.shl'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.shr_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.shr_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.add'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.add_sat_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.add_sat_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.sub'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.sub_sat_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.sub_sat_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.ceil'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.floor'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.min_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.min_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.max_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.max_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.trunc'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i8x16.avgr_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extadd_pairwise_i8x16_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extadd_pairwise_i8x16_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extadd_pairwise_i16x8_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extadd_pairwise_i16x8_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+
+    { --- i16x8 (128..159) -------------------------------------------- }
+    (Mnemonic: 'i16x8.abs'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.neg'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.q15mulr_sat_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.all_true'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.bitmask'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.narrow_i32x4_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.narrow_i32x4_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extend_low_i8x16_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extend_high_i8x16_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extend_low_i8x16_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extend_high_i8x16_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.shl'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.shr_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.shr_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.add'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.add_sat_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.add_sat_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.sub'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.sub_sat_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.sub_sat_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.nearest'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.mul'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.min_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.min_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.max_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.max_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.avgr_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extmul_low_i8x16_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extmul_high_i8x16_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extmul_low_i8x16_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.extmul_high_i8x16_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+
+    { --- i32x4 (160..191) -------------------------------------------- }
+    (Mnemonic: 'i32x4.abs'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.neg'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.all_true'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.bitmask'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extend_low_i16x8_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extend_high_i16x8_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extend_low_i16x8_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extend_high_i16x8_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.shl'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.shr_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.shr_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.add'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.sub'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.mul'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.min_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.min_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.max_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.max_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.dot_i16x8_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extmul_low_i16x8_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extmul_high_i16x8_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extmul_low_i16x8_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.extmul_high_i16x8_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+
+    { --- i64x2 (192..223) -------------------------------------------- }
+    (Mnemonic: 'i64x2.abs'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.neg'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.all_true'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.bitmask'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extend_low_i32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extend_high_i32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extend_low_i32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extend_high_i32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.shl'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.shr_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.shr_u'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.add'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.sub'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.mul'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.eq'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.ne'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.lt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.gt_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.le_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.ge_s'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extmul_low_i32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extmul_high_i32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extmul_low_i32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i64x2.extmul_high_i32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+
+    { --- f32x4 / f64x2 arithmetic (224..247) ------------------------- }
+    (Mnemonic: 'f32x4.abs'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.neg'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.sqrt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.add'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.sub'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.mul'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.div'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.min'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.max'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.pmin'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.pmax'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.abs'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.neg'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.sqrt'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.add'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.sub'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.mul'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.div'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.min'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.max'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.pmin'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.pmax'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+
+    { --- conversions (248..255) — unary ------------------------------ }
+    (Mnemonic: 'i32x4.trunc_sat_f32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.trunc_sat_f32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.convert_i32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.convert_i32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.trunc_sat_f64x2_s_zero'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.trunc_sat_f64x2_u_zero'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.convert_low_i32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.convert_low_i32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+
+    { --- relaxed SIMD (256..275) ------------------------------------- }
+    (Mnemonic: 'i8x16.relaxed_swizzle'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.relaxed_trunc_f32x4_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.relaxed_trunc_f32x4_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.relaxed_trunc_f64x2_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.relaxed_trunc_f64x2_u'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.relaxed_madd'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'f32x4.relaxed_nmadd'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'f64x2.relaxed_madd'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'f64x2.relaxed_nmadd'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'i8x16.relaxed_laneselect'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'i16x8.relaxed_laneselect'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'i32x4.relaxed_laneselect'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'i64x2.relaxed_laneselect'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'f32x4.relaxed_min'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f32x4.relaxed_max'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.relaxed_min'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'f64x2.relaxed_max'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.relaxed_q15mulr_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i16x8.relaxed_dot_i8x16_i7x16_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkUnused),
+    (Mnemonic: 'i32x4.relaxed_dot_i8x16_i7x16_add_s'; DestKind: ifkDestReg;
+      AKind: ifkSrcReg; BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+
+    { === IR-only vector ops ($2.4) ===================================
+
+      Field kinds mirror the scalar op each replaces; the width is 16 bytes
+      by construction, so a tier reads/writes through PWasmV128 without a
+      RegTypes lookup. Mnemonics carry a `.v128` suffix so they stay unique
+      from their scalar twins (the duplicate-mnemonic test asserts this). }
+    (Mnemonic: 'move.v128'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkUnused),
+    (Mnemonic: 'select.v128'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkSrcRegImm),
+    (Mnemonic: 'global.get.v128'; DestKind: ifkDestReg; AKind: ifkUnused;
+      BKind: ifkUnused; ImmKind: ifkGlobalIndex),
+    (Mnemonic: 'global.set.v128'; DestKind: ifkUnused; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkGlobalIndex),
+    (Mnemonic: 'struct.get.v128'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkUnused; ImmKind: ifkPacked),
+    (Mnemonic: 'struct.set.v128'; DestKind: ifkUnused; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkPacked),
+    (Mnemonic: 'array.get.v128'; DestKind: ifkDestReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkTypeIndex),
+    (Mnemonic: 'array.set.v128'; DestKind: ifkSrcReg; AKind: ifkSrcReg;
+      BKind: ifkSrcReg; ImmKind: ifkTypeIndex),
+    (Mnemonic: 'array.fill.v128'; DestKind: ifkUnused; AKind: ifkAuxIndex;
+      BKind: ifkUnused; ImmKind: ifkTypeIndex)
   );
 
 type
@@ -1038,33 +1949,64 @@ type
 
   TWasmIrInitExprs = array of TWasmIrInitExpr;
 
-  { Register numbering, per function, in this order:
+  { Register numbering, per function. Every register names a SLOT of the
+    interpreter's flat 8-byte register file, and the numbering is in slot
+    order:
 
-      [0 .. P-1]                 parameters, in declaration order
-      [P .. P+L-1]               declared locals, run-length expanded
-      [P+L .. P+L+R-1]           the return register block
-      [P+L+R .. RegisterCount-1] merge registers and temporaries
+      [0 .. base of locals)      parameters, in declaration order
+      [.. base of returns)       declared locals, run-length expanded
+      [.. base of temporaries)   the return register block
+      [.. RegisterCount)         merge registers and temporaries
 
-    ReturnRegBase = P + L, so a caller reads a callee's results from a
-    constant offset without consulting the type. Temporaries are allocated
-    monotonically and never reused, which is what lets RegTypes be a plain
-    array — every register has exactly one type for the whole function, so
-    ADR-0011's stack map is a projection of it rather than a second
-    analysis. RegisterCount is the interpreter frame size; there is no
-    separate operand-stack depth. }
+    THE SLOT RULE (SIMD design §1.3-§1.5). A v128 register occupies TWO
+    adjacent slots, low half first, and its low slot is always EVEN;
+    IrAllocReg enforces both by padding to even and reserving a pair. So a
+    register number is a slot index, RegisterCount is a SLOT COUNT (and the
+    interpreter frame size in slots), and Track G broke the old
+    register==local identity: use LocalRegs to map a wasm local index to its
+    low slot. ReturnRegBase = "the first slot after the last local's slots".
+
+    Temporaries are allocated monotonically and never reused, which is what
+    lets RegTypes be a plain array — every slot has exactly one type for the
+    whole function, so ADR-0011's stack map is a projection of it rather
+    than a second analysis.
+
+    THE GC FRAME-WALK INVARIANT (ADR-0011), which G5's interp frame walk and
+    G3's register allocation both depend on: RefRegBits is indexed BY SLOT.
+    A v128 spans two slots and NEITHER is ever a reference, so BOTH bits are
+    clear — RegTypes[k] = RegTypes[k+1] = v128 (Kind = wvkVec), and
+    IrComputeRefRegBits sets a bit only for wvkRef. A reference register
+    allocated after a v128 therefore lands at the next free slot with ITS
+    bit set and the two vector slots left clear. Any padding slot inserted
+    for even alignment is a non-reference type for the same reason. }
   TWasmIrFunction = record
     TypeIndex: UInt32;         { module type space }
     CanonTypeId: UInt32;       { canonical type id, module-local }
-    ParamCount: UInt32;
-    LocalCount: UInt32;        { declared locals, excluding params }
+    ParamCount: UInt32;        { wasm value count, not a slot count }
+    LocalCount: UInt32;        { declared locals, excluding params (values) }
     ResultCount: UInt32;
-    ReturnRegBase: UInt32;     { = ParamCount + LocalCount }
-    RegisterCount: UInt32;
+    ReturnRegBase: UInt32;     { first slot after the last local's slots }
+    RegisterCount: UInt32;     { frame size in SLOTS (a v128 costs two) }
     SourceOffset: NativeUInt;  { absolute, for diagnostics }
     Code: TWasmIrCode;
     RegTypes: TWasmIrRegTypes;
-    { Bit i set iff RegTypes[i].Kind = wvkRef. Computed once, at the end
-      of the function walk, by IrComputeRefRegBits. }
+    { wasm local index -> its low register/slot. Length =
+      ParamCount + LocalCount. Needed because a v128 local breaks the
+      1:1 local-index = register identity the pre-SIMD IR relied on;
+      local.get/set/tee read this rather than assuming register i = local i.
+      Populated by the body walker (Track G3); reuses the u32 array type. }
+    LocalRegs: TWasmIrAuxU32;
+    { wasm result index -> its low register/slot. Length = ResultCount. The
+      return block is allocated with the same even-alignment rule as locals
+      (IrAllocReg), so a scalar result BEFORE a v128 result inserts a pad and
+      the results are NOT a contiguous run from ReturnRegBase. Marshaling the
+      results (DoReturn, ResultSlotCount, the host return path) walks this map
+      pad-aware instead of assuming contiguity, exactly as the param seam walks
+      LocalRegs. Populated by the body walker; reuses the u32 array type. }
+    ResultRegs: TWasmIrAuxU32;
+    { Bit i set iff RegTypes[i].Kind = wvkRef, indexed by SLOT. Computed
+      once, at the end of the function walk, by IrComputeRefRegBits. Both
+      slots of a v128 are clear — see the frame-walk invariant above. }
     RefRegBits: TWasmIrBitset;
     AuxU32: TWasmIrAuxU32;
     AuxRefTypes: TWasmIrRefTypes;
@@ -1261,6 +2203,52 @@ function IrAuxBlockCount(const AAux: TWasmIrAuxU32;
 function IrAuxBlockItem(const AAux: TWasmIrAuxU32;
   const AIndex, AItem: UInt32): UInt32;
 
+{ --- vector aux blocks (Track G) -----------------------------------------
+
+  A 16-byte v128 immediate and the lane-load/store memarg both need more
+  than the record's four fields hold, so both ride in AuxU32 as ordinary
+  length-prefixed blocks — no AuxV128 side table (SIMD design §2.2-§2.3).
+  The instruction's Imm holds the block index, with ImmKind ifkAuxIndex.
+
+  v128 immediate (v128.const, i8x16.shuffle mask): a length-4 block whose
+  four words hold the 16 bytes verbatim, little-endian within the vector.
+  The bytes are copied with a raw Move, so the words are never interpreted
+  numerically and the round-trip is endian-safe.
+
+  lane memarg (v128.loadN_lane / storeN_lane): a length-4 block
+  [MemIdx, OffsetLo, OffsetHi, LaneIdx] — the static offset is u64 (an i64
+  memory does not fit UInt32) so it is split across two words. }
+
+{ Appends a v128's 16 bytes as a length-4 block and returns the block
+  index. Exact growth — see IrAppendAuxBlock. }
+function IrAppendAuxV128(var AAux: TWasmIrAuxU32;
+  const AVec: TWasmV128): UInt32;
+
+{ The amortised form over an (array, live-count) pair. }
+function IrAppendAuxV128Growing(var AAux: TWasmIrAuxU32;
+  var AAuxCount: Integer; const AVec: TWasmV128): UInt32;
+
+{ Reads the 16 bytes back with a single Move; a missing or truncated block
+  yields a zero vector rather than raising (the disassembler runs on
+  half-constructed IR). }
+procedure IrAuxReadV128(const AAux: TWasmIrAuxU32; const AIndex: UInt32;
+  out AVec: TWasmV128);
+
+{ Appends [MemIdx, OffsetLo, OffsetHi, LaneIdx] and returns the block
+  index. Exact growth. }
+function IrAppendAuxLaneMemArg(var AAux: TWasmIrAuxU32;
+  const AMemIdx: UInt32; const AOffset: UInt64; const ALane: UInt32): UInt32;
+
+{ The amortised form. }
+function IrAppendAuxLaneMemArgGrowing(var AAux: TWasmIrAuxU32;
+  var AAuxCount: Integer; const AMemIdx: UInt32; const AOffset: UInt64;
+  const ALane: UInt32): UInt32;
+
+{ Reads the four words back; a missing block yields zeros / IR_NO_REG per
+  IrAuxBlockItem's tolerant contract. }
+procedure IrAuxReadLaneMemArg(const AAux: TWasmIrAuxU32; const AIndex: UInt32;
+  out AMemIdx: UInt32; out AOffset: UInt64; out ALane: UInt32);
+
 { --- safepoints and the reference-register projection -------------------- }
 
 { True for the ops that are safepoints by KIND: calls, tail calls, and the
@@ -1401,10 +2389,45 @@ function IrAllocReg(var ARegTypes: TWasmIrRegTypes;
   var ARegCount: Integer; const AType: TWasmValueType): UInt32;
 var
   { Same hazard, same fix: `IrAllocReg(RegTypes, N, RegTypes[K])` is the
-    natural way to allocate a register of an existing register's type. }
+    natural way to allocate a register of an existing register's type. Copy
+    the type out BEFORE any SetLength so a self-aliased AType survives the
+    reallocation. }
   Ty: TWasmValueType;
+
+  procedure EnsureCapacity(const ANeed: Integer);
+  begin
+    if ANeed > Length(ARegTypes) then
+      SetLength(ARegTypes, (ANeed * 2) + 16);
+  end;
+
 begin
   Ty := AType;
+
+  { A v128 occupies TWO adjacent slots and its low slot must be EVEN (SIMD
+    design §1.5), which — since a scalar allocation advances by one — means
+    padding when the next free slot is odd. The pad is a dead, non-reference
+    filler (i32), so RefRegBits stays clear over it and the GC never scans
+    it. Both halves of the pair get the v128 type, so the stack-map
+    projection and any width query see a consistent RegTypes; neither half
+    is a reference, so both RefRegBits are clear. Returns the low slot. }
+  if Ty.Kind = wvkVec then
+  begin
+    if Odd(ARegCount) then
+    begin
+      EnsureCapacity(ARegCount + 1);
+      ARegTypes[ARegCount] := MakeNumValueType(wntI32);
+      Inc(ARegCount);
+    end;
+    EnsureCapacity(ARegCount + 2);
+    ARegTypes[ARegCount] := Ty;
+    ARegTypes[ARegCount + 1] := Ty;
+    Result := UInt32(ARegCount);
+    Inc(ARegCount, 2);
+    Exit;
+  end;
+
+  { The scalar path keeps the original growth policy verbatim — a caller
+    pins Length after a run of allocations. }
   if ARegCount >= Length(ARegTypes) then
     SetLength(ARegTypes, (ARegCount * 2) + 16);
   ARegTypes[ARegCount] := Ty;
@@ -1493,6 +2516,63 @@ begin
   if AItem >= IrAuxBlockCount(AAux, AIndex) then
     Exit(IR_NO_REG);
   Result := AAux[AIndex + 1 + AItem];
+end;
+
+function IrAppendAuxV128(var AAux: TWasmIrAuxU32;
+  const AVec: TWasmV128): UInt32;
+var
+  Words: array[0..3] of UInt32;
+begin
+  { Raw byte copy, so the four words carry the 16 bytes verbatim regardless
+    of host endianness — they are never read as numbers. }
+  Move(AVec, Words[0], 16);
+  Result := IrAppendAuxBlock(AAux, Words);
+end;
+
+function IrAppendAuxV128Growing(var AAux: TWasmIrAuxU32;
+  var AAuxCount: Integer; const AVec: TWasmV128): UInt32;
+var
+  Words: array[0..3] of UInt32;
+begin
+  Move(AVec, Words[0], 16);
+  Result := IrAppendAuxBlockGrowing(AAux, AAuxCount, Words);
+end;
+
+procedure IrAuxReadV128(const AAux: TWasmIrAuxU32; const AIndex: UInt32;
+  out AVec: TWasmV128);
+begin
+  FillChar(AVec, SizeOf(AVec), 0);
+  { Need the four data words at AIndex+1..AIndex+4 in range. A missing
+    block (IR_NO_AUX) or a truncated one reads as the zero vector. }
+  if (AIndex = IR_NO_AUX) or (Int64(AIndex) + 5 > Int64(Length(AAux))) then
+    Exit;
+  Move(AAux[AIndex + 1], AVec, 16);
+end;
+
+function IrAppendAuxLaneMemArg(var AAux: TWasmIrAuxU32;
+  const AMemIdx: UInt32; const AOffset: UInt64; const ALane: UInt32): UInt32;
+begin
+  Result := IrAppendAuxBlock(AAux, [AMemIdx,
+    UInt32(AOffset and $FFFFFFFF), UInt32((AOffset shr 32) and $FFFFFFFF),
+    ALane]);
+end;
+
+function IrAppendAuxLaneMemArgGrowing(var AAux: TWasmIrAuxU32;
+  var AAuxCount: Integer; const AMemIdx: UInt32; const AOffset: UInt64;
+  const ALane: UInt32): UInt32;
+begin
+  Result := IrAppendAuxBlockGrowing(AAux, AAuxCount, [AMemIdx,
+    UInt32(AOffset and $FFFFFFFF), UInt32((AOffset shr 32) and $FFFFFFFF),
+    ALane]);
+end;
+
+procedure IrAuxReadLaneMemArg(const AAux: TWasmIrAuxU32; const AIndex: UInt32;
+  out AMemIdx: UInt32; out AOffset: UInt64; out ALane: UInt32);
+begin
+  AMemIdx := IrAuxBlockItem(AAux, AIndex, 0);
+  AOffset := UInt64(IrAuxBlockItem(AAux, AIndex, 1))
+    or (UInt64(IrAuxBlockItem(AAux, AIndex, 2)) shl 32);
+  ALane := IrAuxBlockItem(AAux, AIndex, 3);
 end;
 
 function IrOpIsSafepoint(const AOp: TWasmIrOp): Boolean;
@@ -1660,7 +2740,8 @@ begin
         ALow := 'mem';
         AHigh := 'data';
       end;
-    iroStructGet, iroStructGetS, iroStructGetU, iroStructSet:
+    iroStructGet, iroStructGetS, iroStructGetU, iroStructSet,
+    iroStructGetVec, iroStructSetVec:
       begin
         ALow := 'type';
         AHigh := 'field';
@@ -1762,6 +2843,63 @@ begin
     Result := IrRegName(AInstr.Dest) + ' <- ' + Result;
 end;
 
+{ The 16 immediate bytes of a v128 constant, in memory order, as lowercase
+  hex — directly comparable to a `(v128.const i8x16 …)` byte sequence. }
+function IrV128Hex(const AAux: TWasmIrAuxU32; const AAuxIndex: UInt32): string;
+var
+  V: TWasmV128;
+  I: Integer;
+begin
+  IrAuxReadV128(AAux, AAuxIndex, V);
+  Result := '';
+  for I := 0 to 15 do
+    Result := Result + LowerCase(IntToHex(V.B[I], 2));
+end;
+
+{ The 16 shuffle lane indices, decimal, space-separated, from the mask
+  block — matching the text form `i8x16.shuffle 0 1 … 15`. }
+function IrShuffleLanes(const AAux: TWasmIrAuxU32;
+  const AAuxIndex: UInt32): string;
+var
+  V: TWasmV128;
+  I: Integer;
+begin
+  IrAuxReadV128(AAux, AAuxIndex, V);
+  Result := 'lanes[';
+  for I := 0 to 15 do
+  begin
+    if I > 0 then
+      Result := Result + ' ';
+    Result := Result + IntToStr(V.B[I]);
+  end;
+  Result := Result + ']';
+end;
+
+{ `[<addr> + <offset>]` from a lane memarg block. Kept separate from the
+  mem/lane tail because a load renders them adjacent (`[..] mem=.. lane=..,
+  src`) while a store puts the stored value between them (`[..] <- val
+  mem=.. lane=..`), matching the SIMD design §2.6 listing. }
+function IrLaneAddr(const AAux: TWasmIrAuxU32; const AAddr: UInt32;
+  const AAuxIndex: UInt32): string;
+var
+  MemIdx, Lane: UInt32;
+  Offset: UInt64;
+begin
+  IrAuxReadLaneMemArg(AAux, AAuxIndex, MemIdx, Offset, Lane);
+  Result := '[' + IrRegName(AAddr) + ' + ' + IntToStr(Offset) + ']';
+end;
+
+{ `mem=<m> lane=<l>` from a lane memarg block. }
+function IrLaneMemLane(const AAux: TWasmIrAuxU32;
+  const AAuxIndex: UInt32): string;
+var
+  MemIdx, Lane: UInt32;
+  Offset: UInt64;
+begin
+  IrAuxReadLaneMemArg(AAux, AAuxIndex, MemIdx, Offset, Lane);
+  Result := 'mem=' + IntToStr(MemIdx) + ' lane=' + IntToStr(Lane);
+end;
+
 function IrOperands(const ACode: TWasmIrCode;
   const ARegTypes: TWasmIrRegTypes; const AAux: TWasmIrAuxU32;
   const ARefTypes: TWasmIrRefTypes; const AIndex: UInt32): string;
@@ -1774,7 +2912,7 @@ begin
     iroUnreachable, iroReturn:
       Result := '';
 
-    iroMove:
+    iroMove, iroMoveVec:
       Result := IrRegName(Ins.Dest) + ' <- ' + IrRegName(Ins.A);
 
     iroJump:
@@ -1837,14 +2975,21 @@ begin
     iroThrowRef:
       Result := IrRegName(Ins.A);
 
-    { The one op where a register rides in Imm — the condition. }
-    iroSelect:
+    { A register rides in Imm — the condition (select) or the third source
+      operand of a ternary vector op (ifkSrcRegImm). Same shape either way:
+      `Dest <- A, B ? Imm`. }
+    iroSelect, iroSelectVec, iroV128Bitselect,
+    iroF32x4RelaxedMadd, iroF32x4RelaxedNmadd,
+    iroF64x2RelaxedMadd, iroF64x2RelaxedNmadd,
+    iroI8x16RelaxedLaneselect, iroI16x8RelaxedLaneselect,
+    iroI32x4RelaxedLaneselect, iroI64x2RelaxedLaneselect,
+    iroI32x4RelaxedDotI8x16I7x16AddS:
       Result := IrRegName(Ins.Dest) + ' <- ' + IrRegName(Ins.A) + ', '
         + IrRegName(Ins.B) + ' ? ' + IrRegName(UInt32(Ins.Imm));
 
-    iroGlobalGet:
+    iroGlobalGet, iroGlobalGetVec:
       Result := IrRegName(Ins.Dest) + ' <- g' + IntToStr(Ins.Imm);
-    iroGlobalSet:
+    iroGlobalSet, iroGlobalSetVec:
       Result := 'g' + IntToStr(Ins.Imm) + ' <- ' + IrRegName(Ins.A);
 
     iroTableGet:
@@ -1886,6 +3031,53 @@ begin
     iroRefTest:
       Result := IrRegName(Ins.Dest) + ' <- '
         + IrRefTypeName(ARefTypes, Ins.Imm) + ' ' + IrRegName(Ins.A);
+
+    { --- vector special forms (SIMD design §2.6) --------------------- }
+
+    { The 16 immediate bytes render as `v128:<hex>` in memory order. }
+    iroV128Const:
+      Result := IrRegName(Ins.Dest) + ' <- v128:'
+        + IrV128Hex(AAux, UInt32(Ins.Imm));
+
+    { Two vector operands plus the decimal 16-lane mask. }
+    iroI8x16Shuffle:
+      Result := IrRegName(Ins.Dest) + ' <- ' + IrRegName(Ins.A) + ', '
+        + IrRegName(Ins.B) + ' ' + IrShuffleLanes(AAux, UInt32(Ins.Imm));
+
+    { Lane access. Extract has no B (BKind ifkUnused); replace does. }
+    iroI8x16ExtractLaneS .. iroF64x2ReplaceLane:
+      if IR_OP_INFO[Ins.Op].BKind = ifkSrcReg then
+        Result := IrRegName(Ins.Dest) + ' <- ' + IrRegName(Ins.A) + ', '
+          + IrRegName(Ins.B) + ' lane=' + IntToStr(Ins.Imm)
+      else
+        Result := IrRegName(Ins.Dest) + ' <- ' + IrRegName(Ins.A)
+          + ' lane=' + IntToStr(Ins.Imm);
+
+    { Whole-vector / packed / splat / zero loads: same shape as a scalar
+      load — B is the memory index, Imm the static offset. }
+    iroV128Load .. iroV128Load64Splat, iroV128Load32Zero, iroV128Load64Zero:
+      Result := IrRegName(Ins.Dest) + ' <- [' + IrRegName(Ins.A) + ' + '
+        + IntToStr(Ins.Imm) + '] mem=' + IntToStr(Ins.B);
+
+    { The whole-vector store keeps the value register in Dest, like a scalar
+      store, so A stays the address and B the memory index. }
+    iroV128Store:
+      Result := '[' + IrRegName(Ins.A) + ' + ' + IntToStr(Ins.Imm)
+        + '] <- ' + IrRegName(Ins.Dest) + ' mem=' + IntToStr(Ins.B);
+
+    { Lane loads: Dest is the result, A the address, B the source vector,
+      Imm the [mem, offset, lane] block. }
+    iroV128Load8Lane .. iroV128Load64Lane:
+      Result := IrRegName(Ins.Dest) + ' <- '
+        + IrLaneAddr(AAux, Ins.A, UInt32(Ins.Imm)) + ' '
+        + IrLaneMemLane(AAux, UInt32(Ins.Imm)) + ', ' + IrRegName(Ins.B);
+
+    { Lane stores: Dest holds the stored vector, A the address — the value
+      renders between the address and the mem/lane tail. }
+    iroV128Store8Lane .. iroV128Store64Lane:
+      Result := IrLaneAddr(AAux, Ins.A, UInt32(Ins.Imm)) + ' <- '
+        + IrRegName(Ins.Dest) + ' '
+        + IrLaneMemLane(AAux, UInt32(Ins.Imm));
 
   else
     Result := IrGenericOperands(Ins, AAux);

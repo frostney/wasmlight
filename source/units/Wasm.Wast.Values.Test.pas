@@ -65,7 +65,13 @@ type
     procedure TestParseValNanCanonicalMatcher;
     procedure TestParseValRefExternId;
     procedure TestParseValRefNull;
-    procedure TestParseValV128Staged;
+
+    { v128.const parsing → exact 16 bytes }
+    procedure TestParseV128I8x16Bytes;
+    procedure TestParseV128I32x4Lanes;
+    procedure TestParseV128F64x2Lanes;
+    procedure TestParseV128F32x4NanLaneKinds;
+    procedure TestParseV128WrongLaneCountRaises;
 
     { comparator }
     procedure TestCompareExactI32;
@@ -78,6 +84,14 @@ type
     procedure TestCompareRefExternIdentity;
     procedure TestCompareRefExternMismatch;
     procedure TestCompareRefExternBareAnyNonNull;
+
+    { v128 per-lane comparator + (either) }
+    procedure TestVecExactMatch;
+    procedure TestVecOneNanCanonicalLaneMatches;
+    procedure TestVecWrongLaneFails;
+    procedure TestVecNanArithmeticLaneClass;
+    procedure TestEitherMatchesAnyAlternative;
+    procedure TestEitherFailsWhenNoneMatch;
   end;
 
 function TWastValuesTests.ParseVal(const AText: string): TWastVal;
@@ -296,12 +310,79 @@ begin
   Expect<Integer>(Ord(V.Kind)).ToBe(Ord(wvcRefNull));
 end;
 
-procedure TWastValuesTests.TestParseValV128Staged;
+{ --- v128.const parsing -------------------------------------------------- }
+
+procedure TWastValuesTests.TestParseV128I8x16Bytes;
+var
+  V: TWastVal;
+  Vec: TWasmV128;
+  I: Integer;
+  AllExact: Boolean;
+begin
+  V := ParseVal('(v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)');
+  Expect<Integer>(Ord(V.Kind)).ToBe(Ord(wvcV128));
+  Expect<Integer>(Ord(V.VecShape)).ToBe(Ord(wvsI8x16));
+  Vec := WastValToVec(V);
+  AllExact := True;
+  for I := 0 to 15 do
+    if (Vec.B[I] <> I) or (V.VecLaneKinds[I] <> wlkExact) then
+      AllExact := False;
+  Expect<Boolean>(AllExact).ToBe(True);
+  { -0x80 and 0xFF both fit the i8 union range. }
+  V := ParseVal('(v128.const i8x16 -0x80 0xFF 0 0 0 0 0 0 0 0 0 0 0 0 0 0)');
+  Vec := WastValToVec(V);
+  Expect<UInt32>(UInt32(Vec.B[0])).ToBe(UInt32($80));
+  Expect<UInt32>(UInt32(Vec.B[1])).ToBe(UInt32($FF));
+end;
+
+procedure TWastValuesTests.TestParseV128I32x4Lanes;
+var
+  Vec: TWasmV128;
+begin
+  Vec := WastValToVec(ParseVal('(v128.const i32x4 1 2 0xdeadbeef -1)'));
+  Expect<UInt32>(Vec.U32[0]).ToBe(UInt32(1));
+  Expect<UInt32>(Vec.U32[1]).ToBe(UInt32(2));
+  Expect<UInt32>(Vec.U32[2]).ToBe(UInt32($DEADBEEF));
+  Expect<UInt32>(Vec.U32[3]).ToBe(UInt32($FFFFFFFF));
+end;
+
+procedure TWastValuesTests.TestParseV128F64x2Lanes;
+var
+  Vec: TWasmV128;
+begin
+  Vec := WastValToVec(ParseVal('(v128.const f64x2 1.0 2.0)'));
+  Expect<UInt64>(Vec.U64[0]).ToBe(UInt64($3FF0000000000000));
+  Expect<UInt64>(Vec.U64[1]).ToBe(UInt64($4000000000000000));
+end;
+
+procedure TWastValuesTests.TestParseV128F32x4NanLaneKinds;
 var
   V: TWastVal;
 begin
-  V := ParseVal('(v128.const i32x4 0 0 0 0)');
-  Expect<Boolean>(WastValIsStaged(V)).ToBe(True);
+  { A single constant mixing two NaN classes with two exact lanes — the
+    corpus's simd_f32x4_arith.wast:5292 shape. Each lane's kind is recorded
+    independently. }
+  V := ParseVal('(v128.const f32x4 nan:canonical nan:arithmetic 6.0 7.0)');
+  Expect<Integer>(Ord(V.VecShape)).ToBe(Ord(wvsF32x4));
+  Expect<Integer>(Ord(V.VecLaneKinds[0])).ToBe(Ord(wlkNanCanonical));
+  Expect<Integer>(Ord(V.VecLaneKinds[1])).ToBe(Ord(wlkNanArithmetic));
+  Expect<Integer>(Ord(V.VecLaneKinds[2])).ToBe(Ord(wlkExact));
+  Expect<Integer>(Ord(V.VecLaneKinds[3])).ToBe(Ord(wlkExact));
+  Expect<UInt64>(V.VecLanes[2]).ToBe(UInt64($40C00000));   { 6.0f }
+end;
+
+procedure TWastValuesTests.TestParseV128WrongLaneCountRaises;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    ParseVal('(v128.const i32x4 1 2 3)');   { needs 4 lanes }
+  except
+    on E: EWastValueError do
+      Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
 end;
 
 { --- comparator ---------------------------------------------------------- }
@@ -448,6 +529,95 @@ begin
     ActualBits(UInt64(WASM_REF_NULL)), WASM_REF_NULL)).ToBe(False);
 end;
 
+{ --- v128 per-lane comparator + (either) --------------------------------- }
+
+function VecI32(const A, B, C, D: UInt32): TWasmV128;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.U32[0] := A;
+  Result.U32[1] := B;
+  Result.U32[2] := C;
+  Result.U32[3] := D;
+end;
+
+function VecF32Bits(const A, B, C, D: UInt32): TWasmV128;
+begin
+  Result := VecI32(A, B, C, D);   { lanes are raw f32 bit patterns }
+end;
+
+{ Parse AExpectedText into a result matcher and compare AActual (a v128)
+  against it through the real slot-aware entry point. }
+function VecMatches(const AExpectedText: string;
+  const AActual: TWasmV128): Boolean;
+var
+  Script: TWastScript;
+  Exp: TWastExpected;
+  Slots: array[0..1] of TWasmValue;
+begin
+  Script := ParseWastScript(AExpectedText);
+  try
+    Exp := WastParseExpected(Script[0].Node);
+  finally
+    Script.Free;
+  end;
+  Slots[0].Bits := AActual.U64[0];
+  Slots[1].Bits := AActual.U64[1];
+  Result := WastExpectedMatches(Exp, @Slots[0], True, WASM_REF_NULL);
+end;
+
+procedure TWastValuesTests.TestVecExactMatch;
+begin
+  Expect<Boolean>(VecMatches('(v128.const i32x4 1 2 3 4)',
+    VecI32(1, 2, 3, 4))).ToBe(True);
+  Expect<Boolean>(VecMatches('(v128.const i32x4 1 2 3 4)',
+    VecI32(1, 2, 3, 5))).ToBe(False);
+end;
+
+procedure TWastValuesTests.TestVecOneNanCanonicalLaneMatches;
+begin
+  { Lane 0 canonical NaN, lanes 1-3 exact — all four must hold. }
+  Expect<Boolean>(VecMatches(
+    '(v128.const f32x4 nan:canonical 1.0 2.0 3.0)',
+    VecF32Bits($7FC00000, $3F800000, $40000000, $40400000))).ToBe(True);
+end;
+
+procedure TWastValuesTests.TestVecWrongLaneFails;
+begin
+  { Lane 0 matches the canonical class, but lane 1 is 1.5 not 1.0 — a single
+    wrong lane fails the whole result. }
+  Expect<Boolean>(VecMatches(
+    '(v128.const f32x4 nan:canonical 1.0 2.0 3.0)',
+    VecF32Bits($7FC00000, $3FC00000, $40000000, $40400000))).ToBe(False);
+end;
+
+procedure TWastValuesTests.TestVecNanArithmeticLaneClass;
+begin
+  { A non-canonical arithmetic NaN (payload MSB set, extra payload bits)
+    satisfies nan:arithmetic on that lane. }
+  Expect<Boolean>(VecMatches(
+    '(v128.const f32x4 nan:arithmetic 0 0 0)',
+    VecF32Bits($7FE00000, 0, 0, 0))).ToBe(True);
+  { Infinity is not a NaN — the arithmetic class rejects it. }
+  Expect<Boolean>(VecMatches(
+    '(v128.const f32x4 nan:arithmetic 0 0 0)',
+    VecF32Bits($7F800000, 0, 0, 0))).ToBe(False);
+end;
+
+procedure TWastValuesTests.TestEitherMatchesAnyAlternative;
+begin
+  { The relaxed-SIMD form: passes if the actual matches ANY alternative. }
+  Expect<Boolean>(VecMatches(
+    '(either (v128.const i32x4 1 2 3 4) (v128.const i32x4 5 6 7 8))',
+    VecI32(5, 6, 7, 8))).ToBe(True);
+end;
+
+procedure TWastValuesTests.TestEitherFailsWhenNoneMatch;
+begin
+  Expect<Boolean>(VecMatches(
+    '(either (v128.const i32x4 1 2 3 4) (v128.const i32x4 5 6 7 8))',
+    VecI32(9, 9, 9, 9))).ToBe(False);
+end;
+
 procedure TWastValuesTests.SetupTests;
 begin
   Test('i32 decimal', TestInt32Decimal);
@@ -479,7 +649,14 @@ begin
   Test('parse value nan:canonical matcher', TestParseValNanCanonicalMatcher);
   Test('parse value ref.extern id', TestParseValRefExternId);
   Test('parse value ref.null', TestParseValRefNull);
-  Test('parse value v128 staged', TestParseValV128Staged);
+
+  Test('parse v128 i8x16 exact bytes', TestParseV128I8x16Bytes);
+  Test('parse v128 i32x4 lanes', TestParseV128I32x4Lanes);
+  Test('parse v128 f64x2 lanes', TestParseV128F64x2Lanes);
+  Test('parse v128 f32x4 mixed NaN lane kinds',
+    TestParseV128F32x4NanLaneKinds);
+  Test('parse v128 wrong lane count raises',
+    TestParseV128WrongLaneCountRaises);
 
   Test('compare exact i32', TestCompareExactI32);
   Test('compare exact f32 negative zero', TestCompareExactF32NegZero);
@@ -494,6 +671,14 @@ begin
   Test('compare ref extern mismatch', TestCompareRefExternMismatch);
   Test('compare bare ref extern matches any non-null externref',
     TestCompareRefExternBareAnyNonNull);
+
+  Test('vec exact match', TestVecExactMatch);
+  Test('vec one nan:canonical lane matches',
+    TestVecOneNanCanonicalLaneMatches);
+  Test('vec wrong lane fails', TestVecWrongLaneFails);
+  Test('vec nan:arithmetic lane class', TestVecNanArithmeticLaneClass);
+  Test('either matches any alternative', TestEitherMatchesAnyAlternative);
+  Test('either fails when none match', TestEitherFailsWhenNoneMatch);
 end;
 
 begin

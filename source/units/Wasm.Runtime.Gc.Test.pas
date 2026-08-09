@@ -43,7 +43,8 @@ const
   TY_I32_ARRAY = 6;   { (array (mut i32)) }
   TY_TAG = 7;         { (func (param i32 (ref null any))) — an exn's tag }
   TY_NO_DEFAULT = 8;  { (struct (ref any)) — non-nullable, no default }
-  TY_VEC_STRUCT = 9;  { (struct (mut v128)) — a valid TYPE, staged storage }
+  TY_VEC_STRUCT = 9;  { (struct (mut v128)) — 16-byte field storage }
+  TY_VEC_ARRAY = 10;  { (array (mut v128)) — 16-byte element storage }
 
 var
   { The host-box release hook's evidence. A file-level variable because
@@ -121,7 +122,9 @@ type
     procedure TestResetFramesDropsStaleFramesAfterUnwind;
     procedure TestAReleaseHookThatAllocatesIsCaught;
     procedure TestAllocationFailureCollectsThenRetries;
-    procedure TestVectorStorageIsStagedNotAnInternalBug;
+    procedure TestVectorStorageRoundTrips;
+    procedure TestVectorArrayRoundTrips;
+    procedure TestVectorFieldSurvivesCollection;
     procedure TestExternalizeIsInvisibleToAbstractKindStaged;
   end;
 
@@ -199,11 +202,14 @@ begin
   FTypes.Define(TY_NO_DEFAULT, StructOf([
     MakeValueStorageType(NonNullAnyRef)], False));
 
-  { A v128 field is a valid storage type — the validator admits vector
-    value types; only the $FD instruction space is staged (B15). The layout
-    computes (width 16), but reading or writing the field is Track G. }
+  { A v128 field is a valid storage type (width 16), read and written
+    through the 16-byte accessors (simd-spec §7). }
   FTypes.Define(TY_VEC_STRUCT, StructOf([
     MakeValueStorageType(MakeVecValueType)], True));
+
+  { A mutable v128 ARRAY element, for the fill/get/set round-trip. }
+  FTypes.Define(TY_VEC_ARRAY,
+    ArrayOf(MakeValueStorageType(MakeVecValueType)));
 end;
 
 procedure TRuntimeGcTests.BeforeEach;
@@ -1467,27 +1473,91 @@ begin
     Integer(FHeap.CollectionCount), Before + 1);
 end;
 
-procedure TRuntimeGcTests.TestVectorStorageIsStagedNotAnInternalBug;
+procedure TRuntimeGcTests.TestVectorStorageRoundTrips;
 var
   Obj: TWasmRef;
-  Caught: string;
+  Value, Got: TWasmV128;
+  I: Integer;
 begin
-  { A (struct (field v128)) is a valid TYPE — the validator admits vector
-    storage; only $FD instructions are staged. A valid module can still
-    reach the field through struct.new_default, so the runtime fails with
-    the SAME staged-SIMD message the validator uses, not a bare 'internal:'
-    engine bug (B15). }
+  { A (struct (mut v128)) field now round-trips through the 16-byte
+    accessors (simd-spec §7): struct.new_default zeroes the whole cell (the
+    vector default), then a StructSetVec / StructGetVec pair preserves all
+    128 bits with no packing, sign-extension or barrier. }
   Obj := FHeap.AllocStruct(TY_VEC_STRUCT);
-  Caught := 'accepted';
-  try
-    FHeap.StructSetDefaults(Obj);
-  except
-    on E: EWasmTrap do
-      Caught := 'trap: ' + E.Message;
-    on E: EWasmError do
-      Caught := E.Message;
-  end;
-  Expect<string>(Caught).ToBe(MSG_GC_VEC_STORAGE_STAGED);
+
+  { A fresh object reads the zero vector — aux-default for a v128. }
+  FHeap.StructSetDefaults(Obj);
+  FHeap.StructGetVec(Obj, 0, @Got);
+  Expect<Boolean>((Got.U64[0] = 0) and (Got.U64[1] = 0)).ToBe(True);
+
+  for I := 0 to 15 do
+    Value.B[I] := Byte((I * 17) and $FF);
+  FHeap.StructSetVec(Obj, 0, @Value);
+  FHeap.StructGetVec(Obj, 0, @Got);
+  Expect<Boolean>(VecEquals(@Value, @Got)).ToBe(True);
+end;
+
+procedure TRuntimeGcTests.TestVectorArrayRoundTrips;
+var
+  Arr: TWasmRef;
+  Value, Got: TWasmV128;
+  I: Integer;
+begin
+  { A (array (mut v128)): each element is a 16-byte cell. Set then get one
+    element, then fill a sub-range and confirm every covered element and the
+    untouched neighbours (simd-spec §7). }
+  Arr := FHeap.AllocArray(TY_VEC_ARRAY, 4);
+
+  Value.U64[0] := UInt64($0102030405060708);
+  Value.U64[1] := UInt64($1112131415161718);
+  FHeap.ArraySetVec(Arr, 2, @Value);
+  FHeap.ArrayGetVec(Arr, 2, @Got);
+  Expect<Boolean>(VecEquals(@Value, @Got)).ToBe(True);
+
+  { Element 0 was never written: the zero vector default. }
+  FHeap.ArrayGetVec(Arr, 0, @Got);
+  Expect<Boolean>((Got.U64[0] = 0) and (Got.U64[1] = 0)).ToBe(True);
+
+  for I := 0 to 15 do
+    Value.B[I] := Byte(255 - I);
+  FHeap.ArrayFillVec(Arr, 1, 2, @Value);   { fills elements 1 and 2 }
+  FHeap.ArrayGetVec(Arr, 1, @Got);
+  Expect<Boolean>(VecEquals(@Value, @Got)).ToBe(True);
+  FHeap.ArrayGetVec(Arr, 2, @Got);
+  Expect<Boolean>(VecEquals(@Value, @Got)).ToBe(True);
+  { Element 3 is outside the fill range and stays zero. }
+  FHeap.ArrayGetVec(Arr, 3, @Got);
+  Expect<Boolean>((Got.U64[0] = 0) and (Got.U64[1] = 0)).ToBe(True);
+end;
+
+procedure TRuntimeGcTests.TestVectorFieldSurvivesCollection;
+var
+  Obj: TWasmRef;
+  Handle: TWasmRootHandle;
+  Value, Got: TWasmV128;
+  I: Integer;
+begin
+  { A v128 field is not a reference, so the collector never traces it — but
+    the OBJECT holding it must still survive through its root, and the 16
+    bytes must be intact afterwards. Set the field, allocate garbage, then
+    collect while the struct is rooted (the mid-construction-safe path). }
+  Obj := FHeap.AllocStruct(TY_VEC_STRUCT);
+  for I := 0 to 15 do
+    Value.B[I] := Byte($A0 + I);
+  FHeap.StructSetVec(Obj, 0, @Value);
+  Handle := FHeap.RootRegister(Obj);
+
+  FHeap.AllocStruct(TY_BASE);
+  FHeap.AllocArray(TY_I32_ARRAY, 8);
+  FHeap.Collect;
+
+  Expect<Boolean>(RefIsObject(Obj)).ToBe(True);
+  FHeap.StructGetVec(Obj, 0, @Got);
+  Expect<Boolean>(VecEquals(@Value, @Got)).ToBe(True);
+
+  FHeap.RootRelease(Handle);
+  FHeap.Collect;
+  ExpectCount('unreachable', Integer(FHeap.ObjectCount), 0);
 end;
 
 procedure TRuntimeGcTests.TestExternalizeIsInvisibleToAbstractKindStaged;
@@ -1596,8 +1666,12 @@ begin
     TestAReleaseHookThatAllocatesIsCaught);
   Test('allocation failure collects and retries before trapping',
     TestAllocationFailureCollectsThenRetries);
-  Test('a v128 field is staged SIMD, not an internal bug',
-    TestVectorStorageIsStagedNotAnInternalBug);
+  Test('a v128 struct field round-trips through the 16-byte accessors',
+    TestVectorStorageRoundTrips);
+  Test('a v128 array element round-trips through get/set/fill',
+    TestVectorArrayRoundTrips);
+  Test('a struct with a v128 field survives collection intact',
+    TestVectorFieldSurvivesCollection);
   Test('externalization is invisible to the kind-only abstract map (staged)',
     TestExternalizeIsInvisibleToAbstractKindStaged);
 end;

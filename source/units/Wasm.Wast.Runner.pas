@@ -39,9 +39,8 @@
   assembles+validates the operand — a false rejection there is a FAIL, §4 —
   but linkage we cannot yet judge), an `assert_return`/`invoke` whose module
   never instantiated, imports the harness cannot satisfy (no host `spectest`
-  module), the `_custom` directives outside the reference grammar, and
-  modules the assembler cannot yet build (v128 -> STAGED). A skip is an
-  honest "not judged".
+  module), and the `_custom` directives outside the reference grammar. A
+  skip is an honest "not judged".
 
   THE PER-SCRIPT LIFECYCLE. One engine and one store back a whole script,
   mirroring the reference interpreter's per-script state. Modules
@@ -55,10 +54,12 @@
   both the malformed/invalid classes and the runtime trap messages. Running
   this corpus is what settles those prefixes, so a fail records BOTH strings.
 
-  STAGED. `$FD` vector work is staged to Track G and exception handling to
-  Track H. A validation or execution that trips one of those staged
-  messages, or an assertion whose values are `v128`/`(either ...)`, is
-  recorded as STAGED — visible, counted apart, never a false pass or fail. }
+  STAGED. Nothing stages any more. `$FD` vector work assembles, validates,
+  and executes (Track G), and exception handling now throws, unwinds, and is
+  judged (Track H): `assert_exception` is a real verdict and an uncaught guest
+  exception surfaces as EWasmException, so the `wrsStaged` status is retained
+  only as the harness's honest "would fail on deliberately staged work" bucket
+  and is left unused — the `staged` column reads 0 across the corpus. }
 unit Wasm.Wast.Runner;
 
 {$I Shared.inc}
@@ -103,7 +104,6 @@ const
   WAST_REASON_NO_INSTANCE = 'no instantiated module';
   WAST_REASON_UNRESOLVED_IMPORT = 'import not provided by the harness';
   WAST_REASON_NO_EXPORT = 'no such export';
-  WAST_REASON_EXCEPTIONS = 'exception handling not implemented (Track H)';
 
   { Recorded as the actual outcome when an assertion expected a failure
     and the module went through cleanly. Not a message from any layer —
@@ -305,17 +305,6 @@ begin
     and (Copy(AActual, 1, Length(AExpected)) = AExpected);
 end;
 
-{ True when a message names deliberately staged work — SIMD (validator or
-  GC vec storage) or exception handling — so the harness records STAGED
-  rather than a false failure. }
-function IsStagedMessage(const AMsg: string): Boolean;
-begin
-  Result := IsStagedFeatureMessage(AMsg)
-    or ((Length(AMsg) >= Length('exception handling is not implemented'))
-        and (Copy(AMsg, 1, Length('exception handling is not implemented'))
-             = 'exception handling is not implemented'));
-end;
-
 { --- payload extraction -------------------------------------------------- }
 
 { The bytes of a string node as text. Expected strings and export names are
@@ -415,31 +404,6 @@ begin
   SetLength(Result, Length(S));
   for I := 1 to Length(S) do
     Result[I - 1] := Byte(Ord(S[I]));
-end;
-
-{ True when a text error names a deliberately-staged vector mnemonic — the
-  assembler answers `$FD` families with `unknown operator <mnemonic>` until
-  Track G (wave 7). That is not a real text error, so a module failing ONLY on
-  it is STAGED, not fail (design §3 taxonomy). Detected on the appended token,
-  which is a vector mnemonic iff it starts with a lane-typed prefix. }
-function IsStagedSimdText(const AMsg: string): Boolean;
-const
-  PREFIX = 'unknown operator ';
-  VEC: array[0..7] of string = (
-    'v128.', 'i8x16.', 'i16x8.', 'i32x4.', 'i64x2.', 'f32x4.', 'f64x2.',
-    'v128');
-var
-  Tok: string;
-  I: Integer;
-begin
-  Result := False;
-  if Copy(AMsg, 1, Length(PREFIX)) <> PREFIX then
-    Exit;
-  Tok := Copy(AMsg, Length(PREFIX) + 1, MaxInt);
-  for I := 0 to High(VEC) do
-    if (Length(Tok) >= Length(VEC[I]))
-      and (Copy(Tok, 1, Length(VEC[I])) = VEC[I]) then
-      Exit(True);
 end;
 
 { The `(module ...)` operand of an assertion, nil when there is none. }
@@ -571,7 +535,6 @@ type
   TWatAssembleStatus = (
     wasOk,         { bytes produced — ABytes filled }
     wasTextError,  { a real EWasmTextError — ABytes is invalid }
-    wasStaged,     { a staged vector mnemonic (Track G) — not a real error }
     wasInternal    { the assembler raised something other than a text error }
   );
 
@@ -597,10 +560,7 @@ begin
     on E: EWasmTextError do
     begin
       AMsg := E.Message;
-      if IsStagedSimdText(E.Message) then
-        Result := wasStaged
-      else
-        Result := wasTextError;
+      Result := wasTextError;
     end;
     on E: Exception do
     begin
@@ -615,22 +575,12 @@ end;
 
 { The full module-operand attempt across all three forms, WITHOUT
   instantiating: binary decodes directly; text/quote assemble first (a text
-  error becomes wekText), then decode + validate the produced bytes.
-
-  ABlocked is set ONLY when a deliberately-staged vector mnemonic stopped the
-  ASSEMBLER from producing any bytes (Track G): the module cannot be judged at
-  all, so callers record STAGED regardless of the wanted class. A staged
-  message the VALIDATOR raises is a different situation — the module decoded
-  and reached validation — and is NOT flagged here; callers gate that on the
-  wanted class via IsStagedFeatureMessage, so a wrong-class rejection cannot
-  hide behind STAGED (design §4). }
+  error becomes wekText), then decode + validate the produced bytes. }
 function AttemptOperand(const AModel: TWasmModule; const AOperand: TWastNode;
-  const AForm: TWastModuleForm; out AMsg: string;
-  out ABlocked: Boolean): TWastErrorKind;
+  const AForm: TWastModuleForm; out AMsg: string): TWastErrorKind;
 var
   Bytes: TWasmBytes;
 begin
-  ABlocked := False;
   if AForm = wmfBinary then
   begin
     Result := AttemptModule(ModuleBinaryBytes(AOperand), AModel, AMsg);
@@ -638,11 +588,6 @@ begin
   end;
 
   case AssembleOperand(AOperand, AForm, Bytes, AMsg) of
-    wasStaged:
-      begin
-        ABlocked := True;
-        Exit(wekText);
-      end;
     wasTextError:
       Exit(wekText);
     wasInternal:
@@ -809,6 +754,49 @@ begin
   end;
 end;
 
+{ Slots a value type occupies in the flat marshal array: a v128 spans two
+  (design §1.6), everything else one. }
+function TypeSlots(const AType: TWasmValueType): Integer; inline;
+begin
+  if AType.Kind = wvkVec then
+    Result := 2
+  else
+    Result := 1;
+end;
+
+function SumSlots(const ATypes: array of TWasmValueType): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := 0 to High(ATypes) do
+    Inc(Result, TypeSlots(ATypes[I]));
+end;
+
+{ Render a produced vector actual as `(v128.const <expected shape> lane...)`
+  so a failure diff reads in the same notation as the script (design §6.3).
+  AActual points at the low slot of the register pair. }
+function RenderActualVec(const AActual: PWasmV128;
+  const AShape: TWastVecShape): string;
+const
+  SHAPE_NAME: array[TWastVecShape] of string = (
+    'i8x16', 'i16x8', 'i32x4', 'i64x2', 'f32x4', 'f64x2');
+var
+  I, Count: Integer;
+begin
+  Result := '(v128.const ' + SHAPE_NAME[AShape];
+  Count := VecLaneCount(AShape);
+  for I := 0 to Count - 1 do
+    case AShape of
+      wvsI8x16: Result := Result + ' ' + HexU(AActual^.B[I], 2);
+      wvsI16x8: Result := Result + ' ' + HexU(AActual^.U16[I], 4);
+      wvsI32x4, wvsF32x4: Result := Result + ' ' + HexU(AActual^.U32[I], 8);
+    else
+      Result := Result + ' ' + HexU(AActual^.U64[I], 16);   { i64x2 / f64x2 }
+    end;
+  Result := Result + ')';
+end;
+
 { --- action resolution --------------------------------------------------- }
 
 { Which instance an action node targets, and the index of its export-name
@@ -831,11 +819,19 @@ begin
 end;
 
 type
-  TWastActionKind = (wakOk, wakTrap, wakStaged, wakNoExport, wakError,
+  { The outcome class of a wasm action. wakException is an UNCAUGHT guest
+    exception (`throw`/`throw_ref` with no matching `try_table` clause) — the
+    EWasmException that reached the invocation boundary, which `assert_exception`
+    judges. It is a SIBLING of wakTrap, never folded into it: a trap must never
+    satisfy assert_exception and an exception must never satisfy assert_trap. }
+  TWastActionKind = (wakOk, wakTrap, wakException, wakNoExport, wakError,
     wakBadValue);
 
-  { The outcome of running an action: values on wakOk, a message on the
-    error kinds. }
+  { The outcome of running an action. On wakOk, Values holds the raw result
+    SLOTS (a v128 spans two, low half first — design §1.6) and Count is the
+    declared result VALUE count, so the arity check is against value count
+    while the slot walk reads the pair. A message accompanies the error
+    kinds. }
   TWastActionResult = record
     Kind: TWastActionKind;
     Values: array of TWasmValue;
@@ -844,18 +840,19 @@ type
   end;
 
 { Parse the argument nodes [AFirst .. end) of an action into a runtime param
-  buffer, sized to the function's declared parameter count. Reference
-  identities are minted via the runner. A v128/either argument stages the
-  whole action. }
+  buffer whose length is the callee's total SLOT count (a v128 argument
+  occupies two consecutive slots, low half first). Reference identities are
+  minted via the runner. }
 function MarshalArgs(const ARunner: TWastRunner; const AAction: TWastNode;
-  const AFirst: Integer; const AParamCount: Integer;
+  const AFirst: Integer; const AParamSlots: Integer;
   var AParams: array of TWasmValue; var AResult: TWastActionResult): Boolean;
 var
   I, Slot: Integer;
   Val: TWastVal;
+  Vec: TWasmV128;
 begin
   Result := False;
-  for I := 0 to AParamCount - 1 do
+  for I := 0 to AParamSlots - 1 do
     AParams[I].Bits := 0;
   Slot := 0;
   for I := AFirst to AAction.Count - 1 do
@@ -870,24 +867,29 @@ begin
         Exit;
       end;
     end;
-    if WastValIsStaged(Val) then
+    if Val.Kind = wvcV128 then
     begin
-      AResult.Kind := wakStaged;
-      AResult.Message := 'SIMD argument';
-      Exit;
-    end;
-    if Slot < AParamCount then
-    begin
-      case Val.Kind of
-        wvcRefExtern, wvcRefHost:
-          AParams[Slot] := MakeValueRef(ARunner.HostRef(Val.Id));
-        wvcRefFunc:
-          AParams[Slot] := MakeValueNullRef;   { rarely an argument }
-      else
-        AParams[Slot] := WastValToRuntime(Val);
+      if Slot + 1 < AParamSlots then
+      begin
+        Vec := WastValToVec(Val);
+        AParams[Slot].Bits := Vec.U64[0];
+        AParams[Slot + 1].Bits := Vec.U64[1];
       end;
+      Inc(Slot, 2);
+    end
+    else
+    begin
+      if Slot < AParamSlots then
+        case Val.Kind of
+          wvcRefExtern, wvcRefHost:
+            AParams[Slot] := MakeValueRef(ARunner.HostRef(Val.Id));
+          wvcRefFunc:
+            AParams[Slot] := MakeValueNullRef;   { rarely an argument }
+        else
+          AParams[Slot] := WastValToRuntime(Val);
+        end;
+      Inc(Slot);
     end;
-    Inc(Slot);
   end;
   Result := True;
 end;
@@ -903,7 +905,7 @@ var
   Func: TWasmFuncType;
   Params, Results: array of TWasmValue;
   ParamPtr, ResultPtr: PWasmValue;
-  I, ParamCount, ResultCount: Integer;
+  I, ResultCount, ParamSlots, ResultSlots: Integer;
 begin
   Result.Kind := wakOk;
   Result.Count := 0;
@@ -917,20 +919,22 @@ begin
   end;
 
   Func := ARunner.Engine.EngineType(ARunner.Store.Funcs[Addr].TypeId).Comp.Func;
-  ParamCount := Length(Func.Params);
   ResultCount := Length(Func.Results);
+  { Slot counts, not value counts: a v128 param/result spans two (§1.6). }
+  ParamSlots := SumSlots(Func.Params);
+  ResultSlots := SumSlots(Func.Results);
 
-  SetLength(Params, ParamCount);
-  if not MarshalArgs(ARunner, AAction, ANameIndex + 1, ParamCount,
+  SetLength(Params, ParamSlots);
+  if not MarshalArgs(ARunner, AAction, ANameIndex + 1, ParamSlots,
     Params, Result) then
-    Exit;   { staged / bad value — Result already set }
+    Exit;   { bad value — Result already set }
 
-  SetLength(Results, ResultCount);
-  if ParamCount > 0 then
+  SetLength(Results, ResultSlots);
+  if ParamSlots > 0 then
     ParamPtr := @Params[0]
   else
     ParamPtr := nil;
-  if ResultCount > 0 then
+  if ResultSlots > 0 then
     ResultPtr := @Results[0]
   else
     ResultPtr := nil;
@@ -938,9 +942,9 @@ begin
   try
     InterpInvoke(ARunner.Store, Addr, ParamPtr, ResultPtr);
     Result.Kind := wakOk;
-    Result.Count := ResultCount;
-    SetLength(Result.Values, ResultCount);
-    for I := 0 to ResultCount - 1 do
+    Result.Count := ResultCount;   { declared VALUE count for the arity check }
+    SetLength(Result.Values, ResultSlots);
+    for I := 0 to ResultSlots - 1 do
       Result.Values[I] := Results[I];
   except
     on E: EWasmTrap do
@@ -948,12 +952,17 @@ begin
       Result.Kind := wakTrap;
       Result.Message := E.Message;
     end;
+    { EWasmException is a more-derived EWasmError (a SIBLING of EWasmTrap under
+      EWasmError), so it MUST be caught before the generic clause below or that
+      clause would swallow an uncaught guest exception as wakError. }
+    on E: EWasmException do
+    begin
+      Result.Kind := wakException;
+      Result.Message := E.Message;
+    end;
     on E: EWasmError do
     begin
-      if IsStagedMessage(E.Message) then
-        Result.Kind := wakStaged
-      else
-        Result.Kind := wakError;
+      Result.Kind := wakError;
       Result.Message := E.Message;
     end;
   end;
@@ -1123,13 +1132,6 @@ begin
   if Assembled then
   begin
     case AssembleOperand(ANode, AForm, Bytes, Msg) of
-      wasStaged:
-        begin
-          AResult.ActualKind := wekText;
-          AResult.Actual := Msg;
-          AResult.Status := wrsStaged;
-          Exit;
-        end;
       wasTextError:
         begin
           AResult.ActualKind := wekText;
@@ -1176,10 +1178,7 @@ begin
     begin
       AResult.ActualKind := wekValidation;
       AResult.Actual := E.Message;
-      if IsStagedFeatureMessage(E.Message) then
-        AResult.Status := wrsStaged
-      else
-        AResult.Status := wrsFail;
+      AResult.Status := wrsFail;
       Exit;
     end;
     on E: Exception do
@@ -1247,10 +1246,7 @@ begin
     on E: EWasmError do
     begin
       AResult.Actual := E.ClassName + ': ' + E.Message;
-      if IsStagedMessage(E.Message) then
-        AResult.Status := wrsStaged
-      else
-        AResult.Status := wrsFail;
+      AResult.Status := wrsFail;
       Exit;
     end;
   end;
@@ -1272,7 +1268,6 @@ var
   Form: TWastModuleForm;
   Kind, Want: TWastErrorKind;
   Msg: string;
-  Staged: Boolean;
 begin
   Operand := FindModuleOperand(ACommand.Node);
   if Operand = nil then
@@ -1299,24 +1294,17 @@ begin
   else
     Want := wekValidation;
 
-  Kind := AttemptOperand(ARunner.Model, Operand, Form, Msg, Staged);
+  Kind := AttemptOperand(ARunner.Model, Operand, Form, Msg);
   AResult.ActualKind := Kind;
   if Kind = wekNone then
     AResult.Actual := WAST_NO_ERROR
   else
     AResult.Actual := Msg;
 
-  { A vector mnemonic that BLOCKED assembly stages the case whatever the
-    wanted class — the module could not be judged at all, so SIMD noise does
-    not drown the report. Otherwise a wrong-class rejection is a fail (it
-    cannot hide behind STAGED), a validator-staged message of the wanted
-    class stages, and only then does the prefix match decide pass/fail. }
-  if Staged then
-    AResult.Status := wrsStaged
-  else if Kind <> Want then
+  { A wrong-class rejection is a fail; otherwise the prefix match decides
+    pass/fail. Nothing stages any more (Track H retired the last carve-out). }
+  if Kind <> Want then
     AResult.Status := wrsFail
-  else if IsStagedFeatureMessage(Msg) then
-    AResult.Status := wrsStaged
   else if WastMessageMatches(AResult.Expected, Msg) then
     AResult.Status := wrsPass
   else
@@ -1379,16 +1367,13 @@ begin
     end;
     on E: EWasmError do
     begin
-      { A staged feature reached during instantiation stages; anything else is
-        an internal defect surfaced as a fail rather than aborting the run. }
+      { Not the instantiation TRAP we were asked to judge — an internal defect
+        surfaced as a fail rather than aborting the run. }
       ARunner.Store.Heap.ResetFrames;
       ResetInterpContext(ARunner.Store);
       AResult.ActualKind := wekOther;
       AResult.Actual := E.ClassName + ': ' + E.Message;
-      if IsStagedMessage(E.Message) then
-        AResult.Status := wrsStaged
-      else
-        AResult.Status := wrsFail;
+      AResult.Status := wrsFail;
       Exit;
     end;
   end;
@@ -1410,10 +1395,9 @@ procedure RunModulePrecheck(const ARunner: TWastRunner;
 var
   Kind: TWastErrorKind;
   Msg: string;
-  Staged: Boolean;
 begin
   Kind := AttemptOperand(ARunner.Model, AOperand,
-    DetectWastModuleForm(AOperand), Msg, Staged);
+    DetectWastModuleForm(AOperand), Msg);
   if Kind = wekNone then
   begin
     { Assembled, decoded, validated — we simply cannot judge the rest. }
@@ -1422,10 +1406,7 @@ begin
   end;
   AResult.ActualKind := Kind;
   AResult.Actual := Msg;
-  if Staged or IsStagedFeatureMessage(Msg) then
-    AResult.Status := wrsStaged
-  else
-    AResult.Status := wrsFail;
+  AResult.Status := wrsFail;
 end;
 
 procedure RunAssertUnlinkable(const ARunner: TWastRunner;
@@ -1467,10 +1448,9 @@ procedure RunAssertReturn(const ARunner: TWastRunner;
 var
   Action: TWastNode;
   Act: TWastActionResult;
-  HasInstance, AllMatch: Boolean;
-  I, ExpectCount: Integer;
-  Expected: TWastVal;
-  Expecteds: array of TWastVal;
+  HasInstance, AllMatch, IsVec: Boolean;
+  I, ExpectCount, Slot, Need: Integer;
+  Expecteds: array of TWastExpected;
   ActualText: string;
 begin
   if ACommand.Node.Count < 2 then
@@ -1490,12 +1470,6 @@ begin
   AResult.Expected := NodeText(ACommand.Node);
 
   case Act.Kind of
-    wakStaged:
-      begin
-        AResult.Status := wrsStaged;
-        AResult.Actual := Act.Message;
-        Exit;
-      end;
     wakNoExport:
       begin
         Skipped(AResult, WAST_REASON_NO_EXPORT + ': ' + Act.Message);
@@ -1512,6 +1486,12 @@ begin
         AResult.Actual := 'unexpected trap: ' + Act.Message;
         Exit;
       end;
+    wakException:
+      begin
+        AResult.Status := wrsFail;
+        AResult.Actual := 'unexpected exception: ' + Act.Message;
+        Exit;
+      end;
     wakError:
       begin
         AResult.Status := wrsFail;
@@ -1520,14 +1500,12 @@ begin
       end;
   end;
 
-  { First pass: parse each expected value ONCE (cached in Expecteds for the
-    compare pass below). Any value that stages (v128/either) stages the whole
-    assertion — SIMD results are Track G. }
+  { Parse each expected result matcher ONCE. `(either ...)` yields several
+    alternatives; a v128 or scalar yields one. }
   SetLength(Expecteds, ExpectCount);
   for I := 0 to ExpectCount - 1 do
-  begin
     try
-      Expecteds[I] := WastParseVal(ACommand.Node[2 + I]);
+      Expecteds[I] := WastParseExpected(ACommand.Node[2 + I]);
     except
       on E: EWastValueError do
       begin
@@ -1535,14 +1513,9 @@ begin
         Exit;
       end;
     end;
-    if WastValIsStaged(Expecteds[I]) then
-    begin
-      AResult.Status := wrsStaged;
-      AResult.Actual := 'SIMD result';
-      Exit;
-    end;
-  end;
 
+  { Arity is expected count vs the declared result VALUE count (a v128 result
+    is one value across two slots — design §6.3). }
   if Act.Count <> ExpectCount then
   begin
     AResult.Status := wrsFail;
@@ -1551,17 +1524,42 @@ begin
     Exit;
   end;
 
+  { Walk expecteds alongside the produced SLOTS: a v128 result consumes two,
+    everything else one. }
   AllMatch := True;
   ActualText := '';
+  Slot := 0;
   for I := 0 to ExpectCount - 1 do
   begin
-    Expected := Expecteds[I];
+    IsVec := (Length(Expecteds[I].Alts) > 0)
+      and (Expecteds[I].Alts[0].Kind = wvcV128);
+    if IsVec then
+      Need := 2
+    else
+      Need := 1;
+
+    if Slot + Need > Length(Act.Values) then
+    begin
+      { Fewer produced slots than the expected shape needs — a divergence,
+        not a crash. }
+      AllMatch := False;
+      Break;
+    end;
+
     if ActualText <> '' then
       ActualText := ActualText + ' ';
-    ActualText := ActualText + RenderActual(Act.Values[I], Expected.Width);
-    if not WastValMatches(Expected, Act.Values[I],
-      ExpectedRefFor(ARunner, Expected)) then
+    if IsVec then
+      ActualText := ActualText + RenderActualVec(
+        PWasmV128(@Act.Values[Slot]), Expecteds[I].Alts[0].VecShape)
+    else
+      ActualText := ActualText
+        + RenderActual(Act.Values[Slot], Expecteds[I].Alts[0].Width);
+
+    if not WastExpectedMatches(Expecteds[I], @Act.Values[Slot], IsVec,
+      ExpectedRefFor(ARunner, Expecteds[I].Alts[0])) then
       AllMatch := False;
+
+    Inc(Slot, Need);
   end;
 
   if AllMatch then
@@ -1607,11 +1605,6 @@ begin
   end;
 
   case Act.Kind of
-    wakStaged:
-      begin
-        AResult.Status := wrsStaged;
-        AResult.Actual := Act.Message;
-      end;
     wakNoExport:
       Skipped(AResult, WAST_REASON_NO_EXPORT + ': ' + Act.Message);
     wakBadValue:
@@ -1623,6 +1616,13 @@ begin
           AResult.Status := wrsPass
         else
           AResult.Status := wrsFail;
+      end;
+    wakException:
+      begin
+        { A trap and an uncaught exception are separate outcomes: an exception
+          never satisfies assert_trap (design §2.1). }
+        AResult.Status := wrsFail;
+        AResult.Actual := 'unexpected exception: ' + Act.Message;
       end;
     wakError:
       begin
@@ -1655,11 +1655,6 @@ begin
   case Act.Kind of
     wakOk:
       AResult.Status := wrsPass;
-    wakStaged:
-      begin
-        AResult.Status := wrsStaged;
-        AResult.Actual := Act.Message;
-      end;
     wakNoExport:
       Skipped(AResult, WAST_REASON_NO_EXPORT + ': ' + Act.Message);
     wakBadValue:
@@ -1668,6 +1663,11 @@ begin
       begin
         AResult.Status := wrsFail;
         AResult.Actual := 'unexpected trap: ' + Act.Message;
+      end;
+    wakException:
+      begin
+        AResult.Status := wrsFail;
+        AResult.Actual := 'unexpected exception: ' + Act.Message;
       end;
   else
     begin
@@ -1705,6 +1705,67 @@ begin
   AResult.Status := wrsPass;
 end;
 
+{ `assert_exception (invoke ...)`: the action must raise an UNCAUGHT wasm
+  exception — a `throw`/`throw_ref` that reached the invocation boundary with no
+  matching `try_table` clause, delivered as EWasmException (eh-spec §7.1). The
+  reference `assert_exception` asserts only THAT an exception escaped; it carries
+  no expected tag or payload (verified against throw.wast / throw_ref.wast /
+  try_table.wast — every occurrence is a bare `(assert_exception (invoke ...))`),
+  so this judges the class alone. It PASSES iff the action's outcome is
+  wakException; a returned value, a trap, or any other error FAILS. A trap must
+  never satisfy it (they are separate routes, design §2.1). Mirrors
+  RunAssertTrap's shape. }
+procedure RunAssertException(const ARunner: TWastRunner;
+  const ACommand: TWastCommand; var AResult: TWastCommandResult);
+var
+  Action: TWastNode;
+  Act: TWastActionResult;
+  HasInstance: Boolean;
+begin
+  if (ACommand.Node.Count < 2) or (ACommand.Node[1].Kind <> wnkList) then
+  begin
+    Skipped(AResult, WAST_REASON_NO_MODULE_OPERAND);
+    Exit;
+  end;
+  Action := ACommand.Node[1];
+  AResult.Expected := 'uncaught exception';
+
+  Act := RunAction(ARunner, Action, HasInstance);
+  if not HasInstance then
+  begin
+    Skipped(AResult, WAST_REASON_NO_INSTANCE);
+    Exit;
+  end;
+
+  case Act.Kind of
+    wakNoExport:
+      Skipped(AResult, WAST_REASON_NO_EXPORT + ': ' + Act.Message);
+    wakBadValue:
+      Skipped(AResult, 'unsupported value: ' + Act.Message);
+    wakException:
+      begin
+        AResult.Actual := Act.Message;
+        AResult.Status := wrsPass;
+      end;
+    wakTrap:
+      begin
+        AResult.Status := wrsFail;
+        AResult.Actual := 'unexpected trap: ' + Act.Message;
+      end;
+    wakError:
+      begin
+        AResult.Status := wrsFail;
+        AResult.Actual := 'unexpected error: ' + Act.Message;
+      end;
+  else
+    begin
+      { Ran clean where an exception was required. }
+      AResult.Status := wrsFail;
+      AResult.Actual := WAST_NO_ERROR;
+    end;
+  end;
+end;
+
 function ExecuteCommand(const ARunner: TWastRunner;
   const ACommand: TWastCommand): TWastCommandResult;
 begin
@@ -1731,7 +1792,7 @@ begin
     wcRegister:
       RunRegisterCommand(ARunner, ACommand, Result);
     wcAssertException:
-      Skipped(Result, WAST_REASON_EXCEPTIONS);
+      RunAssertException(ARunner, ACommand, Result);
     wcAssertUnlinkable:
       RunAssertUnlinkable(ARunner, ACommand, Result);
     wcUnknown:

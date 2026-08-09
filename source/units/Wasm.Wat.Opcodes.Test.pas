@@ -32,6 +32,10 @@ type
     { Asserts a prefixed row: the prefix, the subopcode, the shape. }
     procedure ExpectPrefixed(const AMnemonic: string;
       const APrefix, ASub: Byte; const AShape: TWasmImmShape);
+    { Asserts a $FD vector row: subopcode (u32, reaches 275), shape, and the
+      natural alignment (meaningful only for the memarg families). }
+    procedure ExpectVector(const AMnemonic: string; const ASub: UInt32;
+      const AShape: TWasmImmShape; const AAlignLog2: Byte);
   public
     procedure SetupTests; override;
 
@@ -45,7 +49,9 @@ type
     procedure TestAggregatePrefixedFamily;
     procedure TestNoDuplicateMnemonics;
     procedure TestUnknownAndObsoleteAbsent;
-    procedure TestSimdGapIsEmpty;
+    procedure TestVectorFamilyOpcodesAndShapes;
+    procedure TestVectorMemoryFamilyNaturalAlignment;
+    procedure TestVectorRelaxedTruncSpelling;
     procedure TestTableSizeFloor;
   end;
 
@@ -81,6 +87,19 @@ begin
   Expect<Integer>(Integer(I.Prefix)).ToBe(Integer(APrefix));
   Expect<Integer>(Integer(I.Opcode)).ToBe(Integer(ASub));
   Expect<Integer>(Ord(I.Shape)).ToBe(Ord(AShape));
+end;
+
+procedure TWatOpcodesTests.ExpectVector(const AMnemonic: string;
+  const ASub: UInt32; const AShape: TWasmImmShape; const AAlignLog2: Byte);
+var
+  I: TWasmOpcodeInfo;
+begin
+  I := Info(AMnemonic);
+  Expect<Boolean>(I.HasPrefix).ToBe(True);
+  Expect<Integer>(Integer(I.Prefix)).ToBe(Integer(OPCODE_PREFIX_FD));
+  Expect<Int64>(Int64(I.Opcode)).ToBe(Int64(ASub));
+  Expect<Integer>(Ord(I.Shape)).ToBe(Ord(AShape));
+  Expect<Integer>(Integer(I.NaturalAlignLog2)).ToBe(Integer(AAlignLog2));
 end;
 
 procedure TWatOpcodesTests.TestControlFamily;
@@ -235,22 +254,78 @@ begin
   Expect<Boolean>(HasOpcode('totally.not.an.op')).ToBe(False);
 end;
 
-procedure TWatOpcodesTests.TestSimdGapIsEmpty;
+procedure TWatOpcodesTests.TestVectorFamilyOpcodesAndShapes;
 begin
-  { The $FD vector space is Track G; none of it is in the table yet, so
-    these must be absent and route to unknown-operator until Track G lands. }
-  Expect<Boolean>(HasOpcode('v128.load')).ToBe(False);
-  Expect<Boolean>(HasOpcode('v128.const')).ToBe(False);
-  Expect<Boolean>(HasOpcode('i8x16.shuffle')).ToBe(False);
-  Expect<Boolean>(HasOpcode('i32x4.add')).ToBe(False);
-  Expect<Boolean>(HasOpcode('f32x4.mul')).ToBe(False);
+  { $FD vector rows, one representative per immediate shape. Subopcodes are
+    the pinned spec's (wasm-mcp category=vec / category=memory prefix=v128.). }
+  { plain memarg load/store (wisMemArg). }
+  ExpectVector('v128.load', 0, wisMemArg, 4);
+  ExpectVector('v128.store', 11, wisMemArg, 4);
+  ExpectVector('v128.load32_zero', 92, wisMemArg, 2);
+  { 16-byte immediates. }
+  ExpectVector('v128.const', 12, wisV128Const, 0);
+  ExpectVector('i8x16.shuffle', 13, wisShuffle, 0);
+  { one laneidx byte. }
+  ExpectVector('i8x16.extract_lane_s', 21, wisLane, 0);
+  ExpectVector('f64x2.replace_lane', 34, wisLane, 0);
+  { memarg then laneidx. }
+  ExpectVector('v128.load8_lane', 84, wisMemArgLane, 0);
+  ExpectVector('v128.store64_lane', 91, wisMemArgLane, 3);
+  { plain no-immediate ops, including a multi-byte-LEB subopcode and the two
+    top relaxed ops (275 exercises the widened UInt32 field). }
+  ExpectVector('i8x16.swizzle', 14, wisNone, 0);
+  ExpectVector('i32x4.splat', 17, wisNone, 0);
+  ExpectVector('v128.bitselect', 82, wisNone, 0);
+  ExpectVector('i16x8.abs', 128, wisNone, 0);
+  ExpectVector('f64x2.convert_low_i32x4_u', 255, wisNone, 0);
+  ExpectVector('i8x16.relaxed_swizzle', 256, wisNone, 0);
+  ExpectVector('i32x4.relaxed_dot_i8x16_i7x16_add_s', 275, wisNone, 0);
+  { the unassigned subopcodes stay absent (154 / 162 / 226 / 238). }
+  Expect<Boolean>(HasOpcode('i16x8.opcode154')).ToBe(False);
+end;
+
+procedure TWatOpcodesTests.TestVectorMemoryFamilyNaturalAlignment;
+begin
+  { Natural alignments from simd_align.wast (the align= upstream marks
+    assert_invalid is one power of two above these). }
+  ExpectVector('v128.load8x8_s', 1, wisMemArg, 3);
+  ExpectVector('v128.load16x4_u', 4, wisMemArg, 3);
+  ExpectVector('v128.load8_splat', 7, wisMemArg, 0);
+  ExpectVector('v128.load16_splat', 8, wisMemArg, 1);
+  ExpectVector('v128.load32_splat', 9, wisMemArg, 2);
+  ExpectVector('v128.load64_splat', 10, wisMemArg, 3);
+  ExpectVector('v128.load64_zero', 93, wisMemArg, 3);
+  ExpectVector('v128.load16_lane', 85, wisMemArgLane, 1);
+  ExpectVector('v128.load32_lane', 86, wisMemArgLane, 2);
+  ExpectVector('v128.store8_lane', 88, wisMemArgLane, 0);
+end;
+
+procedure TWatOpcodesTests.TestVectorRelaxedTruncSpelling;
+var
+  Found: TWasmOpcodeInfo;
+begin
+  { The f64x2 relaxed-trunc ops are spelled WITHOUT _zero to match the IR
+    registry (design deviation note in Wasm.Ir); subopcodes 259/260. The
+    _zero spellings (which the corpus uses) must NOT resolve here. }
+  ExpectVector('i32x4.relaxed_trunc_f64x2_s', 259, wisNone, 0);
+  ExpectVector('i32x4.relaxed_trunc_f64x2_u', 260, wisNone, 0);
+  { The corpus (testsuite@de54fd27) writes the older _zero spelling, so those
+    are accepted as text aliases onto the same subopcodes 259/260. }
+  ExpectVector('i32x4.relaxed_trunc_f64x2_s_zero', 259, wisNone, 0);
+  ExpectVector('i32x4.relaxed_trunc_f64x2_u_zero', 260, wisNone, 0);
+  { The f32x4 relaxed-trunc ops keep their spelling (no _zero either). }
+  ExpectVector('i32x4.relaxed_trunc_f32x4_s', 257, wisNone, 0);
+  Expect<Boolean>(LookupOpcode('i32x4.relaxed_trunc_f32x4_s', Found)).ToBe(True);
 end;
 
 procedure TWatOpcodesTests.TestTableSizeFloor;
 begin
-  { The full non-vector 3.0 set: 238 distinct mnemonics. Asserted exactly
-    so an accidental add or drop shows up rather than passing vacuously. }
-  Expect<Integer>(OpcodeCount).ToBe(238);
+  { The full 3.0 set: 238 non-vector mnemonics plus the 256 assigned $FD
+    vector subopcodes = 494, plus 2 text aliases for the f64x2 relaxed-trunc
+    ops (the corpus's _s_zero / _u_zero spelling onto subopcodes 259/260) =
+    496. Asserted exactly so an accidental add or drop shows up rather than
+    passing vacuously. }
+  Expect<Integer>(OpcodeCount).ToBe(496);
 end;
 
 procedure TWatOpcodesTests.SetupTests;
@@ -268,8 +343,14 @@ begin
   Test('no mnemonic is added twice', TestNoDuplicateMnemonics);
   Test('unknown and obsolete mnemonics are absent',
     TestUnknownAndObsoleteAbsent);
-  Test('the SIMD space is an empty gap', TestSimdGapIsEmpty);
-  Test('the table has the full non-vector 3.0 set', TestTableSizeFloor);
+  Test('$FD vector family opcodes and immediate shapes',
+    TestVectorFamilyOpcodesAndShapes);
+  Test('$FD vector memory family natural alignment',
+    TestVectorMemoryFamilyNaturalAlignment);
+  Test('relaxed_trunc f64x2 spelling matches the IR registry (no _zero)',
+    TestVectorRelaxedTruncSpelling);
+  Test('the table has the full 3.0 set (non-vector + vector)',
+    TestTableSizeFloor);
 end;
 
 begin

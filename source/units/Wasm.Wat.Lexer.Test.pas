@@ -88,6 +88,7 @@ type
     procedure TestIllegalAndMalformedUtf8Source;
     procedure TestLineAndColumnOnErrors;
     procedure TestKeywordVsReservedBoundary;
+    procedure TestPeekIsNonConsumingLookahead;
   end;
 
 function TWatLexerTests.BytesHex(const ABytes: TWasmBytes): string;
@@ -549,6 +550,40 @@ begin
   Expect<string>(OneToken('_x')).ToBe('rsv:_x');
 end;
 
+procedure TWatLexerTests.TestPeekIsNonConsumingLookahead;
+var
+  Lexer: TWatLexer;
+  P1, N1, P2, N2, N3: TWatToken;
+begin
+  { Peek returns the next token without consuming it: a following Next yields
+    the same token, so Peek then Next then Peek then Next walks the stream and
+    each Peek matches the Next that follows it. This is the one-token lookahead
+    the assembler's memidx-vs-lane disambiguation needs (§5.5). Input mirrors
+    the `v128.load8_lane 1 1 (…)` shape: two integers then a paren. }
+  Lexer.Init(TextToBytes('1 1 ('));
+  P1 := Lexer.Peek;
+  N1 := Lexer.Next;
+  Expect<string>(WatTokenKindName(P1.Kind) + ':' + P1.Text)
+    .ToBe(WatTokenKindName(N1.Kind) + ':' + N1.Text);
+  Expect<string>('int:1').ToBe('int:' + N1.Text);
+
+  { The SECOND token is reachable by peek after the first Next — the lookahead
+    that tells `1 1 (` (memidx then lane) from `1 (` (lane only). }
+  P2 := Lexer.Peek;
+  Expect<string>(WatTokenKindName(P2.Kind)).ToBe('integer');
+  N2 := Lexer.Next;
+  Expect<string>(WatTokenKindName(N2.Kind) + ':' + N2.Text).ToBe('integer:1');
+
+  { And the paren after it. }
+  N3 := Lexer.Next;
+  Expect<string>(WatTokenKindName(N3.Kind)).ToBe('lparen');
+
+  { A repeated Peek at end of input keeps returning eof, non-destructively. }
+  Expect<string>(WatTokenKindName(Lexer.Peek.Kind)).ToBe('eof');
+  Expect<string>(WatTokenKindName(Lexer.Peek.Kind)).ToBe('eof');
+  Expect<string>(WatTokenKindName(Lexer.Next.Kind)).ToBe('eof');
+end;
+
 procedure TWatLexerTests.SetupTests;
 begin
   Test('parens, keywords, and structure', TestParensKeywordsAndStructure);
@@ -579,6 +614,8 @@ begin
     TestIllegalAndMalformedUtf8Source);
   Test('line and column on errors', TestLineAndColumnOnErrors);
   Test('keyword vs reserved boundary', TestKeywordVsReservedBoundary);
+  Test('peek is non-consuming one-token lookahead',
+    TestPeekIsNonConsumingLookahead);
 end;
 
 begin

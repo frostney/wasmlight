@@ -26,9 +26,12 @@
   multi-value typeuse. A mnemonic with no row is the reserved-token case: it
   raises `unknown operator <mnemonic>`, loud and never silently wrong.
 
-  STAGED, and the ONE thing not encoded: the $FD SIMD vector space is Track G
-  and has no rows in Wasm.Wat.Opcodes, so a v128 mnemonic takes the same
-  unknown-operator path rather than mis-assembling.
+  THE $FD VECTOR SPACE is encoded (Track G): EmitImmediatesBody gained four
+  immediate shapes — wisV128Const (a shape keyword then N lane literals, 16
+  bytes little-endian), wisShuffle (16 lane indices), wisLane (one laneidx
+  byte), and wisMemArgLane (a memarg then a laneidx byte, with the
+  memidx-vs-lane one-token lookahead of the load/store_lane grammar) — plus
+  the plain load/store family through the existing wisMemArg path.
 
   THE §7 RISK — implicit typeuse ordering — is resolved in two sub-passes:
   sub-pass 1a collects every EXPLICIT type (so they own indices 0..E-1 in
@@ -66,6 +69,13 @@ const
     two` (22); the match is a prefix match, so the long spelling satisfies both
     (§4). align=0/align=7 land here (align.wast:26-37). }
   MSG_ALIGNMENT         = 'alignment must be a power of two';
+  { The two SIMD immediate-count prefixes, raised only here. v128.const's
+    lanes and i8x16.shuffle's indices each have a fixed count; too few or too
+    many is a text error (design §5.2, §5.3; simd_const.wast, simd_lane.wast).
+    A lane literal / index out of range does NOT land here — that is
+    `constant out of range` / `i8 constant out of range` from Wasm.Wat.Numbers. }
+  MSG_WRONG_LANE_LITERALS = 'wrong number of lane literals';
+  MSG_WRONG_LANE_INDICES  = 'wrong number of lane indices';
 
 { Primary entry point: ASource is the module's source BYTES (§2a — UTF-8
   validity is a rule the assembler enforces, so it must be handed bytes).
@@ -116,6 +126,12 @@ type
     TableType: TWasmTableType;
     InlineExports: array of string;
     FinalIndex: Integer;
+    { The 3.0 explicit-init table form `(table limits reftype constexpr)`:
+      a folded constant instruction after the tabletype initialises every
+      slot. Captured as a token range and re-parsed at emit, encoded as
+      $40 $00 tt e (Wasm.Decoder.Entities.DecodeTableSection). }
+    HasInit: Boolean;
+    InitStart, InitEnd: Integer;
   end;
 
   TMemDecl = record
@@ -266,7 +282,8 @@ type
     procedure DeclareTableField;
     procedure DeclareInlineTableElem(var ATable: TTableDecl);
     procedure DeclareMemField;
-    procedure DeclareInlineMemData(var AMem: TMemDecl);
+    procedure DeclareInlineMemData(var AMem: TMemDecl;
+      const AAddr: TWasmAddrType);
     procedure DeclareGlobalField;
     procedure DeclareTagField;
     procedure DeclareExportField;
@@ -284,6 +301,16 @@ type
       const ADefault: UInt32): UInt32;
     function CurIsIndexToken: Boolean;
     procedure EmitMemArg(var AOut: TWasmWriter; const AInfo: TWasmOpcodeInfo);
+    procedure EmitMemArgEx(var AOut: TWasmWriter; const AInfo: TWasmOpcodeInfo;
+      const AHasLeadingMemidx: Boolean);
+    function CurIsLaneLiteral: Boolean;
+    function CurIsIndexPosition: Boolean;
+    function ReadLaneIndex: Byte;
+    procedure EmitV128Const(var AOut: TWasmWriter);
+    procedure EmitShuffle(var AOut: TWasmWriter);
+    procedure EmitLane(var AOut: TWasmWriter);
+    procedure EmitMemArgLane(var AOut: TWasmWriter;
+      const AInfo: TWasmOpcodeInfo);
     procedure EmitBrTable(var AOut: TWasmWriter);
     procedure EmitCallIndirect(var AOut: TWasmWriter);
     procedure EmitCatchVector(var AOut: TWasmWriter);
@@ -1472,6 +1499,7 @@ var
   Exports_: TArray<string>;
   ImpModule, ImpName: string;
   Imp: TImpDecl;
+  CloseIdx: Integer;
 begin
   ExpectLParen;
   ExpectKeyword('table');
@@ -1514,7 +1542,20 @@ begin
   end;
 
   T.TableType := ParseTableTypeInline;
-  ExpectRParen;
+  { A folded constant instruction after the tabletype is the 3.0 explicit
+    initialiser `(table limits reftype constexpr)` (table.wast:19-21,
+    elem.wast:91). Capture its token range; EmitConstExpr re-parses it at emit,
+    when funcidx forward references resolve. }
+  if Cur.Kind <> wttRParen then
+  begin
+    T.HasInit := True;
+    T.InitStart := FPos;
+    CloseIdx := FindFieldClose(FPos);
+    T.InitEnd := CloseIdx;
+    FPos := CloseIdx + 1;
+  end
+  else
+    ExpectRParen;
   SetLength(FTables, Length(FTables) + 1);
   FTables[High(FTables)] := T;
 end;
@@ -1525,6 +1566,7 @@ var
   Exports_: TArray<string>;
   ImpModule, ImpName: string;
   Imp: TImpDecl;
+  MemAddr: TWasmAddrType;
 begin
   ExpectLParen;
   ExpectKeyword('memory');
@@ -1555,11 +1597,21 @@ begin
   NoteDefinition('memory');
   M.InlineExports := Exports_;
 
-  { Inline `(memory id? (data …))`: the memory min=max is ceil(len/64KiB) plus
-    a synthetic active data segment (§2(c.5); bulk.wast:58). }
+  { Inline `(memory id? addrtype? (data …))`: the memory min=max is
+    ceil(len/64KiB) plus a synthetic active data segment (§2(c.5);
+    bulk.wast:58). The address type may be given explicitly before the folded
+    data (i64 for a 64-bit memory — memory64.wast:11-15); default i32. }
+  MemAddr := watI32;
+  if (IsKeyword('i32') or IsKeyword('i64')) and (At(1).Kind = wttLParen)
+    and (At(2).Kind = wttKeyword) and (At(2).Text = 'data') then
+  begin
+    if IsKeyword('i64') then
+      MemAddr := watI64;
+    Advance;   { consume the addrtype }
+  end;
   if IsListHead('data') then
   begin
-    DeclareInlineMemData(M);
+    DeclareInlineMemData(M, MemAddr);
     Exit;
   end;
 
@@ -1615,7 +1667,8 @@ begin
   FInlineElems[High(FInlineElems)] := Rec;
 end;
 
-procedure TWatAssembler.DeclareInlineMemData(var AMem: TMemDecl);
+procedure TWatAssembler.DeclareInlineMemData(var AMem: TMemDecl;
+  const AAddr: TWasmAddrType);
 var
   Rec: TInlineDataDecl;
   I, J: Integer;
@@ -1636,7 +1689,7 @@ begin
   ExpectRParen;   { close (memory …) }
 
   Pages := (UInt64(Length(Rec.Payload)) + 65535) div 65536;
-  AMem.MemType := MakeMemType(MakeLimitsWithMax(watI32, Pages, Pages));
+  AMem.MemType := MakeMemType(MakeLimitsWithMax(AAddr, Pages, Pages));
   SetLength(FMems, Length(FMems) + 1);
   FMems[High(FMems)] := AMem;
 
@@ -1972,9 +2025,9 @@ end;
   power-of-two text error otherwise (§2(c.6); align.wast:26-37). Zero and any
   non-power-of-two land here; `align` LARGER than natural is the validator's
   job, not the assembler's, so it is passed through. }
-function AlignFieldLog2(const AValue: UInt32): Byte;
+function AlignFieldLog2(const AValue: UInt64): Byte;
 var
-  V: UInt32;
+  V: UInt64;
 begin
   if (AValue = 0) or ((AValue and (AValue - 1)) <> 0) then
     raise EWasmTextError.Create(MSG_ALIGNMENT);
@@ -1989,6 +2042,14 @@ end;
 
 procedure TWatAssembler.EmitMemArg(var AOut: TWasmWriter;
   const AInfo: TWasmOpcodeInfo);
+begin
+  { For every memarg EXCEPT the load/store_lane family, a leading index token
+    is unambiguously the memidx. }
+  EmitMemArgEx(AOut, AInfo, CurIsIndexToken);
+end;
+
+procedure TWatAssembler.EmitMemArgEx(var AOut: TWasmWriter;
+  const AInfo: TWasmOpcodeInfo; const AHasLeadingMemidx: Boolean);
 var
   HasMem: Boolean;
   MemIdx: UInt32;
@@ -2000,10 +2061,12 @@ begin
     token), then the `offset=`/`align=` keyword tokens in any order. align is
     encoded as log2 in the flag field, with bit 6 signalling an explicit
     memidx that rides between the flags and the u64 offset (§2(c.6); mirrors
-    Wasm.Decoder.Expr.SkipMemarg). }
+    Wasm.Decoder.Expr.SkipMemarg). The caller decides whether a leading token
+    is the memidx — the load/store_lane family (EmitMemArgLane) must NOT treat
+    a leading lane index as a memidx (§5.5). }
   HasMem := False;
   MemIdx := 0;
-  if CurIsIndexToken then
+  if AHasLeadingMemidx then
   begin
     HasMem := True;
     MemIdx := ReadIndex(wnsMem);
@@ -2016,15 +2079,22 @@ begin
   begin
     Kw := Cur.Text;
     if TextStartsWith(Kw, 'offset=') then
-    begin
-      ValText := Copy(Kw, Length('offset=') + 1, Length(Kw));
-      Offset := ParseIntLiteral(ValText, 64);
-    end
+      ValText := Copy(Kw, Length('offset=') + 1, Length(Kw))
     else
-    begin
       ValText := Copy(Kw, Length('align=') + 1, Length(Kw));
-      AlignLog2 := AlignFieldLog2(UInt32(ParseIntLiteral(ValText, 32)));
-    end;
+    { offset/align values are uN — unsigned, no sign. A leading `+`/`-` means
+      the whole `offset=…`/`align=…` is a reserved token, so it is
+      `unknown operator <token>`, NOT a range error (simd_align.wast:104 —
+      align=-1; simd_address.wast:112 — offset=-1; design §c.6/§d.1). The
+      value itself is a u64 (align's flag stores its log2, so an oversized but
+      well-formed power-of-two reaches the validator's natural-alignment
+      check — align.wast:1016). }
+    if (Length(ValText) > 0) and ((ValText[1] = '-') or (ValText[1] = '+')) then
+      RaiseUnknownOperator(Kw);
+    if TextStartsWith(Kw, 'offset=') then
+      Offset := ParseIntLiteral(ValText, 64)
+    else
+      AlignLog2 := AlignFieldLog2(ParseIntLiteral(ValText, 64));
     Advance;
   end;
 
@@ -2035,6 +2105,192 @@ begin
   if HasMem then
     AOut.WriteU32(MemIdx);
   AOut.WriteU64(Offset);
+end;
+
+function TWatAssembler.CurIsLaneLiteral: Boolean;
+begin
+  { A token that occupies a v128.const lane-literal position: an integer, a
+    float (incl. inf / nan / nan:0x…), a reserved run (a malformed number
+    passed through to Numbers), or the nan:canonical / nan:arithmetic result
+    keywords (illegal in a const — TakeNumberText turns them into
+    `unexpected token`). A '(', ')', $id, or ordinary keyword is NOT a lane
+    literal, so it bounds the list for the count check. }
+  case Cur.Kind of
+    wttInteger, wttFloat, wttReserved:
+      Result := True;
+    wttKeyword:
+      { A `nan:` keyword occupies a lane-literal slot: `nan:0x…` lexes as a
+        float, but `nan:1` (non-hex payload) and the result-class spellings
+        `nan:canonical` / `nan:arithmetic` lex as keywords and must still be
+        CONSUMED as the lane — TakeNumberText / ParseF32 then raise
+        `unknown operator` (nan:1) or `unexpected token` (canonical/arithmetic)
+        rather than the list being cut short as `wrong number of lane literals`
+        (simd_const.wast:384,469). An ordinary mnemonic keyword bounds the
+        list. }
+      Result := TextStartsWith(Cur.Text, 'nan');
+  else
+    Result := False;
+  end;
+end;
+
+function TWatAssembler.CurIsIndexPosition: Boolean;
+begin
+  { A token that occupies a lane-INDEX position: an integer, a float
+    (`15.0`, `inf` — rejected as `unexpected token` by ReadLaneIndex), or a
+    reserved malformed number. A '(' (a folded operand) or a keyword bounds
+    the list, so its appearance where a 16th index is due is the
+    `wrong number of lane indices` case (simd_lane.wast:508-528). }
+  Result := (Cur.Kind = wttInteger) or (Cur.Kind = wttFloat)
+    or (Cur.Kind = wttReserved);
+end;
+
+function TWatAssembler.ReadLaneIndex: Byte;
+begin
+  { A lane index is a NON-NEGATIVE, UNSIGNED integer literal that fits i8. A
+    float, a folded operand, a reserved run, or a SIGNED value — `-1` and also
+    `+0x0f` / `+03` / `+1`, since a lane index is a uN with no sign
+    (simd_lane.wast:877-883) — is `unexpected token` / `unknown operator`; a
+    non-negative integer above 255 (`256`) is `i8 constant out of range` from
+    ParseI8 (simd_lane.wast:398-428, 522-528, 570 — the width-prefixed
+    spelling). The validation-time bound (< lane count / < 32) is the
+    validator's, not the assembler's. }
+  if (Cur.Kind <> wttInteger)
+    or ((Length(Cur.Text) > 0)
+      and ((Cur.Text[1] = '-') or (Cur.Text[1] = '+'))) then
+    RaiseUnexpected;
+  Result := ParseI8(Cur.Text);
+  Advance;
+end;
+
+procedure TWatAssembler.EmitV128Const(var AOut: TWasmWriter);
+var
+  Shape: string;
+  LaneCount, LaneWidth, I, K, BytePos: Integer;
+  IsFloat: Boolean;
+  Bits: UInt64;
+  Bytes: array[0..15] of Byte;
+  LaneTexts: array of string;
+begin
+  { v128.const <shape> <lane>… — a shape keyword (i8x16 / i16x8 / i32x4 /
+    i64x2 / f32x4 / f64x2) then 16/8/4/2/4/2 lane literals, emitted as 16 raw
+    bytes little-endian, low lane first (design §5.2; SkipVecInstr reads a
+    16-byte immediate). A missing/invalid shape keyword is `unexpected token`
+    (simd_const.wast:229-237); a lane literal out of its width's range is the
+    bare `constant out of range` via ParseIntLiteral / ParseF32 / ParseF64;
+    too few or too many literals is `wrong number of lane literals`. }
+  LaneCount := 0;
+  LaneWidth := 0;
+  IsFloat := False;
+  if Cur.Kind <> wttKeyword then
+    RaiseUnexpected;
+  Shape := Cur.Text;
+  if Shape = 'i8x16' then
+  begin LaneCount := 16; LaneWidth := 1; IsFloat := False; end
+  else if Shape = 'i16x8' then
+  begin LaneCount := 8; LaneWidth := 2; IsFloat := False; end
+  else if Shape = 'i32x4' then
+  begin LaneCount := 4; LaneWidth := 4; IsFloat := False; end
+  else if Shape = 'i64x2' then
+  begin LaneCount := 2; LaneWidth := 8; IsFloat := False; end
+  else if Shape = 'f32x4' then
+  begin LaneCount := 4; LaneWidth := 4; IsFloat := True; end
+  else if Shape = 'f64x2' then
+  begin LaneCount := 2; LaneWidth := 8; IsFloat := True; end
+  else
+    RaiseUnexpected;
+  Advance;   { the shape keyword }
+
+  { Collect exactly LaneCount lane tokens BEFORE parsing any value, so a short
+    list is `wrong number of lane literals` even when the tokens present would
+    themselves be malformed or out of range (simd_const.wast:480 —
+    `i32x4 0x1_0000_0000_0000_0000 …` has two u64-overflow tokens for four
+    lanes, and the COUNT is what upstream reports, not the range). TakeNumberText
+    consumes a lane token and turns nan:canonical / nan:arithmetic into
+    `unexpected token`; a following `)` or ordinary keyword bounds the list. }
+  SetLength(LaneTexts, LaneCount);
+  for I := 0 to LaneCount - 1 do
+  begin
+    if not CurIsLaneLiteral then
+      RaiseText(MSG_WRONG_LANE_LITERALS);   { too few }
+    LaneTexts[I] := TakeNumberText;
+  end;
+  if CurIsLaneLiteral then
+    RaiseText(MSG_WRONG_LANE_LITERALS);      { too many }
+
+  { Now parse each collected token: a malformed literal (`nan:1`) raises
+    `unknown operator`, an out-of-range one `constant out of range`. }
+  BytePos := 0;
+  for I := 0 to LaneCount - 1 do
+  begin
+    if IsFloat then
+    begin
+      if LaneWidth = 4 then
+        Bits := ParseF32(LaneTexts[I])
+      else
+        Bits := ParseF64(LaneTexts[I]);
+    end
+    else
+      Bits := ParseIntLiteral(LaneTexts[I], LaneWidth * 8);
+    for K := 0 to LaneWidth - 1 do
+    begin
+      Bytes[BytePos] := Byte((Bits shr (K * 8)) and $FF);
+      Inc(BytePos);
+    end;
+  end;
+
+  for I := 0 to 15 do
+    AOut.WriteByte(Bytes[I]);
+end;
+
+procedure TWatAssembler.EmitShuffle(var AOut: TWasmWriter);
+var
+  I: Integer;
+begin
+  { i8x16.shuffle: exactly 16 lane indices, each a non-negative i8-range
+    integer, emitted as 16 raw bytes (design §5.3). The validation-time bound
+    (< 32) is checked later; the assembler only enforces the i8 byte range and
+    the count. }
+  for I := 0 to 15 do
+  begin
+    if not CurIsIndexPosition then
+      RaiseText(MSG_WRONG_LANE_INDICES);
+    AOut.WriteByte(ReadLaneIndex);
+  end;
+  if CurIsIndexPosition then
+    RaiseText(MSG_WRONG_LANE_INDICES);
+end;
+
+procedure TWatAssembler.EmitLane(var AOut: TWasmWriter);
+begin
+  { extract_lane / replace_lane: a single laneidx byte. }
+  AOut.WriteByte(ReadLaneIndex);
+end;
+
+procedure TWatAssembler.EmitMemArgLane(var AOut: TWasmWriter;
+  const AInfo: TWasmOpcodeInfo);
+var
+  LeadingIsMemidx: Boolean;
+begin
+  { load/store_lane immediate: memidx? offset=? align=? laneidx — the lane
+    index is LAST, after the memarg (§5.5; simd_memory-multi.wast). The
+    disambiguation needs one token of lookahead (the assembler pre-tokenises,
+    so At(1) is that lookahead; Wasm.Wat.Lexer.Peek is the streaming
+    equivalent): a leading $id is always the memidx; a leading numeric token
+    is the memidx only when another numeric or an offset=/align= keyword
+    follows it, otherwise it is the lane index. }
+  case Cur.Kind of
+    wttIdentifier:
+      LeadingIsMemidx := True;
+    wttInteger:
+      LeadingIsMemidx := (At(1).Kind = wttInteger)
+        or ((At(1).Kind = wttKeyword)
+          and (TextStartsWith(At(1).Text, 'offset=')
+            or TextStartsWith(At(1).Text, 'align=')));
+  else
+    LeadingIsMemidx := False;
+  end;
+  EmitMemArgEx(AOut, AInfo, LeadingIsMemidx);
+  AOut.WriteByte(ReadLaneIndex);
 end;
 
 procedure TWatAssembler.EmitBrTable(var AOut: TWasmWriter);
@@ -2271,6 +2527,14 @@ begin
       AOut.WriteHeapType(ParseHeapType);
     wisMemArg:
       EmitMemArg(AOut, AInfo);
+    wisV128Const:
+      EmitV128Const(AOut);
+    wisShuffle:
+      EmitShuffle(AOut);
+    wisLane:
+      EmitLane(AOut);
+    wisMemArgLane:
+      EmitMemArgLane(AOut, AInfo);
     wisBrTable:
       EmitBrTable(AOut);
     wisCallIndirect:
@@ -2767,6 +3031,7 @@ var
   ItemS, ItemE: array of Integer;
   RefType: TWasmRefType;
   Flags, I: Integer;
+  IsFuncRef: Boolean;
   Off: TWasmWriter;
 
   procedure AddItem;
@@ -2872,9 +3137,19 @@ begin
 
   if UsesExprs then
   begin
+    { Flag 4 (active, table 0, expr list) implies element type funcref; a
+      non-funcref reftype at table 0 must therefore take flag 6, which carries
+      an explicit tableidx (0) AND the reftype (elem.wast:1027 — an active
+      externref segment). Passive (5) and declarative (7) already write the
+      reftype. }
+    IsFuncRef := RefType.Nullable and RefType.Heap.IsAbstract
+      and (RefType.Heap.Abs = wahFunc);
     if Declarative then Flags := 7
     else if HasTable then Flags := 6
-    else if HasOffset then Flags := 4
+    else if HasOffset then
+    begin
+      if IsFuncRef then Flags := 4 else Flags := 6;
+    end
     else Flags := 5;
   end
   else
@@ -3069,14 +3344,22 @@ procedure TWatAssembler.EmitInlineElemSegment(const ADecl: TInlineElemDecl;
 var
   Saved, ItemStart, ItemEnd: Integer;
   TableIdx: UInt32;
+  IsFuncRef: Boolean;
   Off: TWasmWriter;
 begin
   { A desugared inline table-elem: an ACTIVE segment at offset (i32.const 0)
     over this table. The explicit-table flags (2 for a funcidx list, 6 for an
     expression list) work for any table index, which the elided-table sugar
-    could not name. }
+    could not name.
+
+    The abbreviation carries the TABLE's reftype: `(table rt (elem …))` is
+    `(elem (table i) (i32.const 0) rt …)` (text-table-abbrev / Telemtable_,
+    spec pin d7b37e4). So the segment's element type must equal rt, not a
+    hardcoded funcref. }
   Saved := FPos;
   TableIdx := UInt32(FTables[ADecl.TableDeclIndex].FinalIndex);
+  IsFuncRef := ADecl.RefType.Nullable and ADecl.RefType.Heap.IsAbstract
+    and (ADecl.RefType.Heap.Abs = wahFunc);
   FPos := ADecl.ListStart;
   if ADecl.UsesExprs then
   begin
@@ -3103,8 +3386,10 @@ begin
       AOut.AppendBytes(Off.ToBytes);
     end;
   end
-  else
+  else if IsFuncRef then
   begin
+    { rt is exactly funcref: the compact elemkind funcidx form (flag 2)
+      already yields a segment whose element type matches the table. }
     AOut.WriteU32(2);
     AOut.WriteU32(TableIdx);
     WriteZeroOffsetExpr(AOut);
@@ -3112,6 +3397,25 @@ begin
     AOut.WriteU32(UInt32(ADecl.ElemCount));
     while FPos < ADecl.ListEnd do
       AOut.WriteU32(ReadIndex(wnsFunc));
+  end
+  else
+  begin
+    { rt is a non-funcref reftype, e.g. `(ref func)` or `(ref null $t)`. The
+      funcidx shorthand still means `(ref.func x)`, but the SEGMENT must carry
+      the table's reftype — so take the reftype+expr form (flag 6) and lower
+      each funcidx to a `ref.func x` const-expr. The elemkind funcidx form
+      cannot express a non-funcref element type. }
+    AOut.WriteU32(6);
+    AOut.WriteU32(TableIdx);
+    WriteZeroOffsetExpr(AOut);
+    AOut.WriteRefType(ADecl.RefType);
+    AOut.WriteU32(UInt32(ADecl.ElemCount));
+    while FPos < ADecl.ListEnd do
+    begin
+      AOut.WriteByte($D2);              { ref.func }
+      AOut.WriteU32(ReadIndex(wnsFunc));
+      AOut.WriteByte($0B);             { end }
+    end;
   end;
   FPos := Saved;
 end;
@@ -3127,7 +3431,17 @@ begin
   MemIdx := UInt32(FMems[ADecl.MemDeclIndex].FinalIndex);
   AOut.WriteU32(2);
   AOut.WriteU32(MemIdx);
-  WriteZeroOffsetExpr(AOut);
+  { The offset const-expr must match the memory's address type: an i64 memory
+    takes `i64.const 0` ($42), an i32 memory `i32.const 0` ($41). The validator
+    checks this match, so a hardcoded i32 offset would reject an i64 memory. }
+  if FMems[ADecl.MemDeclIndex].MemType.Limits.AddrType = watI64 then
+  begin
+    AOut.WriteByte($42);
+    AOut.WriteS64(0);
+    AOut.WriteByte($0B);
+  end
+  else
+    WriteZeroOffsetExpr(AOut);
   AOut.WriteU32(UInt32(Length(ADecl.Payload)));
   AOut.AppendBytes(ADecl.Payload);
 end;
@@ -3252,7 +3566,16 @@ begin
       Body.Init;
       Body.WriteU32(UInt32(Length(FTables)));
       for I := 0 to High(FTables) do
-        Body.WriteTableType(FTables[I].TableType);
+        if FTables[I].HasInit then
+        begin
+          { Explicit-init form: $40 $00 tt e (§ decoder). }
+          Body.WriteByte($40);
+          Body.WriteByte($00);
+          Body.WriteTableType(FTables[I].TableType);
+          EmitConstExpr(Body, FTables[I].InitStart, FTables[I].InitEnd);
+        end
+        else
+          Body.WriteTableType(FTables[I].TableType);
       Emitter.AddSection(wsTable, Body.ToBytes);
     end;
 

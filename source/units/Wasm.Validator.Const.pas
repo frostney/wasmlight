@@ -35,9 +35,11 @@
     - the GC allocation set: `struct.new`, `struct.new_default`,
       `array.new`, `array.new_default`, `array.new_fixed`, `ref.i31`,
       `any.convert_extern`, `extern.convert_any` (`extension-gc`)
-    - `v128.const`, which IS constant in the spec but whose validation is
-      staged to Track G; it raises MSG_SIMD_NOT_IMPLEMENTED rather than
-      being silently accepted or silently called non-constant
+    - `v128.const` (`valid-vconst`, `Instr_const/vconst`): a constant
+      instruction, accepted here — it reads its 16 literal bytes, emits
+      iroV128Const, and pushes v128. Every OTHER assigned $FD subopcode is
+      non-constant and gets the same message any non-constant instruction
+      does, not a SIMD-specific one
 
   Note what is NOT in that list even though it looks like it belongs:
   `array.new_data` and `array.new_elem` are allocation instructions but
@@ -282,6 +284,7 @@ type
     procedure StepConstI64;
     procedure StepConstF32;
     procedure StepConstF64;
+    procedure StepV128Const;
     procedure StepBinop(const AOp: TWasmIrOp;
       const AType: TWasmValueType; const AWhat: string);
     procedure StepRefNull;
@@ -631,6 +634,23 @@ begin
   Push(NumValType(wntF64), Reg);
 end;
 
+{ v128.const ($FD 12): [] -> [v128] with 16 literal bytes. A constant
+  instruction (`valid-vconst`); the 16 bytes ride in an AuxU32 block and
+  the register is a v128 (a slot PAIR — IrAllocReg even-aligns it). }
+procedure TConstWalker.StepV128Const;
+var
+  Vec: TWasmV128;
+  I: Integer;
+  Reg, Aux: UInt32;
+begin
+  for I := 0 to 15 do
+    Vec.B[I] := FReader.ReadByte;
+  Reg := AllocReg(MakeVecValueType);
+  Aux := IrAppendAuxV128Growing(FExpr.AuxU32, FAuxCount, Vec);
+  Emit(iroV128Const, Reg, IR_NO_REG, IR_NO_REG, Int64(Aux));
+  Push(MakeVecValueType, Reg);
+end;
+
 procedure TConstWalker.StepBinop(const AOp: TWasmIrOp;
   const AType: TWasmValueType; const AWhat: string);
 var
@@ -950,16 +970,17 @@ begin
 
     OP_PREFIX_VEC:
       begin
-        { `v128.const` ($FD 12) IS a constant instruction in the spec
-          (`Instr_const/vconst`), but SIMD typing is staged to Track G by
-          the Track B contract, so the whole $FD space fails cleanly and
-          visibly rather than being silently accepted or silently
-          reported as non-constant. The subopcode is read first so the
-          message can name it. }
+        { `v128.const` ($FD 12) IS a constant instruction
+          (`Instr_const/vconst`) and is accepted; every other assigned
+          $FD subopcode is non-constant and gets the ordinary message.
+          An UNASSIGNED subopcode cannot reach here — SkipExpr walked
+          these same bytes during decoding and raised EWasmDecodeError for
+          it — so, like the $FB else branch, that case is defensive. }
         Sub := FReader.ReadU32;
-        raise EWasmValidationError.CreateFmt(
-          '%s: $FD subopcode %u in a constant expression at offset %u',
-          [MSG_SIMD_NOT_IMPLEMENTED, Sub, AOpOffset]);
+        if Sub = 12 then
+          StepV128Const
+        else
+          NotConstant('$FD subopcode ' + IntToStr(Int64(Sub)), AOpOffset);
       end;
   else
     { Everything else in the single-byte space. An UNASSIGNED opcode

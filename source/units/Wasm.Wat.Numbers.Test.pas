@@ -36,6 +36,8 @@ type
   private
     { Capture the EWasmTextError message (or '' on success) for each parse
       entry point. }
+    function I8Err(const AToken: string): string;
+    function I16Err(const AToken: string): string;
     function I32Err(const AToken: string): string;
     function I64Err(const AToken: string): string;
     function F32Err(const AToken: string): string;
@@ -52,6 +54,7 @@ type
     procedure TestI64MinEdge;
     procedure TestIntOutOfRange;
     procedure TestIntMalformed;
+    procedure TestLaneWidthWrappersAndMessages;
 
     procedure TestFloatSpecials;
     procedure TestNaNPayloads;
@@ -67,6 +70,36 @@ type
   end;
 
 { --- private helpers -------------------------------------------------- }
+
+function TWatNumbersTests.I8Err(const AToken: string): string;
+var
+  D: Byte;
+begin
+  Result := '';
+  try
+    D := ParseI8(AToken);
+    if D = 0 then
+      Result := '';
+  except
+    on E: EWasmTextError do
+      Result := E.Message;
+  end;
+end;
+
+function TWatNumbersTests.I16Err(const AToken: string): string;
+var
+  D: Word;
+begin
+  Result := '';
+  try
+    D := ParseI16(AToken);
+    if D = 0 then
+      Result := '';
+  except
+    on E: EWasmTextError do
+      Result := E.Message;
+  end;
+end;
 
 function TWatNumbersTests.I32Err(const AToken: string): string;
 var
@@ -264,6 +297,40 @@ begin
   Expect<string>(I32Err('1x')).ToBe(MSG_UNKNOWN_OPERATOR + ' 1x');
 end;
 
+procedure TWatNumbersTests.TestLaneWidthWrappersAndMessages;
+begin
+  { The lane-INDEX wrappers ParseI8 / ParseI16 accept the union [-2^(N-1),
+    2^N-1] like every width, but raise the WIDTH-PREFIXED spelling on
+    overflow, because a lane index is spelled through them. This is the split
+    the corpus forces (design §5.4): `i8 constant out of range` in
+    simd_lane.wast (lane indices) vs the bare `constant out of range` in
+    simd_const.wast (v128.const lane literals). Prefix matching makes the two
+    unmergeable, so the exact string matters. }
+  Expect<Byte>(ParseI8('0')).ToBe(Byte(0));
+  Expect<Byte>(ParseI8('255')).ToBe(Byte(255));
+  Expect<Byte>(ParseI8('0x1f')).ToBe(Byte($1F));
+  { -1 is IN range for ParseI8 (the signed/unsigned union) and wraps to 255;
+    the assembler, not Numbers, rejects a signed lane index. }
+  Expect<Byte>(ParseI8('-1')).ToBe(Byte(255));
+  Expect<Word>(ParseI16('65535')).ToBe(Word(65535));
+
+  { 256 overflows i8 -> the width-prefixed message (simd_lane.wast:415). }
+  Expect<string>(I8Err('256')).ToBe(MSG_I8_CONSTANT_OUT_OF_RANGE);
+  Expect<string>(I8Err('0x100')).ToBe(MSG_I8_CONSTANT_OUT_OF_RANGE);
+  Expect<string>(I16Err('65536')).ToBe(MSG_I16_CONSTANT_OUT_OF_RANGE);
+
+  { The bare `constant out of range` stays the spelling for ParseIntLiteral at
+    width 8/16 — the v128.const lane-literal path (simd_const.wast). The two
+    must be DISTINCT: `i8 constant out of range` is NOT prefixed by the bare
+    form, so a harness prefix-match keeps them apart. }
+  Expect<Boolean>(Pos(MSG_CONSTANT_OUT_OF_RANGE, MSG_I8_CONSTANT_OUT_OF_RANGE) = 1)
+    .ToBe(False);
+  Expect<string>(I8Err('256')).ToBe(MSG_I8_CONSTANT_OUT_OF_RANGE);
+
+  { A malformed lane-index token is still `unknown operator`, width-agnostic. }
+  Expect<Boolean>(Pos(MSG_UNKNOWN_OPERATOR, I8Err('0xg')) = 1).ToBe(True);
+end;
+
 { --- floats ---------------------------------------------------------- }
 
 procedure TWatNumbersTests.TestFloatSpecials;
@@ -455,6 +522,8 @@ begin
   Test('i64 INT64_MIN across four spellings', TestI64MinEdge);
   Test('integer just-out-of-range boundaries', TestIntOutOfRange);
   Test('malformed integer tokens are unknown operator', TestIntMalformed);
+  Test('lane-width wrappers and the width-prefixed range message',
+    TestLaneWidthWrappersAndMessages);
 
   Test('float inf/nan/zero specials and signs', TestFloatSpecials);
   Test('nan explicit payloads and range rules', TestNaNPayloads);

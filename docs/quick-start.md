@@ -69,7 +69,7 @@ execution tier will consume. One line per module on success:
 
 ```console
 $ ./build/wasmlight validate tests/fixtures/valid/exports.wasm
-tests/fixtures/valid/exports.wasm: valid - 2 function(s) lowered, 2 in the function index space, IR format version 1
+tests/fixtures/valid/exports.wasm: valid - 2 function(s) lowered, 2 in the function index space, IR format version 2
 ```
 
 Both commands take more than one module. A failure names the error class,
@@ -77,14 +77,16 @@ because the class is the answer: `EWasmDecodeError` means the bytes are
 not a module, `EWasmValidationError` means they are a module that is not
 well-typed. The exit status is non-zero if any module failed.
 
+The `v128` vector set now validates like anything else (Track G) — the
+fixture that exercises it is no exception:
+
 ```console
 $ ./build/wasmlight validate tests/fixtures/valid/simd.wasm
-wasmlight validate: tests/fixtures/valid/simd.wasm: EWasmValidationError: SIMD validation is not implemented ($FD 17 at offset 89)
+tests/fixtures/valid/simd.wasm: valid - 5 function(s) lowered, 5 in the function index space, IR format version 2
 ```
 
-That one is not a bug in the fixture. Vector (`$FD`) validation is
-deliberately staged to Track G, and the validator says so rather than
-accepting an instruction it has not checked.
+The IR format version is **2**: it bumped from 1 when Track G appended the
+vector ops.
 
 The third program, `wasmspec`, runs `.wast` conformance scripts. It
 assembles text modules, decodes, validates, instantiates, and *executes*
@@ -102,14 +104,16 @@ TOTAL files=1 errors=0 pass=460 fail=0 skip=0 staged=0 total=460
 
 A directory argument is walked recursively, and the aggregate splits `ROOT`
 (the 3.0 target) from `PROPOSALS` (post-3.0). Over the whole corpus that is
-`pass=38900 fail=444 skip=26161 staged=1620` across 288 files — vector text
-(Track G) is `staged`, and the failures are dominated by post-3.0
-proposals, not 3.0 regressions. See [testing.md](testing.md) for what the
-tallies mean and [`tests/spec/README.md`](../tests/spec/README.md) for
-fetching the corpus.
+`pass=65184 fail=408 skip=1533 staged=0` across 288 files — SIMD judged per
+lane (Track G) and exception handling judged (Track H), so `staged` is 0,
+and the failures are dominated by post-3.0 proposals, not 3.0 regressions.
+See [testing.md](testing.md) for what the tallies mean and
+[`tests/spec/README.md`](../tests/spec/README.md) for fetching the corpus.
 
 Those three programs are the whole shipped surface today: decode, validate,
-instantiate, and execute, conformance-tested against the upstream corpus.
+instantiate, and execute the **complete core wasm 3.0 instruction set** —
+every numeric, reference, GC, SIMD, and exception-handling instruction —
+conformance-tested against the upstream corpus (~65,184 assertions pass).
 See [roadmap.md](roadmap.md) for what comes next and in what order.
 
 For the full command set (formatter, benchmarks, CI gates) see

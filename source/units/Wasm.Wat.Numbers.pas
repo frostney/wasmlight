@@ -69,6 +69,20 @@ const
     to keep one corpus-matched spelling. }
   MSG_CONSTANT_OUT_OF_RANGE = 'constant out of range';
 
+  { The width-PREFIXED spelling belongs to lane INDICES, not lane literals.
+    ParseI8 raises it (the assembler routes shuffle / extract_lane /
+    replace_lane / load-store_lane indices through ParseI8), while
+    ParseIntLiteral(tok, 8) — the path a `v128.const i8x16` lane literal
+    takes — keeps the bare `constant out of range`. That reads inconsistent,
+    but it is exactly the corpus split: `i8 constant out of range` occurs
+    only in simd_lane.wast (lane-index positions) and `constant out of range`
+    only in simd_const.wast (v128.const lane literals). The harness matches by
+    prefix, and `i8 constant out of range` is NOT prefixed by `constant out of
+    range`, so the two cannot be merged (design §5.4). MSG_I16 is the
+    symmetric spelling; UNCONFIRMED — no corpus case reaches it. }
+  MSG_I8_CONSTANT_OUT_OF_RANGE  = 'i8 constant out of range';
+  MSG_I16_CONSTANT_OUT_OF_RANGE = 'i16 constant out of range';
+
 { Parse an integer literal token to its ABitWidth-bit two's-complement pattern,
   returned in the low bits of the result. The value must fit ABitWidth as
   EITHER a signed or an unsigned integer (the union [-2^(N-1), 2^N-1]); a value
@@ -77,10 +91,12 @@ const
   `unknown operator`. ABitWidth is one of 8/16/32/64. }
 function ParseIntLiteral(const AToken: string; const ABitWidth: Integer): UInt64;
 
-{ Width-typed integer wrappers. The small widths exist for SIMD lane literals
-  (design §2(d.1)); note that lanes want the width-prefixed `i8 constant out of
-  range` spelling, which is a Track G concern layered over the bare message this
-  unit raises. }
+{ Width-typed integer wrappers. ParseI8 / ParseI16 exist for SIMD lane
+  INDICES and raise the width-prefixed `i8/i16 constant out of range` on
+  overflow (design §5.4); ParseI32 / ParseI64 and ParseIntLiteral raise the
+  bare `constant out of range`. Choose ParseIntLiteral(tok, 8/16/…) — not
+  ParseI8 / ParseI16 — for a v128.const lane LITERAL, which wants the bare
+  spelling. }
 function ParseI8(const AToken: string): Byte;
 function ParseI16(const AToken: string): Word;
 function ParseI32(const AToken: string): UInt32;
@@ -884,8 +900,12 @@ end;
 
 { --- integers -------------------------------------------------------- }
 
-function ParseIntLiteral(const AToken: string;
-  const ABitWidth: Integer): UInt64;
+{ The shared integer-literal core. ARangeMsg lets a width-typed wrapper pick
+  the diagnostic spelling: the bare `constant out of range` for a literal, or
+  the width-prefixed `i8/i16 constant out of range` for a lane index. Every
+  other diagnostic (`unknown operator`) is width-agnostic and unchanged. }
+function IntLiteralBits(const AToken: string; const ABitWidth: Integer;
+  const ARangeMsg: string): UInt64;
 var
   I, Count: Integer;
   Neg: Boolean;
@@ -927,7 +947,7 @@ begin
       overflowing Int64. }
     Limit := BigShlBits(BigFromU64(1), ABitWidth - 1);
     if BigCompare(Mag, Limit) > 0 then
-      RaiseRange;
+      raise EWasmTextError.Create(ARangeMsg);
     MagU := BigToU64(Mag);
     if ABitWidth >= 64 then
       Result := UInt64(0) - MagU
@@ -942,7 +962,7 @@ begin
     { Positive: magnitude must fit unsigned N, i.e. <= 2^N - 1. }
     Limit := BigSub(BigShlBits(BigFromU64(1), ABitWidth), BigFromU64(1));
     if BigCompare(Mag, Limit) > 0 then
-      RaiseRange;
+      raise EWasmTextError.Create(ARangeMsg);
     MagU := BigToU64(Mag);
     if ABitWidth >= 64 then
       Result := MagU
@@ -954,14 +974,23 @@ begin
   end;
 end;
 
+function ParseIntLiteral(const AToken: string;
+  const ABitWidth: Integer): UInt64;
+begin
+  { Lane LITERAL path (v128.const): the bare `constant out of range`. }
+  Result := IntLiteralBits(AToken, ABitWidth, MSG_CONSTANT_OUT_OF_RANGE);
+end;
+
 function ParseI8(const AToken: string): Byte;
 begin
-  Result := Byte(ParseIntLiteral(AToken, 8));
+  { Lane INDEX path (shuffle / extract_lane / …): the width-prefixed
+    `i8 constant out of range` (design §5.4; simd_lane.wast). }
+  Result := Byte(IntLiteralBits(AToken, 8, MSG_I8_CONSTANT_OUT_OF_RANGE));
 end;
 
 function ParseI16(const AToken: string): Word;
 begin
-  Result := Word(ParseIntLiteral(AToken, 16));
+  Result := Word(IntLiteralBits(AToken, 16, MSG_I16_CONSTANT_OUT_OF_RANGE));
 end;
 
 function ParseI32(const AToken: string): UInt32;

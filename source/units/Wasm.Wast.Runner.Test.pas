@@ -49,11 +49,27 @@ const
   { Preamble; type section (id 1) with one `(func)`; function section
     (id 3) declaring one function of that type; code section (id 10) whose
     single body is `v128.load align=0 offset=0` (FD 00 00 00) then `end`.
-    It decodes — Wasm.Decoder.Expr knows the $FD immediate shapes — and
-    reaches the vector family in the body walk, which is staged to
-    Track G. }
+    It decodes — Wasm.Decoder.Expr knows the $FD immediate shapes — and now
+    reaches the vector family in the body walk, which REJECTS it (no memory
+    and an unbalanced stack): a real VALIDATION error, no longer staged. }
   MODULE_SIMD_BODY = '"\00asm\01\00\00\00\01\04\01\60\00\00\03\02\01\00'
     + '\0a\08\01\06\00\fd\00\00\00\0b"';
+
+  { A well-formed, self-contained v128 module built as literal bytes so the
+    runner/comparator path does not depend on the assembler. One func type
+    () -> v128 (0x7b), exported "v", whose body is a single
+    `v128.const i8x16 0 1 2 ... 15` (FD 0C + 16 lane bytes) then `end`. It
+    validates, instantiates, and — with the interpreter's vector dispatch —
+    returns the lanes 0..15. }
+  MODULE_V128 =
+    '(module binary '
+    + '"\00\61\73\6d\01\00\00\00"'
+    + '"\01\05\01\60\00\01\7b"'
+    + '"\03\02\01\00"'
+    + '"\07\05\01\01\76\00\00"'
+    + '"\0a\16\01\14\00\fd\0c\00\01\02\03\04\05\06\07\08\09\0a\0b'
+    + '\0c\0d\0e\0f\0b"'
+    + ')';
 
   { A hand-assembled binary module that actually runs, for the execution
     tests. Three func types (()->i32, ()->f32, ()->f64) and exports:
@@ -141,7 +157,7 @@ type
     procedure TestAssertInvalidUnknownMemoryIndexInPrefix;
     procedure TestAssertInvalidEmptyExpectedMatchesOnClass;
     procedure TestAssertMalformedEmptyExpectedStillChecksClass;
-    procedure TestStagedSimdWrongClassReportsFail;
+    procedure TestSimdModuleWrongClassReportsFail;
     procedure TestTopLevelBinaryModulePasses;
     procedure TestTopLevelBinaryModuleFailureReported;
     procedure TestTextModuleAssembles;
@@ -149,13 +165,13 @@ type
     procedure TestAssertMalformedTextOperandPasses;
     procedure TestAssertMalformedTextNotMalformedFails;
     procedure TestAssertInvalidTextOperandPasses;
-    procedure TestStagedSimdTextModule;
+    procedure TestSimdTextModuleValidates;
     procedure TestAssertUnlinkablePrechecksThenSkips;
     procedure TestUnknownDirectiveSkipped;
     procedure TestExecutionCommandsSkipped;
     procedure TestAssertWithoutModuleOperandSkipped;
-    procedure TestStagedSimdInAssert;
-    procedure TestStagedSimdAtTopLevel;
+    procedure TestSimdModuleJudgedInvalidNotStaged;
+    procedure TestSimdModuleInstantiatesNotStaged;
     procedure TestFailureDoesNotStopTheScript;
     procedure TestTallyCountsEveryStatus;
     procedure TestPrefixMatchRule;
@@ -176,6 +192,18 @@ type
     procedure TestAssertTrapModuleOobSegmentPersists;
     procedure TestAssertTrapModuleTrappingStartPersists;
     procedure TestAssertTrapModuleNoTrapReportsFail;
+
+    { SIMD execution (Track G, needs the interpreter's vector dispatch) }
+    procedure TestAssertReturnV128PerLane;
+    procedure TestAssertReturnV128WrongLaneFails;
+    procedure TestV128ArgResultRoundTrip;
+    procedure TestRelaxedEitherResultMatches;
+
+    { exception handling (Track H, assert_exception judging) }
+    procedure TestAssertExceptionPassesOnUncaughtThrow;
+    procedure TestAssertExceptionFailsWhenCaughtInternally;
+    procedure TestAssertExceptionFailsOnTrap;
+    procedure TestAssertReturnFailsOnUncaughtException;
   end;
 
 function TWastRunnerTests.StatusSignature(const ASource: string): string;
@@ -356,14 +384,14 @@ begin
   Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('invalid');
 end;
 
-procedure TWastRunnerTests.TestStagedSimdWrongClassReportsFail;
+procedure TWastRunnerTests.TestSimdModuleWrongClassReportsFail;
 var
   Item: TWastCommandResult;
 begin
-  { A SIMD body under assert_malformed: the staged message is raised as a
-    VALIDATION error, but the script demanded MALFORMED. The staged
-    carve-out is gated on the wanted class, so this is a fail — a
-    wrong-class result cannot hide behind STAGED. }
+  { A malformed-in-body SIMD module under assert_malformed: it is now
+    REJECTED by validation (not staged), but the script demanded MALFORMED.
+    A wrong-class rejection is a fail — the class hierarchy is load-bearing
+    and SIMD no longer has a staged carve-out to hide behind. }
   Item := FirstResult('(assert_malformed (module binary ' + MODULE_SIMD_BODY
     + ') "type mismatch")');
   Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
@@ -462,17 +490,16 @@ begin
   ExpectStartsWith(Item.Actual, 'type mismatch');
 end;
 
-procedure TWastRunnerTests.TestStagedSimdTextModule;
+procedure TWastRunnerTests.TestSimdTextModuleValidates;
 var
   Item: TWastCommandResult;
 begin
-  { A text module using a vector mnemonic hits the assembler's `unknown
-    operator v128.const` (Track G), which is STAGED, not a real text error —
-    so SIMD noise cannot drown the report. }
+  { A text module using a vector mnemonic now assembles, validates, and
+    instantiates — the `unknown operator v128.const` staging carve-out is
+    gone. A pass carries no message. }
   Item := FirstResult('(module (func (v128.const i32x4 0 0 0 0) drop))');
-  Expect<string>(WastStatusName(Item.Status)).ToBe('staged');
-  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('text');
-  ExpectStartsWith(Item.Actual, 'unknown operator v128.const');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(Item.Actual).ToBe('');
 end;
 
 procedure TWastRunnerTests.TestAssertUnlinkablePrechecksThenSkips;
@@ -538,29 +565,34 @@ end;
 
 { --- staged work --------------------------------------------------------- }
 
-procedure TWastRunnerTests.TestStagedSimdInAssert;
+procedure TWastRunnerTests.TestSimdModuleJudgedInvalidNotStaged;
 var
   Item: TWastCommandResult;
 begin
-  { The module is rejected, but on work this project has deliberately
-    staged to Track G rather than on the rule the script is about. Neither
-    a pass (nothing was judged) nor a fail (nothing diverged) — its own
-    status, counted separately, so the vector files cannot bury the real
-    divergences. }
+  { The vector body is now VALIDATED for real and rejected as invalid — no
+    longer a staged carve-out. An empty expected string is a class-only
+    match, so a genuinely invalid module passes assert_invalid; the point of
+    the case is that the status is judged (pass), never 'staged'. }
   Item := FirstResult('(assert_invalid (module binary ' + MODULE_SIMD_BODY
-    + ') "type mismatch")');
-  Expect<string>(WastStatusName(Item.Status)).ToBe('staged');
-  Expect<string>(Item.Expected).ToBe('type mismatch');
-  ExpectStartsWith(Item.Actual, 'SIMD validation is not implemented');
+    + ') "")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('invalid');
 end;
 
-procedure TWastRunnerTests.TestStagedSimdAtTopLevel;
+procedure TWastRunnerTests.TestSimdModuleInstantiatesNotStaged;
 var
-  Item: TWastCommandResult;
+  Run: TWastRunResult;
 begin
-  Item := FirstResult('(module binary ' + MODULE_SIMD_BODY + ')');
-  Expect<string>(WastStatusName(Item.Status)).ToBe('staged');
-  ExpectStartsWith(Item.Actual, 'SIMD validation is not implemented');
+  { A well-formed v128 module now assembles/validates/instantiates and
+    passes at top level, and nothing in the script is counted as staged —
+    the SIMD staging is gone (Track G). }
+  Run := RunWastSource(MODULE_V128);
+  try
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+    Expect<Integer>(Run.Tally.Staged).ToBe(0);
+  finally
+    Run.Free;
+  end;
 end;
 
 { --- script-level behaviour ---------------------------------------------- }
@@ -587,24 +619,25 @@ var
   Run: TWastRunResult;
   Tally: TWastTally;
 begin
-  { A register with no current instance is the skip here: a well-formed
-    text `(module (func))` now PASSES rather than skipping, so the skip has to
-    come from a command that genuinely cannot be judged. }
+  { Pass, fail, and skip in one run; a register with no current instance is
+    the skip. SIMD no longer stages, so Staged is now 0 — the last command,
+    a genuinely invalid v128 module under assert_invalid with a class-only
+    (empty) expected, is a judged PASS, not a staged carve-out. }
   Run := RunWastSource(
     '(assert_malformed (module binary ' + MODULE_BAD_MAGIC
       + ') "magic header not detected")' + sLineBreak +
     '(assert_malformed (module binary ' + MODULE_BAD_MAGIC
       + ') "unknown binary version")' + sLineBreak +
     '(register "m")' + sLineBreak +
-    '(assert_invalid (module binary ' + MODULE_SIMD_BODY
-      + ') "type mismatch")');
+    '(assert_invalid (module binary ' + MODULE_SIMD_BODY + ') "")');
   try
     Tally := Run.Tally;
     Expect<Integer>(Run.Count).ToBe(4);
-    Expect<Integer>(Tally.Pass).ToBe(1);
+    Expect<Integer>(Tally.Pass).ToBe(2);
     Expect<Integer>(Tally.Fail).ToBe(1);
     Expect<Integer>(Tally.Skip).ToBe(1);
-    Expect<Integer>(Tally.Staged).ToBe(1);
+    { SIMD is no longer staged; only Track H's exception handling remains. }
+    Expect<Integer>(Tally.Staged).ToBe(0);
     { Skips are counted in the total and never folded into passes — a
       report must not read as more coverage than was measured. }
     Expect<Integer>(Tally.Total).ToBe(4);
@@ -845,6 +878,122 @@ begin
   Expect<string>(Item.Actual).ToBe(WAST_NO_ERROR);
 end;
 
+{ --- SIMD execution (needs the interpreter's vector dispatch) ------------ }
+
+procedure TWastRunnerTests.TestAssertReturnV128PerLane;
+var
+  Item: TWastCommandResult;
+begin
+  { The hand-assembled v128 module returns i8x16 lanes 0..15; the expected
+    vector is compared lane by lane across the two result slots. }
+  Item := ResultAt(MODULE_V128 + sLineBreak
+    + '(assert_return (invoke "v")'
+    + ' (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestAssertReturnV128WrongLaneFails;
+var
+  Item: TWastCommandResult;
+begin
+  { One diverging lane (lane 15 expected 99, produced 15) fails the whole
+    result; the produced vector is rendered in v128.const notation. }
+  Item := ResultAt(MODULE_V128 + sLineBreak
+    + '(assert_return (invoke "v")'
+    + ' (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 99))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  ExpectStartsWith(Item.Actual, '(v128.const i8x16');
+end;
+
+procedure TWastRunnerTests.TestV128ArgResultRoundTrip;
+var
+  Item: TWastCommandResult;
+begin
+  { A v128 argument occupies two marshal slots and a v128 result reads back
+    from two slots; an identity function round-trips the exact lanes. }
+  Item := ResultAt(
+    '(module (func (export "id") (param v128) (result v128) (local.get 0)))'
+    + sLineBreak
+    + '(assert_return (invoke "id" (v128.const i32x4 10 20 30 40))'
+    + ' (v128.const i32x4 10 20 30 40))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestRelaxedEitherResultMatches;
+var
+  Item: TWastCommandResult;
+begin
+  { The relaxed-SIMD `(either A B)` result form passes when the produced
+    vector matches EITHER alternative — here the first. }
+  Item := ResultAt(MODULE_V128 + sLineBreak
+    + '(assert_return (invoke "v") (either'
+    + ' (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)'
+    + ' (v128.const i8x16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0)))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+{ --- exception handling (Track H) ---------------------------------------- }
+
+procedure TWastRunnerTests.TestAssertExceptionPassesOnUncaughtThrow;
+var
+  Item: TWastCommandResult;
+begin
+  { `throw $e` with no enclosing try_table escapes the invocation as an
+    uncaught exception (EWasmException). assert_exception asserts exactly
+    that — the class alone, no expected tag/payload — so it PASSES. }
+  Item := ResultAt(
+    '(module (tag $e) (func (export "boom") (throw $e)))' + sLineBreak
+    + '(assert_exception (invoke "boom"))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+end;
+
+procedure TWastRunnerTests.TestAssertExceptionFailsWhenCaughtInternally;
+var
+  Item: TWastCommandResult;
+begin
+  { The function throws but its own `try_table (catch_all)` catches it and the
+    invocation returns normally. No exception escapes, so assert_exception is
+    NOT satisfied — a fail reporting that no error was raised. A caught
+    exception must never count as an uncaught one. }
+  Item := ResultAt(
+    '(module (tag $e)' + sLineBreak
+    + '  (func (export "safe")' + sLineBreak
+    + '    (block $l (try_table (catch_all $l) (throw $e)))))' + sLineBreak
+    + '(assert_exception (invoke "safe"))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  Expect<string>(Item.Actual).ToBe(WAST_NO_ERROR);
+end;
+
+procedure TWastRunnerTests.TestAssertExceptionFailsOnTrap;
+var
+  Item: TWastCommandResult;
+begin
+  { A trap is a SEPARATE outcome from a wasm exception (design §2.1): they
+    travel different routes and never satisfy each other's assertion. An
+    `unreachable` trap must therefore FAIL assert_exception, not pass it. }
+  Item := ResultAt(
+    '(module (func (export "t") (unreachable)))' + sLineBreak
+    + '(assert_exception (invoke "t"))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  ExpectStartsWith(Item.Actual, 'unexpected trap:');
+end;
+
+procedure TWastRunnerTests.TestAssertReturnFailsOnUncaughtException;
+var
+  Item: TWastCommandResult;
+begin
+  { The complement of assert_exception: an uncaught exception under
+    assert_return is a fail (not a trap, not a value). This pins the handler
+    ORDER too — EWasmException is caught as wakException, before the generic
+    EWasmError clause could swallow it as wakError. }
+  Item := ResultAt(
+    '(module (tag $e)' + sLineBreak
+    + '  (func (export "boom") (result i32) (throw $e)))' + sLineBreak
+    + '(assert_return (invoke "boom") (i32.const 0))', 1);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  ExpectStartsWith(Item.Actual, 'unexpected exception:');
+end;
+
 procedure TWastRunnerTests.SetupTests;
 begin
   Test('assert_malformed passes on a prefix match',
@@ -862,8 +1011,8 @@ begin
     TestAssertInvalidEmptyExpectedMatchesOnClass);
   Test('assert_malformed with an empty expected string still checks class',
     TestAssertMalformedEmptyExpectedStillChecksClass);
-  Test('staged SIMD under the wrong class reports a fail',
-    TestStagedSimdWrongClassReportsFail);
+  Test('a rejected SIMD module under the wrong class reports a fail',
+    TestSimdModuleWrongClassReportsFail);
   Test('top-level binary module passes', TestTopLevelBinaryModulePasses);
   Test('top-level binary module failure is reported',
     TestTopLevelBinaryModuleFailureReported);
@@ -875,16 +1024,18 @@ begin
     TestAssertMalformedTextNotMalformedFails);
   Test('assert_invalid over a text operand passes on validation',
     TestAssertInvalidTextOperandPasses);
-  Test('a staged vector mnemonic in a text module is staged',
-    TestStagedSimdTextModule);
+  Test('a vector mnemonic in a text module validates and passes',
+    TestSimdTextModuleValidates);
   Test('assert_unlinkable pre-checks the operand then skips',
     TestAssertUnlinkablePrechecksThenSkips);
   Test('unknown directive skipped', TestUnknownDirectiveSkipped);
   Test('execution commands skipped', TestExecutionCommandsSkipped);
   Test('assert without a module operand skipped',
     TestAssertWithoutModuleOperandSkipped);
-  Test('staged SIMD inside an assert', TestStagedSimdInAssert);
-  Test('staged SIMD at top level', TestStagedSimdAtTopLevel);
+  Test('a SIMD module is judged invalid, not staged',
+    TestSimdModuleJudgedInvalidNotStaged);
+  Test('a well-formed SIMD module instantiates and nothing stages',
+    TestSimdModuleInstantiatesNotStaged);
   Test('a failure does not stop the script',
     TestFailureDoesNotStopTheScript);
   Test('tally counts every status', TestTallyCountsEveryStatus);
@@ -916,6 +1067,24 @@ begin
     TestAssertTrapModuleTrappingStartPersists);
   Test('assert_trap over a non-trapping module reports a fail',
     TestAssertTrapModuleNoTrapReportsFail);
+
+  Test('assert_return compares a v128 result per lane',
+    TestAssertReturnV128PerLane);
+  Test('assert_return fails on a wrong v128 lane',
+    TestAssertReturnV128WrongLaneFails);
+  Test('a v128 argument and result round-trip across two slots',
+    TestV128ArgResultRoundTrip);
+  Test('a relaxed (either ...) result matches an alternative',
+    TestRelaxedEitherResultMatches);
+
+  Test('assert_exception passes on an uncaught throw',
+    TestAssertExceptionPassesOnUncaughtThrow);
+  Test('assert_exception fails when the throw is caught internally',
+    TestAssertExceptionFailsWhenCaughtInternally);
+  Test('assert_exception fails on a trap (separate routes)',
+    TestAssertExceptionFailsOnTrap);
+  Test('assert_return fails on an uncaught exception',
+    TestAssertReturnFailsOnUncaughtException);
 end;
 
 begin

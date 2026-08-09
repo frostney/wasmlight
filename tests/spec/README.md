@@ -53,7 +53,7 @@ sorted, counted, and diffed with the shell.
 | --- | --- |
 | `PASS` | Judged, and the outcome matched (`--verbose` only) |
 | `FAIL` | Judged, and it did not — carries `got=`, `expected=`, and `actual=` |
-| `STAGED` | Would fail, but only on deliberately staged work (`$FD` vector support, Track G) |
+| `STAGED` | Would fail, but only on deliberately staged work. Nothing is staged today — Track H shipped exception-handling throwing, the last thing this held — so the column reads 0 |
 | `SKIP` | Not judged; carries `reason=` (`--verbose` only) |
 | `FILE` | Per-file tally |
 | `TOTAL` | Aggregate tally, plus the file and error counts |
@@ -113,6 +113,9 @@ path a binary module takes:
   `EWasmValidationError`
 - `(assert_return ...)`, `(assert_trap (invoke ...) ...)`, `(invoke ...)`,
   `(assert_exhaustion ...)` — run through the interpreter and compare
+- `(assert_exception (invoke ...))` — run through the interpreter; the
+  invocation must throw an uncaught wasm exception (`EWasmException`),
+  which Track H's `throw` / `throw_ref` / `try_table` execution produces
 - `(assert_trap (module ...) ...)` / `(assert_exhaustion (module ...) ...)` —
   the instantiation-trap form: the module is built and instantiated for real,
   an out-of-bounds active segment traps after earlier ones persist, and a
@@ -122,10 +125,9 @@ Everything else is `SKIP` with a reason, never a silent pass:
 
 | Reason | Applies to |
 | --- | --- |
-| `no instantiated module` | An `assert_return` / `invoke` whose module did not instantiate — overwhelmingly the staged vector modules |
+| `no instantiated module` | An `assert_return` / `invoke` whose module did not instantiate — now mostly modules downstream of an unprovided import |
 | `needs an execution tier` | An action whose module the assembler cannot yet build for another reason |
 | `import not provided by the harness` | A module importing something the harness does not supply |
-| `exception handling not implemented (Track H)` | `assert_exception` and throwing forms |
 | `assert_unlinkable` | Linkage is not yet judged (the operand is still assembled and validated as a pre-check) |
 | `directive not in the reference grammar` | `assert_malformed_custom`, `assert_invalid_custom`, anything else unrecognised |
 
@@ -138,20 +140,21 @@ reference interpreter: the expected string must be a prefix of our message. Our
 error messages — text, decode, validation, and trap — are therefore part of
 conformance, not merely diagnostics.
 
-`STAGED` exists for one reason. `$FD` vector support is staged to Track G, so a
-module whose text names a `v128` instruction the assembler cannot emit trips
-`unknown operator` and is counted separately, keeping the vector files from
-burying real divergences. It is never a pass, and every assertion downstream of a
-staged module skips as `no instantiated module`.
+`STAGED` sets aside a case that was attempted but deliberately deferred, so it is
+never counted as a pass. **Nothing populates it today.** It held two things in
+turn: before Track G, the `$FD` vector text the assembler could not emit; then,
+before Track H, exception-handling *throwing*. The assembler builds the vector
+forms and the interpreter executes the throwing now, so both pass and the column
+reads 0. The status stays in the harness for the next deferred feature.
 
 ## Where the numbers stand
 
 `WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`, 288 scripts:
 
 ```text
-ROOT      pass=38367 fail=88  skip=25239 staged=1620 total=65314
-PROPOSALS pass=533   fail=356 skip=922   staged=0    total=1811
-TOTAL files=288 errors=0 pass=38900 fail=444 skip=26161 staged=1620 total=67125
+ROOT      pass=64651 fail=52  skip=611  staged=0 total=65314
+PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
+TOTAL files=288 errors=0 pass=65184 fail=408 skip=1533 staged=0 total=67125
 ```
 
 `ROOT` is everything outside `proposals/` (the 3.0 target plus the out-of-scope
@@ -161,37 +164,37 @@ runtime units — the interpreter's traps reach the runtime `MSG_*` strings the
 binary-only runs never did, and a raise site appends its context after the
 prefix rather than in front of it.
 
-Judged commands are `pass + fail + staged` = **~40,900** — up from the old
-binary-only ceiling of 1,075, now that text modules assemble and assertions
-execute. The `staged` column (1,620) belongs in that sum: a staged case was
-attempted and set aside, not skipped. The `skip` column is dominated by the
-25,721 `no instantiated module` cases — assertions against the staged vector
-modules — so read it as the size of the vector work still ahead, not as a
-coverage gap in the shipped layers.
+Judged commands are `pass + fail` = **~65,592**. The `staged` column is **0**:
+Track H shipped exception-handling throwing, so `try_table`, `throw`, and
+`throw_ref` execute and `assert_exception` is judged — the whole core 3.0
+instruction set now runs. The `skip` column (~1,533) is the residue: assertions
+downstream of an unprovided import, host imports the harness does not provide,
+and `assert_unlinkable`.
 
-### What the 444 failures are
+### What the 408 failures are
 
-The split is the headline: **356 are `PROPOSALS`** and only **88 are `ROOT`**, so
-the failures cluster in post-3.0 features, not in the 3.0 target. None is a
-wrong-CLASS rejection between `malformed` and `invalid`.
+The split is the headline: **356 are `PROPOSALS`** and only **52 are `ROOT`**, so
+the failures cluster in post-3.0 features, not in the 3.0 target — and none is a
+SIMD or exception-handling execution failure. None is a wrong-CLASS rejection
+between `malformed` and `invalid`.
 
 **`PROPOSALS` (356)** exercise features outside the pinned conformance target
 ([ADR-0004](../../docs/adr/0004-conformance-target-is-the-3-0-draft.md)):
 `custom-descriptors` (descriptor composite types, exact reference types, the
 `type … does not have a descriptor` family), `custom-page-sizes` (the `invalid
 custom page size` limits flag), `wide-arithmetic` (the `$FC` subopcode), and
-threads. They appear as **false rejections** (`expected=""`, ~130 of them: the
-script presents the module as valid and a 3.0 runtime rejects it — the day the
-feature lands, these must be accepted) and as **wording mismatches** on modules
-upstream also rejects. The justification holds — 3.0 does not have these
-features — but the honest label on the `expected=""` cases is *false rejection*,
-not diagnostics.
+threads. They appear as **false rejections** (`expected=""`: the script presents
+the module as valid and a 3.0 runtime rejects it — the day the feature lands,
+these must be accepted) and as **wording mismatches** on modules upstream also
+rejects. The justification holds — 3.0 does not have these features — but the
+honest label on the `expected=""` cases is *false rejection*, not diagnostics.
 
-**`ROOT` (88)** are three kinds:
+**`ROOT` (52)** are five kinds:
 
 - **Legacy exception handling** (`testsuite/legacy/try_catch.wast`,
-  `rethrow.wast`, `throw.wast`) — the pre-3.0 `try`/`catch`/`delegate`/`rethrow`
-  encoding, out of 3.0 scope (Track H covers the 3.0 `try_table` form only).
+  `rethrow.wast`, `throw.wast`, `try_delegate.wast`, 16 cases) — the pre-3.0
+  `try`/`catch`/`delegate`/`rethrow` encoding, out of 3.0 scope and staying
+  failing (Track H covers the 3.0 `try_table` form only, which passes).
 - **The `binary-leb128` and `binary` wording divergences** carried since the
   binary subset — deliberately overlong or over-wide LEB128 whose bytes run past
   the section that declares them, where upstream reads the whole encoding
@@ -199,9 +202,17 @@ not diagnostics.
   `SubReader` reports the section bound first. Our decoder gives every section
   body and code entry a reader bounded by its declared size, which is what makes
   `length out of bounds` and `section size mismatch` right everywhere else.
-- **A few assembler/execution edges** — `expected=""` text cases the assembler
-  does not yet build, and a handful of execution-tier `type mismatch` and
-  `unknown …` wordings.
+- **The M7 `extern.convert_any` / `any.convert_extern` imprecision** — a handful
+  of `ref_test.wast` / `ref_cast.wast` `assert_return` cases where our result
+  does not match the expected extern/any round-trip.
+- **Two 3.0 `throw` message-wording edges** (`throw.wast`) — `assert_invalid`
+  cases where the module is correctly rejected but our type-mismatch wording
+  differs from upstream's (a validator-message divergence, not a throwing bug;
+  `try_table.wast` and `throw_ref.wast` pass clean).
+- **A few assembler/decoder edges** — `expected=""` text cases the assembler does
+  not yet build (`instance.wast`, `id.wast`, `table*.wast`, `memory*.wast`,
+  `call_indirect64.wast`) and a few decoder wordings (`binary.wast`,
+  `obsolete-keywords.wast`, `ref_func.wast`).
 
 Extract the live signatures rather than trusting this list to stay exact — the
 grep in the "Reading the output" section keys on the `got=`/`expected=` pair and

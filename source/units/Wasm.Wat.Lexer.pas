@@ -140,6 +140,14 @@ type
     { The next token, raising EWasmTextError (with line and column) on
       malformed input. Returns wttEof forever once the input ends. }
     function Next: TWatToken;
+
+    { The next token WITHOUT consuming it. The scan cursor (position, line,
+      column) is saved, Next is run, and the cursor is restored, so the
+      following Next returns the same token. One token of lookahead — what
+      the assembler's memidx-vs-lane disambiguation needs (§5.5). A malformed
+      next token faults exactly as Next would; a peek at end of input returns
+      wttEof. }
+    function Peek: TWatToken;
   end;
 
 const
@@ -1104,6 +1112,21 @@ begin
         comma, semicolon, or a square or curly bracket. }
       Fault(MSG_ILLEGAL_CHAR);
   end;
+end;
+
+function TWatLexer.Peek: TWatToken;
+var
+  SavePos, SaveLine, SaveColumn: Integer;
+begin
+  { Next mutates only the scan cursor (FSource is never rewritten), so saving
+    and restoring the three cursor fields makes the lookahead transparent. }
+  SavePos := FPos;
+  SaveLine := FLine;
+  SaveColumn := FColumn;
+  Result := Next;
+  FPos := SavePos;
+  FLine := SaveLine;
+  FColumn := SaveColumn;
 end;
 
 end.

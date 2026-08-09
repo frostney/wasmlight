@@ -60,12 +60,14 @@ type
   { The interpreter frame slot. A frame is `array of TWasmValue` of
     length TWasmIrFunction.RegisterCount.
 
-    Exactly 8 bytes. v128 needs 16 and deliberately does NOT live here:
-    widening every slot would double frame memory traffic for the
-    functions that have no vector register at all. Track G owns that
-    decision; what is fixed here is that the record stays 8 bytes and
-    that widening it later touches this record plus the frame allocator,
-    never the store. }
+    Exactly 8 bytes. v128 needs 16, and Track G's structural decision
+    (simd-spec §1.3) keeps this record at 8 bytes: a v128 register k is a
+    PAIR of adjacent slots k and k+1, low half first, k always even and so
+    16-byte aligned. The slot record is never widened and the store is not
+    restructured; VecAt below aliases the pair as a TWasmV128 for the one
+    load the SIMD hot path needs, and ValueZeroSlots already zeroes both
+    halves — which is exactly the v128 default value. A v128 is read and
+    written only through PWasmV128, never through this record's fields. }
   TWasmValue = record
     case Integer of
       0: (I32: Int32);
@@ -158,6 +160,20 @@ procedure ValueSetF32(var ASlot: TWasmValue; const AValue: Single); inline;
 procedure ValueSetRef(var ASlot: TWasmValue; const AValue: TWasmRef); inline;
 procedure ValueSetI64(var ASlot: TWasmValue; const AValue: Int64); inline;
 procedure ValueSetF64(var ASlot: TWasmValue; const AValue: Double); inline;
+
+{ --- v128 register pairs (simd-spec §1.3) ---------------------------- }
+
+{ A v128 register k aliases slots k and k+1 (k even, 16-byte aligned).
+  VecAt is the one indexed load the SIMD dispatch path uses, as cheap as
+  the scalar Reg[k] it sits beside. The result points INTO the frame, so
+  writing through it writes the register pair. }
+function VecAt(const ASlots: PWasmValue; const AIndex: UInt32): PWasmV128; inline;
+
+{ Set a v128 register pair to the all-zero vector (the v128 default). }
+procedure VecZero(const ADest: PWasmV128); inline;
+
+{ Bit-exact equality over all 128 bits. }
+function VecEquals(const ALeft, ARight: PWasmV128): Boolean; inline;
 
 { Zero a run of slots. Contract GC-1 requires a frame to be zeroed at
   entry: an unwritten ref slot must read as null, because an unzeroed
@@ -306,6 +322,25 @@ end;
 procedure ValueSetF64(var ASlot: TWasmValue; const AValue: Double);
 begin
   ASlot.F64 := AValue;
+end;
+
+function VecAt(const ASlots: PWasmValue; const AIndex: UInt32): PWasmV128;
+begin
+  { Pointer arithmetic rather than P[i] indexing: this unit does not enable
+    pointer math, and a v128 register pair aliases the two slots at AIndex. }
+  Result := PWasmV128(PByte(ASlots) + NativeUInt(AIndex) * SizeOf(TWasmValue));
+end;
+
+procedure VecZero(const ADest: PWasmV128);
+begin
+  ADest^.U64[0] := 0;
+  ADest^.U64[1] := 0;
+end;
+
+function VecEquals(const ALeft, ARight: PWasmV128): Boolean;
+begin
+  Result := (ALeft^.U64[0] = ARight^.U64[0]) and
+    (ALeft^.U64[1] = ARight^.U64[1]);
 end;
 
 procedure ValueZeroSlots(const ASlots: PWasmValue; const ACount: NativeUInt);

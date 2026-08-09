@@ -41,7 +41,8 @@ uses
 
   Wasm.Core,
   Wasm.Runtime.Values,
-  Wasm.Wast;
+  Wasm.Wast,
+  Wasm.Wat.Numbers;
 
 type
   { Parse-time problem in a value/matcher s-expr — an unrecognised form or
@@ -66,22 +67,48 @@ type
     wvcRefHost,        { host box with identity Id (ref.host N) }
     wvcRefFunc,        { funcref: any non-null, or function Id when HasId }
     wvcRefAny,         { a non-null reference (ref.any/eq/i31/struct/...) }
-    wvcV128,           { SIMD constant — execution staged to Track G }
-    wvcEither          { relaxed-SIMD alternatives — staged to Track G }
+    wvcV128            { SIMD constant — shape + per-lane bits + per-lane kind }
   );
 
   TWastValWidth = (wvwNone, wvw32, wvw64);
 
+  { The declared shape of a `(v128.const <shape> ...)` — it fixes the lane
+    width and count, and whether the lanes are integer or floating-point.
+    A wvcV128 matcher compares lane by lane at this shape's width. }
+  TWastVecShape = (wvsI8x16, wvsI16x8, wvsI32x4, wvsI64x2, wvsF32x4, wvsF64x2);
+
+  { Per-lane matcher class. Only the float shapes ever use the NaN kinds; an
+    integer lane is always wlkExact. A single float lane may be
+    nan:canonical or nan:arithmetic while its neighbours are exact — the
+    corpus mixes classes within one constant (simd_f32x4_arith.wast:5292),
+    so the class lives per lane, not per value (design §6.1). }
+  TWastLaneKind = (wlkExact, wlkNanCanonical, wlkNanArithmetic);
+
   { A parsed value or matcher. For the numeric kinds Bits holds the exact
     pattern (i32/f32 in the low 32 bits). For the reference-identity kinds
-    Id is the host identity or function index. The record is small and
-    copied by value. }
+    Id is the host identity or function index. For wvcV128 the vector fields
+    carry the shape and each lane's bits + kind (a 16-byte value cannot fit
+    Bits). The record is copied by value. }
   TWastVal = record
     Kind: TWastValKind;
     Width: TWastValWidth;
     Bits: UInt64;
     Id: UInt32;
     HasId: Boolean;
+    { wvcV128 only. VecLanes[i] holds lane i's bits low-aligned (an i8 lane
+      in 0..255, an f32 lane in the low 32 bits); only the first
+      lane-count entries are meaningful. }
+    VecShape: TWastVecShape;
+    VecLanes: array[0..15] of UInt64;
+    VecLaneKinds: array[0..15] of TWastLaneKind;
+  end;
+
+  { An expected RESULT matcher: either a single value/matcher (Alts length
+    1) or the relaxed-SIMD `(either A B ...)` form (Alts length 2..4), which
+    passes if the actual matches ANY alternative. Lifted out of TWastVal
+    because a record cannot hold a dynamic array of itself (design §6.1). }
+  TWastExpected = record
+    Alts: array of TWastVal;
   end;
 
 const
@@ -111,33 +138,56 @@ function WastParseF64Bits(const AText: string; out ABits: UInt64): Boolean;
 { --- value / matcher parser ---------------------------------------------- }
 
 { Parse one value/matcher s-expr node. Raises EWastValueError when the
-  node is not a recognised value form or a literal does not parse. }
+  node is not a recognised value form or a literal does not parse. A
+  `(v128.const <shape> lane...)` node parses into a wvcV128 with its shape,
+  per-lane bits, and per-lane kinds. }
 function WastParseVal(const ANode: TWastNode): TWastVal;
 
-{ True when the value form needs a tier feature not yet shipped — v128 and
-  `(either ...)` both fall to Track G. The runner classifies an assertion
-  touching one of these as staged, never a false pass or fail. }
-function WastValIsStaged(const AVal: TWastVal): Boolean;
+{ Parse an expected RESULT node into a matcher. `(either A B ...)` yields a
+  multi-alternative matcher; every other form yields a single-alternative
+  one wrapping WastParseVal. Raises EWastValueError on a bad form. }
+function WastParseExpected(const ANode: TWastNode): TWastExpected;
+
+{ Number of lanes in a v128 shape (16/8/4/2 by lane width). }
+function VecLaneCount(const AShape: TWastVecShape): Integer;
 
 { True when the value form is a host/func reference IDENTITY the runner
   must resolve against its own registry before comparison. }
 function WastValIsRefIdentity(const AVal: TWastVal): Boolean;
 
-{ Materialise a concrete-value TWastVal (numeric, NaN, or ref.null) into a
+{ Materialise a concrete SCALAR TWastVal (numeric, NaN, or ref.null) into a
   runtime slot. The reference-identity kinds cannot be built without the
-  store's heap and are the runner's job; this raises EWastValueError for
-  them (and for the staged v128/either kinds). }
+  store's heap and are the runner's job; a v128 spans two slots and is built
+  with WastValToVec instead. This raises EWastValueError for both. }
 function WastValToRuntime(const AVal: TWastVal): TWasmValue;
+
+{ Build the 16-byte vector of a wvcV128 value from its shape and per-lane
+  bits, little-endian within the vector. The runner writes its two 8-byte
+  halves into two consecutive TWasmValue slots, low half first (design
+  §1.6). A NaN-class lane materialises as the canonical pattern. }
+function WastValToVec(const AVal: TWastVal): TWasmV128;
 
 { --- comparator ---------------------------------------------------------- }
 
-{ Does the produced runtime value AActual match the expected matcher
+{ Does the produced SCALAR runtime value AActual match the expected matcher
   AExpected? For the reference-identity kinds the caller resolves the
   expected reference (its minted host box or the function's handle) and
   passes it as AExpectedRef; the other kinds ignore it. Numeric and exact
   float matches are BITWISE; the NaN classes are per-width bit-class
-  tests. }
+  tests. wvcV128 is never matched here — it goes through WastExpectedMatches
+  — so its arm falls to the defensive default. }
 function WastValMatches(const AExpected: TWastVal; const AActual: TWasmValue;
+  const AExpectedRef: TWasmRef): Boolean;
+
+{ Does the produced result match the expected matcher? True iff ANY of
+  AExpected.Alts matches (the `(either ...)` rule). AActual points at the
+  result slot(s): a v128 alternative reads AActual[0] and AActual[1] as one
+  TWasmV128 (AActualIsVec must be True), comparing lane by lane at the
+  shape's width — bitwise for exact lanes, the canonical/arithmetic bit
+  class for a nan:canonical/nan:arithmetic lane. Scalar alternatives read
+  AActual^ and use AExpectedRef exactly as WastValMatches does. }
+function WastExpectedMatches(const AExpected: TWastExpected;
+  const AActual: PWasmValue; const AActualIsVec: Boolean;
   const AExpectedRef: TWasmRef): Boolean;
 
 implementation
@@ -494,23 +544,25 @@ end;
 function ParseDecimalFloat(const ANeg: Boolean; const AMagText: string;
   const AMantBits, AExpBits: Integer; out ABits: UInt64): Boolean;
 var
-  D: Double;
-  Narrowed: Single;
-  Code: Integer;
   Bits, SignBit: UInt64;
 begin
+  { Correctly-rounded decimal-to-float is delegated to the assembler's
+    ParseFloat (Wasm.Wat.Numbers) — the SAME parser the v128.const lane
+    literals use (ParseF32/ParseF64) — so an expected `f64.const` and a
+    `v128.const` lane round an identical literal to identical bits. The RTL's
+    Val mis-rounds SUBNORMALS (e.g. 1.7976931348623157e-308), which showed
+    up as a false assert_return mismatch on simd_lane.wast where the
+    interpreter had in fact computed the exact IEEE result. }
   Result := False;
-  Val(AMagText, D, Code);
-  if Code <> 0 then
-    Exit;
-  if AMantBits = 23 then
-  begin
-    { Assign (not cast) to narrow Double -> Single by hardware round. }
-    Narrowed := D;
-    Bits := UInt64(SingleBits(Narrowed));
-  end
-  else
-    Bits := DoubleBits(D);
+  try
+    if AMantBits = 23 then
+      Bits := UInt64(ParseF32(AMagText))
+    else
+      Bits := ParseF64(AMagText);
+  except
+    on EWasmTextError do
+      Exit;
+  end;
   SignBit := UInt64(1) shl (AMantBits + AExpBits);
   if ANeg then
     Bits := Bits or SignBit
@@ -618,6 +670,100 @@ begin
     Result := '';
 end;
 
+{ Lanes in a v128 shape: 16/8/4/2 by lane width. }
+function VecLaneCount(const AShape: TWastVecShape): Integer;
+begin
+  case AShape of
+    wvsI8x16: Result := 16;
+    wvsI16x8: Result := 8;
+    wvsI32x4, wvsF32x4: Result := 4;
+  else
+    Result := 2;   { wvsI64x2, wvsF64x2 }
+  end;
+end;
+
+{ Parse `(v128.const <shape> lane0 lane1 ...)` into AVal (already zeroed by
+  the caller). The shape keyword fixes the lane count and width; each lane
+  literal is parsed via Wasm.Wat.Numbers at the lane width. A float lane may
+  be nan:canonical / nan:arithmetic, recorded as a per-lane CLASS with the
+  canonical pattern as its placeholder bits (design §6.1). }
+procedure ParseV128Const(const ANode: TWastNode; var AVal: TWastVal);
+var
+  Shape, Tok: string;
+  Count, I: Integer;
+begin
+  AVal.Kind := wvcV128;
+  AVal.Width := wvwNone;   { VecShape carries the width }
+  if (ANode.Count < 2) or (ANode[1].Kind <> wnkAtom) then
+    raise EWastValueError.Create('v128.const needs a shape');
+  Shape := ANode[1].Atom;
+  if Shape = 'i8x16' then
+    AVal.VecShape := wvsI8x16
+  else if Shape = 'i16x8' then
+    AVal.VecShape := wvsI16x8
+  else if Shape = 'i32x4' then
+    AVal.VecShape := wvsI32x4
+  else if Shape = 'i64x2' then
+    AVal.VecShape := wvsI64x2
+  else if Shape = 'f32x4' then
+    AVal.VecShape := wvsF32x4
+  else if Shape = 'f64x2' then
+    AVal.VecShape := wvsF64x2
+  else
+    raise EWastValueError.CreateFmt('unknown v128 shape "%s"', [Shape]);
+
+  Count := VecLaneCount(AVal.VecShape);
+  if ANode.Count - 2 <> Count then
+    raise EWastValueError.CreateFmt(
+      'v128.const %s needs %d lanes, got %d', [Shape, Count, ANode.Count - 2]);
+
+  for I := 0 to Count - 1 do
+  begin
+    if ANode[2 + I].Kind <> wnkAtom then
+      raise EWastValueError.Create('v128.const lane must be a literal');
+    Tok := ANode[2 + I].Atom;
+    AVal.VecLaneKinds[I] := wlkExact;
+    try
+      case AVal.VecShape of
+        wvsI8x16: AVal.VecLanes[I] := UInt64(ParseI8(Tok));
+        wvsI16x8: AVal.VecLanes[I] := UInt64(ParseI16(Tok));
+        wvsI32x4: AVal.VecLanes[I] := UInt64(ParseI32(Tok));
+        wvsI64x2: AVal.VecLanes[I] := ParseI64(Tok);
+        wvsF32x4:
+          if Tok = 'nan:canonical' then
+          begin
+            AVal.VecLaneKinds[I] := wlkNanCanonical;
+            AVal.VecLanes[I] := UInt64(WASM_F32_CANONICAL_NAN);
+          end
+          else if Tok = 'nan:arithmetic' then
+          begin
+            AVal.VecLaneKinds[I] := wlkNanArithmetic;
+            AVal.VecLanes[I] := UInt64(WASM_F32_CANONICAL_NAN);
+          end
+          else
+            AVal.VecLanes[I] := UInt64(ParseF32(Tok));
+        wvsF64x2:
+          if Tok = 'nan:canonical' then
+          begin
+            AVal.VecLaneKinds[I] := wlkNanCanonical;
+            AVal.VecLanes[I] := WASM_F64_CANONICAL_NAN;
+          end
+          else if Tok = 'nan:arithmetic' then
+          begin
+            AVal.VecLaneKinds[I] := wlkNanArithmetic;
+            AVal.VecLanes[I] := WASM_F64_CANONICAL_NAN;
+          end
+          else
+            AVal.VecLanes[I] := ParseF64(Tok);
+      end;
+    except
+      on E: EWasmTextError do
+        raise EWastValueError.CreateFmt('bad v128 lane "%s": %s',
+          [Tok, E.Message]);
+    end;
+  end;
+end;
+
 function WastParseVal(const ANode: TWastNode): TWastVal;
 var
   Head, Lit: string;
@@ -705,16 +851,30 @@ begin
     or (Head = 'ref.struct') or (Head = 'ref.array') then
     Result.Kind := wvcRefAny
   else if Head = 'v128.const' then
-    Result.Kind := wvcV128
-  else if Head = 'either' then
-    Result.Kind := wvcEither
+    ParseV128Const(ANode, Result)
   else
     raise EWastValueError.CreateFmt('unrecognised value form "%s"', [Head]);
 end;
 
-function WastValIsStaged(const AVal: TWastVal): Boolean;
+function WastParseExpected(const ANode: TWastNode): TWastExpected;
+var
+  I: Integer;
 begin
-  Result := AVal.Kind in [wvcV128, wvcEither];
+  if (ANode.Kind = wnkList) and (ANode.HeadAtom = 'either') then
+  begin
+    { `(either A B ...)` — the relaxed-SIMD alternatives, each a value node.
+      Never nested, never in argument position (design §6.2). }
+    if ANode.Count < 2 then
+      raise EWastValueError.Create('(either ...) needs at least one alternative');
+    SetLength(Result.Alts, ANode.Count - 1);
+    for I := 1 to ANode.Count - 1 do
+      Result.Alts[I - 1] := WastParseVal(ANode[I]);
+  end
+  else
+  begin
+    SetLength(Result.Alts, 1);
+    Result.Alts[0] := WastParseVal(ANode);
+  end;
 end;
 
 function WastValIsRefIdentity(const AVal: TWastVal): Boolean;
@@ -742,8 +902,23 @@ begin
       Result.Bits := 0;
   else
     raise EWastValueError.Create(
-      'value cannot be built without the store (ref identity or staged)');
+      'value cannot be built without the store (ref identity or v128)');
   end;
+end;
+
+function WastValToVec(const AVal: TWastVal): TWasmV128;
+var
+  I, Count: Integer;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Count := VecLaneCount(AVal.VecShape);
+  for I := 0 to Count - 1 do
+    case AVal.VecShape of
+      wvsI8x16: Result.B[I] := Byte(AVal.VecLanes[I]);
+      wvsI16x8: Result.U16[I] := Word(AVal.VecLanes[I]);
+      wvsI32x4, wvsF32x4: Result.U32[I] := UInt32(AVal.VecLanes[I]);
+      wvsI64x2, wvsF64x2: Result.U64[I] := AVal.VecLanes[I];
+    end;
 end;
 
 { --- comparator ---------------------------------------------------------- }
@@ -817,6 +992,71 @@ begin
       Result := not RefIsNull(AActual.Ref);
   else
     Result := False;
+  end;
+end;
+
+{ Compare a produced vector against a wvcV128 matcher, lane by lane at the
+  matcher's shape width. A single diverging lane fails the whole vector. }
+function WastVecMatches(const AExpected: TWastVal;
+  const AActual: PWasmV128): Boolean;
+var
+  I, Count: Integer;
+  ActLane: UInt64;
+begin
+  Result := False;
+  Count := VecLaneCount(AExpected.VecShape);
+  for I := 0 to Count - 1 do
+  begin
+    case AExpected.VecShape of
+      wvsI8x16: ActLane := UInt64(AActual^.B[I]);
+      wvsI16x8: ActLane := UInt64(AActual^.U16[I]);
+      wvsI32x4, wvsF32x4: ActLane := UInt64(AActual^.U32[I]);
+    else
+      ActLane := AActual^.U64[I];   { wvsI64x2, wvsF64x2 }
+    end;
+    case AExpected.VecLaneKinds[I] of
+      wlkExact:
+        { VecLanes[i] is already masked to the lane width by the parser. }
+        if ActLane <> AExpected.VecLanes[I] then
+          Exit;
+      wlkNanCanonical:
+        if AExpected.VecShape = wvsF32x4 then
+        begin
+          if not IsF32Canonical(ActLane) then
+            Exit;
+        end
+        else if not IsF64Canonical(ActLane) then
+          Exit;
+      wlkNanArithmetic:
+        if AExpected.VecShape = wvsF32x4 then
+        begin
+          if not IsF32Arithmetic(ActLane) then
+            Exit;
+        end
+        else if not IsF64Arithmetic(ActLane) then
+          Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function WastExpectedMatches(const AExpected: TWastExpected;
+  const AActual: PWasmValue; const AActualIsVec: Boolean;
+  const AExpectedRef: TWasmRef): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to High(AExpected.Alts) do
+  begin
+    if AExpected.Alts[I].Kind = wvcV128 then
+    begin
+      if AActualIsVec
+        and WastVecMatches(AExpected.Alts[I], PWasmV128(AActual)) then
+        Exit(True);
+    end
+    else if WastValMatches(AExpected.Alts[I], AActual^, AExpectedRef) then
+      Exit(True);
   end;
 end;
 

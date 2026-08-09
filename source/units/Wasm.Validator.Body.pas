@@ -23,12 +23,15 @@
   Spec anchors cited below were read from wasm-mcp 0.2.16, upstream
   spec/main d7b37e4170d8315f2f1283aed4e8076591a9a333.
 
-  SCOPE. Every non-vector instruction the 3.0 draft defines is walked
-  here: control flow, locals, the parametric and call families, the whole
-  numeric family, globals, tables, memory, references, the $FB aggregate
-  (GC) space, and exception handling. The ONE staged family is $FD —
-  vector typing is Track G by the roadmap — and it raises
-  MSG_SIMD_NOT_IMPLEMENTED rather than being silently accepted. }
+  SCOPE. Every instruction the 3.0 draft defines is walked here: control
+  flow, locals, the parametric and call families, the whole numeric
+  family, globals, tables, memory, references, the $FB aggregate (GC)
+  space, exception handling, and the $FD vector ($v128$) space. The
+  vector arm is table-driven exactly as the numeric and load/store arms
+  are (HandleVector over VEC_SIG); a $v128$ register is a PAIR of adjacent
+  even-aligned 8-byte slots (SIMD design §1.3-§1.5), so IrAllocReg
+  even-aligns a wvkVec allocation, FLocalReg maps a wasm local index to
+  its low register, and a $v128$ move emits iroMoveVec. }
 unit Wasm.Validator.Body;
 
 {$I Shared.inc}
@@ -347,6 +350,49 @@ begin
     Result := A.Storage.ValueType;
 end;
 
+{ A move of register AReg is iroMoveVec when AReg is a v128 (a pair of
+  slots, 16 bytes) and iroMove otherwise. The validator knows the width
+  statically, so the interpreter never has to (SIMD design §2.4). }
+function MoveOpFor(const ARegTypes: TWasmIrRegTypes;
+  const AReg: UInt32): TWasmIrOp;
+begin
+  if (AReg < UInt32(Length(ARegTypes)))
+    and (ARegTypes[AReg].Kind = wvkVec) then
+    Result := iroMoveVec
+  else
+    Result := iroMove;
+end;
+
+{ The call ABI names SLOTS, not values: a v128 argument/result contributes
+  TWO consecutive entries (its low register and low+1), so PushWasmFrame and
+  DoReturn's positional per-slot copy carry all 16 bytes and land later
+  operands at the callee's even-aligned slots (SIMD design §1.6). A value
+  list would copy only the low half and misplace every operand after the
+  first vector. ARegs holds one low register per value; ATypes runs
+  in step. }
+function SlotList(const ARegs: TWasmRegList;
+  const ATypes: TWasmValTypeList): TWasmRegList;
+var
+  I, N: Integer;
+begin
+  SetLength(Result, 0);
+  N := 0;
+  for I := 0 to High(ARegs) do
+    if (I <= High(ATypes)) and (ATypes[I].Kind = wvkVec) then
+    begin
+      SetLength(Result, N + 2);
+      Result[N] := ARegs[I];
+      Result[N + 1] := ARegs[I] + 1;
+      Inc(N, 2);
+    end
+    else
+    begin
+      SetLength(Result, N + 1);
+      Result[N] := ARegs[I];
+      Inc(N);
+    end;
+end;
+
 procedure EmitParallelMove(var ACode: TWasmIrCode; var ACodeCount: Integer;
   var ARegTypes: TWasmIrRegTypes; var ARegCount: Integer;
   const ADests, ASources: array of UInt32);
@@ -394,7 +440,8 @@ begin
         if IsSource then
           Continue;
         IrEmitInstr(ACode, ACodeCount,
-          MakeIrInstr(iroMove, Dests[I], Srcs[I], IR_NO_REG, 0));
+          MakeIrInstr(MoveOpFor(ARegTypes, Dests[I]), Dests[I], Srcs[I],
+            IR_NO_REG, 0));
         Live[I] := False;
         Dec(Remaining);
         Progress := True;
@@ -412,7 +459,8 @@ begin
       begin
         Tmp := IrAllocReg(ARegTypes, ARegCount, ARegTypes[Dests[I]]);
         IrEmitInstr(ACode, ACodeCount,
-          MakeIrInstr(iroMove, Tmp, Dests[I], IR_NO_REG, 0));
+          MakeIrInstr(MoveOpFor(ARegTypes, Dests[I]), Tmp, Dests[I],
+            IR_NO_REG, 0));
         for J := 0 to Count - 1 do
           if Live[J] and (Srcs[J] = Dests[I]) then
             Srcs[J] := Tmp;
@@ -821,6 +869,387 @@ const
     (Value: wntI64; MaxAlign: 2; IsStore: True)
   );
 
+{ --- the vector ($FD) signature table -------------------------------------
+
+  Driving the 256 vector instructions from a table, exactly as the numeric
+  and load/store arms are driven, is what keeps the typing checkable: each
+  op's family fixes its stack signature (SIMD design §3.2, anchors
+  valid-vunop / valid-vbinop / valid-vternop / valid-vrelop /
+  valid-vtestop / valid-vshiftop / valid-vbitmask / valid-vcvtop /
+  valid-vsplat / valid-vextract_lane / valid-vreplace_lane /
+  valid-vshuffle / valid-vswizzlop / valid-vload* / valid-vstore*), and
+  Scalar/Dim/MaxAlign carry the family-specific detail.
+
+  The table is indexed by the raw $FD subopcode 0..275; the 20 unassigned
+  slots carry a filler row that HandleVector never reads because the
+  Prefixed dispatch routes an unassigned subopcode to a decode error
+  first. The IR op to emit is NOT a table column: TWasmIrOp's vector
+  members are dense and in subopcode order, so VecOpBySub (built once at
+  unit initialisation by walking the assigned subopcodes) maps a subopcode
+  to its op with no second hand-maintained list.
+
+  Relaxed ops type identically to their non-relaxed twins — the result is
+  implementation-defined, never the type (SIMD design §3.2). }
+
+type
+  TVecFamily = (
+    vfNullary,      { v128.const                 [] -> [v128] + 16-byte imm }
+    vfShuffle,      { i8x16.shuffle    [v128 v128] -> [v128] + 16 lane bytes }
+    vfUnary,        { [v128] -> [v128] }
+    vfBinary,       { [v128 v128] -> [v128] }
+    vfTernary,      { [v128 v128 v128] -> [v128], third source in Imm }
+    vfTest,         { [v128] -> [i32]  (any_true / all_true / bitmask) }
+    vfShift,        { [v128 i32] -> [v128] }
+    vfSplat,        { [Scalar] -> [v128] }
+    vfExtract,      { [v128] -> [Scalar] + lane imm }
+    vfReplace,      { [v128 Scalar] -> [v128] + lane imm }
+    vfLoad,         { [at] -> [v128], memarg }
+    vfStore,        { [at v128] -> [], memarg }
+    vfLoadLane,     { [at v128] -> [v128], memarg + lane }
+    vfStoreLane);   { [at v128] -> [], memarg + lane }
+
+  TVecSig = record
+    Family: TVecFamily;
+    Scalar: TWasmNumType;   { splat / extract / replace scalar; else filler }
+    Dim: Byte;              { lane count for the lane-index bound; 0 = n/a }
+    MaxAlign: Byte;         { log2(access bytes) for the memory families }
+  end;
+
+const
+  { The 20 unassigned subopcodes carry a filler row — (vfUnary, i32, 0, 0)
+    — that HandleVector never reads, because Prefixed routes an unassigned
+    subopcode to a decode error before HandleVector runs. }
+  VEC_SIG: array[0..275] of TVecSig = (
+    { 0..10 whole / packed / splat loads — memarg }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 4),   { 0 v128.load }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 1 load8x8_s }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 2 load8x8_u }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 3 load16x4_s }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 4 load16x4_u }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 5 load32x2_s }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 6 load32x2_u }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 7 load8_splat }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 1),   { 8 load16_splat }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 2),   { 9 load32_splat }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),   { 10 load64_splat }
+    (Family: vfStore; Scalar: wntI32; Dim: 0; MaxAlign: 4),  { 11 v128.store }
+    { 12..13 const / shuffle — 16-byte immediate }
+    (Family: vfNullary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 12 v128.const }
+    (Family: vfShuffle; Scalar: wntI32; Dim: 32; MaxAlign: 0), { 13 shuffle }
+    { 14..20 swizzle and splat }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 14 swizzle }
+    (Family: vfSplat; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 15 i8x16.splat }
+    (Family: vfSplat; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 16 i16x8.splat }
+    (Family: vfSplat; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 17 i32x4.splat }
+    (Family: vfSplat; Scalar: wntI64; Dim: 0; MaxAlign: 0),   { 18 i64x2.splat }
+    (Family: vfSplat; Scalar: wntF32; Dim: 0; MaxAlign: 0),   { 19 f32x4.splat }
+    (Family: vfSplat; Scalar: wntF64; Dim: 0; MaxAlign: 0),   { 20 f64x2.splat }
+    { 21..34 lane access — one lane byte, bound = Dim }
+    (Family: vfExtract; Scalar: wntI32; Dim: 16; MaxAlign: 0), { 21 i8x16 s }
+    (Family: vfExtract; Scalar: wntI32; Dim: 16; MaxAlign: 0), { 22 i8x16 u }
+    (Family: vfReplace; Scalar: wntI32; Dim: 16; MaxAlign: 0), { 23 i8x16 }
+    (Family: vfExtract; Scalar: wntI32; Dim: 8; MaxAlign: 0),  { 24 i16x8 s }
+    (Family: vfExtract; Scalar: wntI32; Dim: 8; MaxAlign: 0),  { 25 i16x8 u }
+    (Family: vfReplace; Scalar: wntI32; Dim: 8; MaxAlign: 0),  { 26 i16x8 }
+    (Family: vfExtract; Scalar: wntI32; Dim: 4; MaxAlign: 0),  { 27 i32x4 }
+    (Family: vfReplace; Scalar: wntI32; Dim: 4; MaxAlign: 0),  { 28 i32x4 }
+    (Family: vfExtract; Scalar: wntI64; Dim: 2; MaxAlign: 0),  { 29 i64x2 }
+    (Family: vfReplace; Scalar: wntI64; Dim: 2; MaxAlign: 0),  { 30 i64x2 }
+    (Family: vfExtract; Scalar: wntF32; Dim: 4; MaxAlign: 0),  { 31 f32x4 }
+    (Family: vfReplace; Scalar: wntF32; Dim: 4; MaxAlign: 0),  { 32 f32x4 }
+    (Family: vfExtract; Scalar: wntF64; Dim: 2; MaxAlign: 0),  { 33 f64x2 }
+    (Family: vfReplace; Scalar: wntF64; Dim: 2; MaxAlign: 0),  { 34 f64x2 }
+    { 35..76 comparisons — all [v128 v128] -> [v128] }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 35 i8x16.eq }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 36 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 37 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 38 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 39 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 40 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 41 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 42 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 43 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 44 i8x16.ge_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 45 i16x8.eq }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 46 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 47 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 48 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 49 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 50 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 51 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 52 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 53 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 54 i16x8.ge_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 55 i32x4.eq }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 56 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 57 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 58 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 59 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 60 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 61 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 62 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 63 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 64 i32x4.ge_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 65 f32x4.eq }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 66 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 67 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 68 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 69 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 70 f32x4.ge }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 71 f64x2.eq }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 72 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 73 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 74 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 75 }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 76 f64x2.ge }
+    { 77..83 bitwise and the whole-vector test }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 77 v128.not }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 78 v128.and }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 79 v128.andnot }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 80 v128.or }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 81 v128.xor }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 82 bitselect }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 83 any_true }
+    { 84..93 lane and zero loads/stores — memarg (+ lane) }
+    (Family: vfLoadLane; Scalar: wntI32; Dim: 16; MaxAlign: 0),  { 84 load8_lane }
+    (Family: vfLoadLane; Scalar: wntI32; Dim: 8; MaxAlign: 1),   { 85 load16_lane }
+    (Family: vfLoadLane; Scalar: wntI32; Dim: 4; MaxAlign: 2),   { 86 load32_lane }
+    (Family: vfLoadLane; Scalar: wntI32; Dim: 2; MaxAlign: 3),   { 87 load64_lane }
+    (Family: vfStoreLane; Scalar: wntI32; Dim: 16; MaxAlign: 0), { 88 store8_lane }
+    (Family: vfStoreLane; Scalar: wntI32; Dim: 8; MaxAlign: 1),  { 89 store16_lane }
+    (Family: vfStoreLane; Scalar: wntI32; Dim: 4; MaxAlign: 2),  { 90 store32_lane }
+    (Family: vfStoreLane; Scalar: wntI32; Dim: 2; MaxAlign: 3),  { 91 store64_lane }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 2),    { 92 load32_zero }
+    (Family: vfLoad; Scalar: wntI32; Dim: 0; MaxAlign: 3),    { 93 load64_zero }
+    { 94..95 float conversions — unary }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 94 demote_zero }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 95 promote_low }
+    { 96..127 i8x16 unary/narrow, f32x4 rounding, i8x16 arith }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 96 i8x16.abs }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 97 i8x16.neg }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 98 popcnt }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 99 all_true }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 100 bitmask }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 101 narrow_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 102 narrow_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 103 f32x4.ceil }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 104 f32x4.floor }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 105 f32x4.trunc }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 106 f32x4.nearest }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 107 i8x16.shl }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 108 i8x16.shr_s }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 109 i8x16.shr_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 110 i8x16.add }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 111 add_sat_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 112 add_sat_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 113 i8x16.sub }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 114 sub_sat_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 115 sub_sat_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 116 f64x2.ceil }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 117 f64x2.floor }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 118 i8x16.min_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 119 i8x16.min_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 120 i8x16.max_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 121 i8x16.max_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 122 f64x2.trunc }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 123 avgr_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 124 extadd_pw }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 125 extadd_pw }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 126 extadd_pw }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 127 extadd_pw }
+    { 128..159 i16x8 (154 unassigned) }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 128 i16x8.abs }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 129 i16x8.neg }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 130 q15mulr_sat_s }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 131 all_true }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 132 bitmask }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 133 narrow_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 134 narrow_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 135 extend_low_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 136 extend_high_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 137 extend_low_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 138 extend_high_u }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 139 i16x8.shl }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 140 i16x8.shr_s }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 141 i16x8.shr_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 142 i16x8.add }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 143 add_sat_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 144 add_sat_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 145 i16x8.sub }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 146 sub_sat_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 147 sub_sat_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 148 f64x2.nearest }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 149 i16x8.mul }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 150 i16x8.min_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 151 i16x8.min_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 152 i16x8.max_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 153 i16x8.max_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 154 unassigned }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 155 avgr_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 156 extmul_low_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 157 extmul_high_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 158 extmul_low_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 159 extmul_high_u }
+    { 160..191 i32x4 (162,165,166,175,176,178..180,187 unassigned) }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 160 i32x4.abs }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 161 i32x4.neg }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 162 unassigned }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 163 all_true }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 164 bitmask }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 165 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 166 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 167 extend_low_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 168 extend_high_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 169 extend_low_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 170 extend_high_u }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 171 i32x4.shl }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 172 i32x4.shr_s }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 173 i32x4.shr_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 174 i32x4.add }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 175 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 176 unassigned }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 177 i32x4.sub }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 178 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 179 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 180 unassigned }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 181 i32x4.mul }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 182 i32x4.min_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 183 i32x4.min_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 184 i32x4.max_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 185 i32x4.max_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 186 dot_i16x8_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 187 unassigned }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 188 extmul_low_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 189 extmul_high_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 190 extmul_low_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 191 extmul_high_u }
+    { 192..223 i64x2 (194,197,198,207,208,210..212 unassigned) }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 192 i64x2.abs }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 193 i64x2.neg }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 194 unassigned }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 195 all_true }
+    (Family: vfTest; Scalar: wntI32; Dim: 0; MaxAlign: 0),    { 196 bitmask }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 197 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 198 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 199 extend_low_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 200 extend_high_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 201 extend_low_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 202 extend_high_u }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 203 i64x2.shl }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 204 i64x2.shr_s }
+    (Family: vfShift; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 205 i64x2.shr_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 206 i64x2.add }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 207 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 208 unassigned }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 209 i64x2.sub }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 210 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 211 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 212 unassigned }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 213 i64x2.mul }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 214 i64x2.eq }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 215 i64x2.ne }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 216 i64x2.lt_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 217 i64x2.gt_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 218 i64x2.le_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 219 i64x2.ge_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 220 extmul_low_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 221 extmul_high_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 222 extmul_low_u }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 223 extmul_high_u }
+    { 224..247 f32x4 / f64x2 arithmetic (226,238 unassigned) }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 224 f32x4.abs }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 225 f32x4.neg }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 226 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 227 f32x4.sqrt }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 228 f32x4.add }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 229 f32x4.sub }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 230 f32x4.mul }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 231 f32x4.div }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 232 f32x4.min }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 233 f32x4.max }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 234 f32x4.pmin }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 235 f32x4.pmax }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 236 f64x2.abs }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 237 f64x2.neg }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),                                                { 238 unassigned }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 239 f64x2.sqrt }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 240 f64x2.add }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 241 f64x2.sub }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 242 f64x2.mul }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 243 f64x2.div }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 244 f64x2.min }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 245 f64x2.max }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 246 f64x2.pmin }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 247 f64x2.pmax }
+    { 248..255 conversions — unary }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 248 trunc_sat_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 249 trunc_sat_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 250 convert_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 251 convert_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 252 trunc_sat_zero_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 253 trunc_sat_zero_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 254 convert_low_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 255 convert_low_u }
+    { 256..275 relaxed SIMD — type as the non-relaxed twin }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 256 rel_swizzle }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 257 rel_trunc_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 258 rel_trunc_u }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 259 rel_trunc_zero_s }
+    (Family: vfUnary; Scalar: wntI32; Dim: 0; MaxAlign: 0),   { 260 rel_trunc_zero_u }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 261 rel_madd }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 262 rel_nmadd }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 263 rel_madd }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 264 rel_nmadd }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 265 rel_lanesel }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 266 rel_lanesel }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 267 rel_lanesel }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0), { 268 rel_lanesel }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 269 rel_min }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 270 rel_max }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 271 rel_min }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 272 rel_max }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 273 rel_q15mulr_s }
+    (Family: vfBinary; Scalar: wntI32; Dim: 0; MaxAlign: 0),  { 274 rel_dot }
+    (Family: vfTernary; Scalar: wntI32; Dim: 0; MaxAlign: 0)  { 275 rel_dot_add }
+  );
+
+{ Whether a $FD subopcode is assigned in the pinned 3.0 grammar. The 20
+  gaps are the same list Wasm.Decoder.Expr and Prefixed spell; keeping the
+  three in lock-step is why the list is written once per unit. }
+function IsAssignedVecSub(const ASub: UInt32): Boolean;
+begin
+  case ASub of
+    0..153, 155..161, 163, 164, 167..174, 177, 181..186, 188..193,
+    195, 196, 199..206, 209, 213..225, 227..237, 239..275:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+{ Subopcode -> IR op. TWasmIrOp's 256 vector members are dense and in
+  subopcode order (SIMD design §2.1), so walking the assigned subopcodes
+  in order pairs each with the next op. Built once (initialisation). }
+var
+  VecOpBySub: array[0..275] of TWasmIrOp;
+
+procedure BuildVecOpTable;
+var
+  Sub: Integer;
+  Op: TWasmIrOp;
+begin
+  Op := iroV128Load;
+  for Sub := 0 to 275 do
+    if IsAssignedVecSub(UInt32(Sub)) then
+    begin
+      VecOpBySub[Sub] := Op;
+      if Op < iroI32x4RelaxedDotI8x16I7x16AddS then
+        Inc(Op);
+    end
+    else
+      VecOpBySub[Sub] := iroV128Load;   { sentinel; never read }
+end;
+
 { --- the walker's state ---------------------------------------------------
 
   The spec's three stacks (`appendix/algorithm-stacks`) plus the locals'
@@ -930,6 +1359,11 @@ type
 
     FLocalTypes: TWasmValTypeList;
     FLocalsInit: array of Boolean;
+    { Wasm local index -> its LOW register (SIMD design §1.4). A v128 local
+      takes two even-aligned slots, so `register i = local i` no longer
+      holds and local.get/set/tee read this map instead of the raw index.
+      Filled in the same loop that fills FLocalTypes. }
+    FLocalReg: array of UInt32;
     FReturnTypes: TWasmValTypeList;
 
     procedure DecErr(const AMessage: string);
@@ -1001,6 +1435,8 @@ type
       const APrefix, AWhat: string);
     procedure ReadMemarg(const AOp: Byte; out AMemIdx: UInt32;
       out AOffset: UInt64; const AOpOffset: NativeUInt);
+    procedure ReadMemargMax(const AMaxAlign: Byte; const AWhat: string;
+      out AMemIdx: UInt32; out AOffset: UInt64; const AOpOffset: NativeUInt);
 
     procedure HandleNumeric(const AOp: Byte; const ASig: TNumSig;
       const AIrOp: TWasmIrOp);
@@ -1048,6 +1484,7 @@ type
     procedure HandleBrOnCast(const AFail: Boolean;
       const AOffset: NativeUInt);
     procedure HandleI31Extern(const ASub: UInt32);
+    procedure HandleVector(const ASub: UInt32; const AOffset: NativeUInt);
 
     procedure Prefixed(const APrefix: Byte; const AOffset: NativeUInt);
   public
@@ -1769,8 +2206,9 @@ end;
   here is 0..63 — there is no alignment OVERFLOW case left to handle on
   this side, and nothing needs shifting: MEM_SIG stores log2(N/8) and the
   check is a comparison. }
-procedure TBodyWalker.ReadMemarg(const AOp: Byte; out AMemIdx: UInt32;
-  out AOffset: UInt64; const AOpOffset: NativeUInt);
+procedure TBodyWalker.ReadMemargMax(const AMaxAlign: Byte;
+  const AWhat: string; out AMemIdx: UInt32; out AOffset: UInt64;
+  const AOpOffset: NativeUInt);
 const
   MEMARG_FLAG_MEMIDX = $40;
 var
@@ -1789,11 +2227,20 @@ begin
   AOffset := FReader.ReadU64;
 
   Align := Flags and (MEMARG_FLAG_MEMIDX - 1);
-  if Align > MEM_SIG[AOp].MaxAlign then
+  if Align > AMaxAlign then
     ValErr(MSG_ALIGNMENT_TOO_LARGE,
-      Format('alignment 2^%u exceeds the natural 2^%u of opcode $%.2x '
-        + 'at offset %u',
-        [Align, MEM_SIG[AOp].MaxAlign, AOp, AOpOffset]));
+      Format('alignment 2^%u exceeds the natural 2^%u of %s at offset %u',
+        [Align, AMaxAlign, AWhat, AOpOffset]));
+end;
+
+procedure TBodyWalker.ReadMemarg(const AOp: Byte; out AMemIdx: UInt32;
+  out AOffset: UInt64; const AOpOffset: NativeUInt);
+begin
+  { The natural alignment for a scalar memory op is MEM_SIG's; the vector
+    load/store family passes its own maximum through ReadMemargMax. The
+    message names the opcode in the same $xx form as before. }
+  ReadMemargMax(MEM_SIG[AOp].MaxAlign, Format('opcode $%.2x', [AOp]),
+    AMemIdx, AOffset, AOpOffset);
 end;
 
 { --- instruction families ------------------------------------------------- }
@@ -1853,7 +2300,11 @@ begin
   if Emitting then
   begin
     Dest := AllocTemp(FLocalTypes[Idx]);
-    Emit(iroMove, Dest, Idx, IR_NO_REG, 0);
+    { The value's register is FLocalReg[Idx], not Idx: a v128 local owns
+      a slot pair and the low slot is what a get reads (SIMD design §1.4),
+      and a v128 move is 16 bytes wide (iroMoveVec). }
+    Emit(MoveOpFor(FFn.RegTypes, FLocalReg[Idx]), Dest, FLocalReg[Idx],
+      IR_NO_REG, 0);
   end
   else
     Dest := IR_NO_REG;
@@ -1878,7 +2329,8 @@ begin
 
   E := PopValExpect(FLocalTypes[Idx]);
   if Emitting then
-    Emit(iroMove, Idx, E.Reg, IR_NO_REG, 0);
+    Emit(MoveOpFor(FFn.RegTypes, FLocalReg[Idx]), FLocalReg[Idx], E.Reg,
+      IR_NO_REG, 0);
 
   { set_local: record the change so the enclosing block's `end` can undo
     it. This is what makes `(block (local.set $r ...)) (local.get $r)`
@@ -1983,7 +2435,12 @@ begin
   if Emitting then
   begin
     Dest := AllocTemp(Chosen);
-    Emit(iroSelect, Dest, V1.Reg, V2.Reg, Int64(Cond.Reg));
+    { A v128 select copies 16 bytes; the condition register rides in Imm
+      (ifkSrcRegImm) for the *Vec arm (SIMD design §2.4). }
+    if Chosen.Kind = wvkVec then
+      Emit(iroSelectVec, Dest, V1.Reg, V2.Reg, Int64(Cond.Reg))
+    else
+      Emit(iroSelect, Dest, V1.Reg, V2.Reg, Int64(Cond.Reg));
   end
   else
     Dest := IR_NO_REG;
@@ -2197,7 +2654,9 @@ var
   Cond: TWasmValEntry;
   Arity: Integer;
   Types: TWasmValTypeList;
-  Regs, TmpRegs, Placeholder: TWasmRegList;
+  Regs, Placeholder: TWasmRegList;
+  Popped: array of TWasmValEntry;
+  J: Integer;
   AuxIdx: UInt32;
 begin
   Start := FReader.Position;
@@ -2232,8 +2691,20 @@ begin
       ValErr(MSG_TYPE_MISMATCH,
         Format('br_table target %d has arity %d, default has %d, at '
           + 'offset %u', [I, Length(Types), Arity, FBase + Start]));
-    TmpRegs := PopVals(Types);
-    PushVals(Types, TmpRegs);
+    { push_vals(pop_vals(...)): re-push the ACTUAL popped operands, NOT the
+      label types. In polymorphic (post-unreachable) code a popped operand
+      is Bot; pushing the label type back instead would leave a CONCRETE
+      type on the stack, so a later target with a DIFFERENT label type sees
+      a spurious mismatch (`expected f64, found f32`) — exactly the
+      meet-bottom case the spec algorithm avoids (appendix
+      `algorithm-validation-of-opcode-sequences`, br_table;
+      unreached-valid.wast). In reachable code the popped entry equals the
+      label type, so this is identical to the old behaviour. }
+    SetLength(Popped, Length(Types));
+    for J := High(Types) downto 0 do
+      Popped[J] := PopValExpect(Types[J]);
+    for J := 0 to High(Popped) do
+      PushEntry(Popped[J]);
   end;
 
   Regs := PopVals(LabelTypes(DefaultIdx));
@@ -2314,7 +2785,7 @@ begin
     CheckTailResults(Results);
     if Emitting then
     begin
-      ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ArgRegs);
+      ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ArgRegs, Params));
       Emit(iroReturnCall, IR_NO_REG, ArgAux, IR_NO_REG, Int64(FuncIdx));
     end;
     MarkUnreachable;
@@ -2324,8 +2795,8 @@ begin
   ResRegs := AllocTemps(Results);
   if Emitting then
   begin
-    ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ArgRegs);
-    ResAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ResRegs);
+    ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ArgRegs, Params));
+    ResAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ResRegs, Results));
     Emit(iroCall, IR_NO_REG, ArgAux, ResAux, Int64(FuncIdx));
   end;
   PushVals(Results, ResRegs);
@@ -2383,7 +2854,7 @@ begin
     CheckTailResults(Results);
     if Emitting then
     begin
-      ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ArgRegs);
+      ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ArgRegs, Params));
       Emit(iroReturnCallIndirect, IdxReg, ArgAux, IR_NO_REG,
         IrPack(TypeIdx, TableIdx));
     end;
@@ -2394,8 +2865,8 @@ begin
   ResRegs := AllocTemps(Results);
   if Emitting then
   begin
-    ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ArgRegs);
-    ResAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ResRegs);
+    ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ArgRegs, Params));
+    ResAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ResRegs, Results));
     Emit(iroCallIndirect, IdxReg, ArgAux, ResAux,
       IrPack(TypeIdx, TableIdx));
   end;
@@ -2426,7 +2897,7 @@ begin
     CheckTailResults(Results);
     if Emitting then
     begin
-      ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ArgRegs);
+      ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ArgRegs, Params));
       Emit(iroReturnCallRef, RefReg, ArgAux, IR_NO_REG, Int64(TypeIdx));
     end;
     MarkUnreachable;
@@ -2436,8 +2907,8 @@ begin
   ResRegs := AllocTemps(Results);
   if Emitting then
   begin
-    ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ArgRegs);
-    ResAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, ResRegs);
+    ArgAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ArgRegs, Params));
+    ResAux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, SlotList(ResRegs, Results));
     Emit(iroCallRef, RefReg, ArgAux, ResAux, Int64(TypeIdx));
   end;
   PushVals(Results, ResRegs);
@@ -2466,14 +2937,23 @@ begin
         Format('global %u is not mutable at offset %u', [Idx, AOffset]));
     Reg := PopValExpect(G.ValueType).Reg;
     if Emitting then
-      Emit(iroGlobalSet, IR_NO_REG, Reg, IR_NO_REG, Int64(Idx));
+      { A v128 global's cell is the 16-byte Vec side (SIMD design §1.7); the
+        validator emits the width-specific op so the interpreter's *Vec arm
+        is the single runtime path and never asks a register's width. }
+      if G.ValueType.Kind = wvkVec then
+        Emit(iroGlobalSetVec, IR_NO_REG, Reg, IR_NO_REG, Int64(Idx))
+      else
+        Emit(iroGlobalSet, IR_NO_REG, Reg, IR_NO_REG, Int64(Idx));
     Exit;
   end;
 
   if Emitting then
   begin
     Dest := AllocTemp(G.ValueType);
-    Emit(iroGlobalGet, Dest, IR_NO_REG, IR_NO_REG, Int64(Idx));
+    if G.ValueType.Kind = wvkVec then
+      Emit(iroGlobalGetVec, Dest, IR_NO_REG, IR_NO_REG, Int64(Idx))
+    else
+      Emit(iroGlobalGet, Dest, IR_NO_REG, IR_NO_REG, Int64(Idx));
   end
   else
     Dest := IR_NO_REG;
@@ -2915,9 +3395,21 @@ begin
     end;
     if (Kind = $01) or (Kind = $03) then
     begin
+      { catch_ref / catch_all_ref deliver a NON-NULL `(ref exn)`, not a
+        nullable `exnref`: a caught exception object always exists, so the
+        appendix's `push_val(Exnref)` (algorithm-validation, try_table) is the
+        non-null reference (valid-try_table -> Instr_ok/try_table -> Catch_ok;
+        exec-handler binds the live exnaddr). try_table.wast's catch_ref1 /
+        catch_all_ref1 prove it: their labels expect `(ref exn)` and MUST
+        validate, while catch_ref2 / catch_all_ref2 (label `(ref null exn)`)
+        still validate because a non-null ref is a subtype of the nullable one.
+        Building this nullable rejected catch_ref1 (a non-null ref is not
+        delivered by a nullable payload). throw_ref's OPERAND stays nullable
+        (HandleThrowRef) — that is a different position, and a null there
+        traps. }
       N := Length(Payload);
       SetLength(Payload, N + 1);
-      Payload[N] := MakeAbsRef(True, wahExn);
+      Payload[N] := MakeAbsRef(False, wahExn);
     end;
 
     Types := LabelTypes(Target);
@@ -3263,8 +3755,15 @@ begin
         ValReg := PopValExpect(UnpackField(Field)).Reg;
         RefReg := PopValExpect(MakeConcreteRef(True, TypeIdx)).Reg;
         if Emitting then
-          Emit(iroStructSet, IR_NO_REG, RefReg, ValReg,
-            IrPack(TypeIdx, FieldIdx));
+          { A v128 field is 16 bytes; the *Vec store carries both slots
+            (SIMD design §2.4/§7). Packed storage is never v128, so get_s/
+            get_u never reach a vector field. }
+          if UnpackField(Field).Kind = wvkVec then
+            Emit(iroStructSetVec, IR_NO_REG, RefReg, ValReg,
+              IrPack(TypeIdx, FieldIdx))
+          else
+            Emit(iroStructSet, IR_NO_REG, RefReg, ValReg,
+              IrPack(TypeIdx, FieldIdx));
       end;
 
     { struct.get / get_s / get_u x n : [(ref null x)] -> [t] }
@@ -3278,8 +3777,14 @@ begin
       if Emitting then
       begin
         Dest := AllocTemp(FieldTy);
-        Emit(TWasmIrOp(Ord(iroStructGet) + Integer(ASub) - 2), Dest,
-          RefReg, IR_NO_REG, IrPack(TypeIdx, FieldIdx));
+        if FieldTy.Kind = wvkVec then
+          { ASub is necessarily 2 (plain get): get_s/get_u require packed
+            storage, which v128 is not. }
+          Emit(iroStructGetVec, Dest, RefReg, IR_NO_REG,
+            IrPack(TypeIdx, FieldIdx))
+        else
+          Emit(TWasmIrOp(Ord(iroStructGet) + Integer(ASub) - 2), Dest,
+            RefReg, IR_NO_REG, IrPack(TypeIdx, FieldIdx));
       end
       else
         Dest := IR_NO_REG;
@@ -3488,8 +3993,12 @@ begin
         if Emitting then
         begin
           Dest := AllocTemp(ElemTy);
-          Emit(TWasmIrOp(Ord(iroArrayGet) + Integer(ASub) - 11), Dest,
-            RefReg, IdxReg, Int64(TypeIdx));
+          if ElemTy.Kind = wvkVec then
+            { ASub is necessarily 11 (plain get) for a v128 element. }
+            Emit(iroArrayGetVec, Dest, RefReg, IdxReg, Int64(TypeIdx))
+          else
+            Emit(TWasmIrOp(Ord(iroArrayGet) + Integer(ASub) - 11), Dest,
+              RefReg, IdxReg, Int64(TypeIdx));
         end
         else
           Dest := IR_NO_REG;
@@ -3504,7 +4013,10 @@ begin
         IdxReg := PopValExpect(MakeI32).Reg;
         RefReg := PopValExpect(MakeConcreteRef(True, TypeIdx)).Reg;
         if Emitting then
-          Emit(iroArraySet, RefReg, IdxReg, ValReg, Int64(TypeIdx));
+          if ElemTy.Kind = wvkVec then
+            Emit(iroArraySetVec, RefReg, IdxReg, ValReg, Int64(TypeIdx))
+          else
+            Emit(iroArraySet, RefReg, IdxReg, ValReg, Int64(TypeIdx));
       end;
 
     { array.fill x : [(ref null x) i32 t i32] -> [] }
@@ -3523,7 +4035,10 @@ begin
           Ops[2] := ValReg;
           Ops[3] := CntReg;
           Aux := IrAppendAuxBlockGrowing(FFn.AuxU32, FAuxCount, Ops);
-          Emit(iroArrayFill, IR_NO_REG, Aux, IR_NO_REG, Int64(TypeIdx));
+          if ElemTy.Kind = wvkVec then
+            Emit(iroArrayFillVec, IR_NO_REG, Aux, IR_NO_REG, Int64(TypeIdx))
+          else
+            Emit(iroArrayFill, IR_NO_REG, Aux, IR_NO_REG, Int64(TypeIdx));
         end;
       end;
 
@@ -3823,6 +4338,268 @@ end;
   deliberate: moving an unassigned encoding from decode to validation
   would move the malformed/invalid boundary the conformance suite
   asserts. }
+{ The $FD vector space, table-driven over VEC_SIG (SIMD design §3). Every
+  v128 operand and result is MakeVecValueType, popped with PopValExpect so
+  a mismatch is the ordinary `type mismatch`; a v128 result is allocated
+  as wvkVec, which IrAllocReg even-aligns into a slot pair. Two rules are
+  vector-specific: the lane immediate is checked against the shape's lane
+  count (MSG_INVALID_LANE_INDEX), and the memory family's memarg alignment
+  is checked against the access's natural alignment (ReadMemargMax). The
+  IR op is VecOpBySub[ASub]; the immediate encodings mirror IR_OP_INFO. }
+procedure TBodyWalker.HandleVector(const ASub: UInt32;
+  const AOffset: NativeUInt);
+var
+  Sig: TVecSig;
+  Op: TWasmIrOp;
+  ScalarTy, VecTy: TWasmValueType;
+  RegA, RegB, RegC, Dest, ValReg, AddrReg, MemIdx, Lane, AuxIdx: UInt32;
+  StaticOffset: UInt64;
+  Mem: TWasmMemType;
+  Vec: TWasmV128;
+  I: Integer;
+
+  { A lane immediate names a lane the shape has: 0 <= lane < ADim
+    (`valid-vextract_lane` / `valid-vreplace_lane` / the *_lane memory
+    forms). The byte 255 parses fine and is rejected HERE, as validation. }
+  procedure ReadLane(const ADim: Byte);
+  begin
+    Lane := FReader.ReadByte;
+    if Lane >= ADim then
+      ValErr(MSG_INVALID_LANE_INDEX,
+        Format('lane %u is not below %u at offset %u',
+          [Lane, ADim, AOffset]));
+  end;
+
+  { memarg for a vector load/store: the same flags/memidx/u64-offset shape
+    as a scalar op, the alignment checked against this access's natural
+    alignment, then the memory-existence and offset-fits checks that
+    HandleLoadStore also runs. }
+  procedure ReadVecMemory;
+  begin
+    ReadMemargMax(Sig.MaxAlign, IR_OP_INFO[Op].Mnemonic, MemIdx,
+      StaticOffset, AOffset);
+    Mem := CheckMemory(MemIdx, AOffset);
+    if (Mem.Limits.AddrType <> watI64) and (StaticOffset > $FFFFFFFF) then
+      ValErr(MSG_OFFSET_OUT_OF_RANGE,
+        Format('static offset %u does not fit the i32 memory %u at '
+          + 'offset %u', [StaticOffset, MemIdx, AOffset]));
+  end;
+
+begin
+  Sig := VEC_SIG[ASub];
+  Op := VecOpBySub[ASub];
+  VecTy := MakeVecValueType;
+
+  case Sig.Family of
+    vfNullary:  { v128.const: [] -> [v128], 16 literal bytes }
+      begin
+        for I := 0 to 15 do
+          Vec.B[I] := FReader.ReadByte;
+        if Emitting then
+        begin
+          AuxIdx := IrAppendAuxV128Growing(FFn.AuxU32, FAuxCount, Vec);
+          Dest := AllocTemp(VecTy);
+          Emit(iroV128Const, Dest, IR_NO_REG, IR_NO_REG, Int64(AuxIdx));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfShuffle:  { i8x16.shuffle: [v128 v128] -> [v128], 16 lane bytes < 32 }
+      begin
+        for I := 0 to 15 do
+        begin
+          Vec.B[I] := FReader.ReadByte;
+          if Vec.B[I] >= Sig.Dim then
+            ValErr(MSG_INVALID_LANE_INDEX,
+              Format('shuffle lane %u is not below %u at offset %u',
+                [Vec.B[I], Sig.Dim, AOffset]));
+        end;
+        RegB := PopValExpect(VecTy).Reg;
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          AuxIdx := IrAppendAuxV128Growing(FFn.AuxU32, FAuxCount, Vec);
+          Dest := AllocTemp(VecTy);
+          Emit(iroI8x16Shuffle, Dest, RegA, RegB, Int64(AuxIdx));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfUnary:  { [v128] -> [v128] }
+      begin
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, RegA, IR_NO_REG, 0);
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfBinary:  { [v128 v128] -> [v128] }
+      begin
+        RegB := PopValExpect(VecTy).Reg;
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, RegA, RegB, 0);
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfTernary:  { [v128 v128 v128] -> [v128], third source in Imm }
+      begin
+        RegC := PopValExpect(VecTy).Reg;
+        RegB := PopValExpect(VecTy).Reg;
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, RegA, RegB, Int64(RegC));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfTest:  { [v128] -> [i32] }
+      begin
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(MakeI32);
+          Emit(Op, Dest, RegA, IR_NO_REG, 0);
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(MakeI32, Dest);
+      end;
+
+    vfShift:  { [v128 i32] -> [v128] }
+      begin
+        RegB := PopValExpect(MakeI32).Reg;
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, RegA, RegB, 0);
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfSplat:  { [Scalar] -> [v128] }
+      begin
+        ScalarTy := MakeNumValueType(Sig.Scalar);
+        RegA := PopValExpect(ScalarTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, RegA, IR_NO_REG, 0);
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfExtract:  { [v128] -> [Scalar], lane in Imm }
+      begin
+        ReadLane(Sig.Dim);
+        ScalarTy := MakeNumValueType(Sig.Scalar);
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(ScalarTy);
+          Emit(Op, Dest, RegA, IR_NO_REG, Int64(Lane));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(ScalarTy, Dest);
+      end;
+
+    vfReplace:  { [v128 Scalar] -> [v128], lane in Imm }
+      begin
+        ReadLane(Sig.Dim);
+        ScalarTy := MakeNumValueType(Sig.Scalar);
+        RegB := PopValExpect(ScalarTy).Reg;
+        RegA := PopValExpect(VecTy).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, RegA, RegB, Int64(Lane));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfLoad:  { [at] -> [v128], memarg }
+      begin
+        ReadVecMemory;
+        AddrReg := PopValExpect(AddrValType(Mem.Limits.AddrType)).Reg;
+        if Emitting then
+        begin
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, AddrReg, MemIdx, Int64(StaticOffset));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfStore:  { [at v128] -> [], memarg }
+      begin
+        ReadVecMemory;
+        ValReg := PopValExpect(VecTy).Reg;
+        AddrReg := PopValExpect(AddrValType(Mem.Limits.AddrType)).Reg;
+        if Emitting then
+          Emit(Op, ValReg, AddrReg, MemIdx, Int64(StaticOffset));
+      end;
+
+    vfLoadLane:  { [at v128] -> [v128], memarg + lane }
+      begin
+        ReadVecMemory;
+        ReadLane(Sig.Dim);
+        RegB := PopValExpect(VecTy).Reg;   { the source vector, on top }
+        AddrReg := PopValExpect(AddrValType(Mem.Limits.AddrType)).Reg;
+        if Emitting then
+        begin
+          AuxIdx := IrAppendAuxLaneMemArgGrowing(FFn.AuxU32, FAuxCount,
+            MemIdx, StaticOffset, Lane);
+          Dest := AllocTemp(VecTy);
+          Emit(Op, Dest, AddrReg, RegB, Int64(AuxIdx));
+        end
+        else
+          Dest := IR_NO_REG;
+        PushVal(VecTy, Dest);
+      end;
+
+    vfStoreLane:  { [at v128] -> [], memarg + lane }
+      begin
+        ReadVecMemory;
+        ReadLane(Sig.Dim);
+        ValReg := PopValExpect(VecTy).Reg;
+        AddrReg := PopValExpect(AddrValType(Mem.Limits.AddrType)).Reg;
+        if Emitting then
+        begin
+          AuxIdx := IrAppendAuxLaneMemArgGrowing(FFn.AuxU32, FAuxCount,
+            MemIdx, StaticOffset, Lane);
+          Emit(Op, ValReg, AddrReg, IR_NO_REG, Int64(AuxIdx));
+        end;
+      end;
+  end;
+end;
+
 procedure TBodyWalker.Prefixed(const APrefix: Byte;
   const AOffset: NativeUInt);
 var
@@ -3875,16 +4652,15 @@ begin
           HandleBulkTable(Sub, AOffset);
       end;
   else
-    { $FD. SIMD typing is Track G by the roadmap's staging; the
-      subopcode is read first so the message can name it, and it is NEVER
-      silently accepted. Unassigned subopcodes stay malformed — the
-      assigned set is the same non-contiguous one Wasm.Decoder.Expr
-      spells out from the pinned grammar. }
+    { $FD. The assigned set is the same non-contiguous one
+      Wasm.Decoder.Expr spells out from the pinned grammar; an UNASSIGNED
+      subopcode stays a DECODE error, exactly as before — that
+      malformed/invalid split is what the conformance suite asserts and
+      Track G does not disturb it. }
     case Sub of
       0..153, 155..161, 163, 164, 167..174, 177, 181..186, 188..193,
       195, 196, 199..206, 209, 213..225, 227..237, 239..275:
-        raise EWasmValidationError.CreateFmt('%s ($FD %u at offset %u)',
-          [MSG_SIMD_NOT_IMPLEMENTED, Sub, AOffset]);
+        HandleVector(Sub, AOffset);
     else
       DecErr(Format('unknown $FD subopcode %u at offset %u',
         [Sub, AOffset]));
@@ -3966,21 +4742,47 @@ begin
     end;
   end;
 
-  { Registers: params, locals, the return block, then temporaries. }
+  { Registers: params, locals, the return block, then temporaries.
+    FRegCount is a SLOT count, not a value count (SIMD design §1.4): a
+    v128 local takes two even-aligned slots, so `register i = local i` no
+    longer holds and FLocalReg records each local's low register. }
   FRegCount := 0;
   FFn.RegTypes := nil;
+  SetLength(FLocalReg, Integer(Total));
   for I := 0 to Integer(Total) - 1 do
-    IrAllocReg(FFn.RegTypes, FRegCount, FLocalTypes[I]);
+    FLocalReg[I] := IrAllocReg(FFn.RegTypes, FRegCount, FLocalTypes[I]);
+  { The return block is the first free slot after the locals, UNLESS the
+    first result is a v128 whose even-alignment inserts a pad — the
+    interpreter reads results from [ReturnRegBase .. +ResultCount)
+    (Wasm.Interp), so ReturnRegBase must be the first result's register,
+    i.e. MergeRegs[0], not the pre-pad slot. Void keeps the first free
+    slot (no result is read there). }
+  FFn.ReturnRegBase := UInt32(FRegCount);
   SetLength(MergeRegs, Length(FReturnTypes));
   for I := 0 to High(FReturnTypes) do
     MergeRegs[I] := IrAllocReg(FFn.RegTypes, FRegCount, FReturnTypes[I]);
+  if Length(MergeRegs) > 0 then
+    FFn.ReturnRegBase := MergeRegs[0];
 
   FFn.TypeIndex := ATypeIndex;
   FFn.CanonTypeId := FTypes.CanonIdOf(ATypeIndex);
   FFn.ParamCount := UInt32(Length(Ft.Params));
   FFn.LocalCount := UInt32(Total - UInt64(Length(Ft.Params)));
   FFn.ResultCount := UInt32(Length(FReturnTypes));
-  FFn.ReturnRegBase := UInt32(Total);
+  { A tier maps a wasm local index back to its register through this copy
+    (Wasm.Ir's TWasmIrFunction.LocalRegs); length = ParamCount +
+    LocalCount, one entry per wasm local. }
+  SetLength(FFn.LocalRegs, Integer(Total));
+  for I := 0 to Integer(Total) - 1 do
+    FFn.LocalRegs[I] := FLocalReg[I];
+  { A tier maps a wasm result index back to its register through this copy
+    (Wasm.Ir's TWasmIrFunction.ResultRegs). The return block is MergeRegs,
+    allocated pad-aware, so ResultRegs[i] is result i's low slot and lets the
+    result marshaling skip any even-alignment pad rather than assuming the
+    results form a contiguous run from ReturnRegBase. }
+  SetLength(FFn.ResultRegs, Length(FReturnTypes));
+  for I := 0 to High(FReturnTypes) do
+    FFn.ResultRegs[I] := MergeRegs[I];
   FFn.SourceOffset := AEntry.Body.Offset;
   FFn.Code := nil;
   FFn.AuxU32 := nil;
@@ -4189,6 +4991,15 @@ begin
     procedure that finished building them (AWasm.Ir's building section).
     Until this point Length() on any of them is the capacity, not the
     length, and no consumer may read them. }
+  { RegisterCount is rounded up to EVEN (SIMD design §1.5): a frame's Base
+    is the running sum of the callers' RegisterCounts, so keeping every
+    count even keeps every Base even by induction from Base = 0, which is
+    what lets a v128's even low slot land 16-byte aligned in the frame.
+    The pad is a dead, non-reference i32 filler — allocated through
+    IrAllocReg so RegTypes stays in step with the count and RefRegBits
+    (computed from RegTypes below) stays clear over it. }
+  if Odd(FRegCount) then
+    IrAllocReg(FFn.RegTypes, FRegCount, MakeI32);
   IrTrimCode(FFn.Code, FCodeCount);
   IrTrimRegTypes(FFn.RegTypes, FRegCount);
   IrTrimAux(FFn.AuxU32, FAuxCount);
@@ -4260,5 +5071,8 @@ begin
   Result := ValidateFunctionBody(AModule, AContext, ABytes, ATypeIndex,
     AEntry, Spaces);
 end;
+
+initialization
+  BuildVecOpTable;
 
 end.

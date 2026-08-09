@@ -6,20 +6,46 @@
   describes shipped behaviour only; anything not shipped is listed here.
 - **Shipped:** the binary reader, the type vocabulary, the populated
   module model, the full section-body decoder (Track A), the validator
-  and the register IR it emits (Track B, vectors excepted), the runtime
-  state and the precise collector (Track D), the interpreter tier that
-  executes the IR (Track E), and the conformance harness now substantially
-  complete (Track C): the `.wast` front end, the wat text-format
-  assembler, and a runner that assembles text modules and *executes*
-  `assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` through
-  the interpreter over the whole corpus. Three programs drive it:
-  `wasmlight inspect` / `wasmlight validate` and `wasmspec`.
+  and the register IR it emits (Track B), the runtime state and the
+  precise collector (Track D), the interpreter tier that executes the IR
+  (Track E), the full `v128` vector instruction set — decoded, validated,
+  executed, assembled from text, and conformance-tested (Track G) —
+  exception handling — `throw` / `throw_ref` / `try_table` executed, tags
+  and exception objects in the store, conformance-judged (Track H) — and
+  the conformance harness now substantially complete (Track C): the
+  `.wast` front end, the wat text-format assembler, and a runner that
+  assembles text modules and *executes* `assert_return` / `assert_trap` /
+  `invoke` / `assert_exhaustion` / `assert_exception` through the
+  interpreter over the whole corpus. Three programs drive it: `wasmlight
+  inspect` / `wasmlight validate` and `wasmspec`.
+- **The core is complete.** With Track H the runtime decodes, validates,
+  instantiates, and **executes all of core wasm 3.0** — every category in
+  the counted backlog, SIMD and exception handling included. Nothing in
+  the interpreter is staged any more: the harness's `STAGED` column is
+  **0**. The corpus runs at **~65,184 pass** of ~67,000 judged commands
+  with `errors=0`. What is left is not a 3.0-core gap — it is the
+  *performance* tiers (baseline JIT and AOT, Tracks I/J), which add no
+  behaviour and are differentially tested against this interpreter.
 - **Garbage collection has landed (Track D).** It was the longest pole by
   structural reach, not by instruction count: it rewrote the type section,
   added a runtime subtyping check, and put a precise collector under the
   runtime. The remaining reach is what runs on it — the execution tiers.
-- **Largest single chunk: SIMD**, at roughly half the instruction set.
-  Large but shallow, and almost entirely independent of everything else.
+- **SIMD has landed (Track G).** It was the largest single chunk — roughly
+  half the instruction set — but large and shallow, and almost entirely
+  independent of everything else, which is what made it the most parallel
+  work in the plan. `v128` now runs the whole pipeline: typing and IR
+  lowering (`IR_FORMAT_VERSION` is now 2), a dedicated interpreter leaf
+  unit, the assembler's vector text forms, GC `v128` struct/array fields,
+  and per-lane conformance judging.
+- **Exception handling has landed (Track H).** The last staged execution
+  feature. `throw` / `throw_ref` / `try_table` execute by an explicit
+  unwind over the interpreter's activation stack — no `longjmp`, matching
+  each frame's handler table by tag store-address; an uncaught throw
+  becomes `EWasmException`, a sibling of `EWasmTrap` reaching the
+  trampoline on its own route ([ADR-0009](adr/0009-traps-unwind-to-a-per-invocation-trampoline.md)).
+  Exception objects are GC objects with a traced payload, and
+  `assert_exception` is judged. `IR_FORMAT_VERSION` stays **2** — the
+  handler tables were in the IR from day one.
 - **No dates.** There is no delivery history to anchor them to (see
   Confidence). Tracks are sized against counted spec surface and ordered
   by dependency.
@@ -72,7 +98,11 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Constant-expression evaluation and the instantiation sequence | `Wasm.Runtime.Instantiate` | `Wasm.Runtime.Instantiate.Test` (incl. fixture instantiation) |
 | Precise, non-moving, stop-the-world mark-sweep collector | `Wasm.Runtime.Gc` | `Wasm.Runtime.Gc.Test` |
 | Interpreter tier: explicit-frame dispatch over the register IR, tail-call frame replacement, epoch check, stack maps | `Wasm.Interp` | `Wasm.Interp.Test` |
+| Exception handling: `throw` / `throw_ref` / `try_table` executed by explicit activation-stack unwind, tag store-address matching, `EWasmException` for an uncaught throw | `Wasm.Interp` | `Wasm.Interp.Test` |
+| Exception objects (`exn`): GC-managed, tag address plus a traced payload | `Wasm.Runtime.Gc` + `Wasm.Runtime.Store` | `Wasm.Runtime.Gc.Test` + `Wasm.Runtime.Store.Test` |
 | Bit-exact numeric operators (integer, float, conversions, NaN classes) | `Wasm.Interp.Numeric` | `Wasm.Interp.Numeric.Test` |
+| Bit-exact `v128` vector operators — every lane shape, saturating/narrowing, per-lane NaN discipline, relaxed SIMD (deterministic profile R=0) | `Wasm.Interp.Vector` | `Wasm.Interp.Vector.Test` |
+| `v128` typing and IR lowering, incl. `v128.const` as a constant instruction | `Wasm.Validator.Body` + `Wasm.Validator.Const` | `Wasm.Validator.Body.Test` + `Wasm.Validator.Const.Test` |
 | wat numeric-literal parser (integer + hex/dec float text → exact bits) | `Wasm.Wat.Numbers` | `Wasm.Wat.Numbers.Test` |
 | wat strict tokenizer (classified keyword/reserved/id/number/string) | `Wasm.Wat.Lexer` | `Wasm.Wat.Lexer.Test` |
 | Binary emitter: canonical LEB128, type/limits/composite encoders, section backpatching | `Wasm.Wat.Emit` | `Wasm.Wat.Emit.Test` |
@@ -80,19 +110,20 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Identifier/label resolution across the twelve index contexts, implicit-typeuse dedup | `Wasm.Wat.Names` | `Wasm.Wat.Names.Test` |
 | wat assembler: module text and `(module quote …)` → bytes into DecodeModule → ValidateModule | `Wasm.Wat.Assembler` | `Wasm.Wat.Assembler.Test` |
 | `.wast` lexer, s-expression parser, command classifier | `Wasm.Wast` | `Wasm.Wast.Test` |
-| `.wast` argument/result value parser and matcher (hex floats, NaN classes, references) | `Wasm.Wast.Values` | `Wasm.Wast.Values.Test` |
+| `.wast` argument/result value parser and matcher (hex floats, NaN classes, references, per-lane `v128` comparison, the relaxed `(either …)` form) | `Wasm.Wast.Values` | `Wasm.Wast.Values.Test` |
 | `.wast` runner: assembles text modules, decodes, validates, instantiates, and *executes* assertions through the interpreter | `Wasm.Wast.Runner` | `Wasm.Wast.Runner.Test` + the corpus |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
-| `wasmspec` (judges the corpus: ~40,900 commands assembled, decoded, validated, and executed) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
+| `wasmspec` (judges the corpus: ~65,592 commands assembled, decoded, validated, and executed, SIMD and exception handling included) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
 | Decoder and LEB128 benchmarks | `source/apps/wasmbench.pas` | measurement only |
 
 Everything below is **Absent** unless marked otherwise. Tracks A, B, C, D,
-and E are delivered; Track C's one remaining slice is the vector text
-forms the assembler cannot yet build (Track G / Wave 7). Track B's caveat
-stands — it walks every non-vector instruction the 3.0 draft defines, with
-the `$FD` space staged to Track G.
+E, G, and H are delivered; the interpreter now executes the whole 3.0
+instruction set, including the `$FD` vector space and exception-handling
+throwing. Nothing is staged in the interpreter any more. What is Absent is
+the embedding/host surface (Track F) and the performance tiers (Tracks
+I/J).
 
 ## The counted backlog
 
@@ -153,7 +184,7 @@ and `comptype` (functype | structtype | arraytype) with mutable and
 **packed** field types. This was the largest single piece of Track A and
 it exists only because of the GC target.
 
-### Track B — Validation and the IR — **delivered, vectors excepted**
+### Track B — Validation and the IR — **delivered**
 
 The spec's static type check, emitting the register-based IR
 ([ADR-0007](adr/0007-validation-emits-the-lowered-ir.md),
@@ -167,18 +198,16 @@ decodes, type-checks, and lowers in a single pass — with local
 initialization tracking for non-defaultable locals. `Wasm.Ir` holds what
 it emits, and `wasmlight validate` is the shipped consumer.
 
-The walk covers the GC (`$FB`) space, exception handling — `try_table`'s
-handler ranges and catch clauses are emitted from day one, though nothing
-throws until Track H — tail calls, multiple memories, and memory64
-address types.
+The walk covers the GC (`$FB`) space, the `$FD` vector space (Track G),
+exception handling — `try_table`'s handler ranges and catch clauses were
+emitted from day one, and Track H now executes the throwing they describe
+— tail calls, multiple memories, and memory64 address types.
+`IR_FORMAT_VERSION` is 2:
+it was 1 for the non-vector IR and bumped when Track G appended the
+vector ops.
 
-Two honest caveats:
+One honest caveat remains (the vector one is closed — see Track G):
 
-- **Vectors are not validated.** `$FD` typing is Track G's, and the walk
-  raises `SIMD validation is not implemented` rather than accepting a
-  `v128` instruction it has not checked. That includes `v128.const`,
-  which *is* a constant instruction in the spec. `IR_FORMAT_VERSION` is 1
-  and bumps to 2 when Track G appends the vector ops.
 - **The error-message prefixes are unconfirmed.** The corpus prefix-
   matches failure strings, so the messages are part of conformance rather
   than diagnostics. Where the upstream spelling could not be confirmed
@@ -186,7 +215,7 @@ Two honest caveats:
   site. Track C's runner is what settles them — until it runs, every
   message is our best reading and some will change.
 
-### Track C — Conformance harness (needs A) — **delivered; vector text forms pending (Track G)**
+### Track C — Conformance harness (needs A) — **delivered**
 
 A `.wast` script runner. This was deliberately early: it is the only
 external judge the project has, and every later track's claim of
@@ -198,42 +227,40 @@ The pieces. `Wasm.Wast` is the front end — lexer, s-expression parser,
 and top-level command classifier — keeping module payloads as raw trees
 so lazy decoding is preserved by construction, and `Wasm.Wast.Values`
 parses assertion arguments and expected results (hex floats, NaN classes,
-reference matchers). The six `Wasm.Wat.*` units are the assembler that
-lowers module text and `(module quote ...)` to bytes, which re-enter the
-same shipped `DecodeModule → ValidateModule → instantiate → interpret`
-path a binary module takes. `Wasm.Wast.Runner` turns each command into a
-verdict: top-level modules assemble/decode/validate/instantiate,
-`assert_malformed` and `assert_invalid` judge the rejection (text operands
-via `EWasmTextError` from the assembler, binary via `EWasmDecodeError`),
-and `assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` now
-*run* through the interpreter and compare. `wasmspec` (`source/apps/`)
-points it at the corpus.
+reference matchers, per-lane `v128` comparison, the relaxed `(either …)`
+form). The six `Wasm.Wat.*` units are the assembler that lowers module
+text and `(module quote ...)` to bytes — vector text forms included —
+which re-enter the same shipped
+`DecodeModule → ValidateModule → instantiate → interpret` path a binary
+module takes. `Wasm.Wast.Runner` turns each command into a verdict:
+top-level modules assemble/decode/validate/instantiate, `assert_malformed`
+and `assert_invalid` judge the rejection (text operands via
+`EWasmTextError` from the assembler, binary via `EWasmDecodeError`), and
+`assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` *run*
+through the interpreter and compare. `wasmspec` (`source/apps/`) points it
+at the corpus.
 
-Over `WebAssembly/testsuite@de54fd27` that is `pass=38900 fail=444
-skip=26161 staged=1620` with `errors=0` across 288 files — the split is
-`ROOT pass=38367 fail=88 staged=1620` and `PROPOSALS pass=533 fail=356`.
-Judged commands (`pass + fail + staged`) rose from **1,075** to
-**~40,900** of the corpus's ~67,000. See [testing.md](testing.md) and
+Over `WebAssembly/testsuite@de54fd27` that is `pass=65184 fail=408
+skip=1533 staged=0` with `errors=0` across 288 files — the split is
+`ROOT pass=64651 fail=52 staged=0` and `PROPOSALS pass=533 fail=356`.
+Judged commands (`pass + fail`) are **~65,592** of the corpus's ~67,000.
+The `staged` column is **0**: Track H shipped the throwing that used to
+sit there. See [testing.md](testing.md) and
 [`tests/spec/README.md`](../tests/spec/README.md) for the tallies and the
 failure breakdown.
 
-The 444 remaining failures are **not** 3.0 regressions. `PROPOSALS`
+The 408 remaining failures are **not** 3.0-core gaps. `PROPOSALS`
 accounts for 356 of them — post-3.0 features outside the pinned target
 ([ADR-0004](adr/0004-conformance-target-is-the-3-0-draft.md)):
 custom-descriptors, custom-page-sizes, wide-arithmetic, and threads, as
-false rejections (`expected=""`) or wording mismatches. The `ROOT` 88 are
-the legacy exception-handling encodings (`testsuite/legacy/`, out of 3.0
-scope), the pre-existing `binary-leb128` wording divergences carried since
-the binary subset, and a handful of assembler/execution-tier edge cases.
-`staged` (1,620) is the vector text the assembler cannot yet build.
-
-What remains of Track C is the **vector text forms**: `v128` module text
-routes to `STAGED` (the assembler answers `$FD` mnemonics with `unknown
-operator` until Track G / Wave 7 appends them), and every assertion
-against a module that therefore did not instantiate skips as `no
-instantiated module` — which is the bulk of the 26,161 skips. A small
-residue skips for host imports the harness does not provide, exception
-handling (Track H), and `assert_unlinkable` (linkage is not yet judged).
+false rejections (`expected=""`) or wording mismatches. The `ROOT` 52 are
+the legacy `try`/`catch`/`delegate`/`rethrow` encoding (`testsuite/legacy/`,
+out of 3.0 scope — the 3.0 `try_table` form passes), the pre-existing
+`binary-leb128` wording divergences carried since the binary subset, the
+M7 `extern.convert_any` / `any.convert_extern` imprecision, two
+validator-message-wording edges on the 3.0 `throw`, and a handful of
+assembler/decoder edge cases. None is a wrong-class rejection, and none is
+a SIMD or exception-handling execution failure.
 
 Requirements the corpus imposes, and where each stands:
 
@@ -249,7 +276,9 @@ Requirements the corpus imposes, and where each stands:
   (3,391) rule out bitwise float comparison, and `assert_return` now
   compares against the class rather than a bit pattern.
 - **`(either ...)` results** (32) for implementation-defined relaxed-SIMD
-  outcomes — reached once vector execution lands with Track G.
+  outcomes — met: the matcher accepts any listed alternative, and the
+  interpreter ships the deterministic profile (R=0), so its result is one
+  of them by construction.
 - **Host references**: `(ref.extern n)` (140) and `(ref.host n)` — the
   identity matchers are in `Wasm.Wast.Values`.
 - **Testsuite-local directives** `assert_malformed_custom` and
@@ -302,15 +331,16 @@ The tier of record and the reference the other tiers will be
 differentially tested against. It consumes the IR, Track D's store, and
 the GC's frame-walk contract — no re-derived rule, no second read of the
 binary. `Wasm.Interp` is the dispatch loop and `Wasm.Interp.Numeric` the
-bit-exact numeric leaf functions. The activation stack is explicit — no
-Pascal recursion per wasm call — so `return_call` replaces the top frame
-in place with O(1) stack growth, as the tail-call rule demands. It carries
-the epoch check
+bit-exact numeric leaf functions, with `Wasm.Interp.Vector` the vector
+leaf unit added by Track G. The activation stack is explicit — no Pascal
+recursion per wasm call — so `return_call` replaces the top frame in place
+with O(1) stack growth, as the tail-call rule demands. It carries the
+epoch check
 ([ADR-0006](adr/0006-epoch-interruption-not-fuel.md)) and stack-map
 production from the start, because retrofitting either is the expensive
 version. It runs the corpus's `assert_return` / `assert_trap` /
-`assert_exhaustion` cases through Track C; SIMD (`$FD`) is not executed
-until Track G, and throwing waits on Track H.
+`assert_exhaustion` / `assert_exception` cases through Track C — `$FD`
+vector execution and exception-handling throwing (Track H) included.
 
 ### Track F — Embedding API and WASI preview1 (needs E)
 
@@ -318,37 +348,68 @@ until Track G, and throwing waits on Track H.
 The v1 host surface is WASI preview1 only
 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
-### Track G — SIMD (B done; needs E for execution) — **largest chunk, most parallel**
+### Track G — SIMD (needs B, E) — **delivered**
 
-~256 instructions counting the `v128` load/store family. Almost entirely
-independent of GC, EH, and the host surface, and internally uniform — the
-best candidate for parallel work, and the one whose progress is least
-informative about the rest of the project.
+~256 instructions counting the `v128` load/store family — the largest
+single chunk, roughly half the instruction set. Almost entirely
+independent of GC, EH, and the host surface, and internally uniform, which
+is what made it the most parallel work in the plan and the one whose
+progress was least informative about the rest of the project. It now runs
+end to end:
 
-**Vector validation is staged here, not in Track B.** The body walk and
-the constant-expression checker both reach the `$FD` space and both raise
-`SIMD validation is not implemented` at it, so the surface is already
-enumerated and the failure is loud rather than silent. Track G's first
-obligation is therefore typing plus IR lowering for these instructions,
-which appends to `TWasmIrOp` and bumps `IR_FORMAT_VERSION` to 2;
-execution follows and needs E. `tests/fixtures/valid/simd.wasm` asserts
-the staged message today, so it is the first thing that fails when the
-work starts.
+- **Typing and IR lowering.** The body walk and the constant-expression
+  checker cover the `$FD` space; `v128.const` is accepted as a constant
+  instruction. The vector ops append to `TWasmIrOp`, which bumped
+  `IR_FORMAT_VERSION` from 1 to 2.
+- **Execution.** `Wasm.Interp.Vector` is the vector leaf unit beside
+  `Wasm.Interp.Numeric` — bit-exact `TWasmV128` operators with the
+  per-lane NaN discipline, saturating/narrowing arithmetic, and relaxed
+  SIMD on the **deterministic profile (R=0)**, so every relaxed op reduces
+  to its non-relaxed twin.
+- **Value model.** A `v128` occupies **two adjacent 8-byte register
+  slots**, low half first, its low slot always even (16-byte aligned).
+  This is the shipped choice; it overrode the earlier side-vector sketch
+  in the runtime-spec notes. Neither slot is ever a reference, so the GC
+  frame walk leaves both clear, and `v128` struct/array fields are traced
+  correctly.
+- **Text and conformance.** The assembler emits the vector text forms, and
+  the harness judges SIMD `assert_return` / `assert_trap` per lane, with
+  `nan:canonical` / `nan:arithmetic` classes and the relaxed `(either …)`
+  form. `tests/fixtures/valid/simd.wasm`, which used to assert the staged
+  message, now decodes and validates.
 
-### Track H — Exception handling (B done; needs D, E)
+### Track H — Exception handling (needs D, E) — **delivered**
 
-Tag section (id 13, already recognised by the decoder), `syntax-tagtype`,
-tag and exception instances in the store, and an **exception-handler
-stack** alongside labels and frames. The static half is done: Track B
-validates `try_table` and its catch clauses and emits the IR's handler
-ranges, resolved targets, and payload registers. What is absent is the
-dynamic half — throwing, matching a handler, and unwinding to it. That is
-a second unwinding mechanism next to the trap path, which is why ADR-0009
-says wasm exceptions need their own route through the trampoline rather
-than reusing the trap one.
+The last staged execution feature, now shipped: the runtime executes all
+of core wasm 3.0. Tag section (id 13, recognised by the decoder since
+Track A), `syntax-tagtype`, tag and exception instances in the store, and
+the dynamic half Track B's static half was always waiting for.
+
+- **The static half** was already done in Track B: it validates
+  `try_table` and its catch clauses and emits the IR's handler ranges,
+  resolved targets, and payload registers. `IR_FORMAT_VERSION` did not
+  move — the handler tables were in the IR from day one.
+- **Throwing** is an **explicit unwind over the interpreter's activation
+  stack**, not a `longjmp`: `throw` / `throw_ref` walk frames from the top,
+  and at each frame test its handler table. This is a second unwinding
+  mechanism next to the trap path, which is why
+  [ADR-0009](adr/0009-traps-unwind-to-a-per-invocation-trampoline.md) has
+  wasm exceptions take their own route to the trampoline rather than
+  reusing the trap one. An uncaught throw becomes `EWasmException` — a
+  sibling of `EWasmTrap` under `EWasmError`, never collapsed into it — and
+  reaches the trampoline as exactly one raise.
+- **Handler matching is by tag store-address**, not by tag type: two
+  modules importing the same tag match on the one address, and
+  `catch_all` / `catch_all_ref` match unconditionally.
+- **Exception objects (`exn`) are GC objects** carrying the tag address
+  and a traced payload; `catch_ref` / `catch_all_ref` push the `exnref`
+  after the payload, and the collector traces the payload's references.
+- **Conformance.** `assert_exception` is judged, and `try_table.wast`,
+  `throw.wast`, and `throw_ref.wast` execute — `staged` fell to 0.
 
 The legacy `try` / `catch` / `delegate` / `rethrow` encoding is **not** in
-3.0 — it lives in `testsuite/legacy/` and is out of scope.
+3.0 — it lives in `testsuite/legacy/` and stays out of scope, so those
+files stay failing.
 
 ### Track I — Baseline JIT (needs E, plus F/G/H for coverage)
 
@@ -382,9 +443,11 @@ graph LR
   C -.judges.-> H
 ```
 
-The critical path is **A → B → D → E**; all four are behind it, so the
-embedding API and host surface (F) are next on it. Everything expensive
-that is not on the path — SIMD especially — can proceed in parallel.
+The execution core is complete: **A → B → C → D → E → G → H** are all
+delivered, so every guest instruction in core wasm 3.0 runs. What remains
+is off the correctness path: the embedding API and host surface (F), and
+the **performance** tiers — baseline JIT (I) and AOT (J) — which add no
+behaviour and are differentially tested against the interpreter (E).
 
 ## Constraints discovered from the spec
 

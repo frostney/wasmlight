@@ -78,6 +78,14 @@ type
     procedure TestReservedTokenIsUnknownOperator;
     procedure TestNanPatternsInConst;
     procedure TestBrOnCastRoundTrip;
+    procedure TestVectorConstAllShapes;
+    procedure TestVectorShuffleAndLanes;
+    procedure TestVectorMemoryAndLaneLookahead;
+    procedure TestVectorImmediateErrors;
+    procedure TestTableInitExpr;
+    procedure TestInlineMemDataAddrType;
+    procedure TestMemArgSignedIsUnknownOperator;
+    procedure TestVectorConstCountBeforeValue;
   end;
 
 function StartsWith(const AWhole, APrefix: string): Boolean;
@@ -418,13 +426,18 @@ end;
 
 procedure TWatAsmTests.TestUnknownOperatorPlaceholder;
 begin
-  { The $FD vector space stays out of scope (Track G): a v128 mnemonic
-    has no row in Wasm.Wat.Opcodes, so it still raises `unknown operator
-    <mnemonic>` rather than mis-assembling — the STAGED marker stays a
-    validator concern, not an assembler excuse. }
+  { The $FD vector space is now encoded (Track G): a real v128 mnemonic
+    assembles rather than raising `unknown operator`. But an invented
+    v128-shaped spelling with no row still takes the unknown-operator path —
+    a missing row is the right signal, exactly as for the obsolete keywords. }
+  Expect<string>(AssembleError('(module (func v128.const i32x4 0 0 0 0 drop))'))
+    .ToBe('');
   Expect<Boolean>(StartsWith(
-    AssembleError('(module (func v128.const i32x4 0 0 0 0))'),
-    'unknown operator v128.const')).ToBe(True);
+    AssembleError('(module (func v128.notareal.op))'),
+    'unknown operator v128.notareal.op')).ToBe(True);
+  Expect<Boolean>(StartsWith(
+    AssembleError('(module (func i8x16.notreal))'),
+    'unknown operator i8x16.notreal')).ToBe(True);
 end;
 
 { --- committed fixtures assemble to the same section shape -------------- }
@@ -698,6 +711,35 @@ begin
   Expect<string>(ValidateOutcome(
     '(module (func $f)' +
     '  (table funcref (elem (ref.func $f) (ref.null func))))')).ToBe('valid');
+
+  { The inline table-elem abbreviation carries the TABLE's reftype, not a
+    hardcoded funcref (text-table-abbrev / Telemtable_). A funcidx shorthand
+    under a NON-funcref reftype must therefore lower to ref.func exprs under
+    the table's reftype (flag 6), else the segment's element type mismatches
+    the table (type-subtyping.wast:381, br_table.wast:3). The reftype must be
+    nullable for the sugar to be valid: the desugared table carries no
+    initialiser, so a non-defaultable (non-nullable) element type is rejected
+    for want of one, independent of the segment — hence `(ref null $t)`. }
+  Expect<string>(ValidateOutcome(
+    '(module (type $t (sub (func))) (func $f (type $t))' +
+    '  (table (ref null $t) (elem $f)))')).ToBe('valid');
+  { And the decoded segment reports both entries for the concrete-ref case.
+    The non-funcref reftype takes the flag-6 expr-list encoding, so the
+    funcidxs land in InitExprs (as ref.func exprs), not FuncIndices. }
+  AssembleAndDecode(
+    '(module (type $t (sub (func)))' +
+    '  (func $f (type $t)) (func $g (type $t))' +
+    '  (table (ref null $t) (elem $f $g)))');
+  Expect<Integer>(FModule.ElementCount).ToBe(1);
+  Expect<Integer>(Ord(FModule.Elements[0].Mode)).ToBe(Ord(wemActive));
+  Expect<Integer>(Length(FModule.Elements[0].InitExprs)).ToBe(2);
+  { The lowered ref.func exprs still type-check each funcidx against rt: a
+    function of an unrelated type is rejected by the validator, not masked. }
+  Expect<string>(ValidateOutcome(
+    '(module (type $t (sub (func)))' +
+    '  (type $u (sub (func (param i32))))' +
+    '  (func $f (type $u))' +
+    '  (table (ref null $t) (elem $f)))')).ToBe('validation error');
 end;
 
 { --- ref.test / ref.cast: the null variant is the +1 subopcode ---------- }
@@ -893,6 +935,284 @@ begin
   Expect<string>(ValidateOutcome(Src)).ToBe('valid');
 end;
 
+{ --- SIMD immediate shapes (Track G, Wave G2) --------------------------- }
+
+procedure TWatAsmTests.TestVectorConstAllShapes;
+
+  function ConstBody(const AShapeAndLanes: string): string;
+  begin
+    AssembleAndDecode(
+      '(module (func (result v128) (v128.const ' + AShapeAndLanes + ')))');
+    Result := BodyHex;
+  end;
+
+begin
+  { v128.const <shape> <lane>… -> FD 0C then 16 raw bytes little-endian, low
+    lane first, then the end byte 0B. All six shapes, with the exact emitted
+    bytes computed by hand (integer lanes LE; float lanes their IEEE754 bits
+    LE). This pins both the count-per-shape and the little-endian lane layout. }
+  Expect<string>(ConstBody('i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15'))
+    .ToBe('FD0C' + '000102030405060708090A0B0C0D0E0F' + '0B');
+  Expect<string>(ConstBody('i16x8 0 1 2 3 4 5 6 7'))
+    .ToBe('FD0C' + '00000100020003000400050006000700' + '0B');
+  Expect<string>(ConstBody('i32x4 0 1 2 3'))
+    .ToBe('FD0C' + '00000000010000000200000003000000' + '0B');
+  Expect<string>(ConstBody('i64x2 0 1'))
+    .ToBe('FD0C' + '00000000000000000100000000000000' + '0B');
+  { f32(0,1,2,3) = 00000000 3F800000 40000000 40400000, each little-endian. }
+  Expect<string>(ConstBody('f32x4 0 1 2 3'))
+    .ToBe('FD0C' + '000000000000803F0000004000004040' + '0B');
+  { f64(0,1) = 0000000000000000 3FF0000000000000, each little-endian. }
+  Expect<string>(ConstBody('f64x2 0 1'))
+    .ToBe('FD0C' + '0000000000000000000000000000F03F' + '0B');
+  { A flat (non-folded) const followed by drop encodes identically. }
+  AssembleAndDecode('(module (func v128.const i32x4 1 2 3 4 drop))');
+  Expect<string>(BodyHex)
+    .ToBe('FD0C' + '01000000020000000300000004000000' + '1A' + '0B');
+end;
+
+procedure TWatAsmTests.TestVectorShuffleAndLanes;
+begin
+  { i8x16.shuffle: 16 lane indices as 16 raw bytes AFTER the two folded
+    operands (2000 2001), opcode FD 0D. Indices 0..15 then 16..31. }
+  AssembleAndDecode(
+    '(module (func (param v128 v128) (result v128)' +
+    '  (i8x16.shuffle 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15' +
+    '    (local.get 0) (local.get 1))))');
+  Expect<string>(BodyHex)
+    .ToBe('20002001' + 'FD0D' + '000102030405060708090A0B0C0D0E0F' + '0B');
+  AssembleAndDecode(
+    '(module (func (param v128 v128) (result v128)' +
+    '  (i8x16.shuffle 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31' +
+    '    (local.get 0) (local.get 1))))');
+  Expect<string>(BodyHex)
+    .ToBe('20002001' + 'FD0D' + '101112131415161718191A1B1C1D1E1F' + '0B');
+
+  { extract_lane_s: operand then FD 15 (sub 21) then one laneidx byte. }
+  AssembleAndDecode(
+    '(module (func (param v128) (result i32)' +
+    '  (i8x16.extract_lane_s 3 (local.get 0))))');
+  Expect<string>(BodyHex).ToBe('2000' + 'FD15' + '03' + '0B');
+  { replace_lane: two operands (vector, scalar) then FD 17 (sub 23) + lane. }
+  AssembleAndDecode(
+    '(module (func (param v128) (result v128)' +
+    '  (i8x16.replace_lane 3 (local.get 0) (i32.const 7))))');
+  Expect<string>(BodyHex).ToBe('2000' + '4107' + 'FD17' + '03' + '0B');
+  { swizzle takes no immediate: FD 0E after the two operands. }
+  AssembleAndDecode(
+    '(module (func (param v128 v128) (result v128)' +
+    '  (i8x16.swizzle (local.get 0) (local.get 1))))');
+  Expect<string>(BodyHex).ToBe('20002001' + 'FD0E' + '0B');
+  { a multi-byte-LEB subopcode proves the widened UInt32 field: i16x8.abs is
+    subopcode 128 = FD 80 01. }
+  AssembleAndDecode(
+    '(module (func (param v128) (result v128) (i16x8.abs (local.get 0))))');
+  Expect<string>(BodyHex).ToBe('2000' + 'FD8001' + '0B');
+end;
+
+procedure TWatAsmTests.TestVectorMemoryAndLaneLookahead;
+begin
+  { v128.load, default alignment: natural align log2 4 -> flags 04, offset 0,
+    so FD 00 04 00 after the address operand (i32.const 0 = 4100). }
+  AssembleAndDecode(
+    '(module (memory 1) (func (result v128) (v128.load (i32.const 0))))');
+  Expect<string>(BodyHex).ToBe('4100' + 'FD00' + '04' + '00' + '0B');
+  { explicit align=8 (log2 3) and offset=16 (0x10). }
+  AssembleAndDecode(
+    '(module (memory 1) (func (result v128)' +
+    '  (v128.load offset=16 align=8 (i32.const 0))))');
+  Expect<string>(BodyHex).ToBe('4100' + 'FD00' + '03' + '10' + '0B');
+
+  { load8_lane, lane only (no memidx): the leading `3` is the LANE because the
+    token after it is `(`. FD 54 (sub 84) then memarg (flags 00, offset 00)
+    then the lane byte 03. Operands: address (4100) then source vector (2000). }
+  AssembleAndDecode(
+    '(module (memory 1) (func (param v128) (result v128)' +
+    '  (v128.load8_lane 3 (i32.const 0) (local.get 0))))');
+  Expect<string>(BodyHex)
+    .ToBe('4100' + '2000' + 'FD54' + '00' + '00' + '03' + '0B');
+  { load8_lane, memidx THEN lane: `1 3` — the leading `1` is the MEMIDX because
+    a numeric follows it (the §5.5 lookahead). flags 40 (memidx bit), memidx
+    01, offset 00, lane 03. }
+  AssembleAndDecode(
+    '(module (memory 1) (func (param v128) (result v128)' +
+    '  (v128.load8_lane 1 3 (i32.const 0) (local.get 0))))');
+  Expect<string>(BodyHex)
+    .ToBe('4100' + '2000' + 'FD54' + '40' + '01' + '00' + '03' + '0B');
+  { store8_lane with an explicit memarg then lane: `offset=0 align=1 2`. No
+    memidx (leads with a keyword), align=1 -> log2 0, lane 2. FD 58 (sub 88). }
+  AssembleAndDecode(
+    '(module (memory 1) (func (param v128)' +
+    '  (v128.store8_lane offset=0 align=1 2 (i32.const 0) (local.get 0))))');
+  Expect<string>(BodyHex)
+    .ToBe('4100' + '2000' + 'FD58' + '00' + '00' + '02' + '0B');
+end;
+
+procedure TWatAsmTests.TestVectorImmediateErrors;
+begin
+  { Wrong lane-literal count (too few) -> `wrong number of lane literals`
+    (simd_const.wast:241-309). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const i8x16 0 0 0 0) drop))'),
+    MSG_WRONG_LANE_LITERALS)).ToBe(True);
+  { A no-lane const is also the wrong count. }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const f64x2) drop))'),
+    MSG_WRONG_LANE_LITERALS)).ToBe(True);
+
+  { Wrong shuffle-index count, both 15 and 17 -> `wrong number of lane
+    indices` (simd_lane.wast:514-520). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (param v128 v128) (result v128)' +
+    '  (i8x16.shuffle 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14' +
+    '    (local.get 0) (local.get 1))))'),
+    MSG_WRONG_LANE_INDICES)).ToBe(True);
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (param v128 v128) (result v128)' +
+    '  (i8x16.shuffle 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16' +
+    '    (local.get 0) (local.get 1))))'),
+    MSG_WRONG_LANE_INDICES)).ToBe(True);
+
+  { A v128.const lane literal out of its width raises the BARE `constant out
+    of range` (simd_const.wast:238), even for i8x16 256. }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const i8x16 256 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))'),
+    'constant out of range')).ToBe(True);
+  { And a zero NaN payload lane is `constant out of range` too. }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const f32x4 nan:0x0 nan:0x0 nan:0x0 nan:0x0) drop))'),
+    'constant out of range')).ToBe(True);
+
+  { A lane INDEX out of the i8 byte range raises the WIDTH-PREFIXED `i8
+    constant out of range` (simd_lane.wast:415), the split that must stay
+    distinct from the bare literal message. }
+  Expect<string>(AssembleError(
+    '(module (func (param v128) (result i32)' +
+    '  (i8x16.extract_lane_s 256 (local.get 0))))'))
+    .ToBe('i8 constant out of range');
+  { A shuffle index of 256 is the same width-prefixed message. }
+  Expect<string>(AssembleError(
+    '(module (func (param v128 v128) (result v128)' +
+    '  (i8x16.shuffle 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 256' +
+    '    (local.get 0) (local.get 1))))'))
+    .ToBe('i8 constant out of range');
+  { A signed lane index (-1) is `unexpected token`, not a range error
+    (simd_lane.wast:398, 522). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (param v128) (result i32)' +
+    '  (i8x16.extract_lane_s -1 (local.get 0))))'),
+    MSG_UNEXPECTED_TOKEN)).ToBe(True);
+  { nan:canonical / a missing shape in a const is `unexpected token`. }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const f32x4 nan:canonical 0 0 0) drop))'),
+    MSG_UNEXPECTED_TOKEN)).ToBe(True);
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const) drop))'),
+    MSG_UNEXPECTED_TOKEN)).ToBe(True);
+
+  { align not a power of two, on a vector load -> `alignment must be a power
+    of two` (simd_align.wast). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (memory 1) (func (result v128)' +
+    '  (v128.load align=3 (i32.const 0))))'),
+    'alignment must be a power of two')).ToBe(True);
+end;
+
+procedure TWatAsmTests.TestTableInitExpr;
+begin
+  { The 3.0 explicit-init table form `(table limits reftype constexpr)`:
+    a folded constant initialises every slot, encoded as $40 $00 tt e
+    (table.wast:19-21, elem.wast:91). Assemble -> decode -> validate. }
+  Expect<string>(ValidateOutcome(
+    '(module (table 1 funcref (ref.null func)))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (func $f) (func $g)' +
+    '  (table $t 10 (ref func) (ref.func $f))' +
+    '  (elem (i32.const 3) $g))')).ToBe('valid');
+  { And the decoded model carries exactly one table. }
+  AssembleAndDecode('(module (table 1 funcref (ref.null func)))');
+  Expect<Integer>(FModule.TableCount).ToBe(1);
+
+  { An active element segment whose element type is NON-funcref (externref)
+    must use flag 6 (explicit reftype), not the funcref-implied flag 4
+    (elem.wast:1027) — else validation reports a funcref/externref mismatch. }
+  Expect<string>(ValidateOutcome(
+    '(module (table 2 externref)' +
+    '  (elem (i32.const 0) externref (ref.null extern)))')).ToBe('valid');
+  { The mismatched form (funcref value into an externref elem) still fails
+    validation, so flag 6 is doing real type checking, not masking it. }
+  Expect<string>(ValidateOutcome(
+    '(module (table 1 (ref null func) (i32.const 0)))'))
+    .ToBe('validation error');
+end;
+
+procedure TWatAsmTests.TestInlineMemDataAddrType;
+begin
+  { `(memory addrtype? (data …))` — an i64 memory keeps its address type and
+    the synthetic active data segment takes an i64.const 0 offset
+    (memory64.wast:11-15). Both i32 and i64 forms must validate. }
+  Expect<string>(ValidateOutcome(
+    '(module (memory (data "abc")))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (memory i64 (data "abc")))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (memory i64 (data)))')).ToBe('valid');
+  { The address type reaches the decoded model. }
+  AssembleAndDecode('(module (memory i64 (data "x")))');
+  Expect<Boolean>(FModule.Memories[0].Limits.AddrType = watI64)
+    .ToBe(True);
+end;
+
+procedure TWatAsmTests.TestMemArgSignedIsUnknownOperator;
+begin
+  { A memarg align/offset value is a uN — no sign. A leading `-`/`+` makes the
+    whole `align=…`/`offset=…` a reserved token: `unknown operator <token>`,
+    NOT a range or power-of-two error (simd_align.wast:104 align=-1,
+    simd_address.wast:112 offset=-1; design §c.6/§d.1). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (memory 1) (func (result v128)' +
+    '  (v128.load align=-1 (i32.const 0))))'),
+    'unknown operator')).ToBe(True);
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (memory 1) (func (result v128)' +
+    '  (v128.load offset=-1 (i32.const 0))))'),
+    'unknown operator')).ToBe(True);
+  { The offending token is appended after the prefix. }
+  Expect<string>(AssembleError(
+    '(module (memory 1) (func i32.const 0 i32.load align=-1 drop))'))
+    .ToBe('unknown operator align=-1');
+  { A well-formed but oversized power-of-two align is NOT a text error — it
+    reaches the validator's natural-alignment check (align.wast:1016). }
+  Expect<string>(ValidateOutcome(
+    '(module (memory 1) (func i32.const 0' +
+    '  i32.load offset=0xFFFFFFFFFFFFFFFF align=0x8000000000000000 drop))'))
+    .ToBe('validation error');
+end;
+
+procedure TWatAsmTests.TestVectorConstCountBeforeValue;
+begin
+  { A short lane list is `wrong number of lane literals` even when the tokens
+    present are themselves out of range — the COUNT is checked before any value
+    is parsed (simd_const.wast:480). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const i32x4' +
+    '  0x10000000000000000 0x10000000000000000) drop))'),
+    MSG_WRONG_LANE_LITERALS)).ToBe(True);
+  { A `nan:1` lane (non-hex payload) is CONSUMED as the lane and rejected as
+    `unknown operator`, not cut short as a count error (simd_const.wast:384). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const f32x4 nan:1 nan:1 nan:1 nan:1) drop))'),
+    'unknown operator')).ToBe(True);
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (v128.const f64x2 nan:1 nan:1) drop))'),
+    'unknown operator')).ToBe(True);
+  { A signed lane INDEX with `+` is unexpected token (simd_lane.wast:877). }
+  Expect<Boolean>(StartsWith(AssembleError(
+    '(module (func (param v128) (result i32)' +
+    '  (i8x16.extract_lane_u +0x0f (local.get 0))))'),
+    MSG_UNEXPECTED_TOKEN)).ToBe(True);
+end;
+
 procedure TWatAsmTests.SetupTests;
 begin
   Test('an empty module (and bare fields) decode to zero sections',
@@ -951,6 +1271,22 @@ begin
     TestNanPatternsInConst);
   Test('br_on_cast emits its opcode once and round-trips (INV-1)',
     TestBrOnCastRoundTrip);
+  Test('v128.const all six shapes emit 16 little-endian bytes',
+    TestVectorConstAllShapes);
+  Test('i8x16.shuffle, extract/replace_lane, swizzle and a LEB subopcode',
+    TestVectorShuffleAndLanes);
+  Test('vector load/store memarg and the memidx-vs-lane lookahead',
+    TestVectorMemoryAndLaneLookahead);
+  Test('vector immediate error cases (counts, ranges, alignment)',
+    TestVectorImmediateErrors);
+  Test('table explicit-init expr and non-funcref active elem (table.wast:19)',
+    TestTableInitExpr);
+  Test('inline (memory i64 (data …)) keeps the i64 address type',
+    TestInlineMemDataAddrType);
+  Test('a signed align=/offset= is unknown operator (simd_align.wast:104)',
+    TestMemArgSignedIsUnknownOperator);
+  Test('v128.const checks lane COUNT before value (simd_const.wast:480)',
+    TestVectorConstCountBeforeValue);
 end;
 
 begin

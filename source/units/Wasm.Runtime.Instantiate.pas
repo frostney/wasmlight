@@ -100,9 +100,9 @@ type
   end;
 
 const
-  { The evaluator's else branch. Track G appends `v128.const`, which IS a
-    constant instruction in the spec; until then the whole $FD space fails
-    in the validator and cannot reach here. }
+  { The evaluator's else branch. `v128.const` IS a constant instruction
+    (valid-vconst) and is handled above; the rest of the $FD space is not
+    constant and never reaches the evaluator. }
   MSG_UNSUPPORTED_CONST_OP = 'unsupported constant instruction';
 
 { Evaluate one constant expression against a (possibly partially built)
@@ -136,6 +136,14 @@ const
 function EvalInitExpr(const AStore: TWasmStore;
   const AInstance: TWasmModuleInstance;
   const AExpr: TWasmIrInitExpr): TWasmValue;
+
+{ The v128 twin: a constant expression whose result is a vector (a
+  `v128.const`, or a `global.get` of an imported v128 global) yields 16
+  bytes, which do not fit a TWasmValue. Reads the result register PAIR
+  (simd-spec §1.7). }
+function EvalInitExprV128(const AStore: TWasmStore;
+  const AInstance: TWasmModuleInstance;
+  const AExpr: TWasmIrInitExpr): TWasmV128;
 
 { Instantiate AIr into AStore.
 
@@ -229,9 +237,14 @@ begin
   Result := AInstance.EngineTypeIds[ATypeIndex];
 end;
 
-function EvalInitExpr(const AStore: TWasmStore;
+{ The shared evaluator. AResult points at the caller's TWasmValue (scalar)
+  or TWasmV128 (AResultIsVec); the result register is read as 8 or 16 bytes
+  accordingly. Splitting scalar/vector at the boundary keeps the frame
+  scratch buffer and the collector frame chain in one place. }
+procedure EvalInitExprCore(const AStore: TWasmStore;
   const AInstance: TWasmModuleInstance;
-  const AExpr: TWasmIrInitExpr): TWasmValue;
+  const AExpr: TWasmIrInitExpr; const AResult: Pointer;
+  const AResultIsVec: Boolean);
 var
   Frame: PWasmValue;
   GcFrame: TWasmGcFrame;
@@ -253,7 +266,6 @@ var
   end;
 
 begin
-  Result.Bits := 0;
   if Length(AExpr.Code) = 0 then
     raise EWasmError.Create(
       'internal: evaluating an absent constant expression');
@@ -302,6 +314,17 @@ begin
         begin
           CheckReg(Instr.Dest, Count, 'f64.const');
           Slot(Instr.Dest)^.Bits := UInt64(Instr.Imm);
+        end;
+
+      iroV128Const:
+        begin
+          { The 16 immediate bytes travel as an aux block (simd-spec §2.2),
+            read verbatim into the result register PAIR. v128.const IS a
+            constant instruction (valid-vconst). }
+          CheckReg(Instr.Dest, Count, 'v128.const');
+          CheckReg(Instr.Dest + 1, Count, 'v128.const high half');
+          IrAuxReadV128(AExpr.AuxU32, UInt32(Instr.Imm),
+            PWasmV128(Slot(Instr.Dest))^);
         end;
 
       iroI32Add, iroI32Sub, iroI32Mul:
@@ -379,8 +402,16 @@ begin
             raise EWasmError.CreateFmt(
               'internal: global.get names global %u of %u',
               [GlobalIndex, UInt32(Length(AInstance.GlobalAddrs))]);
-          Slot(Instr.Dest)^ :=
-            AStore.Globals[AInstance.GlobalAddrs[GlobalIndex]].Value;
+          Addr := AInstance.GlobalAddrs[GlobalIndex];
+          if AStore.Globals[Addr].GlobalType.ValueType.Kind = wvkVec then
+          begin
+            { A v128 global's cell is the 16-byte Vec side (simd-spec §1.7);
+              copy the pair into the result register pair. }
+            CheckReg(Instr.Dest + 1, Count, 'global.get high half');
+            PWasmV128(Slot(Instr.Dest))^ := AStore.Globals[Addr].Vec;
+          end
+          else
+            Slot(Instr.Dest)^ := AStore.Globals[Addr].Value;
         end;
 
       iroAnyConvertExtern, iroExternConvertAny:
@@ -473,11 +504,31 @@ begin
   end;
 
   CheckReg(AExpr.ResultReg, Count, 'result');
-  Result := Slot(AExpr.ResultReg)^;
+  if AResultIsVec then
+  begin
+    CheckReg(AExpr.ResultReg + 1, Count, 'result high half');
+    Move(Slot(AExpr.ResultReg)^, AResult^, 16);
+  end
+  else
+    PWasmValue(AResult)^ := Slot(AExpr.ResultReg)^;
 
   finally
     AStore.Heap.PopFrame;
   end;
+end;
+
+function EvalInitExpr(const AStore: TWasmStore;
+  const AInstance: TWasmModuleInstance;
+  const AExpr: TWasmIrInitExpr): TWasmValue;
+begin
+  EvalInitExprCore(AStore, AInstance, AExpr, @Result, False);
+end;
+
+function EvalInitExprV128(const AStore: TWasmStore;
+  const AInstance: TWasmModuleInstance;
+  const AExpr: TWasmIrInitExpr): TWasmV128;
+begin
+  EvalInitExprCore(AStore, AInstance, AExpr, @Result, True);
 end;
 
 { --- link errors --------------------------------------------------------- }
@@ -762,7 +813,6 @@ var
   TypeId: TWasmEngineTypeId;
   Addr: UInt32;
   DefinedFuncs: Integer;
-  GlobalValue: TWasmValue;
   TableInit: TWasmRef;
   ElemRefs: TSegmentRefsList;
   RootHandles: array of TWasmRootHandle;
@@ -829,9 +879,16 @@ begin
   for Index := 0 to High(AIr.GlobalInits) do
   begin
     ModuleIndex := AIr.GlobalImportCount + UInt32(Index);
-    GlobalValue := EvalInitExpr(AStore, Instance, AIr.GlobalInits[Index]);
-    Addr := AStore.AddGlobal(
-      EngineGlobalType(AIr.Globals[ModuleIndex], TypeIds), GlobalValue);
+    if AIr.Globals[ModuleIndex].ValueType.Kind = wvkVec then
+      { A v128 global stores its 16-byte initial value in the Vec cell
+        (simd-spec §1.7). }
+      Addr := AStore.AddGlobalVec(
+        EngineGlobalType(AIr.Globals[ModuleIndex], TypeIds),
+        EvalInitExprV128(AStore, Instance, AIr.GlobalInits[Index]))
+    else
+      Addr := AStore.AddGlobal(
+        EngineGlobalType(AIr.Globals[ModuleIndex], TypeIds),
+        EvalInitExpr(AStore, Instance, AIr.GlobalInits[Index]));
     SetLength(Instance.GlobalAddrs, Length(Instance.GlobalAddrs) + 1);
     Instance.GlobalAddrs[High(Instance.GlobalAddrs)] := Addr;
   end;

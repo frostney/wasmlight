@@ -131,7 +131,8 @@ type
     procedure TestRejectsUnknownFunction;
     procedure TestRejectsUnknownType;
     procedure TestRejectsNonAggregateTypeIndex;
-    procedure TestRejectsSimd;
+    procedure TestAcceptsV128Const;
+    procedure TestRejectsNonConstSimd;
   end;
 
 { --- TByteBuf ------------------------------------------------------------ }
@@ -670,19 +671,29 @@ begin
     [$01, $6E, $00, $FB, $00, $00, $0B]);
 end;
 
-{ --- negatives: staged SIMD ---------------------------------------------- }
+{ --- SIMD in constant expressions ---------------------------------------- }
 
-procedure TValidatorConstTests.TestRejectsSimd;
+{ v128.const ($FD 12) IS a constant instruction (`valid-vconst`,
+  `Instr_const/vconst`): it validates in a global initialiser and emits
+  iroV128Const with its 16 bytes in an aux block. }
+procedure TValidatorConstTests.TestAcceptsV128Const;
 begin
-  { v128.const ($FD 12) IS a constant instruction in the spec
-    (`Instr_const/vconst`), so this case is not about constness: SIMD
-    typing is staged to Track G and must fail visibly rather than being
-    silently accepted. }
-  ExpectInvalid('v128.const in a constant expression',
-    MSG_SIMD_NOT_IMPLEMENTED,
-    [$01, $7B, $00, $FD, $0C,
-     $00, $00, $00, $00, $00, $00, $00, $00,
-     $00, $00, $00, $00, $00, $00, $00, $00, $0B]);
+  BuildGlobals([$01, $7B, $00, $FD, $0C,
+    $00, $01, $02, $03, $04, $05, $06, $07,
+    $08, $09, $0A, $0B, $0C, $0D, $0E, $0F, $0B]);
+  ExpectIr('v128.const in a global init', ValidateAt(0),
+    IrLine(0, 'v128.const',
+      'r0 <- v128:000102030405060708090a0b0c0d0e0f'));
+end;
+
+{ Every OTHER $FD subopcode is non-constant and gets the ordinary
+  message, not a SIMD-specific one: i8x16.splat ($FD 15) is rejected as
+  not a constant instruction. }
+procedure TValidatorConstTests.TestRejectsNonConstSimd;
+begin
+  ExpectInvalid('i8x16.splat in a constant expression',
+    MSG_CONSTANT_EXPRESSION_REQUIRED,
+    [$01, $7B, $00, $41, $00, $FD, $0F, $0B]);
 end;
 
 { --- registration -------------------------------------------------------- }
@@ -736,7 +747,9 @@ begin
   Test('rejects an unknown type index', TestRejectsUnknownType);
   Test('rejects an aggregate instruction on a function type',
     TestRejectsNonAggregateTypeIndex);
-  Test('rejects the staged SIMD space', TestRejectsSimd);
+  Test('accepts v128.const as a constant instruction',
+    TestAcceptsV128Const);
+  Test('rejects a non-const SIMD instruction', TestRejectsNonConstSimd);
 end;
 
 begin

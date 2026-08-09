@@ -123,7 +123,32 @@ type
     procedure TestBodyEndBeforeSpanEnd;
     procedure TestMisplacedElse;
     procedure TestUnknownOpcode;
-    procedure TestSimdIsStaged;
+
+    { $FD vector typing + IR emission (Track G) }
+    procedure TestVectorConstEmitsIr;
+    procedure TestVectorSplatExtractLane;
+    procedure TestVectorReplaceLane;
+    procedure TestVectorArithmetic;
+    procedure TestVectorShift;
+    procedure TestVectorCompare;
+    procedure TestVectorBitmask;
+    procedure TestVectorShuffle;
+    procedure TestVectorBitselect;
+    procedure TestVectorLoad;
+    procedure TestVectorStore;
+    procedure TestVectorLoadLane;
+    procedure TestVectorRegisterModel;
+    procedure TestVectorExtractLaneOutOfRange;
+    procedure TestVectorShuffleLaneOutOfRange;
+    procedure TestVectorOperandTypeMismatch;
+    procedure TestVectorLoadAlignmentTooLarge;
+    procedure TestVectorUnassignedSubopcodeIsMalformed;
+    procedure TestVectorGlobalEmitsVecOps;
+    procedure TestVectorSelectEmitsVecOp;
+    procedure TestVectorStructFieldEmitsVecOps;
+    procedure TestVectorArrayElementEmitsVecOps;
+    procedure TestBrTablePolymorphicMeetKeepsBottom;
+
     procedure TestBrTableCountIsBoundedByTheBytesLeft;
     procedure TestArrayNewFixedCountIsBoundedByTheStack;
     procedure TestArrayNewFixedIsPolymorphicInDeadCode;
@@ -176,6 +201,7 @@ type
 
     { --- exception handling ------------------------------------------ }
     procedure TestTryTableTwoCatchKinds;
+    procedure TestCatchRefDeliversNonNullExnRef;
     procedure TestThrowRefIsStackPolymorphic;
     procedure TestThrowWithNonEmptyResultTag;
     procedure TestUnknownTag;
@@ -1088,14 +1114,402 @@ begin
   ExpectMalformed('an unassigned opcode', MSG_ILLEGAL_OPCODE + ' 06');
 end;
 
-{ SIMD typing is Track G by the roadmap's staging. The subopcode is read
-  first so the message can name it, and it is NEVER silently accepted. }
-procedure TValidatorBodyTests.TestSimdIsStaged;
+{ --- $FD vector typing and IR emission (Track G) --------------------------
+
+  A v128 value is a register PAIR: IrAllocReg even-aligns a wvkVec result,
+  local.get/set of a v128 emit move.v128, and the 16-byte v128.const
+  immediate rides in an aux block. The disassembly pins the lowering. }
+
+{ v128.const: [] -> [v128], its 16 bytes rendered in memory order. }
+procedure TValidatorBodyTests.TestVectorConstEmitsIr;
+begin
+  Build(B([$01, $60, $00, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]),
+      Cat(B([$FD, $0C, $00, $01, $02, $03, $04, $05, $06, $07, $08, $09,
+              $0A, $0B, $0C, $0D, $0E, $0F]), B([$0B]))));
+
+  ExpectIr('v128.const',
+    L(0, 'v128.const', 'r2 <- v128:000102030405060708090a0b0c0d0e0f') + #10
+    + L(1, 'move.v128', 'r0 <- r2') + #10
+    + L(2, 'return', ''));
+end;
+
+{ A v128 global reads/writes its 16-byte cell through the dedicated *Vec
+  ops the validator emits (SIMD design §1.7/§2.4), never the scalar
+  global.get/set that only carries 8 bytes. }
+procedure TValidatorBodyTests.TestVectorGlobalEmitsVecOps;
+var
+  S: TModuleSections;
+  Ir: string;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $00, $00]);
+  S.FuncSec := B([$01, $00]);
+  { one mutable v128 global, initialised by `v128.const 0` }
+  S.GlobalSec := B([$01, $7B, $01, $FD, $0C,
+    $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $0B]);
+  S.CodeSec := Code1(B([$00]), B([$23, $00, $24, $00, $0B]));
+  BuildAll(S);
+
+  Ir := DescribeIrFunction(ValidateAt(0));
+  Expect<Boolean>((Pos('global.get.v128', Ir) > 0)
+    and (Pos('global.set.v128', Ir) > 0)).ToBe(True);
+end;
+
+{ An untyped select over two v128 operands lowers to iroSelectVec, a
+  16-byte conditional copy. }
+procedure TValidatorBodyTests.TestVectorSelectEmitsVecOp;
+begin
+  { func () -> (v128): two v128 consts, an i32 condition, untyped select. }
+  Build(B([$01, $60, $00, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]),
+      B([$FD, $0C, $00, $00, $00, $00, $00, $00, $00, $00,
+                   $00, $00, $00, $00, $00, $00, $00, $00,
+         $FD, $0C, $00, $00, $00, $00, $00, $00, $00, $00,
+                   $00, $00, $00, $00, $00, $00, $00, $00,
+         $41, $00, $1B, $0B])));
+  Expect<Boolean>(Pos('select.v128',
+    DescribeIrFunction(ValidateAt(0))) > 0).ToBe(True);
+end;
+
+{ struct.get / struct.set on a v128 field emit the *Vec forms. Packed
+  storage is never v128, so get_s/get_u never reach a vector field. }
+procedure TValidatorBodyTests.TestVectorStructFieldEmitsVecOps;
+var
+  Ir: string;
+begin
+  { type0 func()->(); type1 (struct (mut v128)). }
+  Build(B([$02, $60, $00, $00, $5F, $01, $7B, $01]), B([$01, $00]), nil,
+    Code1(B([$00]),
+      B([$D0, $01, $FB, $02, $01, $00, $1A,   { ref.null 1; struct.get 1 0; drop }
+         $D0, $01,                            { ref.null 1 }
+         $FD, $0C, $00, $00, $00, $00, $00, $00, $00, $00,
+                   $00, $00, $00, $00, $00, $00, $00, $00,
+         $FB, $05, $01, $00, $0B])));         { struct.set 1 0; end }
+  Ir := DescribeIrFunction(ValidateAt(0));
+  Expect<Boolean>((Pos('struct.get.v128', Ir) > 0)
+    and (Pos('struct.set.v128', Ir) > 0)).ToBe(True);
+end;
+
+{ array.get / array.set / array.fill on a v128 element emit the *Vec
+  forms. }
+procedure TValidatorBodyTests.TestVectorArrayElementEmitsVecOps;
+var
+  Ir: string;
+begin
+  { type0 func()->(); type1 (array (mut v128)). }
+  Build(B([$02, $60, $00, $00, $5E, $7B, $01]), B([$01, $00]), nil,
+    Code1(B([$00]),
+      B([$D0, $01, $41, $00, $FB, $0B, $01, $1A, { array.get 1; drop }
+         $D0, $01, $41, $00,
+         $FD, $0C, $00, $00, $00, $00, $00, $00, $00, $00,
+                   $00, $00, $00, $00, $00, $00, $00, $00,
+         $FB, $0E, $01,                          { array.set 1 }
+         $D0, $01, $41, $00,
+         $FD, $0C, $00, $00, $00, $00, $00, $00, $00, $00,
+                   $00, $00, $00, $00, $00, $00, $00, $00,
+         $41, $00, $FB, $10, $01, $0B])));       { array.fill 1; end }
+  Ir := DescribeIrFunction(ValidateAt(0));
+  Expect<Boolean>((Pos('array.get.v128', Ir) > 0)
+    and (Pos('array.set.v128', Ir) > 0)
+    and (Pos('array.fill.v128', Ir) > 0)).ToBe(True);
+end;
+
+{ The unreached-valid.wast "meet-bottom" shape: after `unreachable`, a
+  br_table whose targets carry DIFFERENT label types (f32 inner, f64
+  outer) must still validate, because each popped operand is Bot and the
+  spec algorithm re-pushes that Bot — not the concrete label type. A
+  regression here re-raises a spurious `expected f64, found f32`. }
+procedure TValidatorBodyTests.TestBrTablePolymorphicMeetKeepsBottom;
 begin
   Build(B([$01, $60, $00, $00]), B([$01, $00]), nil,
-    Code1(B([$00]), B([$FD, $00, $00, $00, $0B])));
+    Code1(B([$00]),
+      B([$02, $7C,                       { block (result f64) }
+         $02, $7D,                       { block (result f32) }
+         $00,                            { unreachable }
+         $41, $01,                       { i32.const 1 }
+         $0E, $02, $00, $01, $01,        { br_table 0 1 (default 1) }
+         $0B,                            { end inner }
+         $1A,                            { drop }
+         $44, $00, $00, $00, $00, $00, $00, $00, $00,  { f64.const 0 }
+         $0B,                            { end outer }
+         $1A,                            { drop }
+         $0B])));                        { end func }
+  { Validation succeeds; ValidateAt raises on an invalid body. }
+  Expect<Boolean>(Length(DescribeIrFunction(ValidateAt(0))) > 0).ToBe(True);
+end;
 
-  ExpectInvalid('a $FD vector instruction', MSG_SIMD_NOT_IMPLEMENTED);
+{ splat is [scalar] -> [v128]; extract_lane is [v128] -> [scalar] with a
+  lane immediate; the i32 result moves with a plain (scalar) move. }
+procedure TValidatorBodyTests.TestVectorSplatExtractLane;
+begin
+  Build(B([$01, $60, $00, $01, $7F]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$41, $05, $FD, $0F, $FD, $15, $03, $0B])));
+
+  ExpectIr('i8x16.splat then i8x16.extract_lane_s',
+    L(0, 'i32.const', 'r1 <- 5') + #10
+    + L(1, 'i8x16.splat', 'r2 <- r1') + #10
+    + L(2, 'i8x16.extract_lane_s', 'r4 <- r2 lane=3') + #10
+    + L(3, 'move', 'r0 <- r4') + #10
+    + L(4, 'return', ''));
+end;
+
+{ replace_lane is [v128 scalar] -> [v128] with a lane immediate. }
+procedure TValidatorBodyTests.TestVectorReplaceLane;
+begin
+  Build(B([$01, $60, $02, $7B, $7F, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $20, $01, $FD, $17, $02, $0B])));
+
+  ExpectIr('i8x16.replace_lane',
+    L(0, 'move.v128', 'r6 <- r0') + #10
+    + L(1, 'move', 'r8 <- r2') + #10
+    + L(2, 'i8x16.replace_lane', 'r10 <- r6, r8 lane=2') + #10
+    + L(3, 'move.v128', 'r4 <- r10') + #10
+    + L(4, 'return', ''));
+end;
+
+{ binary arith [v128 v128] -> [v128]; the two v128 params are moved with
+  move.v128 and the return v128 is even-aligned at r4. }
+procedure TValidatorBodyTests.TestVectorArithmetic;
+begin
+  Build(B([$01, $60, $02, $7B, $7B, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $20, $01, $FD, $6E, $0B])));
+
+  ExpectIr('i8x16.add',
+    L(0, 'move.v128', 'r6 <- r0') + #10
+    + L(1, 'move.v128', 'r8 <- r2') + #10
+    + L(2, 'i8x16.add', 'r10 <- r6, r8') + #10
+    + L(3, 'move.v128', 'r4 <- r10') + #10
+    + L(4, 'return', ''));
+end;
+
+{ shift is [v128 i32] -> [v128]: the count operand is a plain i32 register
+  (moved with a scalar move), the vector with move.v128. }
+procedure TValidatorBodyTests.TestVectorShift;
+begin
+  Build(B([$01, $60, $02, $7B, $7F, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $20, $01, $FD, $6B, $0B])));
+
+  ExpectIr('i8x16.shl',
+    L(0, 'move.v128', 'r6 <- r0') + #10
+    + L(1, 'move', 'r8 <- r2') + #10
+    + L(2, 'i8x16.shl', 'r10 <- r6, r8') + #10
+    + L(3, 'move.v128', 'r4 <- r10') + #10
+    + L(4, 'return', ''));
+end;
+
+{ a compare is an ordinary binary [v128 v128] -> [v128]. }
+procedure TValidatorBodyTests.TestVectorCompare;
+begin
+  Build(B([$01, $60, $02, $7B, $7B, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $20, $01, $FD, $37, $0B])));
+
+  ExpectIr('i32x4.eq',
+    L(0, 'move.v128', 'r6 <- r0') + #10
+    + L(1, 'move.v128', 'r8 <- r2') + #10
+    + L(2, 'i32x4.eq', 'r10 <- r6, r8') + #10
+    + L(3, 'move.v128', 'r4 <- r10') + #10
+    + L(4, 'return', ''));
+end;
+
+{ bitmask is [v128] -> [i32]; the i32 result is a scalar register. }
+procedure TValidatorBodyTests.TestVectorBitmask;
+begin
+  Build(B([$01, $60, $01, $7B, $01, $7F]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $FD, $64, $0B])));
+
+  ExpectIr('i8x16.bitmask',
+    L(0, 'move.v128', 'r4 <- r0') + #10
+    + L(1, 'i8x16.bitmask', 'r6 <- r4') + #10
+    + L(2, 'move', 'r2 <- r6') + #10
+    + L(3, 'return', ''));
+end;
+
+{ shuffle is [v128 v128] -> [v128]; the 16 lane bytes render decimal. }
+procedure TValidatorBodyTests.TestVectorShuffle;
+begin
+  Build(B([$01, $60, $02, $7B, $7B, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]),
+      Cat(B([$20, $00, $20, $01, $FD, $0D, $00, $01, $02, $03, $04, $05,
+              $06, $07, $08, $09, $0A, $0B, $0C, $0D, $0E, $0F]),
+        B([$0B]))));
+
+  ExpectIr('i8x16.shuffle',
+    L(0, 'move.v128', 'r6 <- r0') + #10
+    + L(1, 'move.v128', 'r8 <- r2') + #10
+    + L(2, 'i8x16.shuffle',
+        'r10 <- r6, r8 lanes[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]') + #10
+    + L(3, 'move.v128', 'r4 <- r10') + #10
+    + L(4, 'return', ''));
+end;
+
+{ bitselect is the ternary form: three v128 sources, the third in Imm. }
+procedure TValidatorBodyTests.TestVectorBitselect;
+begin
+  Build(B([$01, $60, $03, $7B, $7B, $7B, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $20, $01, $20, $02, $FD, $52, $0B])));
+
+  ExpectIr('v128.bitselect',
+    L(0, 'move.v128', 'r8 <- r0') + #10
+    + L(1, 'move.v128', 'r10 <- r2') + #10
+    + L(2, 'move.v128', 'r12 <- r4') + #10
+    + L(3, 'v128.bitselect', 'r14 <- r8, r10 ? r12') + #10
+    + L(4, 'move.v128', 'r6 <- r14') + #10
+    + L(5, 'return', ''));
+end;
+
+{ v128.load is [at] -> [v128], memarg the same shape as a scalar load. }
+procedure TValidatorBodyTests.TestVectorLoad;
+var
+  S: TModuleSections;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $01, $7F, $01, $7B]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $00, $01]);
+  S.CodeSec := Code1(B([$00]), B([$20, $00, $FD, $00, $04, $00, $0B]));
+  BuildAll(S);
+
+  ExpectIr('v128.load',
+    L(0, 'move', 'r4 <- r0') + #10
+    + L(1, 'v128.load', 'r6 <- [r4 + 0] mem=0') + #10
+    + L(2, 'move.v128', 'r2 <- r6') + #10
+    + L(3, 'return', ''));
+end;
+
+{ v128.store is [at v128] -> []; the value rides in Dest, like a scalar
+  store, so one address path serves both. }
+procedure TValidatorBodyTests.TestVectorStore;
+var
+  S: TModuleSections;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $02, $7F, $7B, $00]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $00, $01]);
+  S.CodeSec := Code1(B([$00]),
+    B([$20, $00, $20, $01, $FD, $0B, $04, $00, $0B]));
+  BuildAll(S);
+
+  ExpectIr('v128.store',
+    L(0, 'move', 'r4 <- r0') + #10
+    + L(1, 'move.v128', 'r6 <- r2') + #10
+    + L(2, 'v128.store', '[r4 + 0] <- r6 mem=0') + #10
+    + L(3, 'return', ''));
+end;
+
+{ load8_lane is [at v128] -> [v128] with a memarg AND a lane; B holds the
+  source vector, the memarg+lane ride in an aux block. }
+procedure TValidatorBodyTests.TestVectorLoadLane;
+var
+  S: TModuleSections;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $02, $7F, $7B, $01, $7B]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $00, $01]);
+  S.CodeSec := Code1(B([$00]),
+    B([$20, $00, $20, $01, $FD, $54, $00, $00, $05, $0B]));
+  BuildAll(S);
+
+  ExpectIr('v128.load8_lane',
+    L(0, 'move', 'r6 <- r0') + #10
+    + L(1, 'move.v128', 'r8 <- r2') + #10
+    + L(2, 'v128.load8_lane', 'r10 <- [r6 + 0] mem=0 lane=5, r8') + #10
+    + L(3, 'move.v128', 'r4 <- r10') + #10
+    + L(4, 'return', ''));
+end;
+
+{ The register model, asserted directly: a function with a v128 local and
+  a (ref extern) local. The v128 takes two even-aligned slots (0,1), the
+  ref one (2); RefRegBits sets the ref's bit alone, RegisterCount counts
+  SLOTS, and LocalRegs maps each wasm local to its low register. }
+procedure TValidatorBodyTests.TestVectorRegisterModel;
+var
+  Fn: TWasmIrFunction;
+
+  function BitSet(const AReg: Integer): Boolean;
+  begin
+    Result := (AReg div 32 < Length(Fn.RefRegBits))
+      and (((Fn.RefRegBits[AReg div 32] shr (AReg mod 32)) and 1) = 1);
+  end;
+
+begin
+  { locals: 1 v128 ($7B), 1 externref ($6F, nullable); empty body. }
+  Build(B([$01, $60, $00, $00]), B([$01, $00]), nil,
+    Code1(B([$02, $01, $7B, $01, $6F]), B([$0B])));
+  Fn := ValidateAt(0);
+
+  { Slots: v128 local at 0..1, ref local at 2; the count is rounded up to
+    an even 4 (SIMD design §1.5), the pad at slot 3 a dead i32. }
+  Expect<UInt32>(Fn.RegisterCount).ToBe(4);
+  Expect<Integer>(Length(Fn.LocalRegs)).ToBe(2);
+  Expect<UInt32>(Fn.LocalRegs[0]).ToBe(0);   { v128 local -> low slot 0 }
+  Expect<UInt32>(Fn.LocalRegs[1]).ToBe(2);   { ref local -> slot 2 }
+  { The reference bit is set for the ref's slot and clear over the v128
+    pair — the GC never scans a v128 slot. }
+  Expect<Boolean>(BitSet(0)).ToBe(False);
+  Expect<Boolean>(BitSet(1)).ToBe(False);
+  Expect<Boolean>(BitSet(2)).ToBe(True);
+end;
+
+{ Lane index >= the shape's lane count is a VALIDATION error, not a
+  malformation: 4 is a fine byte but i32x4 has only 4 lanes (0..3). }
+procedure TValidatorBodyTests.TestVectorExtractLaneOutOfRange;
+begin
+  Build(B([$01, $60, $01, $7B, $01, $7F]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $FD, $1B, $04, $0B])));
+
+  ExpectInvalid('i32x4.extract_lane with lane 4', MSG_INVALID_LANE_INDEX);
+end;
+
+{ A shuffle lane index >= 32 is likewise invalid; 255 parses as a byte. }
+procedure TValidatorBodyTests.TestVectorShuffleLaneOutOfRange;
+begin
+  Build(B([$01, $60, $02, $7B, $7B, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]),
+      Cat(B([$20, $00, $20, $01, $FD, $0D, $FF, $01, $02, $03, $04, $05,
+              $06, $07, $08, $09, $0A, $0B, $0C, $0D, $0E, $0F]),
+        B([$0B]))));
+
+  ExpectInvalid('i8x16.shuffle with lane 255', MSG_INVALID_LANE_INDEX);
+end;
+
+{ A v128 op with a wrong operand type is the ordinary type mismatch: here
+  i8x16.add is handed an i32 where it wants a v128. }
+procedure TValidatorBodyTests.TestVectorOperandTypeMismatch;
+begin
+  Build(B([$01, $60, $01, $7B, $01, $7B]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$20, $00, $41, $00, $FD, $6E, $0B])));
+
+  ExpectInvalid('i8x16.add with an i32 operand', MSG_TYPE_MISMATCH);
+end;
+
+{ An alignment above the access's natural alignment is invalid — v128.load
+  is 16-byte, natural 2^4, so align=2^5 is rejected. }
+procedure TValidatorBodyTests.TestVectorLoadAlignmentTooLarge;
+var
+  S: TModuleSections;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $01, $7F, $01, $7B]);
+  S.FuncSec := B([$01, $00]);
+  S.MemorySec := B([$01, $00, $01]);
+  S.CodeSec := Code1(B([$00]), B([$20, $00, $FD, $00, $05, $00, $0B]));
+  BuildAll(S);
+
+  ExpectInvalid('v128.load align 2^5', MSG_ALIGNMENT_TOO_LARGE);
+end;
+
+{ An UNASSIGNED $FD subopcode stays a DECODE error — the malformed/invalid
+  split the conformance suite asserts. 154 is one of the 20 gaps. }
+procedure TValidatorBodyTests.TestVectorUnassignedSubopcodeIsMalformed;
+begin
+  Build(B([$01, $60, $00, $00]), B([$01, $00]), nil,
+    Code1(B([$00]), B([$FD, $9A, $01, $0B])));
+
+  ExpectMalformed('a $FD unassigned subopcode', 'unknown $FD subopcode');
 end;
 
 { ALLOCATION BOUNDS, all four of them, because a hostile count is not a
@@ -1874,6 +2288,42 @@ begin
     + '  catch_all_ref -> @0005 payload (r0)');
 end;
 
+{ A caught exnref is NON-NULL: `catch_ref` / `catch_all_ref` deliver a
+  `(ref exn)`, never a nullable `exnref`, because a caught exception object
+  always exists (valid-try_table -> Catch_ok; exec-handler binds the live
+  exnaddr). So a `catch_ref` whose target label expects `(ref exn)` must
+  VALIDATE — this is the try_table.wast:420 `catch_ref1` shape. Building the
+  payload as a nullable exnref rejected it (a `(ref null exn)` payload does not
+  satisfy a non-null `(ref exn)` label), which was the H2-flagged bug.
+
+  Module: one tag `$e : [] -> []`, one function `[] -> []`. Body:
+    (block (result (ref exn))          ;; label $l expects [(ref exn)]
+      (try_table (catch_ref $e 0))     ;; deliver [(ref exn)] to $l
+      (unreachable))                   ;; fall-through is dead -> block result ok
+    (drop)                             ;; drop the block's (ref exn)
+  `(ref exn)` as a value/blocktype is the long-form non-null ref $64 $69 (exn).
+  The clause's label index 0 resolves in the PRE-PUSH control stack to $l. }
+procedure TValidatorBodyTests.TestCatchRefDeliversNonNullExnRef;
+var
+  S: TModuleSections;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $00, $00]);   { type 0: func [] -> [] }
+  S.FuncSec := B([$01, $00]);             { one func, type 0 }
+  S.TagSec := B([$01, $00, $00]);         { one tag, attr 0, type 0 }
+  S.CodeSec := Code1(B([$00]),
+    B([$02, $64, $69,                     { block (result (ref exn)) }
+       $1F, $40, $01, $01, $00, $00,      { try_table [] (catch_ref tag0 label0) }
+       $0B,                               { end try_table }
+       $00,                               { unreachable }
+       $0B,                               { end block }
+       $1A,                               { drop the (ref exn) }
+       $0B]));                            { end func }
+  BuildAll(S);
+
+  ExpectAccepted('catch_ref delivering a (ref exn) into a (ref exn) label');
+end;
+
 { `syntax-tagtype`: "The result type is empty for exception tags". A tag
   whose function type returns something would push a result `throw` never
   produces. }
@@ -1970,8 +2420,31 @@ begin
     TestBodyEndBeforeSpanEnd);
   Test('a misplaced else is malformed', TestMisplacedElse);
   Test('an unassigned opcode is malformed', TestUnknownOpcode);
-  Test('SIMD validation is staged, never silently accepted',
-    TestSimdIsStaged);
+
+  Test('v128.const lowers to an aux immediate', TestVectorConstEmitsIr);
+  Test('splat and extract_lane lower', TestVectorSplatExtractLane);
+  Test('replace_lane lowers', TestVectorReplaceLane);
+  Test('a v128 binary op lowers', TestVectorArithmetic);
+  Test('a v128 shift lowers', TestVectorShift);
+  Test('a v128 compare lowers', TestVectorCompare);
+  Test('bitmask lowers to an i32', TestVectorBitmask);
+  Test('shuffle lowers with its 16-lane mask', TestVectorShuffle);
+  Test('bitselect lowers as a ternary', TestVectorBitselect);
+  Test('v128.load lowers', TestVectorLoad);
+  Test('v128.store lowers', TestVectorStore);
+  Test('v128.load8_lane lowers', TestVectorLoadLane);
+  Test('the v128 register model (pair + ref bit)',
+    TestVectorRegisterModel);
+  Test('an out-of-range extract lane is invalid',
+    TestVectorExtractLaneOutOfRange);
+  Test('an out-of-range shuffle lane is invalid',
+    TestVectorShuffleLaneOutOfRange);
+  Test('a wrong v128 operand type is a type mismatch',
+    TestVectorOperandTypeMismatch);
+  Test('a too-large v128 load alignment is invalid',
+    TestVectorLoadAlignmentTooLarge);
+  Test('an unassigned $FD subopcode is malformed',
+    TestVectorUnassignedSubopcodeIsMalformed);
   Test('br_table''s label count is bounded by the bytes left',
     TestBrTableCountIsBoundedByTheBytesLeft);
   Test('array.new_fixed''s count is bounded by the value stack',
@@ -2053,10 +2526,23 @@ begin
 
   Test('try_table records a handler range and its catch clauses',
     TestTryTableTwoCatchKinds);
+  Test('catch_ref delivers a non-null (ref exn) to its label',
+    TestCatchRefDeliversNonNullExnRef);
   Test('throw_ref is stack-polymorphic', TestThrowRefIsStackPolymorphic);
   Test('throw with a non-empty tag result type is rejected',
     TestThrowWithNonEmptyResultTag);
   Test('an out-of-range tag index is unknown', TestUnknownTag);
+
+  Test('a v128 global emits global.get.v128 / global.set.v128',
+    TestVectorGlobalEmitsVecOps);
+  Test('an untyped select over v128 emits select.v128',
+    TestVectorSelectEmitsVecOp);
+  Test('a v128 struct field emits struct.get.v128 / struct.set.v128',
+    TestVectorStructFieldEmitsVecOps);
+  Test('a v128 array element emits array.get/set/fill.v128',
+    TestVectorArrayElementEmitsVecOps);
+  Test('br_table in unreachable code meets differing label types at Bot',
+    TestBrTablePolymorphicMeetKeepsBottom);
 end;
 
 begin

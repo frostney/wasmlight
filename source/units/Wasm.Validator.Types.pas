@@ -106,6 +106,14 @@ const
   MSG_DUPLICATE_EXPORT_NAME = 'duplicate export name';
   MSG_INVALID_RESULT_ARITY = 'invalid result arity';
   MSG_ALIGNMENT_TOO_LARGE = 'alignment must not be larger than natural';
+  { A lane immediate that names a lane the shape does not have — an
+    extract/replace lane at or above the shape's lane count, or a shuffle
+    lane index at or above 32 (`valid-vshuffle`, `valid-vextract_lane`,
+    `valid-vreplace_lane`, and the *_lane memory forms). This is a
+    VALIDATION rule, not a malformation: the byte 255 parses fine and is
+    rejected here, whereas a lane above 255 fails in the assembler.
+    Corpus-confirmed as `assert_invalid` across 9 simd_*.wast files. }
+  MSG_INVALID_LANE_INDEX = 'invalid lane index';
   MSG_UNDECLARED_FUNCTION_REFERENCE = 'undeclared function reference';
   { Writing through an immutable handle. Upstream spells the space in the
     noun, not "X is immutable": a mutable-global write is `immutable
@@ -144,8 +152,6 @@ const
     against the upstream testsuite by review 2026-08-08: upstream asserts
     `uninitialized local`. }
   MSG_UNINITIALIZED_LOCAL = 'uninitialized local';
-  { Project-local, by the Track B contract: SIMD typing is Track G. }
-  MSG_SIMD_NOT_IMPLEMENTED = 'SIMD validation is not implemented';
 
   { The bottom heap type. BOT "is a bottom type that matches all value
     types … Similarly, BOT is also used as a bottom type of all heap

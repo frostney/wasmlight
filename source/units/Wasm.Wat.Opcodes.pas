@@ -12,18 +12,20 @@
   against the ranges Wasm.Decoder.Expr already enforces.
 
   The grammar (the Track C assembler) consumes this table and never
-  hard-codes an opcode; Track G appends ~256 vector rows to it without
-  touching the grammar, which is why the table is data-driven and lives in
-  its own unit (.agent/design/wat-assembler.md §6).
+  hard-codes an opcode; the table is data-driven and lives in its own unit
+  (.agent/design/wat-assembler.md §6) so that families can be appended
+  without touching the grammar.
 
-  SIMD is out of scope here. The whole $FD vector space — including the
-  v128 loads/stores that the spec files under the "memory" category — is
-  Track G and is deliberately absent, marked by the GAP note in
-  the builder. An assembler that finds no row for a mnemonic reports it as
-  the reserved-token / unknown-operator case; that is the lexer's and the
-  assembler's job, so a missing row here is exactly the right signal, and
-  obsolete spellings the format dropped (`get_local`, `i32.wrap/i64`, …)
-  are simply never added.
+  The $FD vector space is present: BuildVector adds the 256 assigned
+  subopcodes (0..275 minus the 20 unassigned), including the v128
+  loads/stores the spec files under the "memory" category. Four immediate
+  shapes are unique to it — wisV128Const, wisShuffle, wisLane,
+  wisMemArgLane — the rest reuse wisNone (plain-$FD ops with only stack
+  operands) and wisMemArg (the plain load/store family, with a natural
+  alignment). An assembler that finds no row for a mnemonic reports it as
+  the reserved-token / unknown-operator case; a missing row is the right
+  signal, and obsolete spellings the format dropped (`get_local`,
+  `i32.wrap/i64`, …) are simply never added.
 
   https://webassembly.github.io/spec/core/binary/instructions.html }
 unit Wasm.Wat.Opcodes;
@@ -76,7 +78,13 @@ type
     wisDataMem,       { dataidx then memidx }
     wisMemMem,        { memidx then memidx }
     wisElemTable,     { elemidx then tableidx }
-    wisTableTable     { tableidx then tableidx }
+    wisTableTable,    { tableidx then tableidx }
+
+    { $FD vector immediate shapes (Track G). }
+    wisV128Const,     { v128.const: a shape keyword then N lane literals }
+    wisShuffle,       { i8x16.shuffle: 16 bare lane indices }
+    wisLane,          { extract/replace_lane: one laneidx byte }
+    wisMemArgLane     { load/store lane: a memarg then one laneidx byte }
   );
 
   { One instruction row. For a single-byte opcode HasPrefix is False and
@@ -97,7 +105,7 @@ type
     Mnemonic: string;
     HasPrefix: Boolean;
     Prefix: Byte;
-    Opcode: Byte;
+    Opcode: UInt32;   { was Byte — $FD vector subopcodes reach 275 }
     Shape: TWasmImmShape;
     NaturalAlignLog2: Byte;
   end;
@@ -107,6 +115,7 @@ type
 const
   OPCODE_PREFIX_FB = $FB;  { aggregate / GC space }
   OPCODE_PREFIX_FC = $FC;  { saturating truncation + bulk memory/table }
+  OPCODE_PREFIX_FD = $FD;  { vector (v128 / SIMD) space }
 
 { Looks up a text mnemonic. Returns False for any spelling not in the
   table — an unknown mnemonic, an obsolete keyword, or a vector
@@ -178,6 +187,27 @@ begin
   Info.Opcode := ASub;
   Info.Shape := AShape;
   Info.NaturalAlignLog2 := 0;
+  if FTable.ContainsKey(AMnemonic) then
+    Inc(FDuplicates);
+  FTable.AddOrSetValue(AMnemonic, Info);
+end;
+
+{ Adds a $FD vector row: the prefix is fixed, the subopcode is a u32 (the
+  encoder writes it as a u32 LEB after the prefix byte), the shape is one of
+  the vector shapes (or wisNone / wisMemArg for the plain families), and
+  AAlignLog2 is the natural alignment (meaningful only for wisMemArg /
+  wisMemArgLane). }
+procedure AddVec(const AMnemonic: string; const ASub: UInt32;
+  const AShape: TWasmImmShape; const AAlignLog2: Byte);
+var
+  Info: TWasmOpcodeInfo;
+begin
+  Info.Mnemonic := AMnemonic;
+  Info.HasPrefix := True;
+  Info.Prefix := OPCODE_PREFIX_FD;
+  Info.Opcode := ASub;
+  Info.Shape := AShape;
+  Info.NaturalAlignLog2 := AAlignLog2;
   if FTable.ContainsKey(AMnemonic) then
     Inc(FDuplicates);
   FTable.AddOrSetValue(AMnemonic, Info);
@@ -471,9 +501,313 @@ begin
   AddP('ref.i31', OPCODE_PREFIX_FB, 28, wisNone);
   AddP('i31.get_s', OPCODE_PREFIX_FB, 29, wisNone);
   AddP('i31.get_u', OPCODE_PREFIX_FB, 30, wisNone);
+end;
 
-  { GAP — the $FD vector space (v128 loads/stores, lane ops, splats,
-    shuffles) is Track G and is intentionally not added here. }
+{ The $FD vector space — 256 assigned subopcodes (0..275 minus the 20
+  unassigned). Subopcodes and mnemonics are the pinned spec's (wasm-mcp
+  spec/main @ d7b37e4, instruction_list category=vec and the 22 v128.* the
+  spec files under category=memory), NOT recalled. Natural alignments for
+  the memory families are from simd_align.wast (the align= upstream marks
+  assert_invalid is one power of two above natural).
+
+  ONE deliberate deviation from the spec's text: the f64x2 relaxed-trunc
+  ops (subopcodes 259/260) are spelled i32x4.relaxed_trunc_f64x2_s / _u
+  WITHOUT the _zero suffix, matching the IR registry (Wasm.Ir) so the
+  assembler, disassembler, and corpus comparator share one spelling. }
+procedure BuildVector;
+begin
+  { --- memory: whole/packed/splat/store — memarg (0..11) ------------- }
+  AddVec('v128.load', 0, wisMemArg, 4);
+  AddVec('v128.load8x8_s', 1, wisMemArg, 3);
+  AddVec('v128.load8x8_u', 2, wisMemArg, 3);
+  AddVec('v128.load16x4_s', 3, wisMemArg, 3);
+  AddVec('v128.load16x4_u', 4, wisMemArg, 3);
+  AddVec('v128.load32x2_s', 5, wisMemArg, 3);
+  AddVec('v128.load32x2_u', 6, wisMemArg, 3);
+  AddVec('v128.load8_splat', 7, wisMemArg, 0);
+  AddVec('v128.load16_splat', 8, wisMemArg, 1);
+  AddVec('v128.load32_splat', 9, wisMemArg, 2);
+  AddVec('v128.load64_splat', 10, wisMemArg, 3);
+  AddVec('v128.store', 11, wisMemArg, 4);
+
+  { --- const and shuffle — 16-byte immediate (12..13) --------------- }
+  AddVec('v128.const', 12, wisV128Const, 0);
+  AddVec('i8x16.shuffle', 13, wisShuffle, 0);
+
+  { --- swizzle and splat (14..20) ----------------------------------- }
+  AddVec('i8x16.swizzle', 14, wisNone, 0);
+  AddVec('i8x16.splat', 15, wisNone, 0);
+  AddVec('i16x8.splat', 16, wisNone, 0);
+  AddVec('i32x4.splat', 17, wisNone, 0);
+  AddVec('i64x2.splat', 18, wisNone, 0);
+  AddVec('f32x4.splat', 19, wisNone, 0);
+  AddVec('f64x2.splat', 20, wisNone, 0);
+
+  { --- lane access — one laneidx byte (21..34) ---------------------- }
+  AddVec('i8x16.extract_lane_s', 21, wisLane, 0);
+  AddVec('i8x16.extract_lane_u', 22, wisLane, 0);
+  AddVec('i8x16.replace_lane', 23, wisLane, 0);
+  AddVec('i16x8.extract_lane_s', 24, wisLane, 0);
+  AddVec('i16x8.extract_lane_u', 25, wisLane, 0);
+  AddVec('i16x8.replace_lane', 26, wisLane, 0);
+  AddVec('i32x4.extract_lane', 27, wisLane, 0);
+  AddVec('i32x4.replace_lane', 28, wisLane, 0);
+  AddVec('i64x2.extract_lane', 29, wisLane, 0);
+  AddVec('i64x2.replace_lane', 30, wisLane, 0);
+  AddVec('f32x4.extract_lane', 31, wisLane, 0);
+  AddVec('f32x4.replace_lane', 32, wisLane, 0);
+  AddVec('f64x2.extract_lane', 33, wisLane, 0);
+  AddVec('f64x2.replace_lane', 34, wisLane, 0);
+
+  { --- comparisons (35..76) ----------------------------------------- }
+  AddVec('i8x16.eq', 35, wisNone, 0);
+  AddVec('i8x16.ne', 36, wisNone, 0);
+  AddVec('i8x16.lt_s', 37, wisNone, 0);
+  AddVec('i8x16.lt_u', 38, wisNone, 0);
+  AddVec('i8x16.gt_s', 39, wisNone, 0);
+  AddVec('i8x16.gt_u', 40, wisNone, 0);
+  AddVec('i8x16.le_s', 41, wisNone, 0);
+  AddVec('i8x16.le_u', 42, wisNone, 0);
+  AddVec('i8x16.ge_s', 43, wisNone, 0);
+  AddVec('i8x16.ge_u', 44, wisNone, 0);
+  AddVec('i16x8.eq', 45, wisNone, 0);
+  AddVec('i16x8.ne', 46, wisNone, 0);
+  AddVec('i16x8.lt_s', 47, wisNone, 0);
+  AddVec('i16x8.lt_u', 48, wisNone, 0);
+  AddVec('i16x8.gt_s', 49, wisNone, 0);
+  AddVec('i16x8.gt_u', 50, wisNone, 0);
+  AddVec('i16x8.le_s', 51, wisNone, 0);
+  AddVec('i16x8.le_u', 52, wisNone, 0);
+  AddVec('i16x8.ge_s', 53, wisNone, 0);
+  AddVec('i16x8.ge_u', 54, wisNone, 0);
+  AddVec('i32x4.eq', 55, wisNone, 0);
+  AddVec('i32x4.ne', 56, wisNone, 0);
+  AddVec('i32x4.lt_s', 57, wisNone, 0);
+  AddVec('i32x4.lt_u', 58, wisNone, 0);
+  AddVec('i32x4.gt_s', 59, wisNone, 0);
+  AddVec('i32x4.gt_u', 60, wisNone, 0);
+  AddVec('i32x4.le_s', 61, wisNone, 0);
+  AddVec('i32x4.le_u', 62, wisNone, 0);
+  AddVec('i32x4.ge_s', 63, wisNone, 0);
+  AddVec('i32x4.ge_u', 64, wisNone, 0);
+  AddVec('f32x4.eq', 65, wisNone, 0);
+  AddVec('f32x4.ne', 66, wisNone, 0);
+  AddVec('f32x4.lt', 67, wisNone, 0);
+  AddVec('f32x4.gt', 68, wisNone, 0);
+  AddVec('f32x4.le', 69, wisNone, 0);
+  AddVec('f32x4.ge', 70, wisNone, 0);
+  AddVec('f64x2.eq', 71, wisNone, 0);
+  AddVec('f64x2.ne', 72, wisNone, 0);
+  AddVec('f64x2.lt', 73, wisNone, 0);
+  AddVec('f64x2.gt', 74, wisNone, 0);
+  AddVec('f64x2.le', 75, wisNone, 0);
+  AddVec('f64x2.ge', 76, wisNone, 0);
+
+  { --- bitwise and the whole-vector test (77..83) ------------------- }
+  AddVec('v128.not', 77, wisNone, 0);
+  AddVec('v128.and', 78, wisNone, 0);
+  AddVec('v128.andnot', 79, wisNone, 0);
+  AddVec('v128.or', 80, wisNone, 0);
+  AddVec('v128.xor', 81, wisNone, 0);
+  AddVec('v128.bitselect', 82, wisNone, 0);
+  AddVec('v128.any_true', 83, wisNone, 0);
+
+  { --- memory: lane and zero — memarg+laneidx / memarg (84..93) ----- }
+  AddVec('v128.load8_lane', 84, wisMemArgLane, 0);
+  AddVec('v128.load16_lane', 85, wisMemArgLane, 1);
+  AddVec('v128.load32_lane', 86, wisMemArgLane, 2);
+  AddVec('v128.load64_lane', 87, wisMemArgLane, 3);
+  AddVec('v128.store8_lane', 88, wisMemArgLane, 0);
+  AddVec('v128.store16_lane', 89, wisMemArgLane, 1);
+  AddVec('v128.store32_lane', 90, wisMemArgLane, 2);
+  AddVec('v128.store64_lane', 91, wisMemArgLane, 3);
+  AddVec('v128.load32_zero', 92, wisMemArg, 2);
+  AddVec('v128.load64_zero', 93, wisMemArg, 3);
+
+  { --- float conversions (94..95) ----------------------------------- }
+  AddVec('f32x4.demote_f64x2_zero', 94, wisNone, 0);
+  AddVec('f64x2.promote_low_f32x4', 95, wisNone, 0);
+
+  { --- i8x16 unary/narrow, f32x4 rounding, i8x16 arith (96..127) ---- }
+  AddVec('i8x16.abs', 96, wisNone, 0);
+  AddVec('i8x16.neg', 97, wisNone, 0);
+  AddVec('i8x16.popcnt', 98, wisNone, 0);
+  AddVec('i8x16.all_true', 99, wisNone, 0);
+  AddVec('i8x16.bitmask', 100, wisNone, 0);
+  AddVec('i8x16.narrow_i16x8_s', 101, wisNone, 0);
+  AddVec('i8x16.narrow_i16x8_u', 102, wisNone, 0);
+  AddVec('f32x4.ceil', 103, wisNone, 0);
+  AddVec('f32x4.floor', 104, wisNone, 0);
+  AddVec('f32x4.trunc', 105, wisNone, 0);
+  AddVec('f32x4.nearest', 106, wisNone, 0);
+  AddVec('i8x16.shl', 107, wisNone, 0);
+  AddVec('i8x16.shr_s', 108, wisNone, 0);
+  AddVec('i8x16.shr_u', 109, wisNone, 0);
+  AddVec('i8x16.add', 110, wisNone, 0);
+  AddVec('i8x16.add_sat_s', 111, wisNone, 0);
+  AddVec('i8x16.add_sat_u', 112, wisNone, 0);
+  AddVec('i8x16.sub', 113, wisNone, 0);
+  AddVec('i8x16.sub_sat_s', 114, wisNone, 0);
+  AddVec('i8x16.sub_sat_u', 115, wisNone, 0);
+  AddVec('f64x2.ceil', 116, wisNone, 0);
+  AddVec('f64x2.floor', 117, wisNone, 0);
+  AddVec('i8x16.min_s', 118, wisNone, 0);
+  AddVec('i8x16.min_u', 119, wisNone, 0);
+  AddVec('i8x16.max_s', 120, wisNone, 0);
+  AddVec('i8x16.max_u', 121, wisNone, 0);
+  AddVec('f64x2.trunc', 122, wisNone, 0);
+  AddVec('i8x16.avgr_u', 123, wisNone, 0);
+  AddVec('i16x8.extadd_pairwise_i8x16_s', 124, wisNone, 0);
+  AddVec('i16x8.extadd_pairwise_i8x16_u', 125, wisNone, 0);
+  AddVec('i32x4.extadd_pairwise_i16x8_s', 126, wisNone, 0);
+  AddVec('i32x4.extadd_pairwise_i16x8_u', 127, wisNone, 0);
+
+  { --- i16x8 (128..159; 154 unassigned) ----------------------------- }
+  AddVec('i16x8.abs', 128, wisNone, 0);
+  AddVec('i16x8.neg', 129, wisNone, 0);
+  AddVec('i16x8.q15mulr_sat_s', 130, wisNone, 0);
+  AddVec('i16x8.all_true', 131, wisNone, 0);
+  AddVec('i16x8.bitmask', 132, wisNone, 0);
+  AddVec('i16x8.narrow_i32x4_s', 133, wisNone, 0);
+  AddVec('i16x8.narrow_i32x4_u', 134, wisNone, 0);
+  AddVec('i16x8.extend_low_i8x16_s', 135, wisNone, 0);
+  AddVec('i16x8.extend_high_i8x16_s', 136, wisNone, 0);
+  AddVec('i16x8.extend_low_i8x16_u', 137, wisNone, 0);
+  AddVec('i16x8.extend_high_i8x16_u', 138, wisNone, 0);
+  AddVec('i16x8.shl', 139, wisNone, 0);
+  AddVec('i16x8.shr_s', 140, wisNone, 0);
+  AddVec('i16x8.shr_u', 141, wisNone, 0);
+  AddVec('i16x8.add', 142, wisNone, 0);
+  AddVec('i16x8.add_sat_s', 143, wisNone, 0);
+  AddVec('i16x8.add_sat_u', 144, wisNone, 0);
+  AddVec('i16x8.sub', 145, wisNone, 0);
+  AddVec('i16x8.sub_sat_s', 146, wisNone, 0);
+  AddVec('i16x8.sub_sat_u', 147, wisNone, 0);
+  AddVec('f64x2.nearest', 148, wisNone, 0);
+  AddVec('i16x8.mul', 149, wisNone, 0);
+  AddVec('i16x8.min_s', 150, wisNone, 0);
+  AddVec('i16x8.min_u', 151, wisNone, 0);
+  AddVec('i16x8.max_s', 152, wisNone, 0);
+  AddVec('i16x8.max_u', 153, wisNone, 0);
+  AddVec('i16x8.avgr_u', 155, wisNone, 0);
+  AddVec('i16x8.extmul_low_i8x16_s', 156, wisNone, 0);
+  AddVec('i16x8.extmul_high_i8x16_s', 157, wisNone, 0);
+  AddVec('i16x8.extmul_low_i8x16_u', 158, wisNone, 0);
+  AddVec('i16x8.extmul_high_i8x16_u', 159, wisNone, 0);
+
+  { --- i32x4 (160..191; 162,165,166,175,176,178..180,187 unassigned) - }
+  AddVec('i32x4.abs', 160, wisNone, 0);
+  AddVec('i32x4.neg', 161, wisNone, 0);
+  AddVec('i32x4.all_true', 163, wisNone, 0);
+  AddVec('i32x4.bitmask', 164, wisNone, 0);
+  AddVec('i32x4.extend_low_i16x8_s', 167, wisNone, 0);
+  AddVec('i32x4.extend_high_i16x8_s', 168, wisNone, 0);
+  AddVec('i32x4.extend_low_i16x8_u', 169, wisNone, 0);
+  AddVec('i32x4.extend_high_i16x8_u', 170, wisNone, 0);
+  AddVec('i32x4.shl', 171, wisNone, 0);
+  AddVec('i32x4.shr_s', 172, wisNone, 0);
+  AddVec('i32x4.shr_u', 173, wisNone, 0);
+  AddVec('i32x4.add', 174, wisNone, 0);
+  AddVec('i32x4.sub', 177, wisNone, 0);
+  AddVec('i32x4.mul', 181, wisNone, 0);
+  AddVec('i32x4.min_s', 182, wisNone, 0);
+  AddVec('i32x4.min_u', 183, wisNone, 0);
+  AddVec('i32x4.max_s', 184, wisNone, 0);
+  AddVec('i32x4.max_u', 185, wisNone, 0);
+  AddVec('i32x4.dot_i16x8_s', 186, wisNone, 0);
+  AddVec('i32x4.extmul_low_i16x8_s', 188, wisNone, 0);
+  AddVec('i32x4.extmul_high_i16x8_s', 189, wisNone, 0);
+  AddVec('i32x4.extmul_low_i16x8_u', 190, wisNone, 0);
+  AddVec('i32x4.extmul_high_i16x8_u', 191, wisNone, 0);
+
+  { --- i64x2 (192..223; 194,197,198,207,208,210..212 unassigned) ---- }
+  AddVec('i64x2.abs', 192, wisNone, 0);
+  AddVec('i64x2.neg', 193, wisNone, 0);
+  AddVec('i64x2.all_true', 195, wisNone, 0);
+  AddVec('i64x2.bitmask', 196, wisNone, 0);
+  AddVec('i64x2.extend_low_i32x4_s', 199, wisNone, 0);
+  AddVec('i64x2.extend_high_i32x4_s', 200, wisNone, 0);
+  AddVec('i64x2.extend_low_i32x4_u', 201, wisNone, 0);
+  AddVec('i64x2.extend_high_i32x4_u', 202, wisNone, 0);
+  AddVec('i64x2.shl', 203, wisNone, 0);
+  AddVec('i64x2.shr_s', 204, wisNone, 0);
+  AddVec('i64x2.shr_u', 205, wisNone, 0);
+  AddVec('i64x2.add', 206, wisNone, 0);
+  AddVec('i64x2.sub', 209, wisNone, 0);
+  AddVec('i64x2.mul', 213, wisNone, 0);
+  AddVec('i64x2.eq', 214, wisNone, 0);
+  AddVec('i64x2.ne', 215, wisNone, 0);
+  AddVec('i64x2.lt_s', 216, wisNone, 0);
+  AddVec('i64x2.gt_s', 217, wisNone, 0);
+  AddVec('i64x2.le_s', 218, wisNone, 0);
+  AddVec('i64x2.ge_s', 219, wisNone, 0);
+  AddVec('i64x2.extmul_low_i32x4_s', 220, wisNone, 0);
+  AddVec('i64x2.extmul_high_i32x4_s', 221, wisNone, 0);
+  AddVec('i64x2.extmul_low_i32x4_u', 222, wisNone, 0);
+  AddVec('i64x2.extmul_high_i32x4_u', 223, wisNone, 0);
+
+  { --- f32x4 / f64x2 arithmetic (224..247; 226,238 unassigned) ------ }
+  AddVec('f32x4.abs', 224, wisNone, 0);
+  AddVec('f32x4.neg', 225, wisNone, 0);
+  AddVec('f32x4.sqrt', 227, wisNone, 0);
+  AddVec('f32x4.add', 228, wisNone, 0);
+  AddVec('f32x4.sub', 229, wisNone, 0);
+  AddVec('f32x4.mul', 230, wisNone, 0);
+  AddVec('f32x4.div', 231, wisNone, 0);
+  AddVec('f32x4.min', 232, wisNone, 0);
+  AddVec('f32x4.max', 233, wisNone, 0);
+  AddVec('f32x4.pmin', 234, wisNone, 0);
+  AddVec('f32x4.pmax', 235, wisNone, 0);
+  AddVec('f64x2.abs', 236, wisNone, 0);
+  AddVec('f64x2.neg', 237, wisNone, 0);
+  AddVec('f64x2.sqrt', 239, wisNone, 0);
+  AddVec('f64x2.add', 240, wisNone, 0);
+  AddVec('f64x2.sub', 241, wisNone, 0);
+  AddVec('f64x2.mul', 242, wisNone, 0);
+  AddVec('f64x2.div', 243, wisNone, 0);
+  AddVec('f64x2.min', 244, wisNone, 0);
+  AddVec('f64x2.max', 245, wisNone, 0);
+  AddVec('f64x2.pmin', 246, wisNone, 0);
+  AddVec('f64x2.pmax', 247, wisNone, 0);
+
+  { --- conversions (248..255) --------------------------------------- }
+  AddVec('i32x4.trunc_sat_f32x4_s', 248, wisNone, 0);
+  AddVec('i32x4.trunc_sat_f32x4_u', 249, wisNone, 0);
+  AddVec('f32x4.convert_i32x4_s', 250, wisNone, 0);
+  AddVec('f32x4.convert_i32x4_u', 251, wisNone, 0);
+  AddVec('i32x4.trunc_sat_f64x2_s_zero', 252, wisNone, 0);
+  AddVec('i32x4.trunc_sat_f64x2_u_zero', 253, wisNone, 0);
+  AddVec('f64x2.convert_low_i32x4_s', 254, wisNone, 0);
+  AddVec('f64x2.convert_low_i32x4_u', 255, wisNone, 0);
+
+  { --- relaxed SIMD — the 20 3.0 additions (256..275) --------------- }
+  AddVec('i8x16.relaxed_swizzle', 256, wisNone, 0);
+  AddVec('i32x4.relaxed_trunc_f32x4_s', 257, wisNone, 0);
+  AddVec('i32x4.relaxed_trunc_f32x4_u', 258, wisNone, 0);
+  { 259/260 are spelled WITHOUT _zero to match the IR registry (see note), but
+    the pinned corpus (testsuite@de54fd27, i32x4_relaxed_trunc.wast) writes the
+    older _zero spelling — so the assembler ALSO accepts _s_zero / _u_zero as
+    text aliases onto the same subopcodes. Only the text→opcode direction gains
+    the alias; the IR/disassembler keep the single _s / _u spelling. }
+  AddVec('i32x4.relaxed_trunc_f64x2_s', 259, wisNone, 0);
+  AddVec('i32x4.relaxed_trunc_f64x2_u', 260, wisNone, 0);
+  AddVec('i32x4.relaxed_trunc_f64x2_s_zero', 259, wisNone, 0);
+  AddVec('i32x4.relaxed_trunc_f64x2_u_zero', 260, wisNone, 0);
+  AddVec('f32x4.relaxed_madd', 261, wisNone, 0);
+  AddVec('f32x4.relaxed_nmadd', 262, wisNone, 0);
+  AddVec('f64x2.relaxed_madd', 263, wisNone, 0);
+  AddVec('f64x2.relaxed_nmadd', 264, wisNone, 0);
+  AddVec('i8x16.relaxed_laneselect', 265, wisNone, 0);
+  AddVec('i16x8.relaxed_laneselect', 266, wisNone, 0);
+  AddVec('i32x4.relaxed_laneselect', 267, wisNone, 0);
+  AddVec('i64x2.relaxed_laneselect', 268, wisNone, 0);
+  AddVec('f32x4.relaxed_min', 269, wisNone, 0);
+  AddVec('f32x4.relaxed_max', 270, wisNone, 0);
+  AddVec('f64x2.relaxed_min', 271, wisNone, 0);
+  AddVec('f64x2.relaxed_max', 272, wisNone, 0);
+  AddVec('i16x8.relaxed_q15mulr_s', 273, wisNone, 0);
+  AddVec('i16x8.relaxed_dot_i8x16_i7x16_s', 274, wisNone, 0);
+  AddVec('i32x4.relaxed_dot_i8x16_i7x16_add_s', 275, wisNone, 0);
 end;
 
 procedure BuildTable;
@@ -487,6 +821,7 @@ begin
   BuildRef;
   BuildMisc;
   BuildAggregate;
+  BuildVector;
 end;
 
 function LookupOpcode(const AMnemonic: string;

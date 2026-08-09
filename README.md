@@ -14,11 +14,14 @@ from text — to a running module: the bounds-checked binary reader with
 full LEB128 handling, the decoded module model, the structural decoder, the
 validator that emits the register IR, the runtime layer below the tier seam
 (store, instances, the memory-access chokepoint, traps, instantiation, and
-the precise collector), the interpreter tier that executes the IR, and a
-wat text-format assembler. It is driven by `wasmlight inspect` / `wasmlight
+the precise collector), and the interpreter tier that executes the IR — the
+**complete core wasm 3.0 instruction set**, `v128` SIMD and exception
+handling (`throw` / `throw_ref` / `try_table`) included — plus a wat
+text-format assembler. It is driven by `wasmlight inspect` / `wasmlight
 validate`, and `wasmspec` runs the upstream conformance corpus — assembling
-text modules, validating, instantiating, and executing the assertions. The
-baseline JIT and AOT tiers and the host surface are staged in
+text modules, validating, instantiating, and executing the assertions, SIMD
+judged per lane and `assert_exception` judged. The baseline JIT and AOT
+tiers (performance, not behaviour) and the host surface are staged in
 [docs/roadmap.md](docs/roadmap.md) — that file, not this one, is the honest
 picture of what exists.
 
@@ -59,13 +62,15 @@ modules, validating, instantiating, and executing `assert_return` /
 ```text
 $ ./build/wasmspec tests/spec/testsuite
 ...
-ROOT      pass=38367 fail=88  skip=25239 staged=1620 total=65314
-PROPOSALS pass=533   fail=356 skip=922   staged=0    total=1811
-TOTAL files=288 errors=0 pass=38900 fail=444 skip=26161 staged=1620 total=67125
+ROOT      pass=64651 fail=52  skip=611  staged=0 total=65314
+PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
+TOTAL files=288 errors=0 pass=65184 fail=408 skip=1533 staged=0 total=67125
 ```
 
-`staged` is the vector text awaiting Track G; the failures are dominated by
-post-3.0 proposals outside the pinned 3.0 target, not 3.0 regressions.
+SIMD is judged per lane (Track G) and exception handling is judged (Track
+H), so `staged` is 0 and the interpreter executes all of core wasm 3.0; the
+failures are dominated by post-3.0 proposals outside the pinned 3.0 target,
+not 3.0 regressions.
 
 For the full command set and every development command, see
 [docs/quick-start.md](docs/quick-start.md) and

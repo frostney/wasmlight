@@ -14,13 +14,10 @@
   for what each one covers and how to regenerate the corpus.
 
   The corpus is also the validator's cross-check: every valid fixture must
-  VALIDATE, with exactly one deliberate exception. simd.wat is the only
-  source in the corpus that uses v128 (verified by reading the .wat
-  sources), and vector typing is staged to Track G, so simd.wasm must be
-  rejected with the staged prefix rather than accepted — silently
-  accepting an instruction family nobody has type-checked is the failure
-  this test exists to prevent, and it is also what will tell the next
-  reader that the staging is over when it starts failing.
+  VALIDATE. simd.wat is the only source in the corpus that uses v128; with
+  Track G landed it now decodes and validates cleanly (and, imports
+  permitting, instantiates), so it is asserted like any other valid
+  fixture rather than held out as staged.
 
   Test programs run with the repository root as the working directory
   (verified), so the relative paths below resolve. }
@@ -89,7 +86,7 @@ type
     procedure TestEveryValidFixtureDecodes;
     procedure TestEveryMalformedFixtureIsRejected;
     procedure TestEveryValidFixtureValidates;
-    procedure TestSimdValidationIsStaged;
+    procedure TestSimdValidates;
     procedure TestExportsIr;
     procedure TestReftypesIr;
     procedure TestDataCountPrecedesCode;
@@ -259,9 +256,9 @@ end;
   byte arrays prove the rules match our reading of the spec, this proves
   they match what wabt emits and wasm-tools independently validated.
 
-  Every fixture but simd.wasm must validate. simd.wasm is asserted
-  separately (below) rather than merely skipped here, so that the staging
-  is a claim the suite makes rather than a hole in it. }
+  Every valid fixture must validate, simd.wasm included (Track G): its
+  dedicated assertion below adds an IR-shape check, but it is no longer
+  held out of the sweep. }
 procedure TFixtureTests.TestEveryValidFixtureValidates;
 var
   Files: TStringList;
@@ -273,8 +270,6 @@ begin
   try
     for I := 0 to Files.Count - 1 do
     begin
-      if ExtractFileName(Files[I]) = SIMD_FIXTURE then
-        Continue;
       Error := TryValidate(Files[I]);
       if Error <> '' then
         Failures := Failures + #10 + '  ' + Files[I] + ': ' + Error;
@@ -288,31 +283,21 @@ begin
   Expect<string>(Failures).ToBe('');
 end;
 
-{ Vector typing is Track G by the roadmap's staging, and the Track B
-  contract requires the body walk to FAIL on a $FD prefix rather than
-  accept it. simd.wat is the only source in the corpus that uses v128, so
-  this is the only fixture the staging touches.
-
-  The CLASS matters as much as the prefix: a $FD instruction is perfectly
-  well formed, so this must be EWasmValidationError and never a decode
-  error. When Track G lands, this test flips to an assertion that
-  simd.wasm validates — it does not get deleted. }
-procedure TFixtureTests.TestSimdValidationIsStaged;
+{ Track G landed: simd.wat's v128 instructions now decode AND validate.
+  simd.wasm is the only fixture that exercises the vector path end to end,
+  so this asserts a clean validation (no decode or validation error) and a
+  non-empty lowered function set — the IR the vector tiers consume. }
+procedure TFixtureTests.TestSimdValidates;
 var
-  Error, Outcome: string;
+  Error: string;
 begin
   Error := TryValidate(NativePath(VALID_DIR + '/' + SIMD_FIXTURE));
+  Expect<string>(Error).ToBe('');
 
-  if Error = '' then
-    Outcome := 'ACCEPTED'
-  else if Copy(Error, 1, Length('EWasmValidationError: '
-    + MSG_SIMD_NOT_IMPLEMENTED)) = 'EWasmValidationError: '
-    + MSG_SIMD_NOT_IMPLEMENTED then
-    Outcome := 'staged'
-  else
-    Outcome := Error;
-
-  Expect<string>(Outcome).ToBe('staged');
+  { A validated module lowers to at least one function; TryValidate leaves
+    the assembled IR in FIr on success. }
+  ValidateValid(SIMD_FIXTURE);
+  Expect<Boolean>(Length(FIr.Functions) > 0).ToBe(True);
 end;
 
 { --- per-fixture IR expectations -----------------------------------------
@@ -629,10 +614,9 @@ begin
   Test('every valid fixture decodes', TestEveryValidFixtureDecodes);
   Test('every malformed fixture is rejected',
     TestEveryMalformedFixtureIsRejected);
-  Test('every valid fixture but simd.wasm validates',
-    TestEveryValidFixtureValidates);
-  Test('simd.wasm is staged out of validation',
-    TestSimdValidationIsStaged);
+  Test('every valid fixture validates', TestEveryValidFixtureValidates);
+  Test('simd.wasm decodes and validates (Track G)',
+    TestSimdValidates);
   Test('exports.wasm lowers to the IR its source implies', TestExportsIr);
   Test('reftypes.wasm lowers to the IR its source implies',
     TestReftypesIr);

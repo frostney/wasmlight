@@ -103,6 +103,39 @@ type
     function Describe: string;
   end;
 
+  { The runtime representation of a v128 value — the SHARED shape both the
+    interpreter's register file and the GC's struct/array storage read and
+    write through (.agent/design/simd-spec.md §1.3). It is deliberately a
+    plain 16-byte value record with NO managed fields, so it may live on a
+    frame a trap unwind can skip (ADR-0009) and be copied with a raw Move.
+
+    A v128 register occupies TWO adjacent 8-byte slots of the register file
+    (§1.3): TWasmValue stays exactly 8 bytes, and a v128 is never read or
+    written through TWasmValue's fields — only through a PWasmV128 aliasing
+    the two slots. The two slots are the low half first.
+
+    LANE ORDER is little-endian WITHIN the vector: lane i of a shape t x N
+    occupies bytes [i*w, (i+1)*w), which is exactly the 16 literal bytes of
+    a binary v128.const immediate (§1.3, spec syntax-laneidx). The variant
+    arms below ARE the lane accessors; index them directly (V.U32[2],
+    V.F64[1], V.B[15]). No arm interprets a word numerically for storage —
+    aux round-trips copy raw bytes — so this record is endian-safe as a
+    byte container. }
+  PWasmV128 = ^TWasmV128;
+  TWasmV128 = packed record
+    case Integer of
+      0: (B:   array[0..15] of Byte);
+      1: (U16: array[0..7] of Word);
+      2: (U32: array[0..3] of UInt32);
+      3: (U64: array[0..1] of UInt64);
+      4: (F32: array[0..3] of Single);
+      5: (F64: array[0..1] of Double);
+  end;
+
+{$IF SizeOf(TWasmV128) <> 16}
+  {$MESSAGE ERROR 'TWasmV128 must be exactly 16 bytes; see the header in Wasm.Core'}
+{$IFEND}
+
   { Address types index a linear memory or a table; Wasm 3.0 makes both
     64-bit addressable. The address type is carried INSIDE the limits
     encoding (a flag bit), not next to it, which is why decoding limits
@@ -266,13 +299,36 @@ type
   { Error hierarchy. The distinction is the spec's, and it is load-bearing:
     a decode error means the bytes are not a module, a validation error
     means they are a module that is not well-typed, a link error means the
-    imports could not be satisfied, and a trap means well-typed code failed
-    at run time. Hosts discriminate on these, so never collapse them. }
+    imports could not be satisfied, a trap means well-typed code failed at
+    run time, and an uncaught WebAssembly exception means well-typed code
+    threw and no handler caught it before the invocation boundary. Hosts
+    discriminate on these, so never collapse them. EWasmException and
+    EWasmTrap are SIBLINGS under EWasmError, never one under the other: an
+    uncaught guest exception is a distinct outcome from a trap, and the host
+    (and the .wast runner's assert_exception judge) tells them apart. }
   EWasmError = class(Exception);
   EWasmDecodeError = class(EWasmError);
   EWasmValidationError = class(EWasmError);
   EWasmLinkError = class(EWasmError);
   EWasmTrap = class(EWasmError);
+
+  { An uncaught WebAssembly exception (`throw` / `throw_ref`) that reached the
+    invocation boundary with no `try_table` clause catching it. A SIBLING of
+    EWasmTrap, not a subclass (see the hierarchy note above): the unwind that
+    delivers it is explicit interpreter control flow over the activation
+    stack, and only THIS terminal case leaves the interpreter as a real Pascal
+    exception — the trampoline propagates it unchanged, exactly as it does an
+    EWasmTrap, but the two never merge. Carries the raw wokExn handle (as a
+    NativeUInt, so Wasm.Core keeps its no-runtime-dependency rule — a runtime
+    TWasmRef is NativeUInt) and the thrown tag's store address, so an embedder
+    (Track F) can recover the tag and payload; the conformance corpus only
+    needs the class. .agent/design/eh-spec.md §2.4. }
+  EWasmException = class(EWasmError)
+  public
+    ExnRef: NativeUInt;
+    TagAddr: UInt32;
+    constructor CreateExn(const AExn: NativeUInt; const ATag: UInt32);
+  end;
 
   { A text-format syntax error, raised by the `wat` assembler and its
     sub-units (Wasm.Wat.*). A SIBLING of EWasmDecodeError, never a subclass:
@@ -824,6 +880,16 @@ begin
   else
     Result := '?';
   end;
+end;
+
+{ The message is fixed — the corpus's assert_exception checks only THAT an
+  exception escaped, never a message (eh-spec §2.4). ExnRef/TagAddr carry the
+  observable payload for a host that wants it. }
+constructor EWasmException.CreateExn(const AExn: NativeUInt; const ATag: UInt32);
+begin
+  inherited Create('uncaught exception');
+  ExnRef := AExn;
+  TagAddr := ATag;
 end;
 
 end.

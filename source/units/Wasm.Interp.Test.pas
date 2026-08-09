@@ -163,6 +163,8 @@ type
       const AParams: array of TWasmValue; const AExpectedPrefix: string);
     procedure ExpectError(const AName: string;
       const AParams: array of TWasmValue; const AExpectedSubstring: string);
+    procedure ExpectException(const AName: string;
+      const AParams: array of TWasmValue);
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -202,6 +204,7 @@ type
     procedure TestStructRoundTrip;
     procedure TestStructNullTraps;
     procedure TestArrayRoundTrip;
+    procedure TestVec128StructAndArrayRoundTrip;
     procedure TestArrayOutOfBounds;
     procedure TestArrayCopyOverlap;
     procedure TestArrayNewData;
@@ -214,6 +217,26 @@ type
     procedure TestHostCallTrapPropagates;
     procedure TestHostCallReentrancy;
     procedure TestM7ExternConvertImprecision;
+    { SIMD / v128 (Track G). }
+    procedure TestSimdSplatAddExtract;
+    procedure TestSimdMemoryRoundTrip;
+    procedure TestSimdLoadOutOfBounds;
+    procedure TestSimdGlobalGetSet;
+    procedure TestSimdParamResult;
+    procedure TestSimdCallPaddedParams;
+    procedure TestSimdReturnCallPaddedParams;
+    procedure TestSimdCallVecFirstParamsRegression;
+    procedure TestSimdEntryPaddedResults;
+    { Exception handling (Track H). }
+    procedure TestThrowCatchPayload;
+    procedure TestCatchAll;
+    procedure TestCatchRefDeliversExnref;
+    procedure TestUncaughtThrowRaisesException;
+    procedure TestThrowRefRethrowCaughtByOuter;
+    procedure TestThrowRefNullTraps;
+    procedure TestTagAddressMatching;
+    procedure TestThrowUnwindsAcrossCall;
+    procedure TestRefPayloadSurvivesCollection;
   end;
 
 { --- host callbacks ------------------------------------------------------ }
@@ -1165,6 +1188,57 @@ begin
   Expect<Int32>(Call1('ln', [MakeValueI32(3), MakeValueI32(55)]).I32).ToBe(3);
 end;
 
+{ End-to-end (decode -> validate -> instantiate -> invoke) that a v128
+  survives a round trip through a GC struct field AND an array element,
+  driven entirely by the *Vec IR ops the validator now emits. The param and
+  the result each span two flat slots (SIMD design §1.6); a lost high half
+  or a mis-sized field store would corrupt the top 8 bytes. }
+procedure TInterpTests.TestVec128StructAndArrayRoundTrip;
+var
+  Params, Results: array[0 .. 1] of TWasmValue;
+begin
+  { type0 (struct (mut v128)); type1 (array (mut v128));
+    type2 (func (param v128) (result v128)).
+    "sr": store the param into a fresh struct's field 0, read it back.
+    "ar": store the param into a fresh 1-element array, read it back. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $01, $7B, $01]),
+      BLit([$5E, $7B, $01]),
+      BLit([$60, $01, $7B, $01, $7B])])),
+    Sect(3, VecOf([BLit([$02]), BLit([$02])])),
+    Sect(7, VecOf([
+      BLit([$02, $73, $72, $00, $00]),
+      BLit([$02, $61, $72, $00, $01])])),
+    Sect(10, VecOf([
+      CodeEntry([$01, $01, $63, $00,
+        $FB, $01, $00, $21, $01,           { struct.new_default 0; local.set 1 }
+        $20, $01, $20, $00, $FB, $05, $00, $00,  { struct.set 0 0 }
+        $20, $01, $FB, $02, $00, $00, $0B]),     { struct.get 0 0 }
+      CodeEntry([$01, $01, $63, $01,
+        $41, $01, $FB, $07, $01, $21, $01, { array.new_default 1 (len 1); set 1 }
+        $20, $01, $41, $00, $20, $00, $FB, $0E, $01,  { array.set 1 }
+        $20, $01, $41, $00, $FB, $0B, $01, $0B])]))   { array.get 1 }
+  ]));
+  DoInstantiate;
+
+  Params[0].Bits := UInt64($1122334455667788);
+  Params[1].Bits := UInt64($99AABBCCDDEEFF00);
+
+  Results[0].Bits := 0;
+  Results[1].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('sr'), @Params[0], @Results[0]);
+  Expect<UInt64>(Results[0].Bits).ToBe(UInt64($1122334455667788));
+  Expect<UInt64>(Results[1].Bits).ToBe(UInt64($99AABBCCDDEEFF00));
+
+  Results[0].Bits := 0;
+  Results[1].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('ar'), @Params[0], @Results[0]);
+  Expect<UInt64>(Results[0].Bits).ToBe(UInt64($1122334455667788));
+  Expect<UInt64>(Results[1].Bits).ToBe(UInt64($99AABBCCDDEEFF00));
+end;
+
 procedure TInterpTests.TestArrayOutOfBounds;
 begin
   { $getoob (param i32)(result i32) array.new 0 [len 2]; array.get 0 [param] }
@@ -1493,6 +1567,651 @@ begin
   Expect<Int32>(Call1('m7', []).I32).ToBe(0);
 end;
 
+{ --- SIMD / v128 (Track G) ----------------------------------------------- }
+
+{ Compute with a v128 intermediate and return an i32: splat two i32 params
+  into i32x4 vectors, add lane-wise, extract lane 0. Exercises i32x4.splat
+  ($FD 17), i32x4.add ($FD 174, a two-byte subopcode) and i32x4.extract_lane
+  ($FD 27) — the whole splat/binop/extract spine — end to end. }
+procedure TInterpTests.TestSimdSplatAddExtract;
+begin
+  { (func $vadd (param i32 i32) (result i32)
+      local.get 0 i32x4.splat local.get 1 i32x4.splat
+      i32x4.add i32x4.extract_lane 0) exported "vadd". }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $02, $7F, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$04, $76, $61, $64, $64, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $20, $00, $FD, $11,           { local.get 0 ; i32x4.splat }
+      $20, $01, $FD, $11,           { local.get 1 ; i32x4.splat }
+      $FD, $AE, $01,                { i32x4.add (subopcode 174) }
+      $FD, $1B, $00,                { i32x4.extract_lane 0 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('vadd', [MakeValueI32(40), MakeValueI32(2)]).I32).ToBe(42);
+  Expect<Int32>(Call1('vadd',
+    [MakeValueI32(-5), MakeValueI32(9)]).I32).ToBe(4);
+end;
+
+{ v128.store then v128.load through linear memory, then extract a lane to
+  observe the round trip — both instructions go through the one memory
+  chokepoint (simd-spec §4.5). }
+procedure TInterpTests.TestSimdMemoryRoundTrip;
+begin
+  { (memory 1)
+    (func $rt (param i32) (result i32)
+      i32.const 0 local.get 0 i32x4.splat v128.store
+      i32.const 0 v128.load i32x4.extract_lane 2) exported "rt". }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, $01])])),
+    Sect(7, VecOf([BLit([$02, $72, $74, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $41, $00, $20, $00, $FD, $11, { i32.const 0 ; local.get 0 ; i32x4.splat }
+      $FD, $0B, $00, $00,           { v128.store align=0 offset=0 }
+      $41, $00, $FD, $00, $00, $00, { i32.const 0 ; v128.load align=0 offset=0 }
+      $FD, $1B, $02,                { i32x4.extract_lane 2 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('rt', [MakeValueI32(1234)]).I32).ToBe(1234);
+  Expect<Int32>(Call1('rt', [MakeValueI32(-77)]).I32).ToBe(-77);
+end;
+
+{ A v128.load whose 16-byte access escapes the single page traps the
+  ordinary 'out of bounds memory access', before any byte moves. }
+procedure TInterpTests.TestSimdLoadOutOfBounds;
+begin
+  { (memory 1)
+    (func $oob (param i32) (result i32)
+      local.get 0 v128.load i32x4.extract_lane 0) exported "oob". }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, $01])])),
+    Sect(7, VecOf([BLit([$03, $6F, $6F, $62, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $20, $00, $FD, $00, $00, $00, { local.get 0 ; v128.load align=0 offset=0 }
+      $FD, $1B, $00,                { i32x4.extract_lane 0 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  { 65530 + 16 = 65546 > 65536: the whole access is out of bounds. }
+  ExpectTrap('oob', [MakeValueI32(65530)], 'out of bounds memory access');
+end;
+
+{ A mutable v128 global: set it from a splat, read it back, extract a lane.
+  The global cell is the store's 16-byte Vec side (simd-spec §1.7). }
+procedure TInterpTests.TestSimdGlobalGetSet;
+begin
+  { (global (mut v128) (v128.const i32x4 0 0 0 0))
+    (func $sg (param i32) (result i32)
+      local.get 0 i32x4.splat global.set 0
+      global.get 0 i32x4.extract_lane 1) exported "sg". }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(6, VecOf([Cat([
+      BLit([$7B, $01]),             { valtype v128, mutable }
+      BLit([$FD, $0C]),             { v128.const }
+      BLit([$00, $00, $00, $00, $00, $00, $00, $00,
+            $00, $00, $00, $00, $00, $00, $00, $00]),
+      BLit([$0B])])])),             { end init expr }
+    Sect(7, VecOf([BLit([$02, $73, $67, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $20, $00, $FD, $11,           { local.get 0 ; i32x4.splat }
+      $24, $00,                     { global.set 0 }
+      $23, $00,                     { global.get 0 }
+      $FD, $1B, $01,                { i32x4.extract_lane 1 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('sg', [MakeValueI32(555)]).I32).ToBe(555);
+  Expect<Int32>(Call1('sg', [MakeValueI32(-1)]).I32).ToBe(-1);
+end;
+
+{ A v128 argument in and a v128 result out — the two-slot seam (simd-spec
+  §1.6): each v128 occupies TWO consecutive flat TWasmValue slots, low half
+  first. The function doubles each i32x4 lane; the harness builds the param
+  across two slots and reads the result across two slots. }
+procedure TInterpTests.TestSimdParamResult;
+var
+  Params: array[0 .. 1] of TWasmValue;
+  Results: array[0 .. 1] of TWasmValue;
+begin
+  { (func $vdouble (param v128) (result v128)
+      local.get 0 local.get 0 i32x4.add) exported "vdouble". }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7B, $01, $7B])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$07, $76, $64, $6F, $75, $62, $6C, $65, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $20, $00, $20, $00, $FD, $AE, $01,   { local.get 0 x2 ; i32x4.add }
+      $0B])]))
+  ]));
+  DoInstantiate;
+
+  { i32x4 [1, 2, 3, 4] packed into two slots, low lanes first. }
+  Params[0].U64 := (UInt64(2) shl 32) or UInt64(1);
+  Params[1].U64 := (UInt64(4) shl 32) or UInt64(3);
+  Results[0].Bits := 0;
+  Results[1].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('vdouble'), @Params[0], @Results[0]);
+
+  { Each lane doubled: [2, 4, 6, 8], again across two slots. }
+  Expect<UInt64>(Results[0].U64).ToBe((UInt64(4) shl 32) or UInt64(2));
+  Expect<UInt64>(Results[1].U64).ToBe((UInt64(8) shl 32) or UInt64(6));
+end;
+
+{ Finding 1 (wasm->wasm args). A callee whose signature is
+  (param v128 i32 v128 i32) has an even-alignment PAD before its second v128
+  param (params land at slots 0,2,4,6 with a pad at slot 3). The dense arg
+  block a caller builds has no pad, so the old positional per-slot copy in
+  PushWasmFrame misplaced every operand at/after the pad: the second v128 was
+  read from the wrong half and the trailing i32 dropped to zero. The scatter
+  through the callee's LocalRegs fixes it. The callee returns
+  lane0(v0) + i1 + lane0(v2) + i3; the caller passes distinct-lane v128.const
+  values so a half-misread is observable, plus i1=7 and i3=9. Correct total is
+  100 + 7 + 200 + 9 = 316; the old code produced 309 (v2 half-misread to 202,
+  i3 dropped). }
+procedure TInterpTests.TestSimdCallPaddedParams;
+begin
+  { type0 callee (param v128 i32 v128 i32)->(i32); type1 caller ()->(i32). }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $04, $7B, $7F, $7B, $7F, $01, $7F]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$01])])),
+    Sect(7, VecOf([BLit([$03, $72, $75, $6E, $00, $01])])),
+    Sect(10, VecOf([
+      CodeEntry([
+        $00,
+        $20, $00, $FD, $1B, $00,       { local.get 0 ; i32x4.extract_lane 0 }
+        $20, $01, $6A,                 { local.get 1 ; i32.add }
+        $20, $02, $FD, $1B, $00,       { local.get 2 ; i32x4.extract_lane 0 }
+        $6A,                           { i32.add }
+        $20, $03, $6A,                 { local.get 3 ; i32.add }
+        $0B]),
+      CodeEntry([
+        $00,
+        $FD, $0C, $64, $00, $00, $00, $65, $00, $00, $00,
+                  $66, $00, $00, $00, $67, $00, $00, $00,  { v0 = i32x4(100,101,102,103) }
+        $41, $07,                      { i32.const 7 }
+        $FD, $0C, $C8, $00, $00, $00, $C9, $00, $00, $00,
+                  $CA, $00, $00, $00, $CB, $00, $00, $00,  { v2 = i32x4(200,201,202,203) }
+        $41, $09,                      { i32.const 9 }
+        $10, $00,                      { call 0 }
+        $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('run', []).I32).ToBe(316);
+end;
+
+{ Finding 1 (tail-call args). The same padded (param v128 i32 v128 i32)
+  callee, reached through return_call instead of call, so the fix must apply
+  in ReplaceWasmFrame too. Same expected total, 316. }
+procedure TInterpTests.TestSimdReturnCallPaddedParams;
+begin
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $04, $7B, $7F, $7B, $7F, $01, $7F]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$01])])),
+    Sect(7, VecOf([BLit([$03, $72, $75, $6E, $00, $01])])),
+    Sect(10, VecOf([
+      CodeEntry([
+        $00,
+        $20, $00, $FD, $1B, $00,
+        $20, $01, $6A,
+        $20, $02, $FD, $1B, $00,
+        $6A,
+        $20, $03, $6A,
+        $0B]),
+      CodeEntry([
+        $00,
+        $FD, $0C, $64, $00, $00, $00, $65, $00, $00, $00,
+                  $66, $00, $00, $00, $67, $00, $00, $00,
+        $41, $07,
+        $FD, $0C, $C8, $00, $00, $00, $C9, $00, $00, $00,
+                  $CA, $00, $00, $00, $CB, $00, $00, $00,
+        $41, $09,
+        $12, $00,                      { return_call 0 }
+        $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('run', []).I32).ToBe(316);
+end;
+
+{ Regression: a v128-FIRST call signature (param v128 v128)->(v128) has no
+  internal pad, exactly the shape the corpus exercises. The unified scatter
+  must still marshal it correctly. Callee adds the two i32x4 vectors; caller
+  passes i32x4(1,2,3,4) and i32x4(10,20,30,40) and extracts lane 2 of the
+  result: 3 + 30 = 33. }
+procedure TInterpTests.TestSimdCallVecFirstParamsRegression;
+begin
+  { type0 callee (param v128 v128)->(v128); type1 caller ()->(i32). }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $02, $7B, $7B, $01, $7B]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$01])])),
+    Sect(7, VecOf([BLit([$03, $72, $75, $6E, $00, $01])])),
+    Sect(10, VecOf([
+      CodeEntry([
+        $00,
+        $20, $00, $20, $01, $FD, $AE, $01,   { local.get 0/1 ; i32x4.add }
+        $0B]),
+      CodeEntry([
+        $00,
+        $FD, $0C, $01, $00, $00, $00, $02, $00, $00, $00,
+                  $03, $00, $00, $00, $04, $00, $00, $00,  { i32x4(1,2,3,4) }
+        $FD, $0C, $0A, $00, $00, $00, $14, $00, $00, $00,
+                  $1E, $00, $00, $00, $28, $00, $00, $00,  { i32x4(10,20,30,40) }
+        $10, $00,                      { call 0 }
+        $FD, $1B, $02,                 { i32x4.extract_lane 2 }
+        $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('run', []).I32).ToBe(33);
+end;
+
+{ Finding 2 (results). A plain entry (invoke) of functions whose result
+  signature interleaves a scalar before a v128, so the return block carries an
+  even-alignment pad and the results are NOT contiguous from ReturnRegBase.
+  DoReturn and ResultSlotCount must walk ResultRegs pad-aware. Two shapes:
+  (result i32 v128) and (result v128 i32 v128). The old contiguous copy read
+  the pad slot as a result and dropped a v128. }
+procedure TInterpTests.TestSimdEntryPaddedResults;
+var
+  Res2: array[0 .. 2] of TWasmValue;
+  Res5: array[0 .. 4] of TWasmValue;
+begin
+  { Module A: func "ra" ()->(i32 v128): i32.const 42, v128.const
+    i32x4(10,11,12,13). Flat results: [42, (11<<32)|10, (13<<32)|12]. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $02, $7F, $7B])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$02, $72, $61, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $41, $2A,                        { i32.const 42 }
+      $FD, $0C, $0A, $00, $00, $00, $0B, $00, $00, $00,
+                $0C, $00, $00, $00, $0D, $00, $00, $00,  { i32x4(10,11,12,13) }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Res2[0].Bits := 0;
+  Res2[1].Bits := 0;
+  Res2[2].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('ra'), nil, @Res2[0]);
+  Expect<Int32>(Res2[0].I32).ToBe(42);
+  Expect<UInt64>(Res2[1].U64).ToBe((UInt64(11) shl 32) or UInt64(10));
+  Expect<UInt64>(Res2[2].U64).ToBe((UInt64(13) shl 32) or UInt64(12));
+
+  { Module B: func "rb" ()->(v128 i32 v128): v128.const i32x4(1,2,3,4),
+    i32.const 55, v128.const i32x4(90,91,92,93). Flat results (5 slots):
+    [(2<<32)|1, (4<<32)|3, 55, (91<<32)|90, (93<<32)|92]. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $03, $7B, $7F, $7B])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$02, $72, $62, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $FD, $0C, $01, $00, $00, $00, $02, $00, $00, $00,
+                $03, $00, $00, $00, $04, $00, $00, $00,  { i32x4(1,2,3,4) }
+      $41, $37,                        { i32.const 55 }
+      $FD, $0C, $5A, $00, $00, $00, $5B, $00, $00, $00,
+                $5C, $00, $00, $00, $5D, $00, $00, $00,  { i32x4(90,91,92,93) }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Res5[0].Bits := 0;
+  Res5[1].Bits := 0;
+  Res5[2].Bits := 0;
+  Res5[3].Bits := 0;
+  Res5[4].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('rb'), nil, @Res5[0]);
+  Expect<UInt64>(Res5[0].U64).ToBe((UInt64(2) shl 32) or UInt64(1));
+  Expect<UInt64>(Res5[1].U64).ToBe((UInt64(4) shl 32) or UInt64(3));
+  Expect<Int32>(Res5[2].I32).ToBe(55);
+  Expect<UInt64>(Res5[3].U64).ToBe((UInt64(91) shl 32) or UInt64(90));
+  Expect<UInt64>(Res5[4].U64).ToBe((UInt64(93) shl 32) or UInt64(92));
+end;
+
+{ --- exception handling (Track H) ---------------------------------------- }
+
+{ Assert the action leaves the guest as an uncaught wasm exception —
+  EWasmException, distinct from a trap (EWasmTrap) and from any other error.
+  The three arms are ordered most-derived first: EWasmException and EWasmTrap
+  are siblings under EWasmError, and the base clause must come last or it would
+  swallow both. }
+procedure TInterpTests.ExpectException(const AName: string;
+  const AParams: array of TWasmValue);
+var
+  ParamArr: array of TWasmValue;
+  ParamPtr: PWasmValue;
+  I: Integer;
+  Cls: string;
+begin
+  SetLength(ParamArr, Length(AParams));
+  for I := 0 to High(AParams) do
+    ParamArr[I] := AParams[I];
+  if Length(ParamArr) > 0 then
+    ParamPtr := @ParamArr[0]
+  else
+    ParamPtr := nil;
+
+  Cls := 'NO-EXCEPTION';
+  try
+    InterpInvoke(FStore, FuncAddr(AName), ParamPtr, nil);
+  except
+    on E: EWasmException do
+      Cls := 'exception';
+    on E: EWasmTrap do
+      Cls := 'trap';
+    on E: EWasmError do
+      Cls := 'error';
+  end;
+
+  Expect<string>('class=' + Cls).ToBe('class=exception');
+end;
+
+procedure TInterpTests.TestThrowCatchPayload;
+begin
+  { type0 tag (param i32), type1 () -> (i32).
+    (func (result i32)
+      (try_table (result i32) (catch 0 0)
+        i32.const 5 (throw 0)))
+    catch 0 delivers the tag's i32 payload to label 0 (the try_table result). }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $01, $7F, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([BLit([$01, $66, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $1F, $7F, $01, $00, $00, $00,   { try_table (result i32) (catch tag0 label0) }
+      $41, $05,                       { i32.const 5 }
+      $08, $00,                       { throw tag0 }
+      $0B,                            { end try_table }
+      $0B])]))                        { end func }
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('f', []).I32).ToBe(5);
+end;
+
+procedure TInterpTests.TestCatchAll;
+begin
+  { type0 tag (), type1 () -> (i32).
+    (func (result i32)
+      (block $h (try_table (catch_all $h) (throw 0)))
+      i32.const 7)
+    catch_all catches the throw and branches to $h (arity 0); control then
+    falls through to i32.const 7. Returning (not raising) proves the catch. The
+    catch label is resolved in the enclosing scope, so label 0 is $h. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([BLit([$01, $66, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $40,                       { block $h [] }
+      $1F, $40, $01, $02, $00,        { try_table [] (catch_all label0=$h) }
+      $08, $00,                       { throw tag0 }
+      $0B,                            { end try_table }
+      $0B,                            { end block $h }
+      $41, $07,                       { i32.const 7 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('f', []).I32).ToBe(7);
+end;
+
+procedure TInterpTests.TestCatchRefDeliversExnref;
+begin
+  { type0 tag (), type1 () -> (i32).
+    (func (result i32)
+      (block $h (result exnref) (try_table (catch_ref 0 $h) (throw 0)))
+      ref.is_null)
+    catch_ref delivers the exnref to $h (result exnref); ref.is_null on the
+    delivered value is 0, proving a real (non-null) exnref reached the handler. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([BLit([$01, $66, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $69,                       { block $h (result exnref) }
+      $1F, $69, $01, $01, $00, $00,   { try_table (result exnref) (catch_ref tag0 label0=$h) }
+      $08, $00,                       { throw tag0 }
+      $0B,                            { end try_table }
+      $0B,                            { end block $h }
+      $D1,                            { ref.is_null }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('f', []).I32).ToBe(0);
+end;
+
+procedure TInterpTests.TestUncaughtThrowRaisesException;
+begin
+  { type0 tag (), type1 () -> (i32).
+    (func (result i32) (throw 0))   ; no handler -> EWasmException escapes. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([BLit([$01, $66, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([$00, $08, $00, $0B])]))
+  ]));
+  DoInstantiate;
+  ExpectException('f', []);
+end;
+
+procedure TInterpTests.TestThrowRefRethrowCaughtByOuter;
+begin
+  { type0 tag (), type1 () -> (i32).
+    (func (result i32)
+      (block $outer
+        (try_table (catch_all $outer)                       ; OUTER
+          (block $inner (result exnref)
+            (try_table (catch_ref 0 $inner) (throw 0)))      ; INNER
+          (throw_ref)))                                      ; re-throw
+      i32.const 42)
+    The inner catch_ref binds the exnref into $inner; throw_ref reactivates it
+    and the OUTER catch_all catches the rethrow, branching to $outer and
+    falling through to 42. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([BLit([$01, $66, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $40,                       { block $outer [] }
+      $1F, $40, $01, $02, $00,        { OUTER try_table [] (catch_all label0=$outer) }
+      $02, $69,                       { block $inner (result exnref) }
+      $1F, $69, $01, $01, $00, $00,   { INNER try_table (result exnref) (catch_ref tag0 label0=$inner) }
+      $08, $00,                       { throw tag0 }
+      $0B,                            { end INNER try_table }
+      $0B,                            { end block $inner }
+      $0A,                            { throw_ref (the bound exnref) }
+      $0B,                            { end OUTER try_table }
+      $0B,                            { end block $outer }
+      $41, $2A,                       { i32.const 42 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('f', []).I32).ToBe(42);
+end;
+
+procedure TInterpTests.TestThrowRefNullTraps;
+begin
+  { (func (result i32) ref.null exn throw_ref) -> traps 'null reference'. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$01, $66, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $D0, $69,                       { ref.null exn }
+      $0A,                            { throw_ref }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  ExpectTrap('f', [], 'null reference');
+end;
+
+procedure TInterpTests.TestTagAddressMatching;
+begin
+  { Two distinct tags, both (). One try_table shape (catch tag1 label0).
+    "cB" throws tag1 -> caught, returns 1.
+    "tA" throws tag0 -> NOT matched by the tag1 clause -> escapes as an
+    EWasmException. Identical handler, different thrown tag: matching is by tag
+    address, not structural type (the two tags share a type). }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00]), BLit([$00, $00])])),  { tag0, tag1 : type0 }
+    Sect(7, VecOf([
+      BLit([$02, $63, $42, $00, $00]),                      { "cB" -> func0 }
+      BLit([$02, $74, $41, $00, $01])])),                   { "tA" -> func1 }
+    Sect(10, VecOf([
+      CodeEntry([                       { func0: catch tag1, throw tag1 -> 1 }
+        $00,
+        $02, $40,                       { block $h [] }
+        $1F, $40, $01, $00, $01, $00,   { try_table [] (catch tag1 label0=$h) }
+        $08, $01,                       { throw tag1 }
+        $0B,                            { end try_table }
+        $0B,                            { end block $h }
+        $41, $01,                       { i32.const 1 }
+        $0B]),
+      CodeEntry([                       { func1: catch tag1, throw tag0 -> escapes }
+        $00,
+        $02, $40,                       { block $h [] }
+        $1F, $40, $01, $00, $01, $00,   { try_table [] (catch tag1 label0=$h) }
+        $08, $00,                       { throw tag0 }
+        $0B,                            { end try_table }
+        $0B,                            { end block $h }
+        $41, $01,                       { i32.const 1 }
+        $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('cB', []).I32).ToBe(1);
+  ExpectException('tA', []);
+end;
+
+procedure TInterpTests.TestThrowUnwindsAcrossCall;
+begin
+  { type0 tag (param i32), type1 () (thrower), type2 () -> (i32) (caller).
+    func0 $thrower: i32.const 7 (throw 0)
+    func1 $caller (result i32):
+      (block $h (result i32)
+        (try_table (catch 0 $h) (call 0)) (unreachable))
+    The throw fires in the callee (no handler there); the unwind pops the
+    callee frame and the caller's try_table catches it, delivering 7 to $h. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $01, $7F, $00]),
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$02])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([BLit([$01, $63, $00, $01])])),           { "c" -> func1 }
+    Sect(10, VecOf([
+      CodeEntry([$00, $41, $07, $08, $00, $0B]),             { thrower }
+      CodeEntry([                                            { caller }
+        $00,
+        $02, $7F,                       { block $h (result i32) }
+        $1F, $40, $01, $00, $00, $00,   { try_table [] (catch tag0 label0=$h) }
+        $10, $00,                       { call func0 }
+        $0B,                            { end try_table }
+        $00,                            { unreachable (callee always throws) }
+        $0B,                            { end block $h }
+        $0B])]))                        { end func }
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('c', []).I32).ToBe(7);
+end;
+
+procedure TInterpTests.TestRefPayloadSurvivesCollection;
+begin
+  { type0 struct (field (mut i32)), type1 tag (param (ref null 0)),
+    type2 (param i32) -> (i32).
+    (func (param i32) (result i32)
+      (block $h (result (ref null 0))
+        (try_table (catch 0 $h)
+          (struct.new 0 (local.get 0)) (throw 0)))
+      (struct.get 0 0))
+    The thrown payload is a struct ref; with the GC threshold floored to 0 the
+    exn allocation collects. The field reads back the original value, proving
+    the exn carries and the collector traces a ref-typed payload. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $01, $7F, $01]),
+      BLit([$60, $01, $63, $00, $00]),
+      BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$02])])),
+    Sect(13, VecOf([BLit([$00, $01])])),                    { tag0 : type1 }
+    Sect(7, VecOf([BLit([$01, $72, $00, $00])])),           { "r" -> func0 }
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $63, $00,                       { block $h (result (ref null 0)) }
+      $1F, $63, $00, $01, $00, $00, $00,   { try_table (result (ref null 0)) (catch tag0 label0=$h) }
+      $20, $00,                            { local.get 0 }
+      $FB, $00, $00,                       { struct.new 0 }
+      $08, $00,                            { throw tag0 }
+      $0B,                                 { end try_table }
+      $0B,                                 { end block $h }
+      $FB, $02, $00, $00,                  { struct.get 0 field 0 }
+      $0B])]))
+  ]));
+  DoInstantiate;
+  FStore.Heap.Threshold := 0;   { collect at every allocation }
+  Expect<Int32>(Call1('r', [MakeValueI32(1234)]).I32).ToBe(1234);
+end;
+
 procedure TInterpTests.SetupTests;
 begin
   Test('a numeric add function computes end to end', TestAddFunction);
@@ -1538,6 +2257,8 @@ begin
   Test('struct.get on a null traps null structure reference',
     TestStructNullTraps);
   Test('an array round-trips through new/get/len', TestArrayRoundTrip);
+  Test('a v128 round-trips through a struct field and array element',
+    TestVec128StructAndArrayRoundTrip);
   Test('array.get out of bounds traps', TestArrayOutOfBounds);
   Test('array.copy handles overlap (memmove)', TestArrayCopyOverlap);
   Test('array.new_data initialises from a data segment', TestArrayNewData);
@@ -1553,6 +2274,40 @@ begin
   Test('a host callback re-enters guest code', TestHostCallReentrancy);
   Test('STAGED (M7): extern/any conversion is representation identity, so a '
     + 'cross-hierarchy ref.test is imprecise', TestM7ExternConvertImprecision);
+  Test('v128 splat/add/extract_lane computes end to end',
+    TestSimdSplatAddExtract);
+  Test('v128.store/load round-trips through the memory chokepoint',
+    TestSimdMemoryRoundTrip);
+  Test('a v128.load out of bounds traps', TestSimdLoadOutOfBounds);
+  Test('a mutable v128 global round-trips through global.set/get',
+    TestSimdGlobalGetSet);
+  Test('a v128 argument and result marshal across two flat slots',
+    TestSimdParamResult);
+  Test('a wasm->wasm call with an internal v128 param pad marshals args '
+    + 'to the padded callee registers', TestSimdCallPaddedParams);
+  Test('a return_call with an internal v128 param pad marshals args to the '
+    + 'padded callee registers', TestSimdReturnCallPaddedParams);
+  Test('a v128-first call signature still marshals (no regression)',
+    TestSimdCallVecFirstParamsRegression);
+  Test('an entry invoke returns padded results (scalar before v128) across '
+    + 'the right slots', TestSimdEntryPaddedResults);
+  { Exception handling (Track H). }
+  Test('a throw is caught by try_table catch and resumes with the payload',
+    TestThrowCatchPayload);
+  Test('catch_all catches a throw of any tag', TestCatchAll);
+  Test('catch_ref delivers the exnref to its label', TestCatchRefDeliversExnref);
+  Test('an uncaught throw raises EWasmException at the host boundary',
+    TestUncaughtThrowRaisesException);
+  Test('throw_ref re-throws a caught exnref, caught by an outer handler',
+    TestThrowRefRethrowCaughtByOuter);
+  Test('throw_ref of a null exnref traps null reference',
+    TestThrowRefNullTraps);
+  Test('catch matches by tag address: tag A is not caught by a clause for B',
+    TestTagAddressMatching);
+  Test('an exception unwinds across a call, caught in the caller''s try_table',
+    TestThrowUnwindsAcrossCall);
+  Test('a caught exception whose payload is a ref survives a forced collection',
+    TestRefPayloadSurvivesCollection);
 end;
 
 begin

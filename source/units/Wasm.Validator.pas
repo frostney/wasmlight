@@ -106,12 +106,6 @@ const
   section and the layering forbids exporting them; a mismatch is caught the
   moment interning rejects a module the validator accepted. }
 
-{ True when AMsg is one of the deliberately-staged "not implemented"
-  messages (Track G's SIMD validation). The docs/harness agent classifies
-  an expected staged failure with this rather than string-matching the
-  constant itself. }
-function IsStagedFeatureMessage(const AMsg: string): Boolean;
-
 { The member count of a rolled rec-group key — its leading little-endian
   u32. Re-exported here so Wasm.Runtime.Store need not depend on
   Wasm.Validator.Types for it. }
@@ -175,16 +169,7 @@ const
   KEY_HEAP_REC_REL = $01;
   KEY_HEAP_CANON = $02;
 
-{ --- staged-feature and rec-group key façade (A7 / M3) ------------------- }
-
-function IsStagedFeatureMessage(const AMsg: string): Boolean;
-begin
-  { A prefix test, not equality: the raise sites append the offending
-    opcode and offset to MSG_SIMD_NOT_IMPLEMENTED. }
-  Result := (Length(AMsg) >= Length(MSG_SIMD_NOT_IMPLEMENTED)) and
-    (Copy(AMsg, 1, Length(MSG_SIMD_NOT_IMPLEMENTED)) =
-     MSG_SIMD_NOT_IMPLEMENTED);
-end;
+{ --- rec-group key façade (M3) ------------------------------------------ }
 
 function GroupMemberCount(const AKey: TWasmBytes): UInt32;
 begin
