@@ -107,9 +107,13 @@ const
 
 { The import/export discriminator byte. Exactly five assigned values,
   matching TWasmExternKind's ordinals by construction.
+
+  APrefix is the caller's, not a constant here, because upstream names
+  the failure after the SECTION the byte appears in — `malformed import
+  kind` and `malformed export kind` — even though it is one production.
   https://webassembly.github.io/spec/core/binary/types.html#binary-externtype }
 function ReadExternKind(var AReader: TWasmReader;
-  const ABase: NativeUInt): TWasmExternKind;
+  const ABase: NativeUInt; const APrefix: string): TWasmExternKind;
 var
   Start: NativeUInt;
   Code: Byte;
@@ -118,7 +122,7 @@ begin
   Code := AReader.ReadByte;
   if Code > Ord(High(TWasmExternKind)) then
     raise EWasmDecodeError.CreateFmt(
-      'malformed extern kind $%.2x at offset %u', [Code, ABase + Start]);
+      '%s: $%.2x at offset %u', [APrefix, Code, ABase + Start]);
   Result := TWasmExternKind(Code);
 end;
 
@@ -138,7 +142,7 @@ begin
     Import := Default(TWasmImport);
     Import.ModuleName := ABody.ReadName;
     Import.Name := ABody.ReadName;
-    Import.Kind := ReadExternKind(ABody, ABase);
+    Import.Kind := ReadExternKind(ABody, ABase, MSG_MALFORMED_IMPORT_KIND);
     case Import.Kind of
       wxkFunc:   Import.FuncTypeIndex := ABody.ReadU32;
       wxkTable:  Import.Table := ReadTableType(ABody);
@@ -240,7 +244,7 @@ begin
   for I := 1 to Count do
   begin
     Entry.Name := ABody.ReadName;
-    Entry.Kind := ReadExternKind(ABody, ABase);
+    Entry.Kind := ReadExternKind(ABody, ABase, MSG_MALFORMED_EXPORT_KIND);
     Entry.Index := ABody.ReadU32;
     { No duplicate-name check here on purpose — see the interface
       comment: name disjointness is module validity, not grammar. }

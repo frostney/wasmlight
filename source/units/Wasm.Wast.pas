@@ -20,6 +20,11 @@
   VALUE parsing is a later Track C slice; today's callers only need the
   spelling preserved.
 
+  Annotations (`(@id ...)`) are white space by the same clause that makes
+  comments white space, so the lexer skips them whole and they never
+  reach the tree — see SkipAnnotation, which is also where the reserved
+  characters that are legal only inside one are handled.
+
   The testsuite also uses directives that are not in the reference
   grammar (`assert_malformed_custom`, `assert_invalid_custom`); those
   classify as wcUnknown with their tree intact rather than failing the
@@ -79,6 +84,7 @@ type
     procedure Fault(const AWhat: string; const ALine, AColumn: Integer);
     procedure SkipLineComment;
     procedure SkipBlockComment;
+    procedure SkipAnnotation;
     procedure SkipTrivia;
     function LexString(const ALine, AColumn: Integer): TWastToken;
     function LexAtom(const ALine, AColumn: Integer): TWastToken;
@@ -291,6 +297,66 @@ begin
   end;
 end;
 
+procedure TWastLexer.SkipAnnotation;
+var
+  OpenLine, OpenColumn: Integer;
+  Depth: Integer;
+begin
+  { An annotation `(@id ...)` is WHITE SPACE as far as the enclosing text
+    is concerned — "white space ... is any sequence of literal space
+    characters, formatting characters, comments, or annotations"
+    (https://webassembly.github.io/spec/core/text/lexical.html#text-space,
+    grammar at #text-annot) — and its contents carry no meaning for the
+    core format. So it is skipped whole, exactly like a comment, and no
+    node reaches the tree.
+
+    What the body may contain is much wider than ordinary text: any
+    token, INCLUDING the reserved characters comma, semicolon, square
+    brackets and curly brackets, which are illegal outside an
+    annotation. That is the whole reason this procedure exists rather
+    than the parser simply reading a list —
+    upstream's annotations.wast spells a lone `;` inside one, and the
+    lexer used to reject the file outright.
+
+    Only four things are structural, and each is handled by the same code
+    that handles it anywhere else, so that they nest and interleave
+    correctly: parentheses (which must balance), string literals (whose
+    `"("`, `")"` and escapes must not be counted), block comments (which
+    nest), and line comments (which may contain an unbalanced paren —
+    annotations.wast has `;; bla)`). Everything else is opaque. }
+  OpenLine := FLine;
+  OpenColumn := FColumn;
+  Advance; { ( }
+  Advance; { @ }
+  Depth := 1;
+  while Depth > 0 do
+  begin
+    if Eof then
+      Fault('unterminated annotation opened at', OpenLine, OpenColumn);
+    if (Cur = '(') and (Peek = ';') then
+      SkipBlockComment
+    else if (Cur = ';') and (Peek = ';') then
+      SkipLineComment
+    else if Cur = '"' then
+      { The token is discarded; LexString is called for its scanning —
+        and for its escape and control-character checks, which hold
+        inside an annotation as everywhere else. }
+      LexString(FLine, FColumn)
+    else if Cur = '(' then
+    begin
+      Inc(Depth);
+      Advance;
+    end
+    else if Cur = ')' then
+    begin
+      Dec(Depth);
+      Advance;
+    end
+    else
+      Advance;
+  end;
+end;
+
 procedure TWastLexer.SkipTrivia;
 begin
   while not Eof do
@@ -306,6 +372,8 @@ begin
       '(':
         if Peek = ';' then
           SkipBlockComment
+        else if Peek = '@' then
+          SkipAnnotation
         else
           Break;
     else

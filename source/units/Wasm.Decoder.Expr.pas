@@ -103,7 +103,7 @@ begin
   Flags := AReader.ReadU32;
   if Flags >= $80 then
     raise EWasmDecodeError.CreateFmt(
-      'malformed memarg flags %u at offset %u', [Flags, Start]);
+      '%s: %u at offset %u', [MSG_MALFORMED_MEMOP_FLAGS, Flags, Start]);
 
   if (Flags and MEMARG_FLAG_MEMIDX) <> 0 then
     AReader.ReadU32; { memidx }
@@ -483,8 +483,8 @@ begin
       $FC: SkipMiscInstr(AReader, ABase + OpOffset);
       $FD: SkipVecInstr(AReader, ABase + OpOffset);
     else
-      raise EWasmDecodeError.CreateFmt(
-        'unknown opcode $%.2x at offset %u', [Op, ABase + OpOffset]);
+      raise EWasmDecodeError.Create(
+        IllegalOpcodeMessage(Op, ABase + OpOffset));
     end;
   until False;
 

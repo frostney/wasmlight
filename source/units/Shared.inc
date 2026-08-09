@@ -18,3 +18,18 @@
 { Typed constants are read-only. Delphi mode defaults them writable, which
   would make constants like WASM_MAGIC mutable globals. }
 {$J-}
+
+{ Guard-page linear memory and the MMU fault path (ADR-0005, ADR-0009,
+  ADR-0013) exist only where a 4 GiB-plus reservation AND a POSIX fault
+  handler both do: a 64-bit UNIX host. Everything else — 32-bit hosts and
+  Windows this wave — takes explicit bounds checks and installs no handler.
+
+  This capability flag is centralised HERE, next to the other build
+  directives (AGENTS.md: directives are not repeated per unit), so that
+  Wasm.Runtime.Memory (the chokepoint) and Wasm.Runtime.Traps (the fault
+  handler) split on the SAME symbol. A bare UNIX ifdef in the trap unit
+  would install a real SIGSEGV/SIGBUS handler on a 32-bit UNIX host that
+  has no guard memory to attribute — a handler claiming to be a no-op. }
+{$IF DEFINED(UNIX) AND DEFINED(CPU64)}
+  {$DEFINE WASM_GUARD_STRATEGIES}
+{$ENDIF}

@@ -46,7 +46,7 @@ needed. The committed `.lwpt/modules/` tree plus `lwpt.lock` make
 ## Build and test
 
 ```bash
-lwpt build           # both programs into build/
+lwpt build           # all three programs into build/
 lwpt test            # co-located unit suites
 ```
 
@@ -54,15 +54,57 @@ lwpt test            # co-located unit suites
 
 ```bash
 ./build/wasmlight inspect module.wasm    # section table + entity counts
+./build/wasmlight validate module.wasm   # decode + validate, report the IR
 ./build/wasmlight --version
 ./build/wasmbench --iterations 20000     # component benchmarks
 ```
 
 `inspect` decodes the module and reports its section table plus a
 summary of entity counts per index space (imports broken down by kind,
-start function and data count when present). It is the whole shipped
-surface today — see [roadmap.md](roadmap.md) for what comes next and in
-what order.
+start function and data count when present).
+
+`validate` decodes and then runs the whole static type check, which is
+also the pass that lowers the module to the register IR every future
+execution tier will consume. One line per module on success:
+
+```console
+$ ./build/wasmlight validate tests/fixtures/valid/exports.wasm
+tests/fixtures/valid/exports.wasm: valid - 2 function(s) lowered, 2 in the function index space, IR format version 1
+```
+
+Both commands take more than one module. A failure names the error class,
+because the class is the answer: `EWasmDecodeError` means the bytes are
+not a module, `EWasmValidationError` means they are a module that is not
+well-typed. The exit status is non-zero if any module failed.
+
+```console
+$ ./build/wasmlight validate tests/fixtures/valid/simd.wasm
+wasmlight validate: tests/fixtures/valid/simd.wasm: EWasmValidationError: SIMD validation is not implemented ($FD 17 at offset 89)
+```
+
+That one is not a bug in the fixture. Vector (`$FD`) validation is
+deliberately staged to Track G, and the validator says so rather than
+accepting an instruction it has not checked.
+
+The third program, `wasmspec`, runs `.wast` conformance scripts. It judges
+the binary-module subset — `assert_malformed`, `assert_invalid`, and
+top-level `module` — against decode and validation, and skips everything
+that needs an execution tier:
+
+```console
+$ ./build/wasmspec tests/spec/testsuite/binary.wast
+FAIL tests/spec/testsuite/binary.wast:55 assert_malformed got=malformed expected="END opcode expected" actual="unexpected end of section or function: reading byte at offset 3 (need 1 byte(s), 0 left)"
+...
+FILE tests/spec/testsuite/binary.wast pass=124 fail=3 skip=0 staged=0 total=127
+TOTAL files=1 errors=0 pass=124 fail=3 skip=0 staged=0 total=127
+```
+
+A directory argument is walked recursively. See
+[testing.md](testing.md) for what the corpus tallies mean and
+[`tests/spec/README.md`](../tests/spec/README.md) for fetching it.
+
+Those three commands are the whole shipped surface today — see
+[roadmap.md](roadmap.md) for what comes next and in what order.
 
 For the full command set (formatter, benchmarks, CI gates) see
 [tooling.md](tooling.md).

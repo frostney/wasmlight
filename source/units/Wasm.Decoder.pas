@@ -77,10 +77,16 @@ var
   Magic: array[0..3] of Byte;
   Version: UInt32;
 begin
-  if AReader.Remaining < 8 then
+  { The magic is checked BEFORE the version field is required, not after
+    a single "do we have eight bytes" gate. That ordering is observable:
+    a four-byte input whose bytes are not the magic is `magic header not
+    detected`, while a four-byte input that IS the magic is `unexpected
+    end` — the version is simply missing. Requiring eight bytes up front
+    collapses the two, and upstream's binary.wast asserts both. }
+  if AReader.Remaining < Length(WASM_MAGIC) then
     raise EWasmDecodeError.CreateFmt(
-      'not a WebAssembly module: %u byte(s), the 8-byte preamble needs more',
-      [AReader.Size]);
+      '%s: %u byte(s), the 4-byte magic needs more',
+      [MSG_UNEXPECTED_END, AReader.Size]);
 
   for I := 0 to 3 do
     Magic[I] := AReader.ReadByte;
@@ -88,14 +94,15 @@ begin
   for I := 0 to 3 do
     if Magic[I] <> WASM_MAGIC[I] then
       raise EWasmDecodeError.CreateFmt(
-        'not a WebAssembly module: magic is %.2x %.2x %.2x %.2x, expected 00 61 73 6d',
-        [Magic[0], Magic[1], Magic[2], Magic[3]]);
+        '%s: magic is %.2x %.2x %.2x %.2x, expected 00 61 73 6d',
+        [MSG_MAGIC_HEADER, Magic[0], Magic[1], Magic[2], Magic[3]]);
 
+  { A short version field fails inside ReadFixedU32, as `unexpected end`. }
   Version := AReader.ReadFixedU32;
   if Version <> WASM_BINARY_VERSION then
     raise EWasmDecodeError.CreateFmt(
-      'unsupported binary format version %u (this build decodes version %d)',
-      [Version, WASM_BINARY_VERSION]);
+      '%s: %u (this build decodes version %d)',
+      [MSG_UNKNOWN_BINARY_VERSION, Version, WASM_BINARY_VERSION]);
 
   AModule.Version := Version;
 end;
@@ -195,14 +202,16 @@ begin
 
     if not IsKnownSectionId(RawId) then
       raise EWasmDecodeError.CreateFmt(
-        'unknown section id %d at offset %u', [RawId, SectionStart]);
+        '%s: id %d at offset %u',
+        [MSG_MALFORMED_SECTION_ID, RawId, SectionStart]);
 
     BodySize := Reader.ReadU32;
 
     if Reader.Remaining < BodySize then
       raise EWasmDecodeError.CreateFmt(
-        '%s section at offset %u declares %u byte(s) but only %u remain',
-        [SectionIdName(RawId), SectionStart, BodySize, Reader.Remaining]);
+        '%s: %s section at offset %u declares %u byte(s) but only %u remain',
+        [MSG_LENGTH_OUT_OF_BOUNDS, SectionIdName(RawId), SectionStart,
+         BodySize, Reader.Remaining]);
 
     Section.Id := RawId;
     Section.Name := '';
@@ -215,12 +224,17 @@ begin
         through a sub-reader bounded by the declared size — a name length
         that overruns the section must not be able to read the next one. }
       Body := Reader.SubReader(BodySize);
+      Body.Context := wrcSection;
       try
         Section.Name := Body.ReadName;
       except
+        { The location is APPENDED, never prepended: the message already
+          starts with the canonical prefix the harness matches on, and
+          wrapping it would hide that prefix behind ours. }
         on E: EWasmDecodeError do
           raise EWasmDecodeError.CreateFmt(
-            'custom section at offset %u: %s', [SectionStart, E.Message]);
+            '%s (in the custom section at offset %u)',
+            [E.Message, SectionStart]);
       end;
     end
     else
@@ -230,9 +244,10 @@ begin
         same comparison — the spec allows each at most once. }
       if Position <= HighestPosition then
         raise EWasmDecodeError.CreateFmt(
-          '%s section at offset %u is out of order or repeated ' +
+          '%s: %s section at offset %u is out of order or repeated ' +
           '(prescribed position %d, after position %d)',
-          [SectionIdName(RawId), SectionStart, Position, HighestPosition]);
+          [MSG_UNEXPECTED_CONTENT, SectionIdName(RawId), SectionStart,
+           Position, HighestPosition]);
       HighestPosition := Position;
 
       { Decode the body through a SubReader over exactly the declared
@@ -241,6 +256,7 @@ begin
         (ADR-0003). The SubReader call also advances Reader past the
         body, replacing the skip this walk used to do. }
       Body := Reader.SubReader(BodySize);
+      Body.Context := wrcSection;
       DecodeSectionBody(TWasmSectionId(RawId), Body,
         Section.BodyOffset, AModule);
     end;

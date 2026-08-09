@@ -4,9 +4,16 @@
   The cases that matter most here are the ones a naive lexer gets wrong:
   block comments NEST (the spec says so explicitly), string literals
   decode to BYTES rather than text because `\hh` escapes can spell
-  non-UTF-8 content that `(module binary ...)` needs verbatim, and
-  testsuite-local directives outside the reference grammar must classify
-  as unknown rather than fail the whole script. }
+  non-UTF-8 content that `(module binary ...)` needs verbatim,
+  annotations are white space whose bodies may spell tokens that are
+  illegal anywhere else, and testsuite-local directives outside the
+  reference grammar must classify as unknown rather than fail the whole
+  script.
+
+  The annotation cases are lifted verbatim from upstream's
+  annotations.wast, which is the file that found the gap: it spells a
+  lone `;` inside an annotation, and a lexer that reaches its ordinary
+  semicolon rule there rejects the whole script. }
 program Wasm.Wast.Test;
 
 {$I Shared.inc}
@@ -54,6 +61,10 @@ type
     procedure TestRawNewlineInStringRejected;
     procedure TestUnterminatedBlockCommentRejected;
     procedure TestLoneSemicolonRejected;
+    procedure TestAnnotationsAreWhiteSpace;
+    procedure TestAnnotationBodyIsOpaque;
+    procedure TestAnnotationNestsStringsAndComments;
+    procedure TestUnterminatedAnnotationRejected;
 
     procedure TestRealisticScript;
     procedure TestModuleBinaryFormKeepsExactBytes;
@@ -461,6 +472,63 @@ begin
     'line 2, column 1');
 end;
 
+{ --- annotations --------------------------------------------------------- }
+
+{ `(@id ...)` is white space by the same clause that makes comments white
+  space (text-space, grammar at text-annot), so it produces NO token and
+  leaves no node in the tree. }
+procedure TWastTests.TestAnnotationsAreWhiteSpace;
+begin
+  Expect<string>(TokenSignature('(module (@a) (func))'))
+    .ToBe('( module ( func ) ) eof');
+  { Between commands, and carrying a body. }
+  Expect<string>(TokenSignature('(@a x y z) (module)'))
+    .ToBe('( module ) eof');
+  { The name may be any run of idchars, including punctuation. }
+  Expect<string>(TokenSignature('(@@) (@$) (@+) (@0) (@.) (x)'))
+    .ToBe('( x ) eof');
+end;
+
+{ The body may spell tokens that are illegal outside an annotation — the
+  reserved characters, and a lone semicolon above all, which is what
+  upstream's annotations.wast line 14 exercises. Nothing in it is
+  interpreted; only parentheses have to balance. }
+procedure TWastTests.TestAnnotationBodyIsOpaque;
+begin
+  Expect<string>(TokenSignature('(@a , ; ] [ }} }x{ ({) ,{{};}] ;) (k)'))
+    .ToBe('( k ) eof');
+  Expect<string>(TokenSignature('(@a 0x 8q 0xfa #4g0-.@f#^&@#$*0sf -- @#) (k)'))
+    .ToBe('( k ) eof');
+  { Nested annotations, including empty and name-less ones. }
+  Expect<string>(TokenSignature('(@a @ @x (@x) (@x y) (@) (@ x) (@(@(@(@))))) (k)'))
+    .ToBe('( k ) eof');
+end;
+
+{ Strings and comments inside an annotation are still lexed as strings
+  and comments — otherwise a `")"` or a `;; ...)` inside one would end
+  the annotation at the wrong place. }
+procedure TWastTests.TestAnnotationNestsStringsAndComments;
+begin
+  { A string holding an unbalanced paren must not close the annotation. }
+  Expect<string>(TokenSignature('(@a (bla) () ("aa" a) ")" "(" x")"y) (k)'))
+    .ToBe('( k ) eof');
+  { A block comment holding a paren, then a line comment holding one. }
+  Expect<string>(TokenSignature('(@a (;bla;) (; ) ;)' + sLineBreak
+      + '  ;; bla)' + sLineBreak
+      + '  ;; bla (@x' + sLineBreak
+      + '  ) (k)'))
+    .ToBe('( k ) eof');
+  { An escaped quote inside an annotation string. }
+  Expect<string>(TokenSignature('(@" @ asd\2a 045 \" fdaf") (k)'))
+    .ToBe('( k ) eof');
+end;
+
+procedure TWastTests.TestUnterminatedAnnotationRejected;
+begin
+  ExpectMentions(LexErrorMessage('(module (@a x y'),
+    'unterminated annotation');
+end;
+
 procedure TWastTests.SetupTests;
 begin
   Test('parens and atoms', TestParensAndAtoms);
@@ -479,6 +547,12 @@ begin
   Test('unterminated block comment rejected',
     TestUnterminatedBlockCommentRejected);
   Test('lone semicolon rejected', TestLoneSemicolonRejected);
+  Test('annotations lex as white space', TestAnnotationsAreWhiteSpace);
+  Test('an annotation body is opaque', TestAnnotationBodyIsOpaque);
+  Test('annotations nest strings and comments',
+    TestAnnotationNestsStringsAndComments);
+  Test('unterminated annotation rejected',
+    TestUnterminatedAnnotationRejected);
   Test('realistic script', TestRealisticScript);
   Test('module binary form keeps exact bytes',
     TestModuleBinaryFormKeepsExactBytes);

@@ -272,10 +272,13 @@ var
 begin
   Start := AReader.Position;
   Result := AReader.ReadU32;
+  { The same truncation the reader itself would report one element later,
+    so it carries the reader's own prefix rather than a wording of its
+    own — the count is simply the earliest place it can be seen. }
   if Result > AReader.Remaining then
     raise EWasmDecodeError.CreateFmt(
-      'truncated %s vector (count %u, %u bytes remain) at offset %u',
-      [AWhat, Result, AReader.Remaining, Start]);
+      '%s: truncated %s vector (count %u, %u bytes remain) at offset %u',
+      [AReader.EndOfInputPrefix, AWhat, Result, AReader.Remaining, Start]);
 end;
 
 procedure RequireSectionExhausted(var ABody: TWasmReader;
@@ -283,9 +286,9 @@ procedure RequireSectionExhausted(var ABody: TWasmReader;
 begin
   if not ABody.Eof then
     raise EWasmDecodeError.CreateFmt(
-      'section size mismatch: %u byte(s) left over after %s section '
-      + 'content at offset %u',
-      [ABody.Remaining, AWhat, ABase + ABody.Position]);
+      '%s: %u byte(s) left over after %s section content at offset %u',
+      [MSG_SECTION_SIZE_MISMATCH, ABody.Remaining, AWhat,
+       ABase + ABody.Position]);
 end;
 
 function ReadTagType(var AReader: TWasmReader): TWasmTagType;

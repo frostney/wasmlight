@@ -13,6 +13,15 @@
   tests/fixtures/malformed/ must be rejected. See tests/fixtures/README.md
   for what each one covers and how to regenerate the corpus.
 
+  The corpus is also the validator's cross-check: every valid fixture must
+  VALIDATE, with exactly one deliberate exception. simd.wat is the only
+  source in the corpus that uses v128 (verified by reading the .wat
+  sources), and vector typing is staged to Track G, so simd.wasm must be
+  rejected with the staged prefix rather than accepted — silently
+  accepting an instruction family nobody has type-checked is the failure
+  this test exists to prevent, and it is also what will tell the next
+  reader that the staging is over when it starts failing.
+
   Test programs run with the repository root as the working directory
   (verified), so the relative paths below resolve. }
 program Wasm.Fixtures.Test;
@@ -26,7 +35,10 @@ uses
   TestingPascalLibrary,
   Wasm.Core,
   Wasm.Decoder,
-  Wasm.Module;
+  Wasm.Ir,
+  Wasm.Module,
+  Wasm.Validator,
+  Wasm.Validator.Types;
 
 const
   VALID_DIR = 'tests/fixtures/valid';
@@ -38,11 +50,17 @@ const
   MIN_VALID_FIXTURES = 11;
   MIN_MALFORMED_FIXTURES = 11;
 
+  { The one valid fixture that must NOT validate yet. See the header. }
+  SIMD_FIXTURE = 'simd.wasm';
+
 type
   TFixtureTests = class(TTestSuite)
   private
     FBytes: TWasmBytes;
     FModule: TWasmModule;
+    { The IR borrows the same buffer the module does (ADR-0003), so it is
+      released before the next fixture replaces FBytes. }
+    FIr: TWasmIrModule;
 
     function ListFixtures(const ADir: string): TStringList;
     { Decodes APath into FModule. Returns '' on success, or the decode
@@ -53,6 +71,14 @@ type
     { Decodes valid/<AName> into FModule, asserting the decode succeeds
       so the model assertions that follow never run on a stale module. }
     procedure DecodeValid(const AName: string);
+    { Decodes and validates APath. Returns '' on success, or
+      '<class>: <message>' — the class is part of the answer, because
+      whether a rejection is malformed or invalid is the distinction the
+      error hierarchy exists to keep (AGENTS.md). }
+    function TryValidate(const APath: string): string;
+    { Decodes and validates valid/<AName>, asserting both succeed, and
+      leaves the IR in FIr for the assertions that follow. }
+    procedure ValidateValid(const AName: string);
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -62,6 +88,10 @@ type
     procedure TestCorpusIsPresent;
     procedure TestEveryValidFixtureDecodes;
     procedure TestEveryMalformedFixtureIsRejected;
+    procedure TestEveryValidFixtureValidates;
+    procedure TestSimdValidationIsStaged;
+    procedure TestExportsIr;
+    procedure TestReftypesIr;
     procedure TestDataCountPrecedesCode;
     procedure TestTagPrecedesGlobal;
     procedure TestSectionExtentsStayInsideTheModule;
@@ -127,13 +157,34 @@ begin
   Expect<string>(TryDecode(NativePath(VALID_DIR + '/' + AName))).ToBe('');
 end;
 
+function TFixtureTests.TryValidate(const APath: string): string;
+begin
+  Result := '';
+  FreeAndNil(FIr);
+  try
+    DecodeModuleFile(APath, FModule, FBytes);
+    FIr := ValidateModule(FModule, FBytes);
+  except
+    on E: EWasmError do
+      Result := E.ClassName + ': ' + E.Message;
+  end;
+end;
+
+procedure TFixtureTests.ValidateValid(const AName: string);
+begin
+  Expect<string>(TryValidate(NativePath(VALID_DIR + '/' + AName)))
+    .ToBe('');
+end;
+
 procedure TFixtureTests.BeforeEach;
 begin
   FModule := TWasmModule.Create;
+  FIr := nil;
 end;
 
 procedure TFixtureTests.AfterEach;
 begin
+  FreeAndNil(FIr);
   FreeAndNil(FModule);
 end;
 
@@ -202,6 +253,122 @@ begin
   end;
 
   Expect<string>(Accepted).ToBe('');
+end;
+
+{ The validator's cross-check against real toolchain output: hand-written
+  byte arrays prove the rules match our reading of the spec, this proves
+  they match what wabt emits and wasm-tools independently validated.
+
+  Every fixture but simd.wasm must validate. simd.wasm is asserted
+  separately (below) rather than merely skipped here, so that the staging
+  is a claim the suite makes rather than a hole in it. }
+procedure TFixtureTests.TestEveryValidFixtureValidates;
+var
+  Files: TStringList;
+  I: Integer;
+  Error, Failures: string;
+begin
+  Failures := '';
+  Files := ListFixtures(VALID_DIR);
+  try
+    for I := 0 to Files.Count - 1 do
+    begin
+      if ExtractFileName(Files[I]) = SIMD_FIXTURE then
+        Continue;
+      Error := TryValidate(Files[I]);
+      if Error <> '' then
+        Failures := Failures + #10 + '  ' + Files[I] + ': ' + Error;
+    end;
+  finally
+    Files.Free;
+  end;
+
+  { Every failure is reported, not just the first — one broken rule
+    usually breaks several fixtures, and the set names the rule. }
+  Expect<string>(Failures).ToBe('');
+end;
+
+{ Vector typing is Track G by the roadmap's staging, and the Track B
+  contract requires the body walk to FAIL on a $FD prefix rather than
+  accept it. simd.wat is the only source in the corpus that uses v128, so
+  this is the only fixture the staging touches.
+
+  The CLASS matters as much as the prefix: a $FD instruction is perfectly
+  well formed, so this must be EWasmValidationError and never a decode
+  error. When Track G lands, this test flips to an assertion that
+  simd.wasm validates — it does not get deleted. }
+procedure TFixtureTests.TestSimdValidationIsStaged;
+var
+  Error, Outcome: string;
+begin
+  Error := TryValidate(NativePath(VALID_DIR + '/' + SIMD_FIXTURE));
+
+  if Error = '' then
+    Outcome := 'ACCEPTED'
+  else if Copy(Error, 1, Length('EWasmValidationError: '
+    + MSG_SIMD_NOT_IMPLEMENTED)) = 'EWasmValidationError: '
+    + MSG_SIMD_NOT_IMPLEMENTED then
+    Outcome := 'staged'
+  else
+    Outcome := Error;
+
+  Expect<string>(Outcome).ToBe('staged');
+end;
+
+{ --- per-fixture IR expectations -----------------------------------------
+
+  Ground truth is the same .wat source the model assertions use. These
+  assert what ValidateModule ASSEMBLED, not what the body walk emitted —
+  per-instruction IR belongs to Wasm.Validator.Body.Test. }
+
+procedure TFixtureTests.TestExportsIr;
+begin
+  { exports.wat defines two functions and no imports, so the code section
+    and the function index space have the same size, and the IR carries
+    one lowered function per code entry. }
+  ValidateValid('exports.wasm');
+  Expect<Integer>(Length(FIr.Functions)).ToBe(2);
+  Expect<Integer>(Length(FIr.FuncCanonTypes)).ToBe(2);
+  Expect<Integer>(Integer(FIr.FuncImportCount)).ToBe(0);
+  Expect<Integer>(Length(FIr.ExportList)).ToBe(6);
+  Expect<string>(FIr.ExportList[0].Name).ToBe('add');
+
+  { Both functions are declared `(type $binop)` in the .wat, so they are
+    the SAME defined type and canonicalisation must intern them to one
+    id — which is what makes "same type" a constant-time answer for
+    call_indirect and for linking. Asserted rather than described: the
+    comment used to make this claim with nothing checking it. }
+  Expect<Int64>(Int64(FIr.FuncCanonTypes[0]))
+    .ToBe(Int64(FIr.FuncCanonTypes[1]));
+
+  Expect<Integer>(Length(FIr.GlobalInits)).ToBe(2);
+  { TableInits is POSITIONAL — one entry per DEFINED table, whether or
+    not it has an initialiser — so this counts exports.wat's single
+    `(table $tbl 2 funcref)` and not the initialisers, of which it has
+    none. The entry is therefore the absent-initialiser sentinel: empty
+    Code, and ResultReg reading IR_NO_REG rather than register 0
+    (Wasm.Ir's TWasmIrInitExpr comment). }
+  Expect<Integer>(Length(FIr.TableInits)).ToBe(1);
+  Expect<Integer>(Length(FIr.TableInits[0].Code)).ToBe(0);
+  Expect<Int64>(Int64(FIr.TableInits[0].ResultReg))
+    .ToBe(Int64(IR_NO_REG));
+
+  Expect<Integer>(Integer(FIr.FormatVersion)).ToBe(IR_FORMAT_VERSION);
+end;
+
+procedure TFixtureTests.TestReftypesIr;
+begin
+  { reftypes.wat has five functions and a DECLARATIVE element segment,
+    which exists only to put function indices into C.REFS — so the IR's
+    DeclaredFuncRefs must have entries set even though nothing is
+    initialised. }
+  ValidateValid('reftypes.wasm');
+  Expect<Integer>(Length(FIr.Functions)).ToBe(5);
+  Expect<Integer>(Length(FIr.Elems)).ToBe(1);
+  Expect<Integer>(Ord(FIr.Elems[0].Mode)).ToBe(Ord(iremDeclarative));
+  Expect<Integer>(Length(FIr.Tables)).ToBe(2);
+  Expect<string>(FIr.Tables[0].RefType.Describe).ToBe('funcref');
+  Expect<string>(FIr.Tables[1].RefType.Describe).ToBe('externref');
 end;
 
 procedure TFixtureTests.TestDataCountPrecedesCode;
@@ -462,6 +629,13 @@ begin
   Test('every valid fixture decodes', TestEveryValidFixtureDecodes);
   Test('every malformed fixture is rejected',
     TestEveryMalformedFixtureIsRejected);
+  Test('every valid fixture but simd.wasm validates',
+    TestEveryValidFixtureValidates);
+  Test('simd.wasm is staged out of validation',
+    TestSimdValidationIsStaged);
+  Test('exports.wasm lowers to the IR its source implies', TestExportsIr);
+  Test('reftypes.wasm lowers to the IR its source implies',
+    TestReftypesIr);
   Test('real output puts data count before code', TestDataCountPrecedesCode);
   Test('real output puts tag before global', TestTagPrecedesGlobal);
   Test('section extents stay inside the module',

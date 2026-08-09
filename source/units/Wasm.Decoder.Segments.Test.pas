@@ -178,8 +178,11 @@ var
 begin
   Module := TWasmModule.Create;
   try
-    { Flag 0: active, implicit table 0, offset expr, vec(funcidx) —
-      funcref implied with no type byte at all. }
+    { Flag 0: active, implicit table 0, offset expr, vec(funcidx) — the
+      NON-NULLABLE `(ref func)` implied with no type byte at all, because
+      the production builds its elements as `(ref.func y) end`
+      (binary-elem). Reading `funcref` here wrongly rejects the segment
+      against a `(ref func)` table. }
     Decode('elem',
       [$01,                 { count 1 }
        $00,                 { flags 0 }
@@ -192,7 +195,7 @@ begin
     Expect<Boolean>(Segment.Mode = wemActive).ToBe(True);
     Expect<Int64>(Int64(Segment.TableIndex)).ToBe(0);
     AssertSpan('flag 0 offset expr', Segment.Offset, 2, 3);
-    Expect<string>(Segment.RefType.Describe).ToBe('funcref');
+    Expect<string>(Segment.RefType.Describe).ToBe('(ref func)');
     Expect<Boolean>(Segment.UsesExprs).ToBe(False);
     Expect<Int64>(Int64(Length(Segment.FuncIndices))).ToBe(2);
     Expect<Int64>(Int64(Segment.FuncIndices[0])).ToBe(3);
@@ -212,7 +215,7 @@ begin
   try
     Decode('elem',
       [$02,                 { count 2 }
-       { Flag 1: passive, elemkind ($00 = funcref), vec(funcidx). }
+       { Flag 1: passive, elemkind ($00 = ref func), vec(funcidx). }
        $01, $00, $01, $05,
        { Flag 2: active, explicit table index, offset expr, elemkind,
          vec(funcidx). }
@@ -223,7 +226,8 @@ begin
 
     Segment := Module.Elements[0];
     Expect<Boolean>(Segment.Mode = wemPassive).ToBe(True);
-    Expect<string>(Segment.RefType.Describe).ToBe('funcref');
+    { `elemkind ::= 0x00 => ref func` — non-nullable, as for flag 0. }
+    Expect<string>(Segment.RefType.Describe).ToBe('(ref func)');
     Expect<Boolean>(Segment.UsesExprs).ToBe(False);
     Expect<Int64>(Int64(Length(Segment.FuncIndices))).ToBe(1);
     Expect<Int64>(Int64(Segment.FuncIndices[0])).ToBe(5);
@@ -232,7 +236,7 @@ begin
     Expect<Boolean>(Segment.Mode = wemActive).ToBe(True);
     Expect<Int64>(Int64(Segment.TableIndex)).ToBe(1);
     AssertSpan('flag 2 offset expr', Segment.Offset, 7, 3);
-    Expect<string>(Segment.RefType.Describe).ToBe('funcref');
+    Expect<string>(Segment.RefType.Describe).ToBe('(ref func)');
     Expect<Int64>(Int64(Length(Segment.FuncIndices))).ToBe(2);
     Expect<Int64>(Int64(Segment.FuncIndices[0])).ToBe(7);
     Expect<Int64>(Int64(Segment.FuncIndices[1])).ToBe(8);
@@ -249,12 +253,12 @@ begin
   Module := TWasmModule.Create;
   try
     { Flag 3: declarative, elemkind, vec(funcidx) — no table index and
-      no offset expression. }
+      no offset expression; elemkind again yields `(ref func)`. }
     Decode('elem', [$01, $03, $00, $02, $01, $02], 0, Module);
 
     Segment := Module.Elements[0];
     Expect<Boolean>(Segment.Mode = wemDeclarative).ToBe(True);
-    Expect<string>(Segment.RefType.Describe).ToBe('funcref');
+    Expect<string>(Segment.RefType.Describe).ToBe('(ref func)');
     Expect<Boolean>(Segment.UsesExprs).ToBe(False);
     Expect<Int64>(Int64(Length(Segment.FuncIndices))).ToBe(2);
     Expect<Int64>(Int64(Segment.FuncIndices[0])).ToBe(1);
@@ -271,8 +275,10 @@ var
 begin
   Module := TWasmModule.Create;
   try
-    { Flag 4: active, implicit table 0, offset expr, vec(expr) —
-      funcref implied, initialisers are full expressions. }
+    { Flag 4: active, implicit table 0, offset expr, vec(expr) — the
+      NULLABLE funcref implied, unlike flags 0..3: an element expression
+      may be `ref.null func`, so the production is `elem (ref null func)`
+      (binary-elem). This arm is the discriminating one. }
     Decode('elem',
       [$01,
        $04,

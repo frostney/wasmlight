@@ -80,6 +80,7 @@ type
     procedure TestRejectsBadCastFlags;
     procedure TestRejectsBadCatchKind;
     procedure TestRejectsBadBlockType;
+    procedure TestExprMessagePrefixes;
   end;
 
 function TDecoderExprTests.ReaderOver(
@@ -476,6 +477,38 @@ begin
   ExpectRejected('overlong empty block type', [$02, $C0, $7F, $0B, $0B]);
 end;
 
+{ Two prefixes the corpus pins, both raised from this unit and both
+  spelled differently from the obvious wording. The opcode byte is part
+  of the `illegal opcode` prefix and is lowercase; the memarg flags
+  failure is called `memop` upstream, not `memarg`. }
+procedure TDecoderExprTests.TestExprMessagePrefixes;
+var
+  Reader: TWasmReader;
+  Actual: string;
+
+  procedure Run(const AValues: array of Byte);
+  begin
+    Reader := ReaderOver(AValues);
+    Actual := '<not rejected>';
+    try
+      SkipExpr(Reader, 0);
+    except
+      on E: EWasmDecodeError do
+        Actual := E.Message;
+    end;
+  end;
+
+begin
+  { $FF is documented as never being an opcode or a prefix. }
+  Run([$FF, $0B]);
+  Expect<string>(Copy(Actual, 1, Length(MSG_ILLEGAL_OPCODE) + 3))
+    .ToBe(MSG_ILLEGAL_OPCODE + ' ff');
+
+  Run([$28, $80, $01, $00, $0B]);
+  Expect<string>(Copy(Actual, 1, Length(MSG_MALFORMED_MEMOP_FLAGS)))
+    .ToBe(MSG_MALFORMED_MEMOP_FLAGS);
+end;
+
 procedure TDecoderExprTests.SetupTests;
 begin
   Test('trivial constant expr', TestTrivialConstExpr);
@@ -515,6 +548,8 @@ begin
   Test('rejects bad cast flags', TestRejectsBadCastFlags);
   Test('rejects bad catch clause kinds', TestRejectsBadCatchKind);
   Test('rejects bad block types', TestRejectsBadBlockType);
+  Test('the skipper raises canonical message prefixes',
+    TestExprMessagePrefixes);
 end;
 
 begin

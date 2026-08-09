@@ -137,12 +137,28 @@ begin
 
     { Start from defaults so the fields a production leaves untouched
       are zeroed — two segments decoded from the same bytes compare
-      equal. The one non-zero default is funcref: productions 0/4 imply
-      it with no byte at all, and the elemkind productions (1/2/3) only
-      ever spell funcref — so funcref is the right default and 5/6/7
-      overwrite it. }
+      equal.
+
+      The default element type is the NON-NULLABLE `(ref func)`, not
+      `funcref`, and the difference is load-bearing. The four funcidx
+      productions (0/1/2/3) build their elements as `(ref.func y) end`,
+      which is a non-null reference, and the grammar's element type
+      follows: production 0 yields `ref func` outright and `elemkind
+      ::= 0x00 => ref func` gives 1/2/3 the same. Only production 4 —
+      element EXPRESSIONS with an implied type — yields `ref null func`,
+      because an arbitrary element expression may be `ref.null func`;
+      that arm overwrites the default below, as 5/6/7 do with their
+      explicit reftype.
+
+      Reading `funcref` into the funcidx forms wrongly rejects a
+      shorthand segment against a `(ref func)` table, since `funcref`
+      does not match a non-nullable element type — upstream elem.wast
+      ships exactly that module (flags 0 and 2) as VALID, and ships the
+      production-4 counterpart as `assert_invalid "type mismatch"`.
+      https://webassembly.github.io/spec/core/binary/modules.html#binary-elem
+      https://webassembly.github.io/spec/core/binary/modules.html#binary-elemkind }
     Segment := Default(TWasmElemSegment);
-    Segment.RefType := MakeRefType(True, MakeAbsHeapType(wahFunc));
+    Segment.RefType := MakeRefType(False, MakeAbsHeapType(wahFunc));
 
     { The eight productions of binary-elem, each arm labelled with its
       flag value. Bit 0 = passive/declarative, bit 1 = explicit table
@@ -178,9 +194,11 @@ begin
       end;
       4: begin
         { 4: active, implicit table 0, offset expr, vec(expr) with
-          implied funcref. }
+          implied funcref — NULLABLE, unlike the funcidx forms above:
+          the production is `elem (ref null func) e* (active 0 e_o)`. }
         Segment.Mode := wemActive;
         Segment.UsesExprs := True;
+        Segment.RefType := MakeRefType(True, MakeAbsHeapType(wahFunc));
         Segment.Offset := SkipExpr(ABody, ABase);
         ReadInitExprs(ABody, ABase, Segment);
       end;

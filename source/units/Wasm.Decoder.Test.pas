@@ -10,6 +10,7 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Wasm.Binary,
   Wasm.Core,
   Wasm.Decoder,
   Wasm.Module;
@@ -73,6 +74,9 @@ type
     procedure TestRejectsFunctionCodeCountMismatch;
     procedure TestRejectsDataCountMismatch;
     procedure TestCustomSectionAmongPopulatedSections;
+    procedure TestPreamblePrefixesSplitMagicFromTruncation;
+    procedure TestSectionWalkMessagePrefixes;
+    procedure TestCustomSectionErrorKeepsItsPrefix;
   end;
 
 procedure TDecoderTests.BuildModule(const AValues: array of Byte);
@@ -561,6 +565,103 @@ begin
   Expect<Integer>(FModule.CodeEntryCount).ToBe(1);
 end;
 
+{ --- canonical message prefixes ------------------------------------------ }
+
+{ Four bytes that are not the magic is `magic header not detected`; four
+  bytes that ARE the magic is `unexpected end`, because only the version
+  is missing. The two are told apart by checking the magic BEFORE
+  requiring the version's bytes — a single "do we have eight bytes" gate
+  collapses them, and upstream asserts both. }
+procedure TDecoderTests.TestPreamblePrefixesSplitMagicFromTruncation;
+var
+  Buf: TWasmBytes;
+  I: Integer;
+
+  function MessageFor(const ABytes: TWasmBytes): string;
+  begin
+    Result := '';
+    try
+      DecodeModule(ABytes, FModule);
+    except
+      on E: EWasmDecodeError do
+        Result := E.Message;
+    end;
+  end;
+
+begin
+  { Exactly the magic, nothing after it. }
+  SetLength(Buf, 4);
+  for I := 0 to 3 do
+    Buf[I] := WASM_MAGIC[I];
+  AssertMessagePrefix('the magic alone', MessageFor(Buf),
+    MSG_UNEXPECTED_END);
+
+  { The same length, one byte off the magic. }
+  Buf[3] := $6E;
+  AssertMessagePrefix('four bytes that are not the magic', MessageFor(Buf),
+    MSG_MAGIC_HEADER);
+
+  { Nothing at all is still truncation, not a bad magic. }
+  SetLength(Buf, 0);
+  AssertMessagePrefix('no bytes at all', MessageFor(Buf),
+    MSG_UNEXPECTED_END);
+
+  { A complete preamble with the wrong version number. }
+  SetLength(Buf, 8);
+  for I := 0 to 3 do
+    Buf[I] := WASM_MAGIC[I];
+  Buf[4] := $0D;
+  Buf[5] := 0;
+  Buf[6] := 0;
+  Buf[7] := 0;
+  AssertMessagePrefix('version 13', MessageFor(Buf),
+    MSG_UNKNOWN_BINARY_VERSION);
+end;
+
+procedure TDecoderTests.TestSectionWalkMessagePrefixes;
+begin
+  { An id no section uses. }
+  AssertMessagePrefix('section id 14',
+    RejectionMessage([$0E, $01, $00]), MSG_MALFORMED_SECTION_ID);
+
+  { A type section claiming seven bytes with four left. }
+  AssertMessagePrefix('a section longer than the bytes left',
+    RejectionMessage([$01, $07, $02, $60, $00, $00]),
+    MSG_LENGTH_OUT_OF_BOUNDS);
+
+  { Export (prescribed position 8) before global (position 7). Upstream
+    words an out-of-order section as content after the last section,
+    because its decoder stops at the first section it cannot place. }
+  AssertMessagePrefix('global after export',
+    RejectionMessage([$07, $01, $00, $06, $01, $00]),
+    MSG_UNEXPECTED_CONTENT);
+
+  { The same comparison catches a repeat. }
+  AssertMessagePrefix('two type sections',
+    RejectionMessage([$01, $01, $00, $01, $01, $00]),
+    MSG_UNEXPECTED_CONTENT);
+
+  { A body the grammar finished with bytes to spare. }
+  AssertMessagePrefix('a trailing byte inside a type section',
+    RejectionMessage([$01, $02, $00, $00]), MSG_SECTION_SIZE_MISMATCH);
+end;
+
+{ A failure inside a custom section keeps ITS prefix; the section's
+  location is appended. Wrapping it — `custom section at offset 8: ...` —
+  hides the very prefix the harness matches on, which is what this case
+  exists to prevent. The name here is one byte, $FF, which begins no
+  UTF-8 sequence. }
+procedure TDecoderTests.TestCustomSectionErrorKeepsItsPrefix;
+begin
+  AssertMessagePrefix('a custom section name that is not UTF-8',
+    RejectionMessage([$00, $02, $01, $FF]), MSG_MALFORMED_UTF8);
+
+  { And a custom section whose declared size runs past the input is the
+    same `length out of bounds` as any other section. }
+  AssertMessagePrefix('an oversized custom section',
+    RejectionMessage([$00, $20, $01, $61]), MSG_LENGTH_OUT_OF_BOUNDS);
+end;
+
 procedure TDecoderTests.SetupTests;
 begin
   Test('decodes a module with no sections', TestEmptyModule);
@@ -595,6 +696,12 @@ begin
   Test('rejects a data count mismatch', TestRejectsDataCountMismatch);
   Test('decodes known sections around a custom section',
     TestCustomSectionAmongPopulatedSections);
+  Test('the preamble prefixes split a bad magic from a short input',
+    TestPreamblePrefixesSplitMagicFromTruncation);
+  Test('the section walk raises canonical message prefixes',
+    TestSectionWalkMessagePrefixes);
+  Test('a custom section failure keeps its own prefix',
+    TestCustomSectionErrorKeepsItsPrefix);
 end;
 
 begin

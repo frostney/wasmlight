@@ -25,6 +25,14 @@ type
       AReadKind picks the primitive so one helper covers every width. }
     procedure ExpectRejected(const AReadKind, ADescription: string;
       const AValues: array of Byte);
+    { Runs AReadKind over AValues in AContext and asserts the raised
+      message STARTS with APrefix. Prefixes are conformance surface — the
+      .wast harness prefix-matches them — so they are asserted as
+      prefixes, never as whole strings: the context after the colon is
+      free to change, the prefix is not. }
+    procedure ExpectMessagePrefix(const AReadKind, ADescription,
+      APrefix: string; const AValues: array of Byte;
+      const AContext: TWasmReaderContext);
     { Asserts rejection and names the case in the failure message. Phrased
       as a value comparison rather than a bare Fail() so the test records
       an assertion even on the happy path. }
@@ -59,6 +67,9 @@ type
     procedure TestReadNameRejectsInvalidUtf8;
     procedure TestReadNameAcceptsValidUtf8;
     procedure TestPositionSetter;
+    procedure TestCanonicalLebAndNamePrefixes;
+    procedure TestTruncationPrefixFollowsContext;
+    procedure TestIllegalOpcodeMessageIsLowercaseHex;
   end;
 
 function TBinaryTests.ReaderOver(const AValues: array of Byte): TWasmReader;
@@ -107,6 +118,45 @@ begin
   end;
 
   AssertRejected(ADescription, Rejected);
+end;
+
+procedure TBinaryTests.ExpectMessagePrefix(const AReadKind, ADescription,
+  APrefix: string; const AValues: array of Byte;
+  const AContext: TWasmReaderContext);
+var
+  Reader: TWasmReader;
+  Actual: string;
+begin
+  Reader := ReaderOver(AValues);
+  Reader.Context := AContext;
+  Actual := '<not rejected>';
+
+  try
+    if AReadKind = 'u32' then
+      Reader.ReadU32
+    else if AReadKind = 'u64' then
+      Reader.ReadU64
+    else if AReadKind = 'i32' then
+      Reader.ReadI32
+    else if AReadKind = 'i64' then
+      Reader.ReadI64
+    else if AReadKind = 'name' then
+      Reader.ReadName
+    else
+      Fail('unknown read kind ' + AReadKind);
+  except
+    on E: EWasmDecodeError do
+      Actual := E.Message;
+  end;
+
+  { Compared as values so a failure prints the whole message, and so the
+    test records an assertion on the happy path too. }
+  if Copy(Actual, 1, Length(APrefix)) = APrefix then
+    Expect<string>(ADescription + ': ' + APrefix)
+      .ToBe(ADescription + ': ' + APrefix)
+  else
+    Expect<string>(ADescription + ': ' + Actual)
+      .ToBe(ADescription + ': ' + APrefix + '...');
 end;
 
 procedure TBinaryTests.AssertRejected(const ADescription: string;
@@ -472,6 +522,65 @@ begin
   AssertRejected('seek past end of input', Rejected);
 end;
 
+{ --- canonical message prefixes ------------------------------------------ }
+
+{ These four are the whole reason the LEB and name failures are worded
+  the way they are. The distinction the first two draw is upstream's, not
+  ours: `too large` is a VALUE the width cannot hold, `too long` is an
+  ENCODING that spends more bytes than the width allows — and one input
+  can only be one of them, so the two must not be collapsed. }
+procedure TBinaryTests.TestCanonicalLebAndNamePrefixes;
+begin
+  { Fifth byte of a u32 carrying bits above 32. }
+  ExpectMessagePrefix('u32', 'over-wide u32', MSG_INTEGER_TOO_LARGE,
+    [$80, $80, $80, $80, $10], wrcTopLevel);
+  { A sixth byte for a u32, whatever it spells. }
+  ExpectMessagePrefix('u32', 'over-long u32', MSG_INTEGER_TOO_LONG,
+    [$80, $80, $80, $80, $80, $00], wrcTopLevel);
+  { A signed encoding whose top bits are neither a sign extension nor
+    zero is `too large` as well, not a family of its own. }
+  ExpectMessagePrefix('i32', 'i32 without a full sign extension',
+    MSG_INTEGER_TOO_LARGE, [$FF, $FF, $FF, $FF, $4F], wrcTopLevel);
+  { $FF never begins a UTF-8 sequence. The side condition is in the
+    binary grammar, so this is malformed, not invalid. }
+  ExpectMessagePrefix('name', 'a name that is not UTF-8',
+    MSG_MALFORMED_UTF8, [$01, $FF], wrcTopLevel);
+end;
+
+{ One truncation, two wordings, chosen by WHERE the reader sits — and
+  `unexpected end` is deliberately a PREFIX of the section wording, so a
+  script that asserts only the short form is satisfied by either. }
+procedure TBinaryTests.TestTruncationPrefixFollowsContext;
+var
+  R, Sub: TWasmReader;
+begin
+  ExpectMessagePrefix('u32', 'truncation at top level',
+    MSG_UNEXPECTED_END, [$80], wrcTopLevel);
+  ExpectMessagePrefix('u32', 'truncation inside a section',
+    MSG_UNEXPECTED_END_OF_SECTION, [$80], wrcSection);
+
+  Expect<Boolean>(Copy(MSG_UNEXPECTED_END_OF_SECTION, 1,
+    Length(MSG_UNEXPECTED_END)) = MSG_UNEXPECTED_END).ToBe(True);
+
+  { A sub-reader INHERITS the context: a code entry cut out of a section
+    body is still inside that section. }
+  R := ReaderOver([$01, $02, $03]);
+  R.Context := wrcSection;
+  Sub := R.SubReader(2);
+  Expect<Boolean>(Sub.Context = wrcSection).ToBe(True);
+  Expect<string>(Sub.EndOfInputPrefix).ToBe(MSG_UNEXPECTED_END_OF_SECTION);
+end;
+
+{ The opcode byte is part of the prefix upstream matches, and it is
+  spelled in lowercase hex with no `$` — `illegal opcode ff`. }
+procedure TBinaryTests.TestIllegalOpcodeMessageIsLowercaseHex;
+begin
+  Expect<string>(Copy(IllegalOpcodeMessage($FF, 24), 1, 20))
+    .ToBe('illegal opcode ff at');
+  Expect<string>(Copy(IllegalOpcodeMessage($06, 3), 1, 17))
+    .ToBe('illegal opcode 06');
+end;
+
 procedure TBinaryTests.SetupTests;
 begin
   Test('ReadByte and PeekByte track position', TestReadByteAdvances);
@@ -505,6 +614,12 @@ begin
   Test('accepts valid UTF-8 names at the boundaries',
     TestReadNameAcceptsValidUtf8);
   Test('Position setter seeks and bounds', TestPositionSetter);
+  Test('canonical LEB128 and name message prefixes',
+    TestCanonicalLebAndNamePrefixes);
+  Test('the truncation prefix follows the reader context',
+    TestTruncationPrefixFollowsContext);
+  Test('the illegal-opcode message spells lowercase hex',
+    TestIllegalOpcodeMessageIsLowercaseHex);
 end;
 
 begin

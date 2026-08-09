@@ -5,9 +5,10 @@
   Flags go through the lwpt `cli` package — no hand-rolled ParamStr loops
   (see AGENTS.md).
 
-  Shipped surface today is `inspect`. `run` arrives with the interpreter
-  tier; until then the command does not exist rather than existing and
-  failing, so `--help` never advertises something the binary cannot do. }
+  Shipped surface today is `inspect` and `validate`. `run` arrives with
+  the interpreter tier; until then the command does not exist rather than
+  existing and failing, so `--help` never advertises something the binary
+  cannot do. }
 program wasmlight;
 
 {$I Shared.inc}
@@ -24,7 +25,9 @@ uses
 
   Wasm.Core,
   Wasm.Decoder,
-  Wasm.Module;
+  Wasm.Ir,
+  Wasm.Module,
+  Wasm.Validator;
 
 function ErrPrefix(const ASubcommand: string): string; inline;
 begin
@@ -152,6 +155,86 @@ begin
   end;
 end;
 
+{ --- validate ------------------------------------------------------------ }
+
+{ Decode, then validate. The two are separate commands because they answer
+  separate questions and fail with separate error classes: `inspect`
+  reports what the bytes ARE, `validate` reports whether they are a
+  well-typed module (AGENTS.md's error hierarchy — a decode error means
+  the bytes are not a module, a validation error means they are a module
+  that is not well-typed). The class name is printed alongside the message
+  so the distinction survives the trip to a shell.
+
+  Success prints one line. The IR format version is on it because ADR-0007
+  makes it the thing an ahead-of-time artifact is rejected against, so it
+  is worth being able to read off a build without a debugger. The line is
+  pure ASCII deliberately: it goes to a terminal whose encoding the
+  program does not control, and a mojibake em-dash in the one line most
+  users ever see is not worth the typography.
+
+  TWO handlers, and the outer one is the point. EWasmError is the expected
+  failure and gets the module-qualified report. Anything else — an
+  EAccessViolation, an ERangeError, an EOutOfMemory from a hostile module
+  — is a wasmlight BUG, but an unhandled exception leaves the RTL to abort
+  with exit code 217 and a raw runtime-error dump, which is unreadable and
+  indistinguishable from a crash. The outer handler turns that into a
+  named error on stderr and exit 1. It fixes nothing: it makes the failure
+  reportable. }
+function HandleValidate(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  Module: TWasmModule;
+  Bytes: TWasmBytes;
+  Ir: TWasmIrModule;
+  I: Integer;
+begin
+  if APositionals.Count < 1 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('validate'),
+      'expected at least one <module.wasm>');
+    Exit(1);
+  end;
+
+  Result := 0;
+  Module := TWasmModule.Create;
+  try
+    for I := 0 to APositionals.Count - 1 do
+    begin
+      Ir := nil;
+      try
+        try
+          DecodeModuleFile(APositionals[I], Module, Bytes);
+          Ir := ValidateModule(Module, Bytes);
+          WriteLn(APositionals[I], ': valid - ', Length(Ir.Functions),
+            ' function(s) lowered, ', Module.TotalFunctionCount,
+            ' in the function index space, IR format version ',
+            Ir.FormatVersion);
+        except
+          on E: EWasmError do
+          begin
+            WriteLn(ErrOutput, ErrPrefix('validate'), APositionals[I],
+              ': ', E.ClassName, ': ', E.Message);
+            Result := 1;
+          end;
+          on E: Exception do
+          begin
+            WriteLn(ErrOutput, ErrPrefix('validate'), APositionals[I],
+              ': internal error: ', E.ClassName, ': ', E.Message);
+            Result := 1;
+          end;
+        end;
+      finally
+        { In the finally, not after the except: an outer handler that
+          re-raised, or a future `Exit` inside the loop, would otherwise
+          leak the IR module. }
+        FreeAndNil(Ir);
+      end;
+    end;
+  finally
+    Module.Free;
+  end;
+end;
+
 { --- top-level flags ----------------------------------------------------- }
 
 { The cli package's PrintTopLevelHelp hardcodes lwpt's own tagline
@@ -208,7 +291,7 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   Registry: TSubcommandRegistry;
-  InspectOpts: TOptionArray;
+  InspectOpts, ValidateOpts: TOptionArray;
 begin
   if WantsVersion then
   begin
@@ -224,6 +307,12 @@ begin
       'Decode a module and report its sections and entity counts',
       '<module.wasm> [<module.wasm>...]',
       @HandleInspect, InspectOpts));
+
+    SetLength(ValidateOpts, 0);
+    Registry.Add(TSubcommand.Create('validate',
+      'Decode and validate a module, reporting the lowered IR',
+      '<module.wasm> [<module.wasm>...]',
+      @HandleValidate, ValidateOpts));
 
     if WantsTopLevelHelp then
     begin

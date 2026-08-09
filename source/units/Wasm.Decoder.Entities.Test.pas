@@ -65,6 +65,7 @@ type
     procedure TestStartRejectsMalformed;
     procedure TestTagSection;
     procedure TestTagRejectsMalformed;
+    procedure TestExternKindPrefixNamesTheSection;
   end;
 
 procedure TDecoderEntitiesTests.BeforeEach;
@@ -431,6 +432,43 @@ begin
     [$01, $00, $01, $00]);
 end;
 
+{ The import and export descriptions share ONE production — the
+  externtype discriminator byte — but upstream names the failure after
+  the section it appears in, so the two raise sites must not share a
+  message. A single constant here would silently pass one of these two
+  cases and fail the other against the corpus. }
+procedure TDecoderEntitiesTests.TestExternKindPrefixNamesTheSection;
+var
+  Reader: TWasmReader;
+  Actual: string;
+
+  procedure Run(const ASection: string; const AValues: array of Byte);
+  begin
+    Reader := ReaderOver(AValues);
+    Actual := '<not rejected>';
+    try
+      DecodeSection(ASection, Reader, 0);
+    except
+      on E: EWasmDecodeError do
+        Actual := E.Message;
+    end;
+  end;
+
+begin
+  { One import, both names empty, discriminator $05 — one past the last
+    assigned kind ($04, tag). }
+  Run('import', [$01, $00, $00, $05, $00]);
+  Expect<string>('import: '
+      + Copy(Actual, 1, Length(MSG_MALFORMED_IMPORT_KIND)))
+    .ToBe('import: ' + MSG_MALFORMED_IMPORT_KIND);
+
+  { One export, empty name, the same bad discriminator. }
+  Run('export', [$01, $00, $05, $00]);
+  Expect<string>('export: '
+      + Copy(Actual, 1, Length(MSG_MALFORMED_EXPORT_KIND)))
+    .ToBe('export: ' + MSG_MALFORMED_EXPORT_KIND);
+end;
+
 procedure TDecoderEntitiesTests.SetupTests;
 begin
   Test('imports of all five kinds', TestImportsOfAllFiveKinds);
@@ -454,6 +492,8 @@ begin
   Test('start section rejects malformed forms', TestStartRejectsMalformed);
   Test('tag section', TestTagSection);
   Test('tag section rejects malformed forms', TestTagRejectsMalformed);
+  Test('the extern-kind prefix names the section it appears in',
+    TestExternKindPrefixNamesTheSection);
 end;
 
 begin

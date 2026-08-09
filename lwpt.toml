@@ -20,6 +20,7 @@ cli = { source = "frostney/lwpt", version = "^0.4.0", include = ["packages/cli/*
 [build]
 wasmlight = { source = "source/apps/wasmlight.pas", output = "build/wasmlight" }
 wasmbench = { source = "source/apps/wasmbench.pas", output = "build/wasmbench" }
+wasmspec = { source = "source/apps/wasmspec.pas", output = "build/wasmspec" }
 
 # stamp-version derives source/units/Version.inc from this manifest's
 # [package].version, consumed by Wasm.Core's `{$I Version.inc}`. The

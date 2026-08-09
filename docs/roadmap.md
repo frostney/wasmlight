@@ -5,11 +5,16 @@
 - This file is the honest picture of what exists. Every other doc
   describes shipped behaviour only; anything not shipped is listed here.
 - **Shipped:** the binary reader, the type vocabulary, the populated
-  module model, the full section-body decoder (Track A), the first slice
-  of the `.wast` harness front end, and `wasmlight inspect`.
-- **Longest pole: garbage collection.** Not by instruction count — by
-  structural reach. It rewrites the type section, adds a runtime
-  subtyping check, and puts a collector under every tier.
+  module model, the full section-body decoder (Track A), the validator
+  and the register IR it emits (Track B, vectors excepted), the `.wast`
+  harness front end and its runner over the corpus's binary subset (Track
+  C, partial), the runtime state and the precise collector (Track D,
+  delivered), and three programs: `wasmlight inspect` / `wasmlight
+  validate` and `wasmspec`.
+- **Garbage collection has landed (Track D).** It was the longest pole by
+  structural reach, not by instruction count: it rewrote the type section,
+  added a runtime subtyping check, and put a precise collector under the
+  runtime. The remaining reach is what runs on it — the execution tiers.
 - **Largest single chunk: SIMD**, at roughly half the instruction set.
   Large but shallow, and almost entirely independent of everything else.
 - **No dates.** There is no delivery history to anchor them to (see
@@ -20,9 +25,11 @@
 
 Sizing here is anchored on the **counted specification surface**, not on
 measured throughput, because there is nothing to measure yet: the
-repository has one commit, no closed issues, no merged pull requests, and
-no releases. A throughput-anchored plan needs merged-PR history and
-issue-to-merge lead time; neither exists.
+repository has no closed issues, no merged pull requests, and no releases.
+A throughput-anchored plan needs merged-PR history and issue-to-merge lead
+time; neither exists. Tracks A, B, and D landing — and Track C in part —
+does not change that: tracks landing outside a pull-request workflow are
+not a rate.
 
 That is a real limitation, not a formality. Counts tell you how much
 surface there is, not how fast this project crosses it. **Re-anchor this
@@ -51,14 +58,31 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Expression skipper, full 3.0 opcode immediate table | `Wasm.Decoder.Expr` | `Wasm.Decoder.Expr.Test` |
 | Cross-section grammar checks (function/code, data count) | `Wasm.Decoder` | `Wasm.Decoder.Test` |
 | Populated module model with index-space counts | `Wasm.Module` | `Wasm.Module.Test` |
+| Type-section validity, rec-group canonicalisation, the matching relation | `Wasm.Validator.Types` | `Wasm.Validator.Types.Test` |
+| Constant-expression validation and its lowered init expressions | `Wasm.Validator.Const` | `Wasm.Validator.Const.Test` |
+| Fused body walk — decode, type-check, and IR emission in one pass, including GC, exception handling, and tail calls | `Wasm.Validator.Body` | `Wasm.Validator.Body.Test` |
+| Register-based IR: instruction encoding, aux blocks, safepoints, handler tables, disassembler | `Wasm.Ir` | `Wasm.Ir.Test` |
+| Module-level validation, phase order, and IR assembly (`ValidateModule`) | `Wasm.Validator` | `Wasm.Validator.Test` + `Wasm.Fixtures.Test` |
+| Untagged runtime value slot and reference encoding | `Wasm.Runtime.Values` | `Wasm.Runtime.Values.Test` |
+| Trap vocabulary, fault attribution, and the per-invocation trampoline | `Wasm.Runtime.Traps` | `Wasm.Runtime.Traps.Test` |
+| Linear memory and the one access chokepoint (ADR-0013 strategy matrix) | `Wasm.Runtime.Memory` | `Wasm.Runtime.Memory.Test` |
+| Engine canonical type table, store, instances, runtime subtyping | `Wasm.Runtime.Store` | `Wasm.Runtime.Store.Test` |
+| Constant-expression evaluation and the instantiation sequence | `Wasm.Runtime.Instantiate` | `Wasm.Runtime.Instantiate.Test` (incl. fixture instantiation) |
+| Precise, non-moving, stop-the-world mark-sweep collector | `Wasm.Runtime.Gc` | `Wasm.Runtime.Gc.Test` |
 | `.wast` lexer, s-expression parser, command classifier | `Wasm.Wast` | `Wasm.Wast.Test` |
+| `.wast` runner: binary subset judged (malformed / invalid / top-level module) | `Wasm.Wast.Runner` | `Wasm.Wast.Runner.Test` + the corpus |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
+| `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
+| `wasmspec` (runs the corpus's binary subset) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
 | Decoder and LEB128 benchmarks | `source/apps/wasmbench.pas` | measurement only |
 
-Everything below is **Absent** unless marked otherwise. The one partial
-delivery is Track C, whose script front end exists without its runner —
-noted in the track itself.
+Everything below is **Absent** unless marked otherwise. Tracks A, B, and D
+are delivered; one delivery is partial: Track C's runner judges the
+corpus's binary subset, but the text-format assembler and the
+execution-tier assertions are absent. Track B's caveat stands — it walks
+every non-vector instruction the 3.0 draft defines, with the `$FD` space
+staged to Track G.
 
 ## The counted backlog
 
@@ -119,63 +143,138 @@ and `comptype` (functype | structtype | arraytype) with mutable and
 **packed** field types. This was the largest single piece of Track A and
 it exists only because of the GC target.
 
-### Track B — Validation and the IR (needs A — now unblocked)
+### Track B — Validation and the IR — **delivered, vectors excepted**
 
 The spec's static type check, emitting the register-based IR
 ([ADR-0007](adr/0007-validation-emits-the-lowered-ir.md),
-[ADR-0012](adr/0012-the-ir-is-register-based.md)). Includes the
-`valid-rectype` / `valid-comptype` / `valid-heaptype` / `valid-typeuse`
-clauses and null-tracking for non-nullable reference types.
+[ADR-0012](adr/0012-the-ir-is-register-based.md)). It runs once, before
+any tier, and it is the only pass that reads the raw binary: the type
+section validated incrementally with each rec group canonicalised and
+interned, the `valid-rectype` / `valid-comptype` / `valid-heaptype` /
+`valid-typeuse` clauses, constant expressions, the module-shape rules in
+the phase order `valid-module` fixes, and a fused per-function walk that
+decodes, type-checks, and lowers in a single pass — with local
+initialization tracking for non-defaultable locals. `Wasm.Ir` holds what
+it emits, and `wasmlight validate` is the shipped consumer.
 
-### Track C — Conformance harness (needs A — now unblocked; grows with every later track)
+The walk covers the GC (`$FB`) space, exception handling — `try_table`'s
+handler ranges and catch clauses are emitted from day one, though nothing
+throws until Track H — tail calls, multiple memories, and memory64
+address types.
+
+Two honest caveats:
+
+- **Vectors are not validated.** `$FD` typing is Track G's, and the walk
+  raises `SIMD validation is not implemented` rather than accepting a
+  `v128` instruction it has not checked. That includes `v128.const`,
+  which *is* a constant instruction in the spec. `IR_FORMAT_VERSION` is 1
+  and bumps to 2 when Track G appends the vector ops.
+- **The error-message prefixes are unconfirmed.** The corpus prefix-
+  matches failure strings, so the messages are part of conformance rather
+  than diagnostics. Where the upstream spelling could not be confirmed
+  against the spec text, the source carries an `UNCONFIRMED` marker at the
+  site. Track C's runner is what settles them — until it runs, every
+  message is our best reading and some will change.
+
+### Track C — Conformance harness (needs A) — **runner delivered over the binary subset; wat assembler and execution pending**
 
 A `.wast` script runner. This is deliberately early: it is the only
 external judge the project has, and every later track's claim of
 correctness routes through it.
 
-The first slice is delivered: `Wasm.Wast` holds the lexer, s-expression
+Two slices are delivered. `Wasm.Wast` holds the lexer, s-expression
 parser, and top-level command classifier, keeping module payloads as raw
-trees so the lazy-decoding requirement below is preserved by
-construction. The runner — module assembly, execution, and assertion
-judging — is still absent. Requirements the corpus imposes, none
-optional:
+trees so lazy decoding is preserved by construction. `Wasm.Wast.Runner`
+then assembles each `(module binary ...)` case and runs it through decode
+and validation, judging `assert_malformed`, `assert_invalid`, and
+top-level `module`; `wasmspec` (`source/apps/`) points it at the corpus.
+Over `WebAssembly/testsuite@main` that is `pass=1034 fail=35 staged=6`
+with `errors=0` — 1,075 judged commands (`pass + fail + staged`), the
+`(module binary ...)` cases the runner reached. See [testing.md](testing.md) and
+[`tests/spec/README.md`](../tests/spec/README.md) for the tallies and the
+failure breakdown.
 
-- **Lazy decoding.** `(module quote ...)` (1,311 occurrences) and
-  `(module binary ...)` (1,069) must be parsed or decoded at *command
+Track B is why this became useful without an execution tier:
+`assert_malformed` (2,208) and `assert_invalid` (3,009) exercise decode
+and validation alone, and running them is what settled the
+decode/validation-reachable `UNCONFIRMED` message prefixes (see Track B).
+
+What is still absent is the rest of Track C:
+
+- **The text-format assembler.** `(module ...)` and `(module quote ...)`
+  cases are skipped for want of a `.wat` → bytes assembler, and that is the
+  bulk of the skipped corpus. The design is written up at
+  `.agent/design/wat-assembler.md`, and it is the path to the rest of
+  Track C.
+- **Execution-tier assertions.** `register`, `invoke`, `assert_return`,
+  `assert_trap`, and the rest need a tier (Track E) and are skipped until
+  one exists.
+
+Requirements the corpus imposes, and where each stands:
+
+- **Lazy decoding — met.** `(module quote ...)` (1,311 occurrences) and
+  `(module binary ...)` (1,069) are assembled or decoded at *command
   execution* time, not script-parse time — otherwise `assert_malformed`
   cannot observe the failure it exists to observe.
-- **Prefix-matched failure strings.** The reference interpreter checks
-  that the expected string is a *prefix* of the actual message. Our error
-  messages are therefore part of conformance, not just diagnostics.
+- **Prefix-matched failure strings — met for the binary subset.** The
+  reference interpreter checks that the expected string is a *prefix* of
+  the actual message. Our error messages are therefore part of
+  conformance, not just diagnostics.
 - **NaN classes.** `nan:canonical` (3,283) and `nan:arithmetic` (3,391)
-  rule out bitwise float comparison.
+  rule out bitwise float comparison — once `assert_return` is judged.
 - **`(either ...)` results** (32) for implementation-defined relaxed-SIMD
   outcomes.
 - **Host references**: `(ref.extern n)` (140) and `(ref.host n)`.
 - **Testsuite-local directives** `assert_malformed_custom` and
-  `assert_invalid_custom` are not in the reference grammar; the parser
-  must not choke on them.
+  `assert_invalid_custom` are not in the reference grammar; the runner
+  classifies them as unknown and skips them.
 
 Watch for runner timeouts on the outliers: two SIMD files are 11,676
 lines each.
 
-### Track D — Runtime state and the collector (needs B) — **longest pole**
+### Track D — Runtime state and the collector (needs B) — **delivered**
 
-Store, instances, memories, tables, globals, the trap path
-([ADR-0009](adr/0009-traps-unwind-to-a-per-invocation-trampoline.md)),
-and the precise collector
-([ADR-0011](adr/0011-precise-gc-from-ir-derived-stack-maps.md)).
+The store, instances, memories, tables, and globals; the value
+representation; the memory chokepoint; the trap path
+([ADR-0009](adr/0009-traps-unwind-to-a-per-invocation-trampoline.md));
+instantiation; and the precise collector
+([ADR-0011](adr/0011-precise-gc-from-ir-derived-stack-maps.md)) — all below
+the tier seam, none of it executing a guest instruction yet.
 
-GC's 31 instructions are the small part. The obligations are: aggregate
-instances in the store, an allocator with tracing and reclamation,
-canonicalisation of recursive types, and a **runtime subtyping check**
-behind `ref.test` / `ref.cast` / `br_on_cast*`. Three disjoint heap-type
-hierarchies (func, aggregate, extern) have to be modelled exactly.
+Delivered, unit by unit:
 
-### Track E — Interpreter tier (needs B, D)
+- **Value representation** — the 8-byte untagged slot, references
+  discovered from `RefRegBits` rather than a tag (`Wasm.Runtime.Values`).
+- **Store and instances** — the engine-wide canonical type table that
+  re-interns each module's rolled rec-group keys, plus a **runtime
+  subtyping check** behind `ref.test` / `ref.cast` / `br_on_cast*`; three
+  disjoint heap-type hierarchies (func, aggregate, extern) modelled
+  exactly (`Wasm.Runtime.Store`).
+- **The memory chokepoint** — one access path, the strategy chosen
+  statically per memory by the ADR-0013 matrix (guard pages, guard-assisted
+  checks, or explicit checks), every route trapping identically
+  ([ADR-0013](adr/0013-i64-memories-take-guard-assisted-bounds-checks.md),
+  `Wasm.Runtime.Memory`).
+- **The trap path** — fault attribution and the per-invocation trampoline
+  (`Wasm.Runtime.Traps`).
+- **Instantiation** — the constant-expression evaluator and the
+  `aux-rundata` allocation order, raising `EWasmLinkError` before any
+  mutation on a bad import (`Wasm.Runtime.Instantiate`).
+- **Precise mark-sweep GC** — non-moving, stop-the-world, triggered at
+  allocation sites, with runtime subtyping and the IR-derived frame walk
+  keeping exactly the flagged registers (`Wasm.Runtime.Gc`).
+
+Verified by the `Wasm.Runtime.*` suites, fixture instantiation, and the
+corpus's binary subset. GC's 31 instructions were always the small part;
+the subsystem around them was the work.
+
+### Track E — Interpreter tier (needs B, D — both done) — **critical-path next step**
 
 The tier of record and the reference the other tiers are differentially
-tested against. Carries the epoch check
+tested against. With Track D delivered its prerequisites are met, so it is
+the next step on the critical path. It consumes the IR, Track D's store,
+and the GC's frame-walk contract — no re-derived rule, no second read of
+the binary. Carries the epoch check
 ([ADR-0006](adr/0006-epoch-interruption-not-fuel.md)) and stack-map
 production from the start, because retrofitting either is the expensive
 version.
@@ -186,20 +285,34 @@ version.
 The v1 host surface is WASI preview1 only
 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
-### Track G — SIMD (needs B, E) — **largest chunk, most parallel**
+### Track G — SIMD (B done; needs E for execution) — **largest chunk, most parallel**
 
 ~256 instructions counting the `v128` load/store family. Almost entirely
 independent of GC, EH, and the host surface, and internally uniform — the
 best candidate for parallel work, and the one whose progress is least
 informative about the rest of the project.
 
-### Track H — Exception handling (needs B, D, E)
+**Vector validation is staged here, not in Track B.** The body walk and
+the constant-expression checker both reach the `$FD` space and both raise
+`SIMD validation is not implemented` at it, so the surface is already
+enumerated and the failure is loud rather than silent. Track G's first
+obligation is therefore typing plus IR lowering for these instructions,
+which appends to `TWasmIrOp` and bumps `IR_FORMAT_VERSION` to 2;
+execution follows and needs E. `tests/fixtures/valid/simd.wasm` asserts
+the staged message today, so it is the first thing that fails when the
+work starts.
+
+### Track H — Exception handling (B done; needs D, E)
 
 Tag section (id 13, already recognised by the decoder), `syntax-tagtype`,
 tag and exception instances in the store, and an **exception-handler
-stack** alongside labels and frames. A second unwinding mechanism next to
-the trap path, which is why ADR-0009 says wasm exceptions need their own
-route through the trampoline rather than reusing the trap one.
+stack** alongside labels and frames. The static half is done: Track B
+validates `try_table` and its catch clauses and emits the IR's handler
+ranges, resolved targets, and payload registers. What is absent is the
+dynamic half — throwing, matching a handler, and unwinding to it. That is
+a second unwinding mechanism next to the trap path, which is why ADR-0009
+says wasm exceptions need their own route through the trampoline rather
+than reusing the trap one.
 
 The legacy `try` / `catch` / `delegate` / `rethrow` encoding is **not** in
 3.0 — it lives in `testsuite/legacy/` and is out of scope.
@@ -236,8 +349,9 @@ graph LR
   C -.judges.-> H
 ```
 
-The critical path is **A → B → D → E**. Everything expensive that is not
-on it — SIMD especially — can proceed in parallel once B lands.
+The critical path is **A → B → D → E**; A, B, and D are behind it, so E is
+next. Everything expensive that is not on the path — SIMD especially — can
+proceed in parallel.
 
 ## Constraints discovered from the spec
 

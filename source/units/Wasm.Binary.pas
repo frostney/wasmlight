@@ -22,12 +22,82 @@ uses
 
   Wasm.Core;
 
+const
+  { --- canonical decode message prefixes ---------------------------------
+
+    Every message the decode layer raises STARTS with one of these and
+    appends its own context after a colon. The reference interpreter's
+    script checker prefix-matches `assert_malformed` strings, so the
+    prefix is conformance surface, not decoration: these spellings were
+    settled against WebAssembly/testsuite@de54fd27 by `wasmspec`, which is
+    why they no longer carry Track B's UNCONFIRMED markers.
+
+    They live in Wasm.Binary because it is the lowest unit of the decode
+    layer and every unit above it (Wasm.Decoder and the five
+    Wasm.Decoder.* section decoders, plus the body walk in
+    Wasm.Validator.Body, which reports binary-grammar failures) already
+    uses it. Adding a prefix means adding it here, never re-spelling a
+    literal at a raise site.
+    https://webassembly.github.io/spec/core/appendix/index-instructions.html }
+
+  { Input ran out. The SAME truncation reports differently depending on
+    WHERE the reader sits: upstream distinguishes running off the end of
+    the module from running off the end of a section body or a function.
+    TWasmReader carries that as its Context, so the distinction is a
+    property of the reader, not of each call site. Note the first is a
+    PREFIX of the second, so a case that only asserts `unexpected end`
+    is satisfied by either. }
+  MSG_UNEXPECTED_END = 'unexpected end';
+  MSG_UNEXPECTED_END_OF_SECTION = 'unexpected end of section or function';
+
+  { LEB128. `too large` is a value that does not fit the width; `too
+    long` is an encoding that spends more bytes than the width allows,
+    whatever value it spells. }
+  MSG_INTEGER_TOO_LARGE = 'integer too large';
+  MSG_INTEGER_TOO_LONG = 'integer representation too long';
+
+  { The `name` production's UTF-8 side condition — a DECODE rule, see
+    ReadName below. }
+  MSG_MALFORMED_UTF8 = 'malformed UTF-8 encoding';
+
+  { The preamble and the section walk. }
+  MSG_MAGIC_HEADER = 'magic header not detected';
+  MSG_UNKNOWN_BINARY_VERSION = 'unknown binary version';
+  MSG_MALFORMED_SECTION_ID = 'malformed section id';
+  { A declared size that runs past the bytes that remain. }
+  MSG_LENGTH_OUT_OF_BOUNDS = 'length out of bounds';
+  { A known section out of the prescribed order, or repeated. Upstream
+    words it as content after the last section because its decoder walks
+    the sections in order and stops at the first one it cannot place. }
+  MSG_UNEXPECTED_CONTENT = 'unexpected content after last section';
+  { A section body the grammar finished with bytes still remaining. }
+  MSG_SECTION_SIZE_MISMATCH = 'section size mismatch';
+
+  { The externtype discriminator, which upstream names after the section
+    it appears in rather than after the production. }
+  MSG_MALFORMED_IMPORT_KIND = 'malformed import kind';
+  MSG_MALFORMED_EXPORT_KIND = 'malformed export kind';
+
+  { An unassigned opcode. The hex is part of the prefix upstream asserts
+    (`illegal opcode ff`) and is spelled LOWERCASE. }
+  MSG_ILLEGAL_OPCODE = 'illegal opcode';
+  { The memarg flags field, which upstream calls memop. }
+  MSG_MALFORMED_MEMOP_FLAGS = 'malformed memop flags';
+
 type
+  { Where a reader sits, which is what decides how running out of input
+    is reported — see MSG_UNEXPECTED_END above. Top level is the module
+    buffer itself: the preamble and the section headers. A section body,
+    a code entry, and a function body span are all `wrcSection`, because
+    upstream words those the same way. }
+  TWasmReaderContext = (wrcTopLevel, wrcSection);
+
   TWasmReader = record
   private
     FData: PByte;
     FSize: NativeUInt;
     FPos: NativeUInt;
+    FContext: TWasmReaderContext;
 
     procedure Need(const ACount: NativeUInt; const AWhat: string);
     function ReadUnsigned(const ABits: Byte; const AWhat: string): UInt64;
@@ -79,14 +149,38 @@ type
 
     { A sub-reader over ACount bytes starting at the current position,
       which is advanced past them. Section bodies are read this way so a
-      body can never run past its declared length. }
+      body can never run past its declared length. The context is
+      INHERITED: a code entry inside a section body is still inside a
+      section, so only the caller that opens a section body changes it. }
     function SubReader(const ACount: NativeUInt): TWasmReader;
+
+    { The prefix this reader's truncation failures carry, for the few
+      callers that detect exhaustion themselves (a vector count larger
+      than the bytes left) rather than by reading past the end. }
+    function EndOfInputPrefix: string;
 
     property Position: NativeUInt read FPos write SetPosition;
     property Size: NativeUInt read FSize;
+    property Context: TWasmReaderContext read FContext write FContext;
   end;
 
+{ The canonical message for an unassigned opcode. The opcode byte is part
+  of the PREFIX upstream matches (`illegal opcode ff`), not of the context
+  after it, and it is spelled in LOWERCASE hex with no `$` or `0x` — a
+  detail worth a shared helper rather than two literals, because both the
+  expression skipper and the fused body walk raise it and they must agree.
+  https://webassembly.github.io/spec/core/binary/instructions.html#binary-instr }
+function IllegalOpcodeMessage(const AOpcode: Byte;
+  const AOffset: NativeUInt): string;
+
 implementation
+
+function IllegalOpcodeMessage(const AOpcode: Byte;
+  const AOffset: NativeUInt): string;
+begin
+  Result := Format('%s %s at offset %u',
+    [MSG_ILLEGAL_OPCODE, LowerCase(IntToHex(AOpcode, 2)), AOffset]);
+end;
 
 { Widest LEB128 encoding for a value of ABits bits: ceil(ABits / 7). }
 function MaxLebBytes(const ABits: Byte): Integer; inline;
@@ -105,6 +199,7 @@ begin
   FData := AData;
   FSize := ASize;
   FPos := 0;
+  FContext := wrcTopLevel;
 end;
 
 procedure TWasmReader.InitFromBytes(const ABytes: TWasmBytes);
@@ -136,12 +231,20 @@ begin
   FPos := AValue;
 end;
 
+function TWasmReader.EndOfInputPrefix: string;
+begin
+  if FContext = wrcSection then
+    Result := MSG_UNEXPECTED_END_OF_SECTION
+  else
+    Result := MSG_UNEXPECTED_END;
+end;
+
 procedure TWasmReader.Need(const ACount: NativeUInt; const AWhat: string);
 begin
   if Remaining < ACount then
     raise EWasmDecodeError.CreateFmt(
-      'unexpected end of input reading %s at offset %u ' +
-      '(need %u byte(s), %u left)', [AWhat, FPos, ACount, Remaining]);
+      '%s: reading %s at offset %u (need %u byte(s), %u left)',
+      [EndOfInputPrefix, AWhat, FPos, ACount, Remaining]);
 end;
 
 function TWasmReader.ReadByte: Byte;
@@ -167,6 +270,7 @@ function TWasmReader.SubReader(const ACount: NativeUInt): TWasmReader;
 begin
   Need(ACount, 'sub-range');
   Result.Init(FData + FPos, ACount);
+  Result.FContext := FContext;
   Inc(FPos, ACount);
 end;
 
@@ -199,12 +303,12 @@ begin
     begin
       if (B and $80) <> 0 then
         raise EWasmDecodeError.CreateFmt(
-          '%s at offset %u: LEB128 encoding longer than %d bytes',
-          [AWhat, FPos - NativeUInt(Count), MaxBytes]);
+          '%s: %s at offset %u is longer than %d bytes',
+          [MSG_INTEGER_TOO_LONG, AWhat, FPos - NativeUInt(Count), MaxBytes]);
       if (B and not LastMask) <> 0 then
         raise EWasmDecodeError.CreateFmt(
-          '%s at offset %u: LEB128 encoding sets bits above %d',
-          [AWhat, FPos - NativeUInt(Count), ABits]);
+          '%s: %s at offset %u sets bits above %d',
+          [MSG_INTEGER_TOO_LARGE, AWhat, FPos - NativeUInt(Count), ABits]);
     end;
 
     Result := Result or (UInt64(B and $7F) shl Shift);
@@ -236,21 +340,23 @@ begin
     begin
       if (B and $80) <> 0 then
         raise EWasmDecodeError.CreateFmt(
-          '%s at offset %u: LEB128 encoding longer than %d bytes',
-          [AWhat, FPos - NativeUInt(Count), MaxBytes]);
+          '%s: %s at offset %u is longer than %d bytes',
+          [MSG_INTEGER_TOO_LONG, AWhat, FPos - NativeUInt(Count), MaxBytes]);
       { The bits above the value's width must be a sign extension of its
-        top bit; anything else spells a value the width cannot hold. }
+        top bit; anything else spells a value the width cannot hold —
+        which is `integer too large` either way, however it is spelled. }
       if (B and SignMask) <> 0 then
       begin
         if (B and UpperMask) <> UpperMask then
           raise EWasmDecodeError.CreateFmt(
-            '%s at offset %u: LEB128 sign extension does not fill %d bits',
-            [AWhat, FPos - NativeUInt(Count), ABits]);
+            '%s: %s at offset %u has a sign extension that does not fill '
+            + '%d bits',
+            [MSG_INTEGER_TOO_LARGE, AWhat, FPos - NativeUInt(Count), ABits]);
       end
       else if (B and UpperMask) <> 0 then
         raise EWasmDecodeError.CreateFmt(
-          '%s at offset %u: LEB128 encoding sets bits above %d',
-          [AWhat, FPos - NativeUInt(Count), ABits]);
+          '%s: %s at offset %u sets bits above %d',
+          [MSG_INTEGER_TOO_LARGE, AWhat, FPos - NativeUInt(Count), ABits]);
     end;
 
     Result := Result or (Int64(B and $7F) shl Shift);
@@ -374,7 +480,7 @@ begin
 
   if (Len > 0) and not IsValidUtf8(FData + Start, Len) then
     raise EWasmDecodeError.CreateFmt(
-      'name at offset %u is not valid UTF-8', [Start]);
+      '%s: name at offset %u', [MSG_MALFORMED_UTF8, Start]);
 
   SetLength(Result, Len);
   if Len > 0 then

@@ -19,8 +19,13 @@
   ([ADR-0004](adr/0004-conformance-target-is-the-3-0-draft.md)), so
   garbage collection and exception handling are layers in this diagram,
   not future additions to it.
-- Shipped today: the bottom rows of the table below. Everything else is
-  staged in [roadmap.md](roadmap.md) and is described here as design, not
+- Shipped today: decode, validation and the IR, the runtime state below
+  the tier seam (store, instances, the memory chokepoint, traps,
+  instantiation, the precise collector), and the `.wast` runner over the
+  corpus's binary subset. That runtime row landed ahead of the tiers that
+  will sit on it, so the shipped rows in the table below are no longer
+  contiguous. The execution tiers, the embedding API, and the host surface
+  are staged in [roadmap.md](roadmap.md) and described here as design, not
   as behaviour you can call.
 
 ## Layering
@@ -31,11 +36,11 @@ Read bottom-up; each layer may use only the layers below it.
 | --- | --- | --- | --- |
 | Host surface | `Wasm.Wasi.*` | WASI preview1 host; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | planned |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, instantiate, invoke | planned |
-| Runtime state | `Wasm.Runtime`, `Wasm.Memory`, `Wasm.Gc` | store, instances, memories, tables, globals; guard-page and bounds-checked memory; the precise collector | planned |
+| Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Exec.Interp`, `Wasm.Exec.Jit.*`, `Wasm.Exec.Aot` | three implementations of one seam | planned |
 | Tier seam | `Wasm.Exec` | the contract every tier implements; trap trampoline, epoch check, safepoints | planned |
-| IR | `Wasm.Ir` | register-based lowered form every tier consumes | planned |
-| Validation | `Wasm.Validate` | the spec's static type check, run once, emitting the IR | planned |
+| IR | `Wasm.Ir` | register-based lowered form every tier consumes | **shipped** |
+| Validation | `Wasm.Validator` | the spec's static type check, run once, emitting the IR | **shipped** |
 | Module model | `Wasm.Module` | decoded module: populated entity lists, with unparsed payloads kept as spans | **shipped** |
 | Decode | `Wasm.Decoder` | binary → module model | **shipped** |
 | Primitives | `Wasm.Binary` | bounds-checked cursor, LEB128, little-endian reads | **shipped** |
@@ -50,10 +55,36 @@ section body to `Wasm.Decoder.Common` (the shared type-form readers),
 They are one layer — all of them sit between `Wasm.Binary` and
 `Wasm.Module`.
 
-`Wasm.Wast` sits beside the library rather than in this stack: it is the
-staged first slice of the conformance harness ([roadmap.md](roadmap.md),
-Track C) — a `.wast` lexer, s-expression parser, and command classifier
-with no execution and no module decoding behind it yet.
+The Validation layer is one row and four units behind it. `Wasm.Validator`
+owns the module-shape rules and the order the phases run in, and delegates
+to `Wasm.Validator.Types` (type-section well-formedness, recursive-group
+canonicalisation, and the matching relation), `Wasm.Validator.Const`
+(constant expressions), and `Wasm.Validator.Body` (the fused per-function
+walk). None of them re-implements another's rule, and the validation entry
+point is `ValidateModule` on `Wasm.Validator`: it takes the decoded model
+plus the buffer it borrows and returns a `TWasmIrModule`. Two façade
+functions cross the layer boundary on purpose: `IsStagedFeatureMessage`
+(the staged-SIMD message the conformance harness keys its STAGED status on)
+and `GroupMemberCount` (a rolled rec-group key's member count, which the
+runtime store needs). Both are re-exported by `Wasm.Validator` so the
+harness and the store read them through it rather than reaching into a
+validation sub-unit whose constants are private.
+
+`Wasm.Ir` sits below all four and depends on `Wasm.Core` alone. It is data
+structures plus a disassembler, with no validation logic in it — which is
+also why the IR module carries its own index-space snapshots instead of
+pointing back at `TWasmModule`.
+
+`Wasm.Wast` and `Wasm.Wast.Runner` sit beside the library rather than in
+this stack: they are the conformance harness ([roadmap.md](roadmap.md),
+Track C). `Wasm.Wast` is the front end — a `.wast` lexer, s-expression
+parser, and command classifier that keeps module payloads as raw trees so
+decoding stays lazy. `Wasm.Wast.Runner` is what turns those trees into
+verdicts: it assembles each `(module binary ...)` case and runs it through
+decode and validation, judging `assert_malformed`, `assert_invalid`, and
+top-level `module` commands and tallying everything that needs an
+execution tier as skipped. `wasmspec` is the program that points it at the
+corpus.
 
 `Wasm.Core` depends on nothing in the project. Nothing depends on
 `source/apps/` — the programs are consumers of the library, never a place
@@ -125,11 +156,15 @@ not part of what a host discriminates on when decoding modules.
 
 ## What is shipped today
 
-The decode path, end to end:
+The decode and validation path, end to end:
 
 ```text
 bytes ──► TWasmReader ──► DecodeModule ──► TWasmModule
           (Wasm.Binary)   (Wasm.Decoder)   (Wasm.Module)
+                                                │
+                                                ▼
+                                          ValidateModule ──► TWasmIrModule
+                                          (Wasm.Validator)   (Wasm.Ir)
 ```
 
 `TWasmReader` is a record over a raw pointer, not a class over a stream:
@@ -159,8 +194,103 @@ deliberately **not** instruction-walked here: the instruction grammar
 inside them belongs to the fused validation walk that emits the IR
 ([ADR-0007](adr/0007-validation-emits-the-lowered-ir.md)).
 
-`wasmlight inspect` is the shipped consumer of this path: the section
-table plus an entity-count summary per index space.
+`ValidateModule` runs that walk. It validates the type section
+incrementally, canonicalising each recursive group into interned
+module-local ids so that type equality is a constant-time comparison and
+concrete subtyping is a lookup in a precomputed supertype display; then
+imports, the function section's type uses, tables, memories, tags,
+globals, element and data segments, start, and exports, in an order the
+spec's own module rule fixes; then every function body. Constant
+expressions are validated and lowered wherever they occur. The one staged
+family is `$FD`: vector typing is Track G, and the walk raises a clear
+"SIMD validation is not implemented" error rather than accepting a `v128`
+instruction it has not checked.
+
+The IR is register-based rather than stack-based
+([ADR-0012](adr/0012-the-ir-is-register-based.md)): virtual registers are
+assigned during the symbolic stack walk, every register carries exactly
+one value type for the whole function (so
+[ADR-0011](adr/0011-precise-gc-from-ir-derived-stack-maps.md)'s stack map
+is a projection of that array rather than a second analysis), branches are
+already resolved to instruction indices with control-flow merges
+materialised as explicit moves instead of phi nodes, and loop back-edges
+carry a safepoint flag so the epoch check
+([ADR-0006](adr/0006-epoch-interruption-not-fuel.md)) has a fixed place to
+sit. `try_table` handler and catch-clause tables are emitted from day one;
+throwing arrives with Track H. Every IR module is stamped with
+`IR_FORMAT_VERSION`; an ahead-of-time artifact compiled against an older
+shape is rejected on it rather than misread.
+
+**Both error classes come out of the one walk**, and which one a failure
+gets is decided by the rule it broke, not by where the walk happened to be.
+Binary-grammar violations inside a body are `EWasmDecodeError` — an
+unassigned opcode or prefixed subopcode, a truncated immediate, a
+misplaced `else`, a malformed block type, a body whose terminating `end`
+is not the last byte of its span, and a body naming a data segment with no
+data count section. Everything about typing is `EWasmValidationError`. The
+body walk is the *first* structural pass over a function body, which is
+why it is the only place a decode error can still be raised this late.
+
+`wasmlight inspect` and `wasmlight validate` are the shipped consumers of
+this path: the section table plus an entity-count summary per index space,
+and decode-then-validate reporting the lowered IR.
+
+### The runtime state below the tier seam
+
+The runtime layer is shipped too, ahead of the tiers that will run on it.
+It is everything the interpreter (Track E) will read but does not execute
+a single instruction itself:
+
+- **`Wasm.Runtime.Values`** — the 8-byte untagged value slot. A slot
+  carries no discriminator; register `i`'s type is
+  `TWasmIrFunction.RegTypes[i]` statically, and the collector learns which
+  slots are references from `RefRegBits`, a projection of that same table
+  ([ADR-0011](adr/0011-precise-gc-from-ir-derived-stack-maps.md)). Narrow
+  writes zero the whole slot so a stale high half is never traced as a
+  pointer.
+- **`Wasm.Runtime.Store`** — the engine-wide canonical type table, the
+  store, and the instance records. Validation's canonical type ids are
+  module-local; the engine re-interns each rolled rec-group key so two
+  structurally identical groups from different modules compare equal, and
+  hands each module a remap into engine ids. This is what
+  `call_indirect`, `ref.cast`, and `ref.test` check against.
+- **`Wasm.Runtime.Memory`** — linear memory and the one memory-access
+  chokepoint. The strategy is chosen **statically** per memory from
+  (platform, address type) alone: guard pages for i32 memories on 64-bit
+  POSIX, guard-assisted checks for i64 memories, explicit checks on 32-bit
+  hosts and Windows
+  ([ADR-0005](adr/0005-guard-page-linear-memory.md),
+  [ADR-0013](adr/0013-i64-memories-take-guard-assisted-bounds-checks.md)).
+  Every consumer goes through it; a caller that bypasses it is the failure
+  mode this design is most exposed to.
+- **`Wasm.Runtime.Traps`** — the trap vocabulary, the fault-attribution
+  registry, the fault handler, and the per-invocation trampoline. A trap
+  raised by the MMU inside a signal handler is attributed there and
+  re-raised as `EWasmTrap` by a trampoline on ordinary ground, never out
+  of the handler
+  ([ADR-0009](adr/0009-traps-unwind-to-a-per-invocation-trampoline.md)).
+- **`Wasm.Runtime.Instantiate`** — the constant-expression evaluator and
+  the instantiation sequence, in the order `aux-rundata` fixes:
+  pre-allocate function instances, evaluate initialisers allocating
+  globals as it goes, then the rest of the instance.
+- **`Wasm.Runtime.Gc`** — the precise, non-moving, stop-the-world
+  mark-sweep collector, triggered at allocation sites only. Precise
+  because validation already recorded every register's static type;
+  non-moving so a host can hold a raw reference across a call with only a
+  registration; single-threaded because a store is confined to one thread
+  ([ADR-0008](adr/0008-a-store-is-confined-to-one-thread.md)). It carries
+  the runtime subtyping check behind `ref.test` / `ref.cast` /
+  `br_on_cast*`.
+
+What is **not** built is the tier seam itself: no execution tier consumes
+this state yet. The interpreter (Track E) is the next unbuilt layer, and it
+consumes the IR, the store, and the GC's frame-walk contract — nothing
+re-derived and no second read of the binary.
+
+`wasmspec` is the third shipped program: it runs the `.wast` corpus through
+`Wasm.Wast.Runner`, judging the binary-module subset (decode and
+validation) and skipping what needs a tier. See [testing.md](testing.md)
+for the measured tallies.
 
 ## Related documents
 
