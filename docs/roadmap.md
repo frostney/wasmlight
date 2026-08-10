@@ -16,16 +16,27 @@
   `.wast` front end, the wat text-format assembler, and a runner that
   assembles text modules and *executes* `assert_return` / `assert_trap` /
   `invoke` / `assert_exhaustion` / `assert_exception` through the
-  interpreter over the whole corpus. Three programs drive it: `wasmlight
-  inspect` / `wasmlight validate` and `wasmspec`.
-- **The core is complete.** With Track H the runtime decodes, validates,
-  instantiates, and **executes all of core wasm 3.0** — every category in
-  the counted backlog, SIMD and exception handling included. Nothing in
-  the interpreter is staged any more: the harness's `STAGED` column is
-  **0**. The corpus runs at **~65,184 pass** of ~67,000 judged commands
-  with `errors=0`. What is left is not a 3.0-core gap — it is the
-  *performance* tiers (baseline JIT and AOT, Tracks I/J), which add no
-  behaviour and are differentially tested against this interpreter.
+  interpreter over the whole corpus. And now the embedding API and the
+  host surface (Track F): `Wasm.Engine` — the Pascal host's load / link /
+  instantiate / call / memory facade — the `Wasm.Wasi.*` WASI preview1
+  host module, and `wasmlight run`, which runs a real WASI command to a
+  process exit code under a deny-by-default capability set. Three programs
+  drive it: `wasmlight` (with `inspect` / `validate` / `run`), `wasmspec`,
+  and `wasmbench`.
+- **The core is complete, and the runtime now runs real programs.** With
+  Track H the runtime decodes, validates, instantiates, and **executes all
+  of core wasm 3.0** — every category in the counted backlog, SIMD and
+  exception handling included. Nothing in the interpreter is staged any
+  more: the harness's `STAGED` column is **0**. The corpus runs at
+  **~65,184 pass** of ~67,000 judged commands with `errors=0`. With Track
+  F that execution core is now reachable from a host and from the command
+  line: `wasmlight run tests/fixtures/wasi/hello.wasm` prints `hello` and
+  exits `0`, and a program granted a preopen reads the filesystem through
+  it — the runtime does not merely execute every instruction, it **runs
+  WASI preview1 programs**, hello-world through filesystem-via-preopens.
+  What is left is not a 3.0-core gap and no longer a host-surface gap — it
+  is the *performance* tiers (baseline JIT and AOT, Tracks I/J), which add
+  no behaviour and are differentially tested against this interpreter.
 - **Garbage collection has landed (Track D).** It was the longest pole by
   structural reach, not by instruction count: it rewrote the type section,
   added a runtime subtyping check, and put a precise collector under the
@@ -112,6 +123,9 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | `.wast` lexer, s-expression parser, command classifier | `Wasm.Wast` | `Wasm.Wast.Test` |
 | `.wast` argument/result value parser and matcher (hex floats, NaN classes, references, per-lane `v128` comparison, the relaxed `(either …)` form) | `Wasm.Wast.Values` | `Wasm.Wast.Values.Test` |
 | `.wast` runner: assembles text modules, decodes, validates, instantiates, and *executes* assertions through the interpreter | `Wasm.Wast.Runner` | `Wasm.Wast.Runner.Test` + the corpus |
+| Embedding API: load / link / instantiate / call, guest memory read/write through the chokepoint, host-root registration (contract HOST-1), the typed host-import linker, `EWasmExit` for a clean guest-requested exit | `Wasm.Engine` | `Wasm.Engine.Test` |
+| WASI preview1 host module: args/environ, clock, a real-CSPRNG `random_get`, stdio, and the wave-2 filesystem behind preopen containment — deny-by-default, no ambient authority | `Wasm.Wasi` (+ `Wasm.Wasi.Types`, `Wasm.Wasi.Memory`) | `Wasm.Wasi.Test` (+ `Wasm.Wasi.Types.Test`, `Wasm.Wasi.Memory.Test`) |
+| `wasmlight run`: decode + validate a WASI command, link it deny-by-default, run `_start`, map the outcome to a process exit code | `Wasm.Run` + `source/apps/wasmlight.pas` | `Wasm.Run.Test` + manual |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
@@ -119,11 +133,11 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Decoder and LEB128 benchmarks | `source/apps/wasmbench.pas` | measurement only |
 
 Everything below is **Absent** unless marked otherwise. Tracks A, B, C, D,
-E, G, and H are delivered; the interpreter now executes the whole 3.0
+E, F, G, and H are delivered; the interpreter executes the whole 3.0
 instruction set, including the `$FD` vector space and exception-handling
-throwing. Nothing is staged in the interpreter any more. What is Absent is
-the embedding/host surface (Track F) and the performance tiers (Tracks
-I/J).
+throwing, and the embedding API and WASI preview1 host surface (Track F)
+now run that core as real programs. Nothing is staged in the interpreter
+any more. What is Absent is the performance tiers (Tracks I/J).
 
 ## The counted backlog
 
@@ -342,10 +356,55 @@ version. It runs the corpus's `assert_return` / `assert_trap` /
 `assert_exhaustion` / `assert_exception` cases through Track C — `$FD`
 vector execution and exception-handling throwing (Track H) included.
 
-### Track F — Embedding API and WASI preview1 (needs E)
+### Track F — Embedding API and WASI preview1 (needs E) — **delivered**
 
-`Wasm.Engine`, `wasmlight run`, and the deny-by-default capability set.
-The v1 host surface is WASI preview1 only
+The runtime is now reachable from a Pascal host and from the command line,
+and it runs real WASI preview1 programs. The v1 host surface is WASI
+preview1 only
+([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)); the
+Component Model stays out.
+
+- **The embedding API (`Wasm.Engine`).** A facade over the shipped
+  runtime, adding no runtime logic of its own: load (decode + validate,
+  keeping `EWasmDecodeError` and `EWasmValidationError` distinct), link
+  through a typed host-import builder (`TWasmLinker` — an import the host
+  did not define is simply absent, so instantiation fails with
+  `EWasmLinkError`; there is no ambient fallback), instantiate, call, and
+  read/write guest memory through the one chokepoint. It also re-exports
+  the collector's host-root registration for contract HOST-1, so a host
+  holding a reference across an allocation roots it. `EWasmExit` — a clean,
+  guest-requested exit, a sibling under `EWasmError`, distinct from a trap
+  and from a wasm exception — is declared here.
+- **WASI preview1 (`Wasm.Wasi.*`).** A host module wired entirely over
+  `Wasm.Engine`. Wave-1 (args/environ, clock, `random_get`, stdio,
+  `proc_exit`, `sched_yield`) and wave-2 (`path_open` and the filesystem
+  file ops) are defined and run; `random_get` fills from the platform
+  CSPRNG (`/dev/urandom` on POSIX, `RtlGenRandom` on Windows), not a PRNG.
+  The capability model is **deny-by-default**: a bare config grants stdio +
+  clock + random and nothing else — no environment, no filesystem, argv
+  only as set. **Preopened directories are the only route to the
+  filesystem**, and every filesystem path is contained to the preopen it
+  derives from — an absolute path, a `..` escape, or an escaping symlink is
+  `ENOTCAPABLE`, rejected before any real OS call. The clock, entropy, and
+  filesystem seams are injectable, which is what makes the host module
+  hermetically testable.
+- **`wasmlight run` (`Wasm.Run` + the CLI).** `wasmlight run [--dir
+  GUEST=HOST]... [--env KEY=VALUE]... <module.wasm> [args...]` decodes and
+  validates a WASI command module, links it against the granted surface,
+  runs `_start`, and maps the outcome to a process exit code — normal
+  return → 0, `proc_exit(n)` (`EWasmExit`) → `n`, a trap → 134, an uncaught
+  wasm exception → 1, a decode/validate/link failure → 1. `--dir` and
+  `--env` add exactly the preopens and variables named and nothing else.
+  The driver is factored out of the program entry point into `Wasm.Run` so
+  it is hermetically unit-testable with injected streams.
+
+Honest scope. This is preview1 **command** modules (`_start`): a reactor's
+`_initialize`-only shape is reported, not run. The wave-3 long tail
+(`path_link` / `symlink` / `readlink` / `rename`, `fd_advise` /
+`allocate` / `sync`, `poll_oneoff`, and the `sock_*` family) is
+intentionally **not defined** — a module importing one fails to link, which
+is the honest deny-by-default posture rather than a silent stub. The
+Component Model is out
 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
 ### Track G — SIMD (needs B, E) — **delivered**
@@ -443,11 +502,13 @@ graph LR
   C -.judges.-> H
 ```
 
-The execution core is complete: **A → B → C → D → E → G → H** are all
-delivered, so every guest instruction in core wasm 3.0 runs. What remains
-is off the correctness path: the embedding API and host surface (F), and
-the **performance** tiers — baseline JIT (I) and AOT (J) — which add no
-behaviour and are differentially tested against the interpreter (E).
+The execution core is complete and the host surface is on it:
+**A → B → C → D → E → F → G → H** are all delivered, so every guest
+instruction in core wasm 3.0 runs and the embedding API and WASI preview1
+host (F) run that core as real programs. What remains is off the
+correctness path: the **performance** tiers — baseline JIT (I) and AOT
+(J) — which add no behaviour and are differentially tested against the
+interpreter (E).
 
 ## Constraints discovered from the spec
 

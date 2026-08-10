@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Thirty-three suites today, 974 tests, all green.
+  independent programs. Thirty-eight suites today, 1,044 tests, all green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -116,6 +116,11 @@ instead.
 | `Wasm.Interp.Numeric.Test` | The numeric leaf functions on raw bit patterns: modulo-2^N integer arithmetic, the trapping conversions, sign extension, and float ops preserving NaN payloads across the call boundary — each case a literal input and expected bits. |
 | `Wasm.Interp.Vector.Test` | The `v128` vector leaf functions on literal 16-byte vectors: lane-wise arithmetic wrapping the lane width, saturating/narrowing clamps, shift counts taken mod the lane width, the per-lane NaN discipline (canonicalise to the positive pattern; `pmin`/`pmax` and `min`/`max` selecting bit-for-bit), swizzle/shuffle lane indexing, and relaxed SIMD reducing to its non-relaxed twin on the deterministic profile (R=0). |
 | `Wasm.Interp.Test` | The dispatch loop over the IR: numeric/parametric/variable/control/call flow, the explicit activation stack with `return_call` replacing the top frame in bounded stack, traps long-jumping to the trampoline as exactly one `EWasmTrap`, the epoch check at loop back-edges, the frame register file zeroed at entry, and exception handling (Track H) — `throw` / `throw_ref` / `try_table` unwinding the activation stack, handler matching by tag store-address, `catch`/`catch_ref`/`catch_all`/`catch_all_ref` binding, and an uncaught throw surfacing as exactly one `EWasmException`. |
+| `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
+| `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |
+| `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
+| `Wasm.Wasi.Test` | The host module, hermetically: captured stdio buffers instead of real fds, an injected fixed clock and deterministic random source, and temp-dir preopens for the filesystem — args/environ, `fd_write`/`read`/`seek`/`close`, `clock_time_get`, `random_get`, and `path_open` plus the wave-2 file ops. The deny-by-default negatives carry the weight: a fabricated fd is `weBadf`, an ungranted clock or an absent preopen is `weNotCapable`, and a path that is absolute, escapes via `..`, or escapes via a symlink is `weNotCapable` before any OS call. |
+| `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and
@@ -246,6 +251,19 @@ must produce identical outcomes
 ([ADR-0001](adr/0001-tiered-execution-seam.md)), so the suite doubles as
 the differential test between them. [roadmap.md](roadmap.md) is where that
 sits in the order of work.
+
+### The WASI conformance corpus is a future wave
+
+The WASI host surface (Track F) is proved today by the hermetic
+`Wasm.Wasi.Test` and `Wasm.Run.Test` suites — captured stdio, an injected
+clock and random source, temp-dir preopens, and the containment negatives.
+Its **external** net, the upstream
+[wasi-testsuite](https://github.com/WebAssembly/wasi-testsuite), is not
+wired up yet — it stands to the host surface exactly as the core
+`testsuite` stood to the runtime before `wasmspec`: the independent judge
+the project does not get to grade itself against. Wiring it in is a future
+wave, tracked in [roadmap.md](roadmap.md); until then the WASI claim rests
+on the hermetic suites, not on an external corpus.
 
 ## Boundaries
 

@@ -24,11 +24,13 @@
   instantiation, the precise collector), the interpreter tier that
   executes the IR — the full `v128` vector set (Track G) and exception
   handling (Track H) included, so **all of core wasm 3.0 executes** — the
-  wat text-format assembler, and the `.wast` runner that assembles,
-  decodes, validates, instantiates, and executes over the whole corpus.
-  The baseline JIT and AOT tiers, the embedding API, and the host surface
-  are staged in [roadmap.md](roadmap.md) and described here as design, not
-  as behaviour you can call.
+  wat text-format assembler, the `.wast` runner that assembles, decodes,
+  validates, instantiates, and executes over the whole corpus, and the
+  embedding API (`Wasm.Engine`) and WASI preview1 host surface
+  (`Wasm.Wasi.*`) that run that core as real programs, deny-by-default,
+  from a Pascal host or from `wasmlight run` (Track F). Only the baseline
+  JIT and AOT tiers are staged in [roadmap.md](roadmap.md) and described
+  here as design, not as behaviour you can call.
 
 ## Layering
 
@@ -36,8 +38,8 @@ Read bottom-up; each layer may use only the layers below it.
 
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
-| Host surface | `Wasm.Wasi.*` | WASI preview1 host; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | planned |
-| Embedding API | `Wasm.Engine` | what a Pascal host calls: load, instantiate, invoke | planned |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run` | deny-by-default WASI preview1 host and the `wasmlight run` driver; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
+| Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT and AOT to come | three implementations of one seam — the interpreter is the tier of record | interpreter **shipped**; JIT/AOT planned |
 | Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
@@ -162,6 +164,15 @@ load-bearing, because a host discriminates on them:
 
 Never collapse them, and never raise a bare `EWasmError` where a specific
 one applies.
+
+A fifth class, `EWasmExit`, is declared in `Wasm.Engine` rather than
+`Wasm.Core`, because a clean exit is a host-surface concept, not a guest
+fault. It is what WASI `proc_exit(n)` raises: a request to stop, carrying
+the exit code, propagated unchanged through the invocation trampoline. It
+is an `EWasmError` subtype so the trampoline carries it out, but a distinct
+sibling — neither a trap nor a `throw` — so a host classifies it exactly;
+`wasmlight run` maps it to the process exit code and everything else is an
+error.
 
 `EWasmException` is a **sibling of `EWasmTrap`, not a subclass** — both
 under `EWasmError`, but a host discriminates between a trap and an escaped
@@ -363,6 +374,42 @@ instantiates, and executes assertions through the interpreter — SIMD judged
 per lane and `assert_exception` judged (Track H), so the `staged` column is
 0 — leaving only host imports and `assert_unlinkable` still ahead. See
 [testing.md](testing.md) for the measured tallies.
+
+### The embedding API and the host surface
+
+Above the runtime sits the layer a host actually calls (Track F). It adds
+no runtime logic — every entry point delegates to a shipped procedure —
+but it is where the runtime becomes reachable and where the capability
+boundary is drawn.
+
+- **`Wasm.Engine`** is the facade: load (decode + validate), link through
+  the typed `TWasmLinker`, instantiate, call, and read/write guest memory.
+  Two invariants are enforced here rather than merely inherited. The
+  **capability boundary is explicit** — a host import reaches the guest
+  only if the linker defines it; an undefined import is absent, so
+  instantiation fails with `EWasmLinkError`, and there is no ambient
+  fallback. And **memory stays behind the chokepoint** — reads and writes
+  route to the store's range check with an overflow-safe pre-check, so the
+  facade never sees a memory's base pointer. It re-exports the collector's
+  host-root API (contract HOST-1) so a host holding a reference across an
+  allocation can root it, and declares `EWasmExit`.
+- **`Wasm.Wasi.*`** is the deny-by-default host module, wired entirely over
+  `Wasm.Engine`. The capability model is the point: a bare config grants
+  stdio + clock + random and nothing else — no environment, no filesystem,
+  argv only as set, **no ambient authority**. Preopened directories are the
+  only route to the filesystem, and the memory chokepoint plus preopen
+  containment together form the sandbox boundary — every guest pointer is
+  bounds-checked through the store, and every filesystem path is contained
+  to the preopen it derives from, so an absolute path, a `..` escape, or an
+  escaping symlink is `ENOTCAPABLE` before any OS call. The clock, entropy
+  (a real platform CSPRNG), and filesystem seams are injectable, which is
+  what makes the host module hermetically testable.
+- **`Wasm.Run`** is the driver behind `wasmlight run`: decode + validate a
+  WASI command, link it against the granted surface, run `_start`, and map
+  the outcome to a process exit code — `EWasmExit` to its code, a trap to
+  134, an uncaught exception to 1, a decode/validate/link failure to 1. It
+  is factored out of the program entry point so it is unit-testable with
+  injected streams, never touching real stdio.
 
 ## Related documents
 

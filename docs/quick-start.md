@@ -55,6 +55,7 @@ lwpt test            # co-located unit suites
 ```bash
 ./build/wasmlight inspect module.wasm    # section table + entity counts
 ./build/wasmlight validate module.wasm   # decode + validate, report the IR
+./build/wasmlight run module.wasm        # run a WASI preview1 command
 ./build/wasmlight --version
 ./build/wasmbench --iterations 20000     # component benchmarks
 ```
@@ -110,10 +111,36 @@ and the failures are dominated by post-3.0 proposals, not 3.0 regressions.
 See [testing.md](testing.md) for what the tallies mean and
 [`tests/spec/README.md`](../tests/spec/README.md) for fetching the corpus.
 
+## Run a WASI program
+
+`wasmlight run` executes a real WASI preview1 command to a process exit
+code. The committed hello-world fixture prints to stdout through
+`fd_write` and returns:
+
+```console
+$ ./build/wasmlight run tests/fixtures/wasi/hello.wasm
+hello
+$ echo $?
+0
+```
+
+The capability model is **deny-by-default**: a bare `run` grants the guest
+stdio, the clock, and random, and nothing else — no environment, no
+filesystem. `--env KEY=VALUE` adds exactly the variables named, and `--dir
+GUEST=HOST` grants a preopened directory, which is the *only* route to the
+host filesystem; every path inside it is contained, so a `..` escape or an
+absolute path is refused before any OS call. Arguments after the module
+(or after `--`) are passed to the guest as argv:
+
+```bash
+./build/wasmlight run --dir /data=./out --env LANG=C app.wasm arg1 arg2
+```
+
 Those three programs are the whole shipped surface today: decode, validate,
 instantiate, and execute the **complete core wasm 3.0 instruction set** —
 every numeric, reference, GC, SIMD, and exception-handling instruction —
-conformance-tested against the upstream corpus (~65,184 assertions pass).
+conformance-tested against the upstream corpus (~65,184 assertions pass),
+**and run WASI preview1 command modules** under deny-by-default sandboxing.
 See [roadmap.md](roadmap.md) for what comes next and in what order.
 
 For the full command set (formatter, benchmarks, CI gates) see

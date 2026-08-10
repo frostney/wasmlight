@@ -1,102 +1,109 @@
 # Handoff
 
-Updated: 2026-08-09 (Track H — exception handling)
+Updated: 2026-08-09 (Track F — embedding API + WASI preview1)
 
-## Current state — CORE WASM 3.0 IS COMPLETE
+## Current state — CORE 3.0 COMPLETE + RUNS REAL WASI PROGRAMS
 
-- **Tracks A, B, C, D, E, G, H delivered.** The runtime decodes,
-  validates, instantiates, and EXECUTES the COMPLETE core wasm 3.0
-  instruction set — numeric, reference, GC, SIMD, and exception
-  handling. There is no staged core feature left.
+- **Tracks A, B, C, D, E, F, G, H delivered.** The runtime decodes,
+  validates, instantiates, and executes the COMPLETE core wasm 3.0
+  instruction set, AND runs real WASI preview1 programs via
+  `wasmlight run` with a deny-by-default sandbox.
 - Gates on the merged tree: `lwpt format`, `lwpt build`, `lwpt test`
-  (33 suites, 974 tests), `lwpt install --frozen` — all green. Docs
+  (38 suites, ~1,044 tests), `lwpt install --frozen` — all green. Docs
   markdownlint-clean.
-- **Corpus (WebAssembly/testsuite@de54fd27, 288 files, errors=0):**
-  pass=65184 fail=408 skip=1533 **staged=0**. ROOT (3.0): pass=64651
-  fail=52. Judged ~65,600 of ~67,000. staged fell 38→0 (EH was the last
-  staged feature).
+- `./build/wasmlight run tests/fixtures/wasi/hello.wasm` → prints hello,
+  exit 0. proc_exit(n)→n, trap→134, uncaught exception→1.
+- Core corpus (WebAssembly/testsuite@de54fd27) unchanged: pass=65184
+  fail=408 skip=1533 staged=0 errors=0 (Track F doesn't touch the core
+  corpus; its own tests are the coverage).
 - **Everything is UNCOMMITTED** (the user commits between turns; the
-  whole runtime is untracked working state — `git stash`/HEAD is NOT a
-  valid baseline).
+  whole runtime is untracked working state).
 
-## What shipped this session (Track H — exception handling)
+## What shipped this session (Track F)
 
-Design doc: .agent/design/eh-spec.md. The groundwork was pre-shipped by
-earlier tracks (the IR ops iroThrow/iroThrowRef, try_table validation +
-handler tables + catch payload registers, tag validation, exn GC objects
-wokExn with traced args) — Track H was mostly the interpreter unwind.
-- H1 (Wasm.Core): EWasmException = class(EWasmError), a SIBLING of
-  EWasmTrap (an uncaught wasm exception is distinct from a trap; the
-  harness discriminates). Carries ExnRef + TagAddr.
-- H2 (Wasm.Interp — the crux): un-staged throw/throw_ref; the EXPLICIT
-  unwind over the activation stack (NO longjmp, NO Pascal raise except
-  the uncaught case → EWasmException to the trampoline, satisfying
-  ADR-0009's "own route"). throw allocates the exn (its only safepoint,
-  before the arg copy), then UnwindException searches each frame's static
-  handler table innermost-first, matching by TAG ADDRESS, popping frames
-  (Heap.PopFrame) until a clause matches; ResumeAtClause writes the
-  payload (+ exnref for _ref clauses) into the target label's merge
-  registers and resumes. Deviation (correct, reviewed): popped-into
-  caller frames are scanned at IP-1 (call-site), the throwing frame at
-  IP — the standard return-address rule the corpus requires.
-- H3 (Wasm.Wast.Runner + Wasm.Validator.Body): assert_exception judging
-  (wakException, PASS iff EWasmException, handler ordered before the
-  generic EWasmError); retired the EH staging; fixed the validator so
-  catch_ref/catch_all_ref deliver a NON-NULL (ref exn) not a nullable
-  exnref (unblocked try_table.wast:420).
+Design doc: .agent/design/embedding-spec.md. Waves F0–F4:
+- Wasm.Wasi.Types: the preview1 errno/filetype/rights/oflags/fdflags/
+  clockid/whence consts + struct sizes/offsets (CONFIRMED except the
+  wave-3 poll_oneoff values).
+- Wasm.Engine: the embedding facade over the shipped runtime —
+  TWasmLoadedModule (owns bytes, ADR-0003), TWasmLinker (DefineFunc/
+  Memory/Global; the engine-type-id import matching), TWasmInstance,
+  load/instantiate/call/memory accessors (through the chokepoint, never
+  raw Base), and the HOST-1 host-root registration that closes Track H's
+  forward-hazard (RootRegister/RootExceptionRef). EWasmExit lives here
+  (clean guest-requested exit, sibling under EWasmError).
+- Wasm.Wasi.Memory: the guest-pointer helpers (GuestReadBytes/WriteBytes/
+  ReadU32/ReadIoVec) — overflow-safe bounds → EFAULT, the sandbox's
+  memory boundary. Never touches Base.
+- Wasm.Wasi: deny-by-default TWasmWasiConfig (argv/env/preopens +
+  injectable stdio/clock/random), the fd table, and the preview1 host
+  functions — wave-1 (args/env/clock/random/stdio/proc_exit) + wave-2 fs
+  via preopens (path_open with STRICT containment, file/dir ops,
+  fd_readdir, filestat). Real CSPRNG (/dev/urandom / RtlGenRandom, fails
+  closed → EIO). clock_gettime nanosecond precision.
+- Wasm.Run + wasmlight run: the CLI (`run [--dir g=h] [--env K=V] [--]
+  <mod.wasm> [args]`), the `--` guest-argv pre-scan (a 2nd sanctioned
+  cli exception, now documented in AGENTS.md), the exit-code mapping.
 
-## Review outcome (Opus-5; corpus = behavior oracle)
+## Review outcome (Opus-5 SECURITY + standards + corpus)
 
-CLEAN — no correctness bugs. All unwind edges verified: GC safety during
-pop-and-continue (allocation-free unwind; popped frames unregistered;
-exnref rooted before resume), the IP-1 call-site scan, tag-address
-matching, TRAP-1 at the uncaught raise, the (ref exn) fix. Findings all
-LOW/INFO: dead wrsStaged bucket (defensible), a trivial dead ArgC
-compute, and three FORWARD hazards for Track F host embedding (uncaught
-ExnRef is an unrooted raw handle after the entry frame pops — safe today
-because the harness reads only the message and nothing allocates between
-raise and read; a real Pascal host frame between two invokes receiving
-an EWasmException is untested). None are bugs; all are documented.
+Security review of the sandbox boundary: **core sandbox sound** — no
+guest-only escape in the shipped function set; guest-memory bounds are
+overflow-safe at every level (incl. the iovec double-indirection);
+the memory chokepoint is never bypassed (no raw Base anywhere in the
+WASI units); deny-by-default holds (no ambient fs/env/argv; bare config
+= stdio only); CSPRNG fails closed. Found + FIXED:
+- **F1 (MEDIUM, containment)**: path_open with O_CREAT to a non-existent
+  target validated only the parent, so a dangling symlink in the
+  operator's preopen let the guest create/write OUTSIDE the sandbox.
+  Fixed: lstat the leaf, reject a final-component symlink on create
+  (weNotCapable) — regression test proves the outside file is not
+  created.
+- Hardened (LOW): reject embedded-NUL paths (weInval); rights check on
+  fd_filestat_get; per-context fd cap (weMFile); clamp 64-bit I/O
+  lengths; one central OsErrnoToWasi translator (was fixed guesses).
+- Documented residuals: F2 (path-string TOCTOU — external-writer-only,
+  the guest can't race under single-thread ADR-0008; openat/*at is the
+  full fix), F5 (host dev/ino/nlink/timestamps passthrough — kept real
+  st_ino so hardlink/cycle detection in real programs works).
+Standards review: high quality, clean layering DAG, no inversion; fixed
+a dead wxkTable arm, added a non-EWasmError catch-all to run, documented
+the run CLI exception + the EWasmExit/EWasmException hierarchy, and
+covered the hello.wasm fixture with a load-and-run test.
 
-## Remaining fails (characterized, NOT 3.0-core gaps)
+## Honest scope (Track F)
 
-- ~356 PROPOSALS: custom-descriptors, custom-page-sizes, threads,
-  wide-arithmetic — post-3.0, outside ADR-0004.
-- ~52 ROOT: LEGACY EH encoding (try/catch/delegate/rethrow in
-  testsuite/legacy/ — OUT of scope per the roadmap, correctly failing),
-  the binary-leb128 decode wording (limits u64-vs-address-type-u32
-  width, deliberately deferred), 2 throw.wast assert_invalid type-
-  mismatch WORDING edges (generic "operand stack underflows" vs upstream
-  "instruction requires [i32] but stack has []"), M7 extern/any convert
-  imprecision, the `(module definition/instance)` multi-module linking-
-  harness forms (a runner feature, not built), a couple assembler edges
-  (id.wast $"quoted", obsolete anyfunc, call_indirect64 inline elem).
-- staged=0, skip ~1,533 (mostly assert_unlinkable 262 + host-import-
-  dependent + the linking-harness forms).
+- Preview1 COMMAND modules (_start) run; reactors (_initialize-only) are
+  detected/reported, not driven, in v1.
+- fs is wave-1 (stdio/args/env/clock/random) + wave-2 (path_open + file/
+  dir ops via preopens). The long tail (path_link/symlink/readlink/
+  rename, fd_advise/allocate/sync, poll_oneoff) is NOT defined — a module
+  importing one fails to link (honest deny-by-default). sock_* stays
+  ENOTCAPABLE (no network by design). A future F5 wave stubs the tail
+  ENOSYS + wires the external wasi-testsuite as a conformance net.
+- Component Model OUT (ADR-0014). Threads/shared-memory OUT (ADR-0008).
+- UNCONFIRMED: Windows CSPRNG link path + non-UNIX clock fidelity; the
+  wave-3 poll_oneoff constants; a few witx struct details (F5/wasi-
+  testsuite validates them).
 
 ## Next steps (dependency order)
 
 1. **Track I — baseline JIT** (x86-64 + aarch64). The interpreter is the
-   differential reference (ADR-0001). Inherits: emit the epoch check at
-   back-edges, produce a stack map at safepoints (RefRegBits is already
-   the projection), keep live refs discoverable (constrains regalloc).
-   Guard-page memory becomes the JIT's inline-access optimization once
-   signal→trampoline delivery is proven in-process (interpreter uses
-   explicit checks today). Observational-identity items to match are in
-   interp-spec §8 + simd-spec §9 + eh-spec §9 (unwind semantics, tag-
-   address matching, exn alloc as a safepoint, relaxed-op R=0, per-lane
-   NaN, FP rounding, trap timing).
+   differential reference (ADR-0001). Inherits the epoch check at
+   back-edges, stack maps at safepoints (RefRegBits is the projection),
+   live-ref discoverability constraining regalloc. Guard-page memory
+   becomes the JIT's inline-access optimization once signal→trampoline
+   delivery is proven in-process (interpreter uses explicit checks).
+   Observational-identity contracts: interp-spec §8, simd-spec §9,
+   eh-spec §9 (unwind semantics, tag-address match, exn alloc safepoint,
+   relaxed-op R=0, per-lane NaN, FP rounding, trap timing).
 2. **Track J — AOT + artifact cache** (needs I). Artifacts record the IR
-   version (currently 2) and are rejected on mismatch.
-3. **Track F — embedding API + WASI preview1** (needs E; independent of
-   I/J). Wasm.Engine, wasmlight run, deny-by-default capabilities. Track
-   H's F3/F4 forward-hazards land here: host-root registration for a
-   live exn/ref handle across host frames.
-4. Small residuals if desired: the `(module definition/instance)`
-   linking-harness support (unlocks more linking assertions + the
-   `unexpected token` module cluster); the binary-leb128 limits-width
-   decode fix; the 2 throw.wast type-mismatch wording edges; a spectest
-   host module in the runner.
+   version (currently 2), rejected on mismatch.
+3. WASI F5 (long-tail stubs + wasi-testsuite net) if broader WASI
+   conformance is wanted; the openat/*at fs rewrite to close F2's TOCTOU.
+4. Small residuals: the `(module definition/instance)` linking-harness
+   forms; the binary-leb128 limits-width decode; the 2 throw.wast
+   wording edges; a spectest host module in the wast runner.
 5. User decision standing: NO GitHub issues until the roadmap is done.
 6. Local hygiene: builds drop gitignored .o/.ppu into
    .lwpt/modules/testing/, breaking a LOCAL `lwpt install --frozen`

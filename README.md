@@ -4,8 +4,10 @@ A WebAssembly runtime for Object Pascal, built for speed on a conformant
 core. FreePascal throughout, built and tested with
 [lwpt](https://github.com/frostney/lwpt). One validated module feeds three
 execution tiers behind a single seam — an interpreter, a baseline JIT, and
-an ahead-of-time compiler — under a host surface of WASI preview1 and the
-Component Model. See [docs/architecture.md](docs/architecture.md).
+an ahead-of-time compiler — under a deny-by-default host surface of WASI
+preview1 (the Component Model is post-v1,
+[ADR-0014](docs/adr/0014-the-component-model-is-deferred-to-post-v1.md)).
+See [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
@@ -17,13 +19,17 @@ validator that emits the register IR, the runtime layer below the tier seam
 the precise collector), and the interpreter tier that executes the IR — the
 **complete core wasm 3.0 instruction set**, `v128` SIMD and exception
 handling (`throw` / `throw_ref` / `try_table`) included — plus a wat
-text-format assembler. It is driven by `wasmlight inspect` / `wasmlight
-validate`, and `wasmspec` runs the upstream conformance corpus — assembling
-text modules, validating, instantiating, and executing the assertions, SIMD
-judged per lane and `assert_exception` judged. The baseline JIT and AOT
-tiers (performance, not behaviour) and the host surface are staged in
-[docs/roadmap.md](docs/roadmap.md) — that file, not this one, is the honest
-picture of what exists.
+text-format assembler. On top of that core sits the host surface: the
+`Wasm.Engine` embedding API and a deny-by-default WASI preview1 host, so
+the runtime now **runs real WASI programs** — `wasmlight run
+hello.wasm` prints `hello` and exits 0, and a program granted a preopen
+reads the filesystem through it. It is driven by `wasmlight inspect` /
+`wasmlight validate` / `wasmlight run`, and `wasmspec` runs the upstream
+conformance corpus — assembling text modules, validating, instantiating,
+and executing the assertions, SIMD judged per lane and `assert_exception`
+judged. Only the baseline JIT and AOT tiers (performance, not behaviour)
+are staged in [docs/roadmap.md](docs/roadmap.md) — that file, not this one,
+is the honest picture of what exists.
 
 The project's durable direction and delivery gates live in
 [VISION.md](VISION.md), [DEFINITION_OF_READY.md](DEFINITION_OF_READY.md),
@@ -53,6 +59,17 @@ type                         10          4
 function                     16          2
 code                         20          4
 custom "name"                26         11
+```
+
+`wasmlight run` executes a WASI preview1 command module to a process exit
+code, deny-by-default — stdio, clock, and random only, unless `--dir` grants
+a preopened directory or `--env` sets a variable:
+
+```text
+$ ./build/wasmlight run tests/fixtures/wasi/hello.wasm
+hello
+$ echo $?
+0
 ```
 
 `wasmspec` runs the upstream `.wast` conformance corpus — assembling text

@@ -8,7 +8,9 @@
 - Releases go through the `create-release` skill: changelog first, then
   an unprefixed SemVer tag matching `[package].version` in `lwpt.toml`.
 - wasmlight is consumed as an lwpt dependency, not as a distributed
-  binary — the CLI is a development and inspection tool, not the product.
+  binary — the CLI (`inspect` / `validate` / `run`, the last running a
+  WASI preview1 command) is a development and inspection tool, not the
+  product.
 
 ## Consuming wasmlight
 

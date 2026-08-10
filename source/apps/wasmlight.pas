@@ -27,7 +27,9 @@ uses
   Wasm.Decoder,
   Wasm.Ir,
   Wasm.Module,
-  Wasm.Validator;
+  Wasm.Run,
+  Wasm.Validator,
+  Wasm.Wasi;
 
 function ErrPrefix(const ASubcommand: string): string; inline;
 begin
@@ -235,6 +237,244 @@ begin
   end;
 end;
 
+{ --- run ----------------------------------------------------------------- }
+
+{ `wasmlight run [--dir GUEST=HOST]... [--env KEY=VALUE]... <module.wasm>
+  [args...]` — decode + validate a WASI preview1 command, wire it to the
+  wasi_snapshot_preview1 host module under a deny-by-default capability set, run
+  `_start`, and map the guest's exit to a process code. The heavy lifting lives
+  in Wasm.Run so it is hermetically unit-testable (Wasm.Run.Test injects
+  capturing streams); this file only parses the flags, wires the REAL process
+  stdio, and forwards.
+
+  The flag parse is a hand-rolled ParamStr scan rather than the cli parser, and
+  that is a DELIBERATE extension of the one documented CLI exception already in
+  this file (the top-level help/unknown-command handling). embedding-spec.md §4.2
+  records why: lwpt's CLI.Parser has no `--` terminator and rejects any unknown
+  long flag, so a flag-shaped GUEST argument (`app.wasm --verbose`) would choke
+  wasmlight's own parser before the module ran. The scan below consumes
+  wasmlight's own --dir/--env (into their real cli TRepeatableOption objects, so
+  the registry still owns them and `run --help` renders from them), takes the
+  first positional as the module path, and captures everything after it — and
+  everything after a bare `--` — as opaque guest argv that never reaches the cli
+  parser. }
+
+{ Split one --dir GUEST=HOST spec and add it as a preopen. Deny-by-default: the
+  only filesystem the guest reaches is a directory the user named here. }
+function AddDirPreopen(const AConfig: TWasmWasiConfig; const ASpec: string;
+  out AError: string): Boolean;
+var
+  EqPos: Integer;
+  GuestPath, HostPath: string;
+begin
+  EqPos := Pos('=', ASpec);
+  if EqPos <= 1 then
+  begin
+    AError := 'invalid --dir "' + ASpec + '": expected GUEST=HOST';
+    Exit(False);
+  end;
+  GuestPath := Copy(ASpec, 1, EqPos - 1);
+  HostPath := Copy(ASpec, EqPos + 1, MaxInt);
+  if HostPath = '' then
+  begin
+    AError := 'invalid --dir "' + ASpec + '": HOST path is empty';
+    Exit(False);
+  end;
+  AConfig.AddPreopenDir(GuestPath, HostPath, WASM_RUN_DIR_RIGHTS);
+  Result := True;
+end;
+
+{ The ParamStr pre-scan (embedding-spec.md §4.2). Applies --dir/--env to their
+  option objects, sets AModulePath to the first positional, and fills AGuestArgs
+  with every token after the module (and after a bare `--`) verbatim. Returns
+  False with AError on a bad/unknown wasmlight option; sets AWantsHelp when a
+  leading --help/-h is seen (before the module — a --help AFTER the module is a
+  guest argument). }
+function ParseRunArgs(const ADirOpt, AEnvOpt: TRepeatableOption;
+  out AModulePath: string; const AGuestArgs: TStringList;
+  out AWantsHelp: Boolean; out AError: string): Boolean;
+var
+  I, EqPos: Integer;
+  Arg, Body, Name, Value: string;
+  HasEquals, SepSeen, ModuleFound: Boolean;
+begin
+  AModulePath := '';
+  AError := '';
+  AWantsHelp := False;
+  SepSeen := False;
+  ModuleFound := False;
+
+  I := 2;
+  while I <= ParamCount do
+  begin
+    Arg := ParamStr(I);
+
+    { The first bare `--` is the option/guest-argv separator: drop it and stop
+      wasmlight option parsing. Any later `--` is a real guest argument. }
+    if (Arg = '--') and (not SepSeen) then
+    begin
+      SepSeen := True;
+      Inc(I);
+      Continue;
+    end;
+
+    { Once the module is found, everything is guest argv — including flag-shaped
+      tokens, which is the whole point of not routing this through the parser. }
+    if ModuleFound then
+    begin
+      AGuestArgs.Add(Arg);
+      Inc(I);
+      Continue;
+    end;
+
+    if not SepSeen then
+    begin
+      if (Arg = '--help') or (Arg = '-h') then
+      begin
+        AWantsHelp := True;
+        Exit(True);
+      end;
+      if Copy(Arg, 1, 2) = '--' then
+      begin
+        Body := Copy(Arg, 3, MaxInt);
+        EqPos := Pos('=', Body);
+        if EqPos > 0 then
+        begin
+          Name := Copy(Body, 1, EqPos - 1);
+          Value := Copy(Body, EqPos + 1, MaxInt);
+          HasEquals := True;
+        end
+        else
+        begin
+          Name := Body;
+          Value := '';
+          HasEquals := False;
+        end;
+        if (Name = 'dir') or (Name = 'env') then
+        begin
+          if not HasEquals then
+          begin
+            if I >= ParamCount then
+            begin
+              AError := '--' + Name + ' requires a value';
+              Exit(False);
+            end;
+            Inc(I);
+            Value := ParamStr(I);
+          end;
+          if Name = 'dir' then
+            ADirOpt.Apply(Value)
+          else
+            AEnvOpt.Apply(Value);
+          Inc(I);
+          Continue;
+        end;
+        AError := 'unknown option: ' + Arg;
+        Exit(False);
+      end;
+    end;
+
+    { A positional (or the first token after `--`): the module path. }
+    AModulePath := Arg;
+    ModuleFound := True;
+    Inc(I);
+  end;
+
+  Result := True;
+end;
+
+{ The `run` command. Not dispatched through TSubcommandRegistry.Run (whose
+  ParseCommandLine cannot see a `--` terminator or a flag-shaped guest arg);
+  invoked directly from the top-level dispatch, reading its --dir/--env option
+  objects back out of the registry so they stay the single, registry-owned
+  definition that `run --help` renders. }
+function RunCommand(const ARegistry: TSubcommandRegistry): Integer;
+var
+  Sub: TSubcommand;
+  DirOpt, EnvOpt: TRepeatableOption;
+  GuestArgs: TStringList;
+  ModulePath, ErrMsg: string;
+  WantsHelp: Boolean;
+  Config: TWasmWasiConfig;
+  OsIn: TWasmWasiOsInStream;
+  OsOut, OsErr: TWasmWasiOsOutStream;
+  Argv: array of string;
+  RunRes: TWasmRunResult;
+  I: Integer;
+begin
+  Sub := ARegistry.Find('run');
+  DirOpt := TRepeatableOption(Sub.Options[0]);
+  EnvOpt := TRepeatableOption(Sub.Options[1]);
+
+  GuestArgs := TStringList.Create;
+  try
+    if not ParseRunArgs(DirOpt, EnvOpt, ModulePath, GuestArgs, WantsHelp,
+      ErrMsg) then
+    begin
+      WriteLn(ErrOutput, ErrPrefix('run'), ErrMsg);
+      Exit(1);
+    end;
+
+    if WantsHelp then
+    begin
+      ARegistry.PrintSubcommandHelp(PROGRAM_NAME, Sub);
+      Exit(0);
+    end;
+
+    if ModulePath = '' then
+    begin
+      WriteLn(ErrOutput, ErrPrefix('run'), 'expected <module.wasm>');
+      Exit(1);
+    end;
+
+    { Deny-by-default (embedding-spec.md §2.2, §4.3): the config grants stdio +
+      clock + random and nothing else; --dir adds exactly the named preopens and
+      --env exactly the named vars. The real process fds replace the config's
+      default capture buffers (embedding-spec.md §4.5) — these three streams are
+      ours to free, since the config frees only what it created. }
+    Config := TWasmWasiConfig.Create;
+    OsIn := TWasmWasiOsInStream.Create(StdInputHandle);
+    OsOut := TWasmWasiOsOutStream.Create(StdOutputHandle);
+    OsErr := TWasmWasiOsOutStream.Create(StdErrorHandle);
+    try
+      Config.Stdin := OsIn;
+      Config.Stdout := OsOut;
+      Config.Stderr := OsErr;
+
+      { argv[0] = the module basename with extension (embedding-spec.md §4.4),
+        then the forwarded guest args. }
+      SetLength(Argv, 1 + GuestArgs.Count);
+      Argv[0] := ExtractFileName(ModulePath);
+      for I := 0 to GuestArgs.Count - 1 do
+        Argv[I + 1] := GuestArgs[I];
+      Config.SetArgv(Argv);
+
+      for I := 0 to DirOpt.Values.Count - 1 do
+        if not AddDirPreopen(Config, DirOpt.Values[I], ErrMsg) then
+        begin
+          WriteLn(ErrOutput, ErrPrefix('run'), ErrMsg);
+          Exit(1);
+        end;
+      for I := 0 to EnvOpt.Values.Count - 1 do
+        Config.AddEnv(EnvOpt.Values[I]);
+
+      RunRes := RunConfiguredModule(ModulePath, Config);
+      { Diagnostics go to stderr, never stdout — stdout is the guest's
+        (embedding-spec.md §6). }
+      if RunRes.Diagnostic <> '' then
+        WriteLn(ErrOutput, ErrPrefix('run'), RunRes.Diagnostic);
+      Result := RunRes.ExitCode;
+    finally
+      Config.Free;
+      OsIn.Free;
+      OsOut.Free;
+      OsErr.Free;
+    end;
+  finally
+    GuestArgs.Free;
+  end;
+end;
+
 { --- top-level flags ----------------------------------------------------- }
 
 { The cli package's PrintTopLevelHelp hardcodes lwpt's own tagline
@@ -288,12 +528,22 @@ begin
   Result := (A = 'help') or (A = '--help') or (A = '-h');
 end;
 
+{ True when the first argument is the `run` command word — used to keep the
+  version scan from swallowing a guest `-v`, since after the module every token
+  is the guest's (embedding-spec.md §4.2). }
+function IsRunCommand: Boolean;
+begin
+  Result := (ParamCount >= 1) and (LowerCase(ParamStr(1)) = 'run');
+end;
+
 { --- registration -------------------------------------------------------- }
 var
   Registry: TSubcommandRegistry;
-  InspectOpts, ValidateOpts: TOptionArray;
+  InspectOpts, ValidateOpts, RunOpts: TOptionArray;
 begin
-  if WantsVersion then
+  { A `run` invocation forwards its own argv tail to the guest, where `-v` is a
+    guest flag, not a request for wasmlight's version. }
+  if WantsVersion and not IsRunCommand then
   begin
     WriteLn(PROGRAM_NAME, ' ', PROGRAM_VERSION);
     ExitCode := 0;
@@ -314,11 +564,32 @@ begin
       '<module.wasm> [<module.wasm>...]',
       @HandleValidate, ValidateOpts));
 
+    { --dir and --env are repeatable and are the ONLY host capabilities `run`
+      grants beyond stdio (deny-by-default). The registry owns these option
+      objects; RunCommand reads them back out of it, and `run --help` renders
+      from them. RunCommand is dispatched directly (below), not via
+      Registry.Run, so its guest-argv pre-scan can see the whole tail. }
+    SetLength(RunOpts, 2);
+    RunOpts[0] := TRepeatableOption.Create('dir',
+      'grant a preopened directory as GUEST=HOST (repeatable)');
+    RunOpts[1] := TRepeatableOption.Create('env',
+      'set an environment variable KEY=VALUE (repeatable)');
+    Registry.Add(TSubcommand.Create('run',
+      'Run a WASI preview1 command module (_start) to a process exit code',
+      '[--dir GUEST=HOST]... [--env KEY=VALUE]... <module.wasm> [args...]',
+      nil, RunOpts));
+
     if WantsTopLevelHelp then
     begin
       PrintTopLevelHelp(Registry);
       ExitCode := 0;
     end
+    else if IsRunCommand then
+      { Dispatched directly, not through Registry.Run: the run handler needs to
+        pre-scan the whole argv tail for guest argv (embedding-spec.md §4.2),
+        which the registry's ParseCommandLine — no `--` terminator, rejects
+        unknown long flags — cannot do. }
+      ExitCode := RunCommand(Registry)
     else if Registry.Find(LowerCase(ParamStr(1))) = nil then
     begin
       { Handled here rather than in the registry for the same reason as

@@ -123,6 +123,28 @@ validation errors.
 | `custom-name-overrun.wasm` | 14 | Custom section name length 64 inside a 4-byte body | The name is read from within the section's own declared extent and must never consume the next section. |
 | `trailing-section-id.wasm` | 113 | One stray section id byte appended to a complete module | A module ends at its last section; trailing bytes are not a permitted suffix. |
 
+## `wasi/` — a runnable WASI command
+
+Unlike `valid/` and `malformed/`, this holds a whole program rather than a
+decoder probe: a minimal WASI preview1 *command* the `run` path executes
+end to end.
+
+| Fixture | Bytes | What it covers |
+| --- | --- | --- |
+| `hello.wasm` | 136 | Imports `wasi_snapshot_preview1.fd_write`, exports `memory` + `_start`; lays out a ciovec and writes `hello\n` to fd 1, then returns. The hello-world milestone for `wasmlight run`. |
+
+`hello.wat` is the source; `hello.wasm` is assembled from it with
+`wat2wasm hello.wat -o hello.wasm` (wabt 1.0.41, no extra features — the
+module uses only the MVP plus the default-on set). It is *also* the
+byte-for-byte source of the inline `HELLO_WAT` in
+`source/units/Wasm.Run.Test.pas`, which both assembles that text and loads
+this committed binary, so the two cannot drift apart unnoticed.
+
+`regenerate.sh` does not build this file: that script derives the decoder
+corpus (`valid/` from its `.wat`, `malformed/` by byte-patching), and this
+program stands on its own. Re-assemble it by hand with the `wat2wasm`
+line above if `hello.wat` ever changes.
+
 ## Feature support notes
 
 Everything requested is covered by this toolchain; nothing had to be

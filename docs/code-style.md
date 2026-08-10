@@ -31,8 +31,14 @@ unit. Toolkit state under `.lwpt/` is excluded by lwpt itself.
   carry a short namespace prefix (`wvtI32`, `wsCustom`, `wetInterpreter`)
   so a bare member name is unambiguous at a call site.
 - Exceptions are `E`-prefixed and derive from `EWasmError`. Raise the
-  specific class — the four subclasses mean different things to a host
-  (see [architecture.md](architecture.md#error-boundaries)).
+  specific class — the four core subclasses (`EWasmDecodeError`,
+  `EWasmValidationError`, `EWasmLinkError`, `EWasmTrap`) are the
+  module-contract errors and mean different things to a host.
+  `EWasmException` (an uncaught wasm `throw`, Track H) is a further
+  execution-side sibling of `EWasmTrap`; `EWasmExit` (a clean,
+  guest-requested `proc_exit`, Track F) is a tooling/host-side sibling
+  declared in `Wasm.Engine`, not a fault. Never fold either into the core
+  four (see [architecture.md](architecture.md#error-boundaries)).
 - Test programs are `Wasm.<Unit>.Test.pas`, co-located with the unit they
   cover.
 
