@@ -1,110 +1,109 @@
 # Handoff
 
-Updated: 2026-08-09 (Track F — embedding API + WASI preview1)
+Updated: 2026-08-10 (Track I — baseline JIT: foundation + numeric/control spine)
 
-## Current state — CORE 3.0 COMPLETE + RUNS REAL WASI PROGRAMS
+## Current state
 
-- **Tracks A, B, C, D, E, F, G, H delivered.** The runtime decodes,
-  validates, instantiates, and executes the COMPLETE core wasm 3.0
-  instruction set, AND runs real WASI preview1 programs via
-  `wasmlight run` with a deny-by-default sandbox.
+- **Tracks A, B, C, D, E, F, G, H delivered; Track I IN PROGRESS** — the
+  baseline JIT's foundation and numeric/control/variable spine are
+  shipped and PROVEN. Remaining Track I: Waves 3 (calls), 4 (memory/
+  table/ref), 5 (GC), 6 (v128 via leaves), 7 (x86-64 backend).
 - Gates on the merged tree: `lwpt format`, `lwpt build`, `lwpt test`
-  (38 suites, ~1,044 tests), `lwpt install --frozen` — all green. Docs
-  markdownlint-clean.
-- `./build/wasmlight run tests/fixtures/wasi/hello.wasm` → prints hello,
-  exit 0. proc_exit(n)→n, trap→134, uncaught exception→1.
-- Core corpus (WebAssembly/testsuite@de54fd27) unchanged: pass=65184
-  fail=408 skip=1533 staged=0 errors=0 (Track F doesn't touch the core
-  corpus; its own tests are the coverage).
-- **Everything is UNCOMMITTED** (the user commits between turns; the
-  whole runtime is untracked working state).
+  (41 suites), `lwpt install --frozen` — all green.
+- **THE PROOF**: `./build/wasmspec --tier=jit tests/spec/testsuite`
+  compiles **4,562 functions** to native aarch64 and produces a
+  **byte-identical** pass/fail set to `--tier=interp` (both 65184 pass /
+  408 fail, diff empty) — zero JIT divergence. The 65k-assertion corpus
+  is the JIT's conformance net (ADR-0001: validated by being identical
+  to the conformant interpreter).
+- **Everything is UNCOMMITTED** (the user commits between turns).
 
-## What shipped this session (Track F)
+## What shipped this session (Track I so far)
 
-Design doc: .agent/design/embedding-spec.md. Waves F0–F4:
-- Wasm.Wasi.Types: the preview1 errno/filetype/rights/oflags/fdflags/
-  clockid/whence consts + struct sizes/offsets (CONFIRMED except the
-  wave-3 poll_oneoff values).
-- Wasm.Engine: the embedding facade over the shipped runtime —
-  TWasmLoadedModule (owns bytes, ADR-0003), TWasmLinker (DefineFunc/
-  Memory/Global; the engine-type-id import matching), TWasmInstance,
-  load/instantiate/call/memory accessors (through the chokepoint, never
-  raw Base), and the HOST-1 host-root registration that closes Track H's
-  forward-hazard (RootRegister/RootExceptionRef). EWasmExit lives here
-  (clean guest-requested exit, sibling under EWasmError).
-- Wasm.Wasi.Memory: the guest-pointer helpers (GuestReadBytes/WriteBytes/
-  ReadU32/ReadIoVec) — overflow-safe bounds → EFAULT, the sandbox's
-  memory boundary. Never touches Base.
-- Wasm.Wasi: deny-by-default TWasmWasiConfig (argv/env/preopens +
-  injectable stdio/clock/random), the fd table, and the preview1 host
-  functions — wave-1 (args/env/clock/random/stdio/proc_exit) + wave-2 fs
-  via preopens (path_open with STRICT containment, file/dir ops,
-  fd_readdir, filestat). Real CSPRNG (/dev/urandom / RtlGenRandom, fails
-  closed → EIO). clock_gettime nanosecond precision.
-- Wasm.Run + wasmlight run: the CLI (`run [--dir g=h] [--env K=V] [--]
-  <mod.wasm> [args]`), the `--` guest-argv pre-scan (a 2nd sanctioned
-  cli exception, now documented in AGENTS.md), the exit-code mapping.
+Design doc: .agent/design/jit-spec.md. Key decisions: memory-register-
+file baseline (the JIT'd frame IS the interpreter's frame → trivial
+stack maps, inherited GC/tail-call/exhaustion); aarch64 first, 64-bit
+only (32-bit stays interpreter-only); explicit bounds checks (guard-page
+inline deferred); float/div-rem via the interpreter's OWN
+Wasm.Interp.Numeric leaves (identical NaN/rounding/traps); EH/GC/memory
+functions declined by the compile predicate → interpreted (the scope
+fence); the differential harness is the correctness proof.
 
-## Review outcome (Opus-5 SECURITY + standards + corpus)
+- **GO/NO-GO settled: JIT'd machine code EXECUTES on aarch64-darwin.**
+  The macOS MAP_JIT + pthread_jit_write_protect_np + sys_icache_invalidate
+  dance works unsigned in development (proof test emits movz/add/ret,
+  returns 42).
+- Wasm.Jit.CodeBuffer: W^X exec-memory + emission + label/patch map.
+  Builds green on all 6 CI targets; the JIT only RUNS on 64-bit
+  aarch64/x86-64-UNIX (WASM_JIT_EXEC / WASM_JIT_ARM64 gates); unsupported
+  legs raise "JIT not supported".
+- The tier seam (in Store + Interp): TWasmFuncInst.CompiledEntry/
+  CallCount, the JitInvokeCompiled hook, the SHARED JitEnterFrame/
+  JitLeaveFrame frame helpers (InterpTierInvoke now routes through them
+  too → ONE frame impl for both tiers), WasmJitOffsets/WasmJitFrameOffsets
+  (O-J5 field-offset probes, asserted so a record reorder goes red).
+- Wasm.Jit.Arm64: the A64 encoder + per-op templates. Calling convention:
+  prologue pins register-file base=x19, store=x20, &Epoch=x21,
+  epoch-snapshot=x22 (callee-saved, survive helper calls), saves x19-x22+
+  x30 in a 48-byte 16-aligned frame; cdecl thunks (JitOpBinary/Unary/
+  JitTrapKind) call the interpreter's leaves. Templated: iroMove, i32/i64
+  const/add/sub/mul/and/or/xor/shl/shr/rotl/rotr/clz/ctz/eqz/relops
+  (inline), popcnt/div/rem + ALL float + ALL conversions (leaf-call),
+  select, jump/branch_if/br_table (compare-chain)/return/unreachable, the
+  epoch check at IR_JUMP_SAFEPOINT back-edges, forward branches via the
+  label/patch pass.
+- Wasm.Jit: the driver — JitCanCompile (predicate/scope fence),
+  JitCompileFunction, JitDispatch, RegisterJit + the per-store code cache
+  (freed before the store).
+- --tier=jit / --tier=interp corpus mode in Wast.Runner + wasmspec
+  (compiled=N in the TOTAL line); default stays pure interpreter.
 
-Security review of the sandbox boundary: **core sandbox sound** — no
-guest-only escape in the shipped function set; guest-memory bounds are
-overflow-safe at every level (incl. the iovec double-indirection);
-the memory chokepoint is never bypassed (no raw Base anywhere in the
-WASI units); deny-by-default holds (no ambient fs/env/argv; bare config
-= stdio only); CSPRNG fails closed. Found + FIXED:
-- **F1 (MEDIUM, containment)**: path_open with O_CREAT to a non-existent
-  target validated only the parent, so a dangling symlink in the
-  operator's preopen let the guest create/write OUTSIDE the sandbox.
-  Fixed: lstat the leaf, reject a final-component symlink on create
-  (weNotCapable) — regression test proves the outside file is not
-  created.
-- Hardened (LOW): reject embedded-NUL paths (weInval); rights check on
-  fd_filestat_get; per-context fd cap (weMFile); clamp 64-bit I/O
-  lengths; one central OsErrnoToWasi translator (was fixed guesses).
-- Documented residuals: F2 (path-string TOCTOU — external-writer-only,
-  the guest can't race under single-thread ADR-0008; openat/*at is the
-  full fix), F5 (host dev/ino/nlink/timestamps passthrough — kept real
-  st_ino so hardlink/cycle detection in real programs works).
-Standards review: high quality, clean layering DAG, no inversion; fixed
-a dead wxkTable arm, added a non-EWasmError catch-all to run, documented
-the run CLI exception + the EWasmExit/EWasmException hierarchy, and
-covered the hello.wasm fixture with a load-and-run test.
+## Review outcome (Opus-5; corpus differential = behavior oracle)
 
-## Honest scope (Track F)
+Verified CLEAN: every A64 encoding (numerically checked), the AAPCS64
+ABI (callee-saved pins survive helper calls, SP 16-aligned at every bl,
+x30 preserved), i32 zero-extension identity (W-form stores), trap
+timing/unwind (a compiled body that traps is cleaned up by the
+trampoline's ResetFrames since the JIT frame IS an interp frame), W^X/
+cache-flush, predicate↔template completeness, layering. Found + FIXED:
+- **(Medium, Wave-3 BLOCKER) epoch snapshot** was captured per-compiled-
+  entry but the interpreter captures it per-outermost-invocation → a
+  compiled leaf entered after an epoch bump wouldn't interrupt where the
+  interpreter would. Fixed: TWasmStore.EpochSnapshot set once at the
+  outermost guest entry (InterpTierInvoke), read by BOTH tiers' back-edge
+  checks. Differential test proven to have teeth (reverting fails exactly
+  that test).
+- **(Medium) branch-range** was masked into imm26/imm19 with no guard →
+  a >1MB-code function would silently mis-encode. Fixed: the resolver
+  raises EWasmJitBranchRange on overflow, ForceCompile catches it and
+  declines → the over-large function stays interpreted.
+- Minor: renamed a Word-shadowing local; doc note on JIT-context-before-
+  store teardown ordering.
 
-- Preview1 COMMAND modules (_start) run; reactors (_initialize-only) are
-  detected/reported, not driven, in v1.
-- fs is wave-1 (stdio/args/env/clock/random) + wave-2 (path_open + file/
-  dir ops via preopens). The long tail (path_link/symlink/readlink/
-  rename, fd_advise/allocate/sync, poll_oneoff) is NOT defined — a module
-  importing one fails to link (honest deny-by-default). sock_* stays
-  ENOTCAPABLE (no network by design). A future F5 wave stubs the tail
-  ENOSYS + wires the external wasi-testsuite as a conformance net.
-- Component Model OUT (ADR-0014). Threads/shared-memory OUT (ADR-0008).
-- UNCONFIRMED: Windows CSPRNG link path + non-UNIX clock fidelity; the
-  wave-3 poll_oneoff constants; a few witx struct details (F5/wasi-
-  testsuite validates them).
+## Next steps (Track I remaining, dependency order)
 
-## Next steps (dependency order)
-
-1. **Track I — baseline JIT** (x86-64 + aarch64). The interpreter is the
-   differential reference (ADR-0001). Inherits the epoch check at
-   back-edges, stack maps at safepoints (RefRegBits is the projection),
-   live-ref discoverability constraining regalloc. Guard-page memory
-   becomes the JIT's inline-access optimization once signal→trampoline
-   delivery is proven in-process (interpreter uses explicit checks).
-   Observational-identity contracts: interp-spec §8, simd-spec §9,
-   eh-spec §9 (unwind semantics, tag-address match, exn alloc safepoint,
-   relaxed-op R=0, per-lane NaN, FP rounding, trap timing).
-2. **Track J — AOT + artifact cache** (needs I). Artifacts record the IR
-   version (currently 2), rejected on mismatch.
-3. WASI F5 (long-tail stubs + wasi-testsuite net) if broader WASI
-   conformance is wanted; the openat/*at fs rewrite to close F2's TOCTOU.
-4. Small residuals: the `(module definition/instance)` linking-harness
-   forms; the binary-leb128 limits-width decode; the 2 throw.wast
-   wording edges; a spectest host module in the wast runner.
-5. User decision standing: NO GitHub issues until the roadmap is done.
-6. Local hygiene: builds drop gitignored .o/.ppu into
+1. **Wave 3 — calls (aarch64)**: iroCall/iroReturnCall (tail-call O(1)),
+   iroCallIndirect/iroCallRef (bounds→null→type / null trap order),
+   host-call interop — via the seam so compiled↔interpreted interoperate.
+   The shared-epoch fix un-blocked this. Diff: call*.wast, a 1e6 tail
+   loop in bounded stack, deep recursion trapping 'call stack exhausted'.
+2. **Wave 4 — memory + table + reference + global** (explicit bounds
+   checks via the chokepoint helper; table/ref/global ops). ∥ **Wave 5 —
+   GC** (struct/array/i31/ref.test/cast via Wasm.Runtime.Gc helpers;
+   safepoints — the frame is already GC-walkable; publish-first). Waves 4
+   and 5 can parallelize (disjoint op families) once Wave 3 lands.
+3. **Wave 6 — v128 via Wasm.Interp.Vector leaf calls** (predicate stops
+   declining v128 functions).
+4. **Wave 7 — x86-64 backend** (Wasm.Jit.X64 — same templates, ModRM/REX
+   encoding; the differential gate runs on the x86-64 CI legs).
+5. Then **Track J — AOT + artifact cache** (needs I): serialize compiled
+   code + the IR version (currently 2), rejected on mismatch.
+6. Deferred JIT optimizations (wasmbench-gated): guard-page inline memory
+   access (needs in-process signal→trampoline proven robust); native SIMD
+   codegen; machine-register allocation (needs per-safepoint liveness
+   maps). All behind the compile predicate / measured, never required for
+   correctness (the interpreter is the tier of record).
+7. User decision standing: NO GitHub issues until the roadmap is done.
+8. Local hygiene: builds drop gitignored .o/.ppu into
    .lwpt/modules/testing/, breaking a LOCAL `lwpt install --frozen`
    (fresh CI clone unaffected). `rm` them if frozen complains.

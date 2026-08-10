@@ -22,6 +22,18 @@ program Wasm.Wast.Runner.Test;
 
 {$I Shared.inc}
 
+{ The baseline JIT compiles only on a 64-bit UNIX aarch64 host this wave
+  (jit-spec §2.1). Recompute the backend gate here — define symbols do not
+  cross unit boundaries — so the JIT-mode cases assert compilation WHERE it is
+  possible and assert the interpreter fall-back (compiled count 0) elsewhere,
+  keeping the suite green on every CI leg. }
+{$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
+  {$DEFINE WASM_JIT_EXEC}
+{$ENDIF}
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  {$DEFINE WASM_JIT_ARM64}
+{$ENDIF}
+
 uses
   SysUtils,
 
@@ -132,6 +144,27 @@ const
     + '"\07\05\01\01\66\00\00"'
     + ')';
 
+  { The JIT milestone function as text (jit-spec §12.2): one exported "add"
+    whose body is exactly `local.get 0; local.get 1; i32.add`, which lowers to
+    iroMove/iroI32Add/iroReturn — the ops the aarch64 backend emits. Under
+    --tier=jit it force-compiles and every invoke routes through the machine
+    code via the CompiledEntry seam. }
+  MODULE_JIT_ADD =
+    '(module (func (export "add") (param i32 i32) (result i32)'
+    + ' (i32.add (local.get 0) (local.get 1))))';
+
+  { A module with one compilable function ("add") and a second function
+    ("seven") the backend may not yet template — so a --tier=jit run tiers the
+    first up while the second stays interpreted, and both still return the right
+    value: compiled and interpreted code coexisting behind the seam. (As op
+    coverage grows the second may also compile; the durable claim is that both
+    results are correct and at least one function was compiled.) }
+  MODULE_JIT_MIXED =
+    '(module'
+    + ' (func (export "add") (param i32 i32) (result i32)'
+    + '   (i32.add (local.get 0) (local.get 1)))'
+    + ' (func (export "seven") (result i32) (i32.const 7)))';
+
 type
   TWastRunnerTests = class(TTestSuite)
   private
@@ -204,6 +237,13 @@ type
     procedure TestAssertExceptionFailsWhenCaughtInternally;
     procedure TestAssertExceptionFailsOnTrap;
     procedure TestAssertReturnFailsOnUncaughtException;
+
+    { baseline JIT corpus mode (Track I, jit-spec §11, §12.3) }
+    procedure TestTierModeName;
+    procedure TestDefaultModeCompilesNothing;
+    procedure TestJitModeCompilesAndPasses;
+    procedure TestJitModeMixedTiersCoexist;
+    procedure TestJitTallyIdenticalToInterp;
   end;
 
 function TWastRunnerTests.StatusSignature(const ASource: string): string;
@@ -994,6 +1034,135 @@ begin
   ExpectStartsWith(Item.Actual, 'unexpected exception:');
 end;
 
+{ --- baseline JIT corpus mode (Track I) --------------------------------- }
+
+procedure TWastRunnerTests.TestTierModeName;
+begin
+  { The tier a run reports must be stable and unambiguous — wasmspec prints it
+    in the TOTAL line. }
+  Expect<string>(WastTierModeName(wtmInterp)).ToBe('interp');
+  Expect<string>(WastTierModeName(wtmJit)).ToBe('jit');
+end;
+
+procedure TWastRunnerTests.TestDefaultModeCompilesNothing;
+var
+  Run: TWastRunResult;
+begin
+  { The default entry points are the pure interpreter: no JIT is registered, so
+    nothing compiles and the milestone function runs and returns exactly as
+    before. This is the zero-behaviour-change guarantee for every existing
+    caller. }
+  Run := RunWastSource(MODULE_JIT_ADD + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 17) (i32.const 25)) '
+    + '(i32.const 42))');
+  try
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestJitModeCompilesAndPasses;
+var
+  Run: TWastRunResult;
+begin
+  { Under --tier=jit the single compilable function is force-compiled after
+    instantiation, so both invokes route through the compiled machine code via
+    the CompiledEntry seam. The assert_returns still judge against the SPEC's
+    expecteds: a pass means the JIT matched the spec (i.e. the interpreter). The
+    wrap case (-1 + 1 = 0) exercises two's-complement wrap through the compiled
+    add. On the aarch64 backend exactly one function is compiled; off it the
+    predicate declines and the function runs interpreted (count 0) — still a
+    pass, because that IS the interpreter. }
+  Run := RunWastSource(MODULE_JIT_ADD + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 17) (i32.const 25)) '
+    + '(i32.const 42))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const -1) (i32.const 1)) '
+    + '(i32.const 0))', wtmJit);
+  try
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    {$IFDEF WASM_JIT_ARM64}
+    { The function was ACTUALLY compiled — CompiledEntry set (§12.2). }
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(1);
+    {$ELSE}
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
+    {$ENDIF}
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestJitModeMixedTiersCoexist;
+var
+  Run: TWastRunResult;
+begin
+  { A compilable and a (currently) non-compilable function in one module: under
+    --tier=jit the compilable one tiers up while the other stays interpreted,
+    and BOTH invokes return the correct value — compiled and interpreted code
+    coexisting behind the seam within one instance. }
+  Run := RunWastSource(MODULE_JIT_MIXED + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 40) (i32.const 2)) '
+    + '(i32.const 42))' + sLineBreak
+    + '(assert_return (invoke "seven") (i32.const 7))', wtmJit);
+  try
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    {$IFDEF WASM_JIT_ARM64}
+    { At least the "add" function compiled; it coexists with the interpreted
+      "seven" (or, once coverage grows, both compile — still >= 1). }
+    Expect<Boolean>(Run.CompiledFuncCount >= 1).ToBe(True);
+    {$ELSE}
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
+    {$ENDIF}
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestJitTallyIdenticalToInterp;
+const
+  { A compilable module, one passing assert and one DELIBERATELY-wrong-expected
+    assert. The wrong expected is a mismatch of the SCRIPT, not a JIT
+    divergence, so both tiers must fail it identically — the whole invariant in
+    one script: the JIT tally equals the interpreter tally, verdict for verdict
+    (§11.3). If the compiled add ever diverged, the pass would flip to a fail
+    here and the tallies would differ. }
+  Src =
+    '(module (func (export "add") (param i32 i32) (result i32)'
+    + ' (i32.add (local.get 0) (local.get 1))))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 1) (i32.const 2)) '
+    + '(i32.const 3))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 1) (i32.const 2)) '
+    + '(i32.const 999))';
+var
+  InterpRun, JitRun: TWastRunResult;
+begin
+  InterpRun := RunWastSource(Src, wtmInterp);
+  try
+    JitRun := RunWastSource(Src, wtmJit);
+    try
+      { Verdict-for-verdict identity: the JIT changed no outcome. }
+      Expect<Integer>(JitRun.Tally.Pass).ToBe(InterpRun.Tally.Pass);
+      Expect<Integer>(JitRun.Tally.Fail).ToBe(InterpRun.Tally.Fail);
+      Expect<Integer>(JitRun.Tally.Skip).ToBe(InterpRun.Tally.Skip);
+      Expect<Integer>(JitRun.Tally.Staged).ToBe(InterpRun.Tally.Staged);
+      { And the shape is what we intended: module pass, one assert pass, one
+        assert fail — under BOTH tiers. }
+      Expect<Integer>(InterpRun.Tally.Pass).ToBe(2);
+      Expect<Integer>(InterpRun.Tally.Fail).ToBe(1);
+    finally
+      JitRun.Free;
+    end;
+  finally
+    InterpRun.Free;
+  end;
+end;
+
 procedure TWastRunnerTests.SetupTests;
 begin
   Test('assert_malformed passes on a prefix match',
@@ -1085,6 +1254,16 @@ begin
     TestAssertExceptionFailsOnTrap);
   Test('assert_return fails on an uncaught exception',
     TestAssertReturnFailsOnUncaughtException);
+
+  Test('tier mode name is stable', TestTierModeName);
+  Test('default mode compiles nothing and is unchanged',
+    TestDefaultModeCompilesNothing);
+  Test('--tier=jit compiles the function and passes against the spec',
+    TestJitModeCompilesAndPasses);
+  Test('--tier=jit lets compiled and interpreted functions coexist',
+    TestJitModeMixedTiersCoexist);
+  Test('the --tier=jit tally is identical to the interpreter tally',
+    TestJitTallyIdenticalToInterp);
 end;
 
 begin

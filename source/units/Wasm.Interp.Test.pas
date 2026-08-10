@@ -237,6 +237,11 @@ type
     procedure TestTagAddressMatching;
     procedure TestThrowUnwindsAcrossCall;
     procedure TestRefPayloadSurvivesCollection;
+    { Baseline-JIT tier seam (O-J1, O-J2, O-J5). }
+    procedure TestCallCountIncrementsPerInterpretedCall;
+    procedure TestJitHookDispatchedAtEntry;
+    procedure TestJitHookDispatchedForInternalCall;
+    procedure TestJitFrameOffsetsMatchLayout;
   end;
 
 { --- host callbacks ------------------------------------------------------ }
@@ -246,6 +251,27 @@ var
     reach the exported guest function it re-invokes on the same store. }
   GReenterStore: TWasmStore;
   GReenterDouble: TWasmFuncAddr;
+
+  { The baseline-JIT seam tests register FakeJitAddHundred as the store's
+    JitInvokeCompiled hook and flag a function "compiled" with a sentinel
+    CompiledEntry. The hook records that it ran, which function it ran, and
+    marshals a result the interpreter would NOT produce (param + 100), so the
+    tests can prove the interpreter dispatched to the hook rather than running
+    the body itself. }
+  GJitHookCalls: Integer;
+  GJitHookLastAddr: TWasmFuncAddr;
+
+{ A stand-in for compiled code, satisfying TWasmJitInvokeProc: flat params in,
+  flat results out (O-J1). It never touches the register file — it only proves
+  the seam hands off at the flat boundary. }
+procedure FakeJitAddHundred(const AStore: TWasmStore;
+  const AFuncAddr: TWasmFuncAddr; const AParams: PWasmValue;
+  const AResults: PWasmValue);
+begin
+  Inc(GJitHookCalls);
+  GJitHookLastAddr := AFuncAddr;
+  AResults[0] := MakeValueI32(AParams[0].I32 + 100);
+end;
 
 procedure HostAddCallback(const AStore: TWasmStore; const AData: Pointer;
   const AParams: PWasmValue; const AResults: PWasmValue);
@@ -2212,6 +2238,138 @@ begin
   Expect<Int32>(Call1('r', [MakeValueI32(1234)]).I32).ToBe(1234);
 end;
 
+{ --- baseline-JIT tier seam (O-J1, O-J2, O-J5) --------------------------- }
+
+{ The identity function (param i32)(result i32) local.get 0, exported "id". }
+procedure TInterpTests.TestCallCountIncrementsPerInterpretedCall;
+var
+  Addr: TWasmFuncAddr;
+begin
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$02, $69, $64, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([$00, $20, $00, $0B])]))
+  ]));
+  DoInstantiate;
+  Addr := FuncAddr('id');
+
+  { O-J1: not compiled, and the compile-on-hot counter starts at zero. }
+  Expect<Boolean>(FStore.Funcs[Addr].CompiledEntry = nil).ToBe(True);
+  Expect<Int32>(Integer(FStore.Funcs[Addr].CallCount)).ToBe(0);
+
+  Expect<Int32>(Call1('id', [MakeValueI32(9)]).I32).ToBe(9);
+  Expect<Int32>(Call1('id', [MakeValueI32(9)]).I32).ToBe(9);
+  Expect<Int32>(Call1('id', [MakeValueI32(9)]).I32).ToBe(9);
+
+  { Each interpreted top-level entry bumped the counter once. }
+  Expect<Int32>(Integer(FStore.Funcs[Addr].CallCount)).ToBe(3);
+end;
+
+procedure TInterpTests.TestJitHookDispatchedAtEntry;
+var
+  Addr: TWasmFuncAddr;
+  R: TWasmValue;
+begin
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([BLit([$02, $69, $64, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([$00, $20, $00, $0B])]))
+  ]));
+  DoInstantiate;
+  Addr := FuncAddr('id');
+
+  { Fake a compiled entry: register the hook and flag the function compiled
+    with a sentinel pointer. The top-level entry must dispatch to the hook
+    (flat params in, flat results out) instead of running the interpreter's
+    identity body — proving the seam before any real codegen exists. }
+  GJitHookCalls := 0;
+  GJitHookLastAddr := High(TWasmFuncAddr);
+  FStore.JitInvokeCompiled := @FakeJitAddHundred;
+  FStore.Funcs[Addr].CompiledEntry := Pointer(1);
+
+  R := Call1('id', [MakeValueI32(7)]);
+
+  { 7 + 100 is the hook's answer; the interpreter's identity would be 7. }
+  Expect<Int32>(R.I32).ToBe(107);
+  Expect<Int32>(GJitHookCalls).ToBe(1);
+  Expect<Boolean>(GJitHookLastAddr = Addr).ToBe(True);
+  { The interpreter never ran the body, so the counter stayed at zero. }
+  Expect<Int32>(Integer(FStore.Funcs[Addr].CallCount)).ToBe(0);
+end;
+
+procedure TInterpTests.TestJitHookDispatchedForInternalCall;
+var
+  OuterAddr, TargetAddr: TWasmFuncAddr;
+  R: TWasmValue;
+begin
+  { Two functions of type (i32)->(i32): func0 "target" is the identity, func1
+    "outer" returns target(x) via a direct call. Flag target compiled: the
+    interpreter runs outer but EnterCall must route the internal call through
+    the hook and thread its flat result back into outer's dest register. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00])])),
+    Sect(7, VecOf([
+      BLit([$06, $74, $61, $72, $67, $65, $74, $00, $00]),   { "target" f0 }
+      BLit([$05, $6F, $75, $74, $65, $72, $00, $01])])),     { "outer"  f1 }
+    Sect(10, VecOf([
+      CodeEntry([$00, $20, $00, $0B]),                       { target: local 0 }
+      CodeEntry([$00, $20, $00, $10, $00, $0B])]))           { outer: call 0 }
+  ]));
+  DoInstantiate;
+  OuterAddr := FuncAddr('outer');
+  TargetAddr := FuncAddr('target');
+
+  GJitHookCalls := 0;
+  GJitHookLastAddr := High(TWasmFuncAddr);
+  FStore.JitInvokeCompiled := @FakeJitAddHundred;
+  FStore.Funcs[TargetAddr].CompiledEntry := Pointer(1);
+
+  R := Call1('outer', [MakeValueI32(5)]);
+
+  { outer returns the compiled target's answer (5 + 100), threaded back through
+    the flat seam. }
+  Expect<Int32>(R.I32).ToBe(105);
+  Expect<Int32>(GJitHookCalls).ToBe(1);
+  Expect<Boolean>(GJitHookLastAddr = TargetAddr).ToBe(True);
+  { outer ran interpreted at the top level (its counter bumped once); the
+    compiled target's counter stayed at zero. }
+  Expect<Int32>(Integer(FStore.Funcs[OuterAddr].CallCount)).ToBe(1);
+  Expect<Int32>(Integer(FStore.Funcs[TargetAddr].CallCount)).ToBe(0);
+end;
+
+procedure TInterpTests.TestJitFrameOffsetsMatchLayout;
+var
+  Off: TWasmJitFrameOffsets;
+begin
+  { O-J5: the register-file / frame offsets the JIT's generated code reads. }
+  Off := WasmJitFrameOffsets;
+
+  { Reg[k] = Values[Base + k]: an 8-byte slot stride, the invariant every
+    frame-relative load assumes (jit-spec §1.1). TWasmValue is a union over a
+    UInt64, so the slot is 8 bytes on every target. }
+  Expect<Int32>(Integer(Off.ValueSlotSize)).ToBe(8);
+
+  { The prologue publishes a TWasmGcFrame laid out Prev, Slots, RefRegBits,
+    RegisterCount, Instance; the collector reads Slots / RefRegBits /
+    RegisterCount at these fixed offsets (jit-spec §9.1). }
+  Expect<Int32>(Integer(Off.GcFrameSlots)).ToBe(SizeOf(Pointer));
+  Expect<Int32>(Integer(Off.GcFrameRefRegBits)).ToBe(2 * SizeOf(Pointer));
+  Expect<Int32>(Integer(Off.GcFrameRegisterCount)).ToBe(3 * SizeOf(Pointer));
+
+  { The context cursors the JIT reads to carve a frame: Store is first, Values
+    right after it, and ValueTop past Values. Pointer-aligned. }
+  Expect<Int32>(Integer(Off.CtxValues)).ToBe(SizeOf(Pointer));
+  Expect<Boolean>(Off.CtxValues < Off.CtxValueTop).ToBe(True);
+  Expect<Boolean>((Off.CtxValueTop and (SizeOf(Pointer) - 1)) = 0).ToBe(True);
+  Expect<Boolean>(Off.ActBase < Off.ActStride).ToBe(True);
+end;
+
 procedure TInterpTests.SetupTests;
 begin
   Test('a numeric add function computes end to end', TestAddFunction);
@@ -2308,6 +2466,15 @@ begin
     TestThrowUnwindsAcrossCall);
   Test('a caught exception whose payload is a ref survives a forced collection',
     TestRefPayloadSurvivesCollection);
+  { Baseline-JIT tier seam (O-J1, O-J2, O-J5). }
+  Test('the compile-on-hot counter increments once per interpreted call',
+    TestCallCountIncrementsPerInterpretedCall);
+  Test('a compiled top-level entry dispatches through the JIT hook',
+    TestJitHookDispatchedAtEntry);
+  Test('a compiled internal callee dispatches through the JIT hook',
+    TestJitHookDispatchedForInternalCall);
+  Test('the JIT register-file and frame offsets match the layout',
+    TestJitFrameOffsetsMatchLayout);
 end;
 
 begin

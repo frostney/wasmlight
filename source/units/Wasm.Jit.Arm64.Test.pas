@@ -1,0 +1,409 @@
+{ Unit suite for Wasm.Jit.Arm64 — the aarch64 encoder and op templates
+  (.agent/design/jit-spec.md §12.3 Wave 1 + Wave 2).
+
+  TWO layers of proof:
+    - PORTABLE bit assertions on the pure word builders, so a wrong constant is
+      caught on every CI leg (the builders compute bytes and never execute).
+      Load-bearing encodings are cross-checked against the byte patterns already
+      proven executable in Wasm.Jit.CodeBuffer.Test (add w0,w0,w1 = 0x0B010000;
+      ret = 0xD65F03C0; movz w0,#42 = 0x52800540) and against the ARMv8-A A64
+      base-instruction encodings.
+    - EXECUTABLE proof (aarch64 only): emit the Wave-2 prologue, an op template,
+      and the epilogue into a real code buffer, make it executable, and call it
+      against an in-memory register file — proving the frame-relative addressing,
+      the pinned register-file base in x19, the callee-saved save/restore, and
+      each inlined template, at the encoder level and below the whole runtime.
+      The heavy differential coverage (float via leaves, div/rem traps, loops,
+      NaN bits, br_table, unreachable) lives in Wasm.Jit.Test, which runs the
+      real decode -> validate -> instantiate -> two-tier pipeline (§11).
+
+  FPC gotchas (AGENTS.md): every test records at least one assertion; a generic
+  Expect<T>(...) is never the lone statement of an `on..do`. }
+program Wasm.Jit.Arm64.Test;
+
+{$I Shared.inc}
+
+{$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
+  {$DEFINE WASM_JIT_EXEC}
+{$ENDIF}
+
+uses
+  SysUtils,
+
+  TestingPascalLibrary,
+  Wasm.Core,
+  Wasm.Ir,
+  Wasm.Jit.Arm64,
+  Wasm.Jit.CodeBuffer;
+
+type
+  { The register-file base is the FIRST pointer argument (x0 on AAPCS64); the
+    Wave-2 prologue moves it into x19. The store is the second argument (x1) and
+    is unused by these tests (they emit no epoch capture), so a one-argument
+    cdecl call is fine — x1 is simply never dereferenced. }
+  TWasmSlotFn = procedure(const ASlots: Pointer); cdecl;
+
+  TArm64Tests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+
+    procedure TestWordBuilderBits;
+    procedure TestFrameWordBits;
+    procedure TestBranchPlaceholderBits;
+    procedure TestSlotOffset;
+    procedure TestPredicateCoversWave2;
+    procedure TestBranchOffsetRangeGuard;
+
+    procedure TestExecAddTemplate;
+    procedure TestExecAddWraps;
+    procedure TestExecMoveTemplate;
+    procedure TestExecSubTemplate;
+    procedure TestExecShlMasksCount;
+    procedure TestExecRelopSigned;
+    procedure TestExecConst;
+    procedure TestExecI64Add;
+  end;
+
+function Ins(const AOp: TWasmIrOp; const ADest, AA, AB: UInt32): TWasmIrInstr;
+begin
+  Result.Op := AOp;
+  Result.Dest := ADest;
+  Result.A := AA;
+  Result.B := AB;
+  Result.Imm := 0;
+end;
+
+{ --- portable bit assertions -------------------------------------------- }
+
+procedure TArm64Tests.TestWordBuilderBits;
+begin
+  { The two proven executable in the CodeBuffer suite; asserting them here pins
+    the builders to those exact bytes. }
+  Expect<UInt32>(Arm64Ret).ToBe($D65F03C0);
+  Expect<UInt32>(Arm64AddW(0, 0, 1)).ToBe($0B010000);
+  Expect<UInt32>(Arm64MovzW(0, 42, 0)).ToBe($52800540);
+
+  { Frame-relative loads/stores. }
+  Expect<UInt32>(Arm64LdrW(1, 0, 8)).ToBe($B9400801);
+  Expect<UInt32>(Arm64LdrX(1, 0, 8)).ToBe($F9400401);
+  Expect<UInt32>(Arm64StrX(2, 0, 16)).ToBe($F9000802);
+
+  { Wave-2 integer spine (ARMv8-A C6.2). }
+  Expect<UInt32>(Arm64SubW(0, 1, 2)).ToBe($4B020020);
+  Expect<UInt32>(Arm64MulW(0, 1, 2)).ToBe($1B027C20);
+  Expect<UInt32>(Arm64AndW(0, 1, 2)).ToBe($0A020020);
+  Expect<UInt32>(Arm64OrrW(0, 1, 2)).ToBe($2A020020);
+  Expect<UInt32>(Arm64EorW(0, 1, 2)).ToBe($4A020020);
+  Expect<UInt32>(Arm64LslvW(0, 1, 2)).ToBe($1AC22020);
+  Expect<UInt32>(Arm64LsrvW(0, 1, 2)).ToBe($1AC22420);
+  Expect<UInt32>(Arm64AsrvW(0, 1, 2)).ToBe($1AC22820);
+  Expect<UInt32>(Arm64RorvW(0, 1, 2)).ToBe($1AC22C20);
+  Expect<UInt32>(Arm64ClzW(0, 1)).ToBe($5AC01020);
+
+  { cmp / cset / csel. cset w0,eq = 0x1A9F17E0 (a known value). }
+  Expect<UInt32>(Arm64CmpW(1, 2)).ToBe($6B02003F);
+  Expect<UInt32>(Arm64CsetW(0, ARM64_COND_EQ)).ToBe($1A9F17E0);
+  Expect<UInt32>(Arm64CsetW(0, ARM64_COND_NE)).ToBe($1A9F07E0);
+  Expect<UInt32>(Arm64CselX(10, 10, 11, ARM64_COND_NE)).ToBe($9A8B114A);
+
+  { movk, add-immediate, blr, mov reg. }
+  Expect<UInt32>(Arm64MovkW(0, 1, 1)).ToBe($72A00020);
+  Expect<UInt32>(Arm64AddImmX(21, 20, 8)).ToBe($91002295);
+  Expect<UInt32>(Arm64Blr(9)).ToBe($D63F0120);
+  Expect<UInt32>(Arm64MovReg(19, 0)).ToBe($AA0003F3);
+end;
+
+procedure TArm64Tests.TestFrameWordBits;
+begin
+  { The Wave-2 frame save/restore words (jit-spec §5.3). }
+  Expect<UInt32>(Arm64StpX19X20PreIndex48).ToBe($A9BD53F3);
+  Expect<UInt32>(Arm64StpX21X22Off16).ToBe($A9015BF5);
+  Expect<UInt32>(Arm64LdpX21X22Off16).ToBe($A9415BF5);
+  Expect<UInt32>(Arm64LdpX19X20PostIndex48).ToBe($A8C353F3);
+  { str/ldr x30 at [sp,#32] reuse the scaled LDR/STR builders. }
+  Expect<UInt32>(Arm64StrX(30, 31, 32)).ToBe($F90013FE);
+  Expect<UInt32>(Arm64LdrX(30, 31, 32)).ToBe($F94013FE);
+end;
+
+procedure TArm64Tests.TestBranchPlaceholderBits;
+begin
+  Expect<UInt32>(Arm64BPlaceholder).ToBe($14000000);
+  Expect<UInt32>(Arm64BCondPlaceholder(ARM64_COND_EQ)).ToBe($54000000);
+  Expect<UInt32>(Arm64CbzWPlaceholder(9)).ToBe($34000009);
+  Expect<UInt32>(Arm64CbnzWPlaceholder(9)).ToBe($35000009);
+end;
+
+procedure TArm64Tests.TestSlotOffset;
+begin
+  Expect<UInt32>(Arm64SlotByteOffset(0)).ToBe(0);
+  Expect<UInt32>(Arm64SlotByteOffset(3)).ToBe(24);
+end;
+
+procedure TArm64Tests.TestPredicateCoversWave2;
+begin
+  { The Wave-2 spine: numeric, control, parametric, variable-move. }
+  Expect<Boolean>(Arm64CanEmitOp(iroMove)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32Add)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32Sub)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI64Mul)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32DivS)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroF64Add)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroF32Sqrt)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32LtS)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroSelect)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroBrTable)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroReturn)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroUnreachable)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32TruncSatF32S)).ToBe(True);
+
+  { Still declined -> the function runs interpreted (Wave 3/4/5/6). }
+  Expect<Boolean>(Arm64CanEmitOp(iroGlobalGet)).ToBe(False);
+  Expect<Boolean>(Arm64CanEmitOp(iroCall)).ToBe(False);
+  Expect<Boolean>(Arm64CanEmitOp(iroThrow)).ToBe(False);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32Load)).ToBe(False);
+  Expect<Boolean>(Arm64CanEmitOp(iroV128Load)).ToBe(False);
+end;
+
+{ The branch-displacement range guard (jit-spec §4.3). Arm64ResolvePatches masks
+  the scaled offset Imm = byteDelta div 4 into imm26 (B) or imm19 (B.cond / CBZ /
+  CBNZ) and raises EWasmJitBranchRange when it does not fit, so an over-large
+  function is transparently interpreted rather than silently mis-encoded.
+  Building a >1 MiB function to exercise the raise is impractical in a unit test
+  (jit-spec §11.4), so the range predicate itself is asserted at its exact
+  two's-complement boundaries — the load-bearing logic the resolver keys on. }
+procedure TArm64Tests.TestBranchOffsetRangeGuard;
+begin
+  { imm19 (conditional branches): signed 19-bit, [-262144, 262143]. }
+  Expect<Boolean>(Arm64SignedImmFits(262143, 19)).ToBe(True);
+  Expect<Boolean>(Arm64SignedImmFits(262144, 19)).ToBe(False);
+  Expect<Boolean>(Arm64SignedImmFits(-262144, 19)).ToBe(True);
+  Expect<Boolean>(Arm64SignedImmFits(-262145, 19)).ToBe(False);
+
+  { imm26 (B): signed 26-bit, [-33554432, 33554431]. }
+  Expect<Boolean>(Arm64SignedImmFits(33554431, 26)).ToBe(True);
+  Expect<Boolean>(Arm64SignedImmFits(33554432, 26)).ToBe(False);
+  Expect<Boolean>(Arm64SignedImmFits(-33554432, 26)).ToBe(True);
+  Expect<Boolean>(Arm64SignedImmFits(-33554433, 26)).ToBe(False);
+
+  { Zero (a same-site displacement) fits every field; the common in-range case. }
+  Expect<Boolean>(Arm64SignedImmFits(0, 19)).ToBe(True);
+  Expect<Boolean>(Arm64SignedImmFits(0, 26)).ToBe(True);
+end;
+
+{ --- executable proof (aarch64) -----------------------------------------
+
+  Each exec test emits: prologue (saves callee-saved, x19 := x0 = base),
+  the op template(s), then the epilogue (restores, ret). No epoch capture is
+  emitted, so x20/x21/x22 are unused and the store argument is irrelevant. }
+
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+procedure RunOne(const AIns: TWasmIrInstr; var ASlots: array of UInt64);
+var
+  Buf: TWasmCodeBuffer;
+  Fn: TWasmSlotFn;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitPrologue(Buf);
+    Arm64EmitOp(Buf, AIns, nil);
+    Arm64EmitEpilogue(Buf);
+    Buf.MakeExecutable;
+    Fn := TWasmSlotFn(Buf.EntryPoint);
+    Fn(@ASlots[0]);
+  finally
+    Buf.Free;
+  end;
+end;
+{$ENDIF}
+
+procedure TArm64Tests.TestExecAddTemplate;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  Slots[0] := 17;
+  Slots[1] := 25;
+  Slots[2] := $DEADBEEF;
+  RunOne(Ins(iroI32Add, 2, 0, 1), Slots);
+  Expect<UInt64>(Slots[2]).ToBe(42);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecAddWraps;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  { 0xFFFFFFFF + 1 wraps to 0 in 32 bits and the 64-bit store leaves the high
+    half clear (the widening-store identity, §13 item 7). High garbage in the
+    operands proves the W-form ignores it. }
+  Slots[0] := (UInt64($AAAAAAAA) shl 32) or UInt64($FFFFFFFF);
+  Slots[1] := (UInt64($BBBBBBBB) shl 32) or UInt64($00000001);
+  Slots[2] := High(UInt64);
+  RunOne(Ins(iroI32Add, 2, 0, 1), Slots);
+  Expect<UInt64>(Slots[2]).ToBe(0);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecMoveTemplate;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  Slots[0] := $1122334455667788;
+  Slots[3] := 0;
+  RunOne(Ins(iroMove, 3, 0, 0), Slots);
+  Expect<UInt64>(Slots[3]).ToBe($1122334455667788);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecSubTemplate;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  Slots[0] := 5;
+  Slots[1] := 8;
+  Slots[2] := 0;
+  RunOne(Ins(iroI32Sub, 2, 0, 1), Slots);
+  { 5 - 8 = -3 as i32, high half clear -> 0x00000000FFFFFFFD. }
+  Expect<UInt64>(Slots[2]).ToBe(UInt64($FFFFFFFD));
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecShlMasksCount;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  { i32.shl takes the count modulo 32: 1 << 33 == 1 << 1 == 2. }
+  Slots[0] := 1;
+  Slots[1] := 33;
+  Slots[2] := 0;
+  RunOne(Ins(iroI32Shl, 2, 0, 1), Slots);
+  Expect<UInt64>(Slots[2]).ToBe(2);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecRelopSigned;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  { i32.lt_s(-1, 0) = 1 (signed); the high garbage must be ignored. }
+  Slots[0] := UInt64($FFFFFFFF);
+  Slots[1] := 0;
+  Slots[2] := High(UInt64);
+  RunOne(Ins(iroI32LtS, 2, 0, 1), Slots);
+  Expect<UInt64>(Slots[2]).ToBe(1);
+
+  { And the false case: lt_s(10, 5) = 0. }
+  Slots[0] := 10;
+  Slots[1] := 5;
+  Slots[2] := High(UInt64);
+  RunOne(Ins(iroI32LtS, 2, 0, 1), Slots);
+  Expect<UInt64>(Slots[2]).ToBe(0);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecConst;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Buf: TWasmCodeBuffer;
+  Fn: TWasmSlotFn;
+  Slots: array[0 .. 5] of UInt64;
+  Ci: TWasmIrInstr;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  { i32.const 0xABCD1234 into slot 1: low 32 set, high half clear. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Ci.Op := iroI32Const;
+    Ci.Dest := 1;
+    Ci.A := 0;
+    Ci.B := 0;
+    Ci.Imm := Int64(Integer($ABCD1234));
+    Arm64EmitPrologue(Buf);
+    Arm64EmitOp(Buf, Ci, nil);
+    Arm64EmitEpilogue(Buf);
+    Buf.MakeExecutable;
+    Slots[1] := High(UInt64);
+    Fn := TWasmSlotFn(Buf.EntryPoint);
+    Fn(@Slots[0]);
+    Expect<UInt64>(Slots[1]).ToBe(UInt64($ABCD1234));
+  finally
+    Buf.Free;
+  end;
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.TestExecI64Add;
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+var
+  Slots: array[0 .. 5] of UInt64;
+{$ENDIF}
+begin
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
+  { Full 64-bit add, no truncation. }
+  Slots[0] := $00000000FFFFFFFF;
+  Slots[1] := $0000000100000001;
+  Slots[2] := 0;
+  RunOne(Ins(iroI64Add, 2, 0, 1), Slots);
+  Expect<UInt64>(Slots[2]).ToBe($0000000200000000);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TArm64Tests.SetupTests;
+begin
+  Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
+  Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
+  Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
+  Test('slot byte offset is register*8', TestSlotOffset);
+  Test('predicate covers the Wave-2 op set', TestPredicateCoversWave2);
+  Test('branch-offset range guard fits imm19/imm26 at the boundaries',
+    TestBranchOffsetRangeGuard);
+  Test('executes the i32.add template over a register file', TestExecAddTemplate);
+  Test('i32.add template wraps at 2^32 and clears the high half',
+    TestExecAddWraps);
+  Test('executes the move template as a full slot copy', TestExecMoveTemplate);
+  Test('executes the i32.sub template', TestExecSubTemplate);
+  Test('i32.shl masks the shift count modulo 32', TestExecShlMasksCount);
+  Test('executes a signed i32 relop via cmp+cset', TestExecRelopSigned);
+  Test('executes an i32.const template', TestExecConst);
+  Test('executes a full-width i64.add template', TestExecI64Add);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TArm64Tests.Create('Wasm.Jit.Arm64'));
+  TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
+end.

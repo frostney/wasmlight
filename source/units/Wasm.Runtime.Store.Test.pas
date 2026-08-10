@@ -132,6 +132,9 @@ type
     procedure TestTrampolineContextCarriesTheStore;
     procedure TestFrameChainResetsAfterATrap;
     procedure TestThreadConfinementCheckAcceptsTheOwner;
+    { Baseline-JIT tier seam (O-J1, O-J5). }
+    procedure TestFuncInstTierFieldsDefaultToNotCompiled;
+    procedure TestJitOffsetsMatchTheRecordLayout;
   end;
 
 { --- TByteBuf ------------------------------------------------------------ }
@@ -1190,6 +1193,62 @@ begin
   Expect<Boolean>(FStore.OwnerThread = GetCurrentThreadId).ToBe(True);
 end;
 
+procedure TRuntimeStoreTests.TestFuncInstTierFieldsDefaultToNotCompiled;
+var
+  W, H: TWasmFuncAddr;
+begin
+  { O-J1: a freshly added function is NOT compiled — CompiledEntry nil and the
+    compile-on-hot counter zero — for both a wasm and a host function, so a
+    store with no JIT registered dispatches everything to the interpreter and
+    nothing observable changes. The JIT's own dispatch hook is likewise nil
+    until a JIT registers it. }
+  W := FStore.AddWasmFunc(0, 0);
+  H := FStore.AddHostFunc(0, nil, nil);
+
+  Expect<Boolean>(FStore.Funcs[W].CompiledEntry = nil).ToBe(True);
+  ExpectCount('wasm CallCount', Integer(FStore.Funcs[W].CallCount), 0);
+  Expect<Boolean>(FStore.Funcs[H].CompiledEntry = nil).ToBe(True);
+  ExpectCount('host CallCount', Integer(FStore.Funcs[H].CallCount), 0);
+  Expect<Boolean>(Assigned(FStore.JitInvokeCompiled)).ToBe(False);
+end;
+
+procedure TRuntimeStoreTests.TestJitOffsetsMatchTheRecordLayout;
+var
+  Off: TWasmJitOffsets;
+begin
+  { O-J5: the offsets the JIT hard-codes come from the live Pascal layout, and
+    this asserts the concrete values the generated code assumes. A field
+    reorder moves one of these and the test goes red before any miscompile. }
+  Off := WasmJitOffsets(FStore);
+
+  { A memory instance keeps Base first and ByteSize immediately after it — the
+    hot pair the inline bounds check loads (jit-spec §7.1). }
+  ExpectCount('MemBase', Integer(Off.MemBase), 0);
+  ExpectCount('MemByteSize', Integer(Off.MemByteSize), SizeOf(Pointer));
+
+  { A func inst keeps Kind first (the wasm/host discriminator), and the two
+    tier fields are adjacent (CompiledEntry then the u32 CallCount), all within
+    the record. }
+  ExpectCount('FuncKind', Integer(Off.FuncKind), 0);
+  ExpectCount('FuncCallCount - FuncCompiledEntry',
+    Integer(Off.FuncCallCount - Off.FuncCompiledEntry), SizeOf(Pointer));
+  Expect<Boolean>(Off.FuncCompiledEntry + SizeOf(Pointer) +
+    SizeOf(UInt32) <= Off.FuncInstStride).ToBe(True);
+  Expect<Boolean>((Off.FuncCompiledEntry and (SizeOf(Pointer) - 1)) = 0)
+    .ToBe(True);
+
+  { Store.Epoch is read from the object reference at every back-edge safepoint
+    (jit-spec §6): it sits past the object header and is pointer-aligned. }
+  Expect<Boolean>(Off.StoreEpoch > 0).ToBe(True);
+  Expect<Boolean>((Off.StoreEpoch and (SizeOf(UInt64) - 1)) = 0).ToBe(True);
+
+  { The accessor must agree with a direct probe on the live store — the guard
+    that the reported StoreEpoch is the real one the JIT would load. }
+  ExpectCount('StoreEpoch probe',
+    Integer(PtrUInt(@FStore.Epoch) - PtrUInt(Pointer(FStore))),
+    Integer(Off.StoreEpoch));
+end;
+
 procedure TRuntimeStoreTests.SetupTests;
 begin
   Test('interning a module allocates one group per distinct rec group',
@@ -1263,6 +1322,11 @@ begin
     TestFrameChainResetsAfterATrap);
   Test('the confinement check accepts the owning thread',
     TestThreadConfinementCheckAcceptsTheOwner);
+
+  Test('a fresh function instance is not compiled and its counter is zero',
+    TestFuncInstTierFieldsDefaultToNotCompiled);
+  Test('the JIT field offsets match the record layout',
+    TestJitOffsetsMatchTheRecordLayout);
 end;
 
 begin

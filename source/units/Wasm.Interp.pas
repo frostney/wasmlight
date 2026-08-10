@@ -58,62 +58,20 @@ interface
 uses
   SysUtils,
 
+  Wasm.Ir,
+  Wasm.Runtime.Gc,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values;
 
-var
-  { The two reservations' sizes (interp-spec §1.1). Read once, when a store's
-    interpreter context is first created. Mutable globals rather than
-    constants so a test can shrink them before the first invoke to make
-    assert_exhaustion trip a small cap deterministically. A push past EITHER
-    cap traps 'call stack exhausted'. }
-  WasmInterpValueSlots: NativeUInt = 1 shl 20;   { 1 Mi slots = 8 MiB }
-  WasmInterpMaxDepth: NativeUInt = 8192;         { activation records }
-
-{ Set AStore.TierInvoke/TierContext/TierContextFree so the store runs guest
-  code through this interpreter. Allocates the per-store context (the two
-  fixed reservations) if not already present. Idempotent. }
-procedure RegisterInterpreter(const AStore: TWasmStore);
-
-{ The guest-entry helper the tests and the .wast runner call: installs the
-  trampoline (WasmInvoke) so a trap becomes a catchable EWasmTrap, runs the
-  export, and re-establishes the frame chain and the context cursors after
-  any unwind. Never call InterpTierInvoke directly from a host — a trap would
-  LongJmp into a missing trampoline. }
-procedure InterpInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
-  const AParams: PWasmValue; const AResults: PWasmValue);
-
-{ Zero the context cursors after a trap unwind (interp-spec §5.3/§7.3),
-  called at the same landing as Heap.ResetFrames. Safe when no context
-  exists. }
-procedure ResetInterpContext(const AStore: TWasmStore);
-
-implementation
-
-uses
-  Wasm.Core,
-  Wasm.Interp.Numeric,
-  Wasm.Interp.Vector,
-  Wasm.Ir,
-  Wasm.Runtime.Gc,
-  Wasm.Runtime.Traps;
-
 type
-  { Wasm.Ir declares the records but no pointer types; the interpreter
-    borrows stable pointers into the (never-modified) IR and value stack. }
+  { The interpreter's activation and per-store context, exposed so the
+    baseline JIT can build a frame through the shared helpers below (O-J2).
+    Both tiers run in ONE TWasmInterpContext — the same value-stack and
+    activation reservations — so a compiled frame and an interpreted frame
+    are bit-identical (jit-spec §5.1). }
   PWasmIrFunction = ^TWasmIrFunction;
   PWasmIrInstr = ^TWasmIrInstr;
 
-const
-  { A fixed ceiling on the parameter/result count a single call marshals
-    through a stack-local scratch buffer (interp-spec §1.4 TRAP-1: the
-    scratch must be plain stack data, not a managed dynamic array a TrapNow
-    could skip). Comfortably above the spec's function-arity implementation
-    limits; a module exceeding it raises a loud internal error rather than
-    misbehaving. }
-  WASM_INTERP_MAX_MARSHAL = 1024;
-
-type
   PWasmActivation = ^TWasmActivation;
 
   TWasmRetKind = (rtCaller, rtEntry);
@@ -157,6 +115,110 @@ type
     DepthCap: NativeUInt;
     Depth: NativeUInt;               { number of live activations }
   end;
+
+  { O-J5: the register-file / frame offsets the JIT's generated code reads
+    at fixed offsets — the slot stride for Reg[k] = Values[Base + k]
+    addressing, the context cursors, and the TWasmGcFrame fields a prologue
+    publishes. Layout-only (no instance needed); the co-located test asserts
+    the values the JIT hard-codes. Store.Epoch and the memory-instance
+    offsets live in Wasm.Runtime.Store's WasmJitOffsets. }
+  TWasmJitFrameOffsets = record
+    ValueSlotSize: NativeUInt;       { SizeOf(TWasmValue) — the slot stride }
+    CtxValues: NativeUInt;           { TWasmInterpContext.Values }
+    CtxValueTop: NativeUInt;         { TWasmInterpContext.ValueTop }
+    CtxValueCap: NativeUInt;         { TWasmInterpContext.ValueCap }
+    CtxDepth: NativeUInt;            { TWasmInterpContext.Depth }
+    ActStride: NativeUInt;           { SizeOf(TWasmActivation) }
+    ActBase: NativeUInt;             { TWasmActivation.Base }
+    GcFrameSlots: NativeUInt;        { TWasmGcFrame.Slots }
+    GcFrameRefRegBits: NativeUInt;   { TWasmGcFrame.RefRegBits }
+    GcFrameRegisterCount: NativeUInt;{ TWasmGcFrame.RegisterCount }
+  end;
+
+var
+  { The two reservations' sizes (interp-spec §1.1). Read once, when a store's
+    interpreter context is first created. Mutable globals rather than
+    constants so a test can shrink them before the first invoke to make
+    assert_exhaustion trip a small cap deterministically. A push past EITHER
+    cap traps 'call stack exhausted'. }
+  WasmInterpValueSlots: NativeUInt = 1 shl 20;   { 1 Mi slots = 8 MiB }
+  WasmInterpMaxDepth: NativeUInt = 8192;         { activation records }
+
+{ Set AStore.TierInvoke/TierContext/TierContextFree so the store runs guest
+  code through this interpreter. Allocates the per-store context (the two
+  fixed reservations) if not already present. Idempotent. }
+procedure RegisterInterpreter(const AStore: TWasmStore);
+
+{ The guest-entry helper the tests and the .wast runner call: installs the
+  trampoline (WasmInvoke) so a trap becomes a catchable EWasmTrap, runs the
+  export, and re-establishes the frame chain and the context cursors after
+  any unwind. Never call InterpTierInvoke directly from a host — a trap would
+  LongJmp into a missing trampoline. }
+procedure InterpInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
+  const AParams: PWasmValue; const AResults: PWasmValue);
+
+{ Zero the context cursors after a trap unwind (interp-spec §5.3/§7.3),
+  called at the same landing as Heap.ResetFrames. Safe when no context
+  exists. }
+procedure ResetInterpContext(const AStore: TWasmStore);
+
+{ --- the shared tier-seam frame helpers (O-J2, jit-spec §5.1) ------------
+
+  These are the ONE implementation of the frame carve / zero / GC-push /
+  param-marshal / result-marshal / pop discipline. The interpreter's own
+  entry path (InterpTierInvoke) builds its frame through JitEnterFrame, and
+  the baseline JIT's compiled-function dispatcher calls the identical pair —
+  so a compiled frame and an interpreted frame are carved, zeroed, pushed,
+  and popped by the same code, and the exhaustion threshold, the GC contract,
+  and the null/default-init discipline are identical by construction rather
+  than by parallel re-implementation (jit-spec §5.1, §5.4). }
+
+{ Return the interpreter/JIT execution context for a store, creating it on
+  first use. The JIT shares this exact context (its value stack, activation
+  array, depth accounting) so stack-exhaustion, GC, and epoch behaviour stay
+  bit-identical across tiers. }
+function InterpContextFor(const AStore: TWasmStore): PWasmInterpContext;
+
+{ Prologue. Exhaustion-check both caps (-> TrapNow(wtkStackExhausted), the
+  same threshold every path uses); carve the register file at ValueTop; zero
+  every slot (a ref reads null, a numeric local defaults 0); marshal the FLAT
+  AParams into the callee's padded param registers (a v128 param spans two
+  consecutive flat slots); wire the frame to deliver its results to the flat
+  AResults; push the TWasmGcFrame before the first safepoint; Inc(Depth).
+  Returns @Values[Base], the register-file base the compiled body reads and
+  writes. AParams may be nil for a 0-parameter function. }
+function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue): PWasmValue;
+
+{ Epilogue. The compiled body has written its result registers; marshal them
+  into the AResults handed to JitEnterFrame and pop the frame — identical to
+  iroReturn on an rtEntry frame. Pops the top activation of ACtx. }
+procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
+
+{ O-J5: the register-file / frame offsets the JIT hard-codes (see the record
+  above). Layout-only; the co-located test asserts them. }
+function WasmJitFrameOffsets: TWasmJitFrameOffsets;
+
+implementation
+
+uses
+  Wasm.Core,
+  Wasm.Interp.Numeric,
+  Wasm.Interp.Vector,
+  Wasm.Runtime.Traps;
+
+const
+  { A fixed ceiling on the parameter/result count a single call marshals
+    through a stack-local scratch buffer (interp-spec §1.4 TRAP-1: the
+    scratch must be plain stack data, not a managed dynamic array a TrapNow
+    could skip). Comfortably above the spec's function-arity implementation
+    limits; a module exceeding it raises a loud internal error rather than
+    misbehaving. }
+  WASM_INTERP_MAX_MARSHAL = 1024;
+
+{ TWasmActivation, TWasmInterpContext and the IR pointer types now live in
+  the interface (moved for O-J2 so the JIT can build a frame through the
+  shared helpers). }
 
 { --- register-file addressing -------------------------------------------- }
 
@@ -575,15 +637,103 @@ begin
   Result := FuncAddr;
 end;
 
-{ --- call dispatch (wasm vs host) ---------------------------------------- }
+{ --- compiled callee dispatch (O-J1, jit-spec §4.4) ----------------------
+
+  A wasm callee whose CompiledEntry <> nil is run through the JIT hook, and
+  from the interpreter's side it behaves EXACTLY like a host function: gather
+  the caller's args into a flat buffer, hand them to the hook, scatter the
+  flat results back into the caller's dest registers. The flat buffer format
+  (v128 = two consecutive entries, wasm operand order) is the same one the
+  entry seam uses, so params/results marshal identically whether the callee
+  is compiled or interpreted — the observational-identity property. The
+  compiled callee runs to completion and returns; no interpreter frame is
+  pushed for it. }
+procedure CompiledCall(const ACtx: PWasmInterpContext;
+  const ACaller: PWasmActivation; const AArgAux, ADstAux: UInt32;
+  const AAddr: TWasmFuncAddr);
+var
+  CallerRegs: PWasmValue;
+  ArgN, ResN, I: UInt32;
+  ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+begin
+  ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
+  ResN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
+  if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
+    raise EWasmError.Create('internal: compiled-call arity exceeds the marshal cap');
+
+  CallerRegs := Frame(ACtx^.Values, ACaller^.Base);
+  I := 0;
+  while I < ArgN do
+  begin
+    ParamBuf[I] := CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, AArgAux, I)];
+    Inc(I);
+  end;
+
+  ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0]);
+
+  { The value stack is fixed, so CallerRegs is still valid even if the
+    compiled callee re-entered guest code (the guarantee HostCall relies on). }
+  I := 0;
+  while I < ResN do
+  begin
+    CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, ADstAux, I)] := ResBuf[I];
+    Inc(I);
+  end;
+end;
+
+{ return_call to a COMPILED function (jit-spec §4.5): run the compiled callee
+  to completion, take its results as THIS frame's results, and return them to
+  this frame's caller — the interpreter's ReturnHostCall shape, keeping the
+  tail call O(1) (no wasm frame added). }
+procedure ReturnCompiledCall(const ACtx: PWasmInterpContext;
+  const ATop: PWasmActivation; const AArgAux: UInt32;
+  const AAddr: TWasmFuncAddr);
+var
+  TopRegs: PWasmValue;
+  ArgN, ResN, I: UInt32;
+  ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+begin
+  ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
+  ResN := ATop^.Fn^.ResultCount;   { equals the tail callee's result arity }
+  if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
+    raise EWasmError.Create('internal: compiled-call arity exceeds the marshal cap');
+
+  TopRegs := Frame(ACtx^.Values, ATop^.Base);
+  I := 0;
+  while I < ArgN do
+  begin
+    ParamBuf[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
+    Inc(I);
+  end;
+
+  ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0]);
+
+  { ResBuf is the flat result block; scatter it into this frame's padded
+    result registers so DoReturn reads it back pad-aware, exactly as
+    ReturnHostCall does for a host tail callee. }
+  ScatterResultsFlat(ATop^.Fn, Frame(ACtx^.Values, ATop^.Base), @ResBuf[0]);
+  DoReturn(ACtx, ATop);
+end;
+
+{ --- call dispatch (wasm vs host vs compiled) ---------------------------- }
 
 procedure EnterCall(const ACtx: PWasmInterpContext; const ACaller: PWasmActivation;
   const AArgAux, ADstAux: UInt32; const AAddr: TWasmFuncAddr);
 begin
   if ACtx^.Store.Funcs[AAddr].Kind = wfkHost then
     HostCall(ACtx, ACaller, AArgAux, ADstAux, AAddr)
+  else if Assigned(ACtx^.Store.JitInvokeCompiled) and
+    (ACtx^.Store.Funcs[AAddr].CompiledEntry <> nil) then
+    { Tier up: the JIT compiled this callee. The Assigned test comes first so
+      the common no-JIT case is a single predicted-not-taken branch. }
+    CompiledCall(ACtx, ACaller, AArgAux, ADstAux, AAddr)
   else
+  begin
+    { O-J1: the compile-on-hot counter — bumped on each interpreted call so
+      the JIT can decide to compile this function. Invisible without a JIT. }
+    Inc(ACtx^.Store.Funcs[AAddr].CallCount);
     PushWasmFrame(ACtx, ACaller, AArgAux, ADstAux, AAddr);
+  end;
 end;
 
 procedure EnterTailCall(const ACtx: PWasmInterpContext; const ATop: PWasmActivation;
@@ -591,8 +741,14 @@ procedure EnterTailCall(const ACtx: PWasmInterpContext; const ATop: PWasmActivat
 begin
   if ACtx^.Store.Funcs[AAddr].Kind = wfkHost then
     ReturnHostCall(ACtx, ATop, AArgAux, AAddr)
+  else if Assigned(ACtx^.Store.JitInvokeCompiled) and
+    (ACtx^.Store.Funcs[AAddr].CompiledEntry <> nil) then
+    ReturnCompiledCall(ACtx, ATop, AArgAux, AAddr)
   else
+  begin
+    Inc(ACtx^.Store.Funcs[AAddr].CallCount);
     ReplaceWasmFrame(ACtx, ATop, AArgAux, AAddr);
+  end;
 end;
 
 { --- memory access: everything through the chokepoint (interp-spec §3.7) ---
@@ -1420,7 +1576,14 @@ var
 
 begin
   Store := ACtx^.Store;
-  EpochCache := Store.Epoch;
+  { ADR-0006 / jit-spec §6: source the back-edge snapshot from the SHARED
+    per-invocation slot InterpTierInvoke seeded at the outermost guest-entry,
+    NOT a fresh Store.Epoch read here. This keeps EpochCache a Run-local (so a
+    nested host->guest re-entry, which re-seeds the shared slot for its own
+    Run, never disturbs this outer Run's snapshot) while making the value the
+    SAME one a compiled leaf's prologue loads — so both tiers observe an
+    interrupt at exactly the same back-edges. }
+  EpochCache := Store.EpochSnapshot;
   LoadTop;
 
   while True do
@@ -2614,14 +2777,91 @@ begin
   end;
 end;
 
-procedure InterpTierInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
-  const AParams: PWasmValue; const AResults: PWasmValue);
+{ --- the shared tier-seam frame helpers (O-J2) --------------------------- }
+
+function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue): PWasmValue;
 var
-  Ctx: PWasmInterpContext;
   Inst: TWasmModuleInstance;
   Fn: PWasmIrFunction;
   Entry: PWasmActivation;
   Slots: PWasmValue;
+begin
+  Inst := AStore.Funcs[AFuncAddr].Instance;
+  Fn := @Inst.Ir.Functions[AStore.Funcs[AFuncAddr].FuncIrIndex];
+
+  { Exhaustion guard BEFORE any mutation (interp-spec §5.2 / jit-spec §5.1),
+    against BOTH caps and the same threshold every frame push uses. }
+  if (ACtx^.Depth >= ACtx^.DepthCap) or
+    (ACtx^.ValueTop + Fn^.RegisterCount > ACtx^.ValueCap) then
+    TrapNow(wtkStackExhausted);
+
+  Entry := @ACtx^.Acts[ACtx^.Depth];
+  Entry^.Fn := Fn;
+  Entry^.Instance := Inst;
+  Entry^.Base := ACtx^.ValueTop;
+  Entry^.IP := 0;
+  ACtx^.ValueTop := Entry^.Base + Fn^.RegisterCount;
+
+  { GC-1: zero the whole register file — an unwritten ref slot reads null,
+    numeric locals default 0. }
+  Slots := Frame(ACtx^.Values, Entry^.Base);
+  ValueZeroSlots(Slots, Fn^.RegisterCount);
+
+  { Marshal AParams into the padded param registers. SEAM (simd-spec §1.6):
+    AParams is a FLAT slot array in which a v128 param occupies TWO
+    consecutive entries, low half first. ScatterParamsFlat places each param
+    at its register (LocalRegs[k]) so the v128 even-alignment pad is honoured,
+    the same translation the wasm->wasm and tail-call paths use. A scalar-only
+    function walks 1:1. AParams may be nil for a no-parameter entry
+    (ParamCount = 0 skips the loop). }
+  ScatterParamsFlat(Fn, Slots, AParams);
+
+  Entry^.RetKind := rtEntry;
+  { RetCount is a SLOT count so a v128 result flows into two flat AResults
+    slots (simd-spec §1.6); DoReturn's per-slot copy then needs no change. }
+  Entry^.RetCount := ResultSlotCount(Fn);
+  Entry^.RetDest := nil;
+  Entry^.RetBase := 0;
+  Entry^.EntryResults := AResults;
+
+  { GC-1: push before the IP-0 safepoint (the body's first op may allocate). }
+  PushGcFrame(ACtx, Entry, Fn, Entry^.Base);
+  Inc(ACtx^.Depth);
+  Result := Slots;
+end;
+
+procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
+begin
+  { The compiled body wrote its result registers; DoReturn on an rtEntry
+    frame marshals them into EntryResults and pops — the ONE result-marshal /
+    pop implementation the interpreter's iroReturn also uses. }
+  DoReturn(ACtx, @ACtx^.Acts[ACtx^.Depth - 1]);
+end;
+
+function WasmJitFrameOffsets: TWasmJitFrameOffsets;
+var
+  C: TWasmInterpContext;
+  A: TWasmActivation;
+  G: TWasmGcFrame;
+begin
+  { Only field ADDRESSES are taken, so the uninitialised locals are not read. }
+  Result.ValueSlotSize := SizeOf(TWasmValue);
+  Result.CtxValues := PtrUInt(@C.Values) - PtrUInt(@C);
+  Result.CtxValueTop := PtrUInt(@C.ValueTop) - PtrUInt(@C);
+  Result.CtxValueCap := PtrUInt(@C.ValueCap) - PtrUInt(@C);
+  Result.CtxDepth := PtrUInt(@C.Depth) - PtrUInt(@C);
+  Result.ActStride := SizeOf(TWasmActivation);
+  Result.ActBase := PtrUInt(@A.Base) - PtrUInt(@A);
+  Result.GcFrameSlots := PtrUInt(@G.Slots) - PtrUInt(@G);
+  Result.GcFrameRefRegBits := PtrUInt(@G.RefRegBits) - PtrUInt(@G);
+  Result.GcFrameRegisterCount := PtrUInt(@G.RegisterCount) - PtrUInt(@G);
+end;
+
+procedure InterpTierInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
+  const AParams: PWasmValue; const AResults: PWasmValue);
+var
+  Ctx: PWasmInterpContext;
   SavedDepth, SavedTop: NativeUInt;
 begin
   AStore.CheckThread;                     { ADR-0008 }
@@ -2648,46 +2888,39 @@ begin
     Exit;
   end;
 
+  { ADR-0006 / jit-spec §6: capture the epoch snapshot ONCE, here at the
+    outermost guest-entry (the ONLY site that begins a guest invocation —
+    every host->guest re-entry re-enters through here, and every nested
+    wasm->wasm call, compiled or interpreted, is dispatched WITHOUT passing
+    through here, so it never re-seeds). Both tiers read this shared slot: the
+    interpreter's Run seeds its EpochCache from it, and a compiled entry's
+    prologue loads it into its snapshot register. Setting it before the
+    compiled-dispatch check below covers a top-level compiled entry too. A
+    mid-invocation epoch bump is thus observed as an interrupt at the next
+    back-edge under BOTH tiers, identically. }
+  AStore.EpochSnapshot := AStore.Epoch;
+
+  { O-J1 tier check at the top-level entry: if the JIT compiled this function,
+    dispatch to it through the same flat seam an interpreted entry uses, so
+    the params/results marshal identically. Assigned() first keeps the no-JIT
+    case a single predicted-not-taken branch. }
+  if Assigned(AStore.JitInvokeCompiled) and
+    (AStore.Funcs[AFuncAddr].CompiledEntry <> nil) then
+  begin
+    AStore.JitInvokeCompiled(AStore, AFuncAddr, AParams, AResults);
+    Exit;
+  end;
+
+  { The compile-on-hot counter (O-J1): bumped on each interpreted entry so the
+    JIT can decide to compile. Invisible without a JIT registered. }
+  Inc(AStore.Funcs[AFuncAddr].CallCount);
+
   SavedDepth := Ctx^.Depth;
   SavedTop := Ctx^.ValueTop;
 
-  Inst := AStore.Funcs[AFuncAddr].Instance;
-  Fn := @Inst.Ir.Functions[AStore.Funcs[AFuncAddr].FuncIrIndex];
-
-  if (Ctx^.Depth >= Ctx^.DepthCap) or
-    (Ctx^.ValueTop + Fn^.RegisterCount > Ctx^.ValueCap) then
-    TrapNow(wtkStackExhausted);
-
-  Entry := @Ctx^.Acts[Ctx^.Depth];
-  Entry^.Fn := Fn;
-  Entry^.Instance := Inst;
-  Entry^.Base := Ctx^.ValueTop;
-  Entry^.IP := 0;
-  Ctx^.ValueTop := Entry^.Base + Fn^.RegisterCount;
-
-  Slots := Frame(Ctx^.Values, Entry^.Base);
-  ValueZeroSlots(Slots, Fn^.RegisterCount);
-
-  { Marshal AParams into the param registers. SEAM (simd-spec §1.6): AParams
-    is a FLAT slot array in which a v128 param occupies TWO consecutive
-    entries, low half first. ScatterParamsFlat places each param at its
-    register (LocalRegs[k]) so the v128 even-alignment pad is honoured, keeping
-    the packed flat array and the padded register file in step — the same
-    translation the wasm->wasm and tail-call paths use. A scalar-only function
-    walks 1:1. AParams may be nil for a no-parameter entry (e.g.
-    RunPendingStart); ParamCount = 0 skips the loop. }
-  ScatterParamsFlat(Fn, Slots, AParams);
-
-  Entry^.RetKind := rtEntry;
-  { RetCount is a SLOT count so a v128 result flows into two flat AResults
-    slots (simd-spec §1.6); DoReturn's per-slot copy then needs no change. }
-  Entry^.RetCount := ResultSlotCount(Fn);
-  Entry^.RetDest := nil;
-  Entry^.RetBase := 0;
-  Entry^.EntryResults := AResults;
-
-  PushGcFrame(Ctx, Entry, Fn, Entry^.Base);
-  Inc(Ctx^.Depth);
+  { Build the entry frame through the SAME helper the JIT uses (O-J2), then
+    run the interpreter loop over it. }
+  JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults);
 
   Run(Ctx, SavedDepth);
 

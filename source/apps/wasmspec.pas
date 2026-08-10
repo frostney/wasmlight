@@ -192,8 +192,9 @@ end;
   when the file could not be read or parsed, which is an operational
   failure rather than a conformance result and so is never folded into the
   pass/fail columns. }
-function RunOne(const APath: string; const AShowPass, AShowSkip,
-  AShowStaged, AShowFileLine: Boolean; var AErrors: Integer): TWastTally;
+function RunOne(const APath: string; const AMode: TWastTierMode;
+  const AShowPass, AShowSkip, AShowStaged, AShowFileLine: Boolean;
+  var AErrors, ACompiled: Integer): TWastTally;
 var
   Run: TWastRunResult;
   Item: TWastCommandResult;
@@ -203,7 +204,7 @@ begin
   Run := nil;
   try
     try
-      Run := RunWastFile(APath);
+      Run := RunWastFile(APath, AMode);
     except
       { EWastParseError for script text, EWasmDecodeError for an
         unreadable file, and a bare Exception guard so one bad file cannot
@@ -228,6 +229,7 @@ begin
     end;
 
     Result := Run.Tally;
+    Inc(ACompiled, Run.CompiledFuncCount);
     if AShowFileLine then
       WriteLn('FILE ', APath, ' ', TallyText(Result));
   finally
@@ -269,11 +271,13 @@ end;
 var
   Options: TOptionList;
   VerboseOpt, FailuresOnlyOpt, HelpOpt: TFlagOption;
+  TierOpt: TStringOption;
   Positionals, Scripts: TStringList;
   Verbose, FailuresOnly: Boolean;
   ShowPass, ShowSkip, ShowStaged, ShowFileLine: Boolean;
+  Mode: TWastTierMode;
   Total, Root, Proposals, FileTally: TWastTally;
-  Errors, I: Integer;
+  Errors, Compiled, I: Integer;
 begin
   Options := TOptionList.Create;
   Positionals := nil;
@@ -283,6 +287,13 @@ begin
       'One line per command, including passes and skips');
     FailuresOnlyOpt := Options.AddFlag('failures-only',
       'Only failure lines and the totals');
+    { The tier the corpus runs under (jit-spec §11, §12.3). interp is the tier
+      of record and the default — omitting the flag leaves every number exactly
+      as before. jit registers the baseline JIT and force-compiles every
+      compilable function, turning the corpus into the JIT's conformance net:
+      the tally MUST match an interp run, or a compiled function diverged. }
+    TierOpt := Options.AddString('tier',
+      'Execution tier: interp (default) or jit');
     HelpOpt := Options.AddFlag('help', 'Show usage');
 
     try
@@ -311,6 +322,26 @@ begin
       Exit;
     end;
 
+    { Resolve the tier. Absent or 'interp' is the interpreter (the default and
+      the tier of record); 'jit' opts into the baseline JIT. An unrecognised
+      value is an operational error, not a silent fall-through to interpreter —
+      a run must never claim a tier it did not use. }
+    Mode := wtmInterp;
+    if TierOpt.Present then
+    begin
+      if TierOpt.Value = 'jit' then
+        Mode := wtmJit
+      else if TierOpt.Value = 'interp' then
+        Mode := wtmInterp
+      else
+      begin
+        WriteLn(ErrOutput, TOOL_NAME, ': unknown --tier "', TierOpt.Value,
+          '" (expected interp or jit)');
+        ExitCode := 1;
+        Exit;
+      end;
+    end;
+
     Verbose := VerboseOpt.Present;
     FailuresOnly := FailuresOnlyOpt.Present;
     { --failures-only wins over --verbose where they disagree: it is the
@@ -337,10 +368,11 @@ begin
     Total.Clear;
     Root.Clear;
     Proposals.Clear;
+    Compiled := 0;
     for I := 0 to Scripts.Count - 1 do
     begin
-      FileTally := RunOne(Scripts[I], ShowPass, ShowSkip, ShowStaged,
-        ShowFileLine, Errors);
+      FileTally := RunOne(Scripts[I], Mode, ShowPass, ShowSkip, ShowStaged,
+        ShowFileLine, Errors, Compiled);
       Total.Add(FileTally);
       if IsProposalScript(Scripts[I]) then
         Proposals.Add(FileTally)
@@ -349,10 +381,14 @@ begin
     end;
 
     { The 3.0-draft root and the proposal corpora split out, so a run reports
-      core-conformance movement apart from post-3.0 proposal coverage. }
+      core-conformance movement apart from post-3.0 proposal coverage. The TOTAL
+      line names the tier and, under --tier=jit, how many functions were
+      actually compiled — so a run's tier is unambiguous and the JIT is provably
+      exercised rather than silently all-interpreted (jit-spec §11.3, §12.3). }
     WriteLn('ROOT ', TallyText(Root));
     WriteLn('PROPOSALS ', TallyText(Proposals));
-    WriteLn('TOTAL files=', Scripts.Count, ' errors=', Errors, ' ',
+    WriteLn('TOTAL files=', Scripts.Count, ' errors=', Errors,
+      ' tier=', WastTierModeName(Mode), ' compiled=', Compiled, ' ',
       TallyText(Total));
 
     if (Total.Fail > 0) or (Errors > 0) then

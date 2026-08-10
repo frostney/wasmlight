@@ -261,6 +261,25 @@ type
     { wfkWasm }
     Instance: TWasmModuleInstance;   { BORROWED }
     FuncIrIndex: UInt32;
+    { --- baseline-JIT tier seam (O-J1, jit-spec §4.1/§4.2) -------------
+      The JIT annotates a wfkWasm function here; both are zero for a host
+      function and zero-initialised for a wasm one.
+
+      CompiledEntry is nil until the JIT compiles this function. nil means
+      "not compiled -> interpret"; once the JIT sets it, it is the entry
+      point of the compiled machine code and every call site dispatches to
+      it (through TWasmStore.JitInvokeCompiled) instead of the interpreter.
+      The call-site check is a single predicted-not-taken branch, so a store
+      with no JIT registered — where this stays nil forever — runs exactly
+      as before.
+
+      CallCount is the compile-on-hot counter (jit-spec §4.2). The
+      interpreter Inc's it on each INTERPRETED call into the function; the
+      JIT reads it and compiles once it crosses the driver's threshold. The
+      interpreter only maintains the counter — the compile decision and the
+      threshold belong to Wasm.Jit. }
+    CompiledEntry: Pointer;
+    CallCount: UInt32;
     { wfkHost }
     Callback: TWasmHostFunc;
     HostData: Pointer;               { opaque to the runtime }
@@ -412,6 +431,24 @@ type
     const AFuncAddr: TWasmFuncAddr; const AParams: PWasmValue;
     const AResults: PWasmValue);
 
+  { The baseline JIT's compiled-invocation hook (O-J1, jit-spec §4.1/§4.4).
+    nil until Wasm.Jit registers it; the interpreter calls it INSTEAD of its
+    own dispatch loop whenever a wasm callee's CompiledEntry <> nil. The
+    contract is the SAME flat seam a wasm entry and a host call already use:
+    AParams / AResults are flat slot arrays (a v128 occupies two consecutive
+    slots, low half first, in wasm operand order), so params and results
+    marshal identically whether the callee is compiled or interpreted — the
+    observational-identity property the tier seam turns on. The hook resolves
+    AStore.Funcs[AFuncAddr].CompiledEntry itself, sets up the callee's frame
+    through the shared JitEnterFrame / JitLeaveFrame helpers (so a compiled
+    frame is bit-identical to an interpreted one), runs the compiled code to
+    completion, and writes the flat results into AResults. There is no OSR:
+    it runs the whole callee and returns. Shape matches TWasmTierInvokeProc
+    deliberately. }
+  TWasmJitInvokeProc = procedure(const AStore: TWasmStore;
+    const AFuncAddr: TWasmFuncAddr; const AParams: PWasmValue;
+    const AResults: PWasmValue);
+
   TWasmStore = class
   private
     FEngine: TWasmEngine;
@@ -462,7 +499,36 @@ type
       the single exception; do not generalise it. }
     Epoch: UInt64;
 
+    { The per-invocation epoch SNAPSHOT (ADR-0006, jit-spec §6). Captured ONCE
+      at the outermost guest-entry (Wasm.Interp.InterpTierInvoke, when a fresh
+      invocation begins) as EpochSnapshot := Epoch, and read — never written —
+      by BOTH tiers at their back-edge safepoints: the interpreter seeds its
+      Run-local EpochCache from it, and every compiled function's prologue
+      loads it into its snapshot register. A nested wasm->wasm call (compiled
+      or interpreted) does NOT overwrite it, so a compiled leaf called mid-
+      invocation inherits the invocation's ORIGINAL snapshot and traps
+      'interrupt' at the same point the interpreter would — closing the
+      epoch-interrupt observational-identity gap between tiers. A host->guest
+      re-entry is a new outermost invocation and re-snapshots; because both
+      tiers capture the value into stack-local / callee-saved state at entry,
+      that re-snapshot never disturbs an outer activation already running.
+      Kept beside Epoch (a store field, not the interp context) because the
+      compiled entry receives the store pointer but not the context, so this
+      is the one location both tiers can reach. Confined to the store's thread
+      (ADR-0008); no atomic. }
+    EpochSnapshot: UInt64;
+
     TierInvoke: TWasmTierInvokeProc;
+
+    { The baseline JIT's compiled-invocation hook (O-J1, jit-spec §4.1). nil
+      until Wasm.Jit's RegisterJit sets it; when a wasm callee carries a
+      non-nil CompiledEntry the interpreter dispatches through this instead
+      of running its own loop for that callee. Set beside the per-function
+      CompiledEntry pointers, so leaving it nil (no JIT) means every function
+      runs interpreted and nothing observable changes. A plain procedure var,
+      not a method or closure — the TRAP-1 discipline the tier fields already
+      follow (Wasm.Runtime.Traps). }
+    JitInvokeCompiled: TWasmJitInvokeProc;
 
     { The tier's per-store execution context (O-10). Opaque here, exactly
       like TierInvoke: nil until Track E's RegisterInterpreter sets it, and
@@ -784,6 +850,35 @@ function MatchTagImport(const AEngine: TWasmEngine;
   guest code, so nothing writes it yet; the accessor is here so the
   convention has one spelling rather than a cast at each future site. }
 function TrampolineStore(const ATrampoline: PWasmTrampoline): TWasmStore;
+
+{ --- O-J5: field offsets the baseline JIT hard-codes ---------------------
+
+  The JIT's generated code reads a handful of fields at FIXED byte offsets:
+  Store.Epoch at every back-edge safepoint (jit-spec §6), a memory
+  instance's Base / ByteSize on the inline bounds-check path (§7.1 form 2),
+  and the func-inst tier fields. A silent record-layout change would
+  miscompile rather than fail to build, so these offsets come from the live
+  Pascal layout — PtrUInt(@rec.field) - PtrUInt(@rec) — and the co-located
+  test asserts the values the JIT hard-codes against them. Reorder a field
+  and the test goes red; the generated code never sees a stale offset.
+
+  StoreEpoch is measured from the object reference (the JIT holds the store
+  as a class pointer), which is why the accessor needs a live store. The
+  record offsets are layout-only and independent of AStore. }
+type
+  TWasmJitOffsets = record
+    StoreEpoch: NativeUInt;          { TWasmStore.Epoch, from the object ref }
+    StoreEpochSnapshot: NativeUInt;  { TWasmStore.EpochSnapshot, from the object ref }
+    FuncInstStride: NativeUInt;      { SizeOf(TWasmFuncInst) }
+    FuncKind: NativeUInt;            { TWasmFuncInst.Kind }
+    FuncCompiledEntry: NativeUInt;   { TWasmFuncInst.CompiledEntry }
+    FuncCallCount: NativeUInt;       { TWasmFuncInst.CallCount }
+    MemInstStride: NativeUInt;       { SizeOf(TWasmMemoryInst) }
+    MemBase: NativeUInt;             { TWasmMemoryInst.Base }
+    MemByteSize: NativeUInt;         { TWasmMemoryInst.ByteSize }
+  end;
+
+function WasmJitOffsets(const AStore: TWasmStore): TWasmJitOffsets;
 
 implementation
 
@@ -1549,6 +1644,10 @@ begin
   Funcs[Result].TypeId := ATypeId;
   Funcs[Result].Instance := nil;
   Funcs[Result].FuncIrIndex := AFuncIrIndex;
+  { O-J1: nil CompiledEntry = not compiled -> interpret; the JIT sets it and
+    bumps CallCount off the interpreter's increments. }
+  Funcs[Result].CompiledEntry := nil;
+  Funcs[Result].CallCount := 0;
   Funcs[Result].Callback := nil;
   Funcs[Result].HostData := nil;
   { The handle is created once, with the instance, so ref.func returns the
@@ -1573,6 +1672,9 @@ begin
   Funcs[Result].TypeId := ATypeId;
   Funcs[Result].Instance := nil;
   Funcs[Result].FuncIrIndex := 0;
+  { A host function is never compiled; keep the tier fields zero. }
+  Funcs[Result].CompiledEntry := nil;
+  Funcs[Result].CallCount := 0;
   Funcs[Result].Callback := ACallback;
   Funcs[Result].HostData := AData;
   Funcs[Result].RefObject := FHeap.AllocFuncRef(Result, ATypeId);
@@ -2081,6 +2183,25 @@ begin
   if ATrampoline = nil then
     Exit(nil);
   Result := TWasmStore(ATrampoline^.Context);
+end;
+
+function WasmJitOffsets(const AStore: TWasmStore): TWasmJitOffsets;
+var
+  F: TWasmFuncInst;
+  M: TWasmMemoryInst;
+begin
+  { Only the ADDRESSES of fields are taken, never their values, so the
+    uninitialised locals F and M are not read. }
+  Result.StoreEpoch := PtrUInt(@AStore.Epoch) - PtrUInt(Pointer(AStore));
+  Result.StoreEpochSnapshot :=
+    PtrUInt(@AStore.EpochSnapshot) - PtrUInt(Pointer(AStore));
+  Result.FuncInstStride := SizeOf(TWasmFuncInst);
+  Result.FuncKind := PtrUInt(@F.Kind) - PtrUInt(@F);
+  Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);
+  Result.FuncCallCount := PtrUInt(@F.CallCount) - PtrUInt(@F);
+  Result.MemInstStride := SizeOf(TWasmMemoryInst);
+  Result.MemBase := PtrUInt(@M.Base) - PtrUInt(@M);
+  Result.MemByteSize := PtrUInt(@M.ByteSize) - PtrUInt(@M);
 end;
 
 end.

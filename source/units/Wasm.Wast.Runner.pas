@@ -73,6 +73,7 @@ uses
   Wasm.Decoder,
   Wasm.Interp,
   Wasm.Ir,
+  Wasm.Jit,
   Wasm.Module,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
@@ -117,6 +118,27 @@ type
     wrsSkip,    { not judged; Actual carries the reason }
     wrsStaged   { would fail, but only on deliberately staged work }
   );
+
+  { Which execution tier a run drives (.agent/design/jit-spec.md §11, §12.3).
+
+    wtmInterp is the DEFAULT and the tier of record (ADR-0001): no JIT is
+    registered, every function runs interpreted, and every corpus number is
+    exactly what it was before this mode existed — the opt-in JIT changes
+    nothing unless asked for.
+
+    wtmJit registers the baseline JIT on the per-script store and FORCE-COMPILES
+    every compilable function of each instantiated module (§11.1's force-tier
+    control, threshold effectively 1). The compiled functions are then invoked
+    transparently through the CompiledEntry seam; anything the compile predicate
+    (JitCanCompile) declines stays interpreted, which is correct because it IS
+    the interpreter. The corpus's assert_return/assert_trap expecteds — the
+    spec's values, which the interpreter already matches — become the JIT's
+    conformance net at zero authoring cost (§11.3): a wtmJit run MUST produce a
+    tally identical to a wtmInterp run over the same scripts, because the
+    compiled functions match the spec and the declined rest ARE the interpreter.
+    Any divergence is a JIT bug the corpus surfaces as a fail with file:line +
+    expected/actual. }
+  TWastTierMode = (wtmInterp, wtmJit);
 
   { Which error class a module attempt produced. The hierarchy is
     load-bearing (AGENTS.md): malformed and invalid are different answers.
@@ -168,6 +190,7 @@ type
     FResults: array of TWastCommandResult;
     FCount: Integer;
     FTally: TWastTally;
+    FCompiledFuncCount: Integer;
 
     function GetResult(const AIndex: Integer): TWastCommandResult;
   public
@@ -179,22 +202,36 @@ type
     property Results[const AIndex: Integer]: TWastCommandResult
       read GetResult; default;
     property Tally: TWastTally read FTally;
+    { How many wasm functions this script actually JIT-compiled (a distinct
+      function counted once). Zero in wtmInterp mode and on a target/op-set the
+      backend cannot emit; a positive count is the evidence that the JIT path
+      was exercised rather than silently all-interpreted (§11.3, §12.3). }
+    property CompiledFuncCount: Integer read FCompiledFuncCount;
   end;
 
 { Run every command of AScript in order. Never raises for a command
   outcome — a command that cannot be judged is a skip and a command that
-  fails is a failure, both recorded. }
-function RunWastScript(const AScript: TWastScript): TWastRunResult;
+  fails is a failure, both recorded. The no-mode overload runs the pure
+  interpreter (wtmInterp), so every existing caller is byte-for-byte
+  unchanged; the mode overload selects the tier (§11, §12.3). }
+function RunWastScript(const AScript: TWastScript): TWastRunResult; overload;
+function RunWastScript(const AScript: TWastScript;
+  const AMode: TWastTierMode): TWastRunResult; overload;
 
 { Parse ASource and run it. Raises EWastParseError when the SCRIPT itself
   is malformed. }
-function RunWastSource(const ASource: string): TWastRunResult;
+function RunWastSource(const ASource: string): TWastRunResult; overload;
+function RunWastSource(const ASource: string;
+  const AMode: TWastTierMode): TWastRunResult; overload;
 
 { Read APath and run it. }
-function RunWastFile(const APath: string): TWastRunResult;
+function RunWastFile(const APath: string): TWastRunResult; overload;
+function RunWastFile(const APath: string;
+  const AMode: TWastTierMode): TWastRunResult; overload;
 
 function WastStatusName(const AStatus: TWastStatus): string;
 function WastErrorKindName(const AKind: TWastErrorKind): string;
+function WastTierModeName(const AMode: TWastTierMode): string;
 
 { True when AExpected is a prefix of AActual — the reference interpreter's
   rule for failure and trap strings. }
@@ -294,6 +331,16 @@ begin
     wekValidation: Result := 'invalid';
     wekText: Result := 'text';
     wekOther: Result := 'internal';
+  else
+    Result := '?';
+  end;
+end;
+
+function WastTierModeName(const AMode: TWastTierMode): string;
+begin
+  case AMode of
+    wtmInterp: Result := 'interp';
+    wtmJit: Result := 'jit';
   else
     Result := '?';
   end;
@@ -624,8 +671,15 @@ type
     { Instances borrow these; they must outlive the store (ADR-0003). }
     FIrs: array of TWasmIrModule;
     FBuffers: array of TWasmBytes;
+    { The tier this script runs. wtmInterp leaves FJit nil and touches
+      nothing; wtmJit registers the baseline JIT below and force-compiles each
+      module's functions after it instantiates. }
+    FMode: TWastTierMode;
+    FJit: TWasmJitContext;           { OWNED, nil unless wtmJit }
+    FCompiledCount: Integer;         { distinct functions actually compiled }
   public
-    constructor Create;
+    constructor Create; overload;
+    constructor Create(const AMode: TWastTierMode); overload;
     destructor Destroy; override;
 
     function LookupNamed(const AId: string): TWasmModuleInstance;
@@ -636,35 +690,87 @@ type
     { Mint (once) and return a stable host box carrying identity AId, kept
       alive as a root for the life of the script. }
     function HostRef(const AId: UInt32): TWasmRef;
+    { In wtmJit mode, force-compile every compilable wasm function reachable
+      through AInst's function index space (§11.1). A no-op in wtmInterp mode or
+      when the compile predicate declines every op the function uses — in which
+      case the function stays interpreted, which is correct and identical. }
+    procedure ForceCompileInstance(const AInst: TWasmModuleInstance);
 
     property Engine: TWasmEngine read FEngine;
     property Store: TWasmStore read FStore;
     property Model: TWasmModule read FModel;
     property Current: TWasmModuleInstance read FCurrent write FCurrent;
+    property CompiledCount: Integer read FCompiledCount;
   end;
 
 constructor TWastRunner.Create;
 begin
+  Create(wtmInterp);
+end;
+
+constructor TWastRunner.Create(const AMode: TWastTierMode);
+begin
   inherited Create;
+  FMode := AMode;
   FEngine := TWasmEngine.Create;
   FStore := TWasmStore.Create(FEngine);
   RegisterInterpreter(FStore);
   FModel := TWasmModule.Create;
   FCurrent := nil;
+  FJit := nil;
+  FCompiledCount := 0;
+  { Register the JIT companion on the store (§4.1): it points the store's
+    JitInvokeCompiled hook at the compiled-function dispatcher but leaves
+    TierInvoke on the interpreter and compiles nothing until a function is
+    force-compiled. Off the supported backend leg it still registers cleanly
+    and JitCanCompile simply declines everything, so wtmJit degrades to the
+    interpreter with the same tallies. }
+  if FMode = wtmJit then
+    FJit := RegisterJit(FStore);
 end;
 
 destructor TWastRunner.Destroy;
 var
   I: Integer;
 begin
-  { The store owns the instances, which borrow the IR, which borrows the
-    buffer — so free in that order. }
+  { The JIT context owns the code blocks and points the store's hook at its
+    dispatcher; free it BEFORE the store (jit-spec §3.4 ownership) so it can
+    clear the CompiledEntry pointers and the hook while the store is still
+    whole. Then the store owns the instances, which borrow the IR, which
+    borrows the buffer — so free in that order. }
+  FJit.Free;
   FStore.Free;
   FEngine.Free;
   for I := 0 to High(FIrs) do
     FIrs[I].Free;
   FModel.Free;
   inherited Destroy;
+end;
+
+procedure TWastRunner.ForceCompileInstance(const AInst: TWasmModuleInstance);
+var
+  I: Integer;
+  Addr: TWasmFuncAddr;
+  WasCompiled: Boolean;
+begin
+  if (FJit = nil) or (AInst = nil) then
+    Exit;
+  { Walk the instance's function index space (defined + imported). ForceCompile
+    is idempotent per address, so an imported function already compiled when its
+    own instance was built is a no-op here, and a distinct function is counted
+    once — it was nil before this call and is non-nil after. }
+  for I := 0 to High(AInst.FuncAddrs) do
+  begin
+    Addr := AInst.FuncAddrs[I];
+    if Addr > High(FStore.Funcs) then
+      Continue;
+    if FStore.Funcs[Addr].Kind <> wfkWasm then
+      Continue;
+    WasCompiled := FStore.Funcs[Addr].CompiledEntry <> nil;
+    if FJit.ForceCompile(Addr) and (not WasCompiled)
+      and (FStore.Funcs[Addr].CompiledEntry <> nil) then
+      Inc(FCompiledCount);
+  end;
 end;
 
 function TWastRunner.LookupNamed(const AId: string): TWasmModuleInstance;
@@ -1255,6 +1361,10 @@ begin
   Id := ModuleId(ACommand.Node);
   if Id <> '' then
     ARunner.BindNamed(Id, Inst);
+  { In wtmJit mode, tier every compilable function of this instance up NOW, so
+    the assert_return/assert_trap invokes that follow route through the compiled
+    code via the CompiledEntry seam. A no-op in the default interpreter mode. }
+  ARunner.ForceCompileInstance(Inst);
   AResult.Status := wrsPass;
 end;
 
@@ -1823,13 +1933,19 @@ begin
 end;
 
 function RunWastScript(const AScript: TWastScript): TWastRunResult;
+begin
+  Result := RunWastScript(AScript, wtmInterp);
+end;
+
+function RunWastScript(const AScript: TWastScript;
+  const AMode: TWastTierMode): TWastRunResult;
 var
   I: Integer;
   Runner: TWastRunner;
 begin
   Result := TWastRunResult.Create;
   try
-    Runner := TWastRunner.Create;
+    Runner := TWastRunner.Create(AMode);
     try
       for I := 0 to AScript.Count - 1 do
         try
@@ -1838,6 +1954,9 @@ begin
           on E: Exception do
             Result.AddResult(CommandCrashResult(AScript[I], E));
         end;
+      { Carry the count of functions actually JIT-compiled out to the caller;
+        zero in interpreter mode. Same-unit access to the private field. }
+      Result.FCompiledFuncCount := Runner.CompiledCount;
     finally
       Runner.Free;
     end;
@@ -1848,12 +1967,18 @@ begin
 end;
 
 function RunWastSource(const ASource: string): TWastRunResult;
+begin
+  Result := RunWastSource(ASource, wtmInterp);
+end;
+
+function RunWastSource(const ASource: string;
+  const AMode: TWastTierMode): TWastRunResult;
 var
   Script: TWastScript;
 begin
   Script := ParseWastScript(ASource);
   try
-    Result := RunWastScript(Script);
+    Result := RunWastScript(Script, AMode);
   finally
     Script.Free;
   end;
@@ -1861,7 +1986,13 @@ end;
 
 function RunWastFile(const APath: string): TWastRunResult;
 begin
-  Result := RunWastSource(BytesToText(LoadFileBytes(APath)));
+  Result := RunWastFile(APath, wtmInterp);
+end;
+
+function RunWastFile(const APath: string;
+  const AMode: TWastTierMode): TWastRunResult;
+begin
+  Result := RunWastSource(BytesToText(LoadFileBytes(APath)), AMode);
 end;
 
 end.
