@@ -1,0 +1,546 @@
+{ Unit suite for Wasm.Jit.X64 — the x86-64 (System V AMD64) encoder and op
+  templates (.agent/design/jit-spec.md §12.3 Wave 7).
+
+  PRIMARY PROOF ON THIS HOST: PORTABLE byte assertions on the encoder. The
+  emitters compute bytes and never execute, so every assertion runs on the
+  aarch64 dev host (and every CI leg). Each expected sequence is cited to the
+  Intel SDM Vol. 2 (opcode maps, ModRM/SIB/REX, §2.1-2.2). A wrong byte is
+  caught here before the x86-64 differential run in the amd64 VM ever runs.
+
+  The EXECUTABLE differential proof (compiled == interpreter across the corpus)
+  runs only on a real x86-64 host; those tests are gated on CPUX86_64 and are
+  inert here (the co-located Wasm.Jit.Test differential suite drives the real
+  decode -> validate -> instantiate -> two-tier pipeline in the VM).
+
+  FPC gotchas (AGENTS.md): every test records at least one assertion; a generic
+  Expect<T>(...) is never the lone statement of an `on..do`. }
+program Wasm.Jit.X64.Test;
+
+{$I Shared.inc}
+
+{$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
+  {$DEFINE WASM_JIT_EXEC}
+{$ENDIF}
+
+uses
+  SysUtils,
+
+  TestingPascalLibrary,
+  Wasm.Core,
+  Wasm.Ir,
+  Wasm.Jit.CodeBuffer,
+  Wasm.Jit.X64;
+
+type
+  TX64Tests = class(TTestSuite)
+  private
+    { Assert the whole emitted byte sequence of ABuf against AExpected. }
+    procedure CheckSeq(const ABuf: TWasmCodeBuffer;
+      const AExpected: array of Byte);
+  public
+    procedure SetupTests; override;
+
+    procedure TestMovRegReg;
+    procedure TestMovImm;
+    procedure TestLoadStoreSlots;
+    procedure TestAluAddSubImul;
+    procedure TestCmpTestShift;
+    procedure TestSetccMovzxCmov;
+    procedure TestPushPopRsp;
+    procedure TestCallRet;
+    procedure TestLea;
+    procedure TestBranchPlaceholders;
+    procedure TestResolvePatchRel32;
+    procedure TestPrologueBytes;
+    procedure TestEpilogueBytes;
+    procedure TestEpochCaptureBytes;
+    procedure TestEpochCheckCoreBytes;
+    procedure TestRuntimeCallMarshalBytes;
+    procedure TestSlotOffset;
+    procedure TestPredicateCoversWaves;
+    procedure TestPredicateDeclinesEh;
+    procedure TestCallArityFence;
+
+    procedure TestExecPlaceholder;
+  end;
+
+procedure TX64Tests.CheckSeq(const ABuf: TWasmCodeBuffer;
+  const AExpected: array of Byte);
+var
+  I: Integer;
+begin
+  Expect<Integer>(ABuf.Size).ToBe(Length(AExpected));
+  for I := 0 to High(AExpected) do
+    if I < ABuf.Size then
+      Expect<Byte>(ABuf.ByteAt(I)).ToBe(AExpected[I]);
+end;
+
+{ --- register-register / immediate moves (SDM: MOV 89 /r, B8+rd) --------- }
+
+procedure TX64Tests.TestMovRegReg;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { mov rbx, rdi = 48 89 FB ; mov r12, rsi = 49 89 F4 (the prologue's two pins). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitMovRegReg(Buf, X64_RBX, X64_RDI);
+    X64EmitMovRegReg(Buf, X64_R12, X64_RSI);
+    CheckSeq(Buf, [$48, $89, $FB, $49, $89, $F4]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestMovImm;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { movabs rax, 0x1122334455667788 = 48 B8 88 77 66 55 44 33 22 11. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitMovRegImm64(Buf, X64_RAX, UInt64($1122334455667788));
+    CheckSeq(Buf, [$48, $B8, $88, $77, $66, $55, $44, $33, $22, $11]);
+  finally
+    Buf.Free;
+  end;
+
+  { mov edi, 42 = BF 2A 00 00 00 (no REX; zero-extends). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitMovRegImm32(Buf, X64_RDI, 42);
+    CheckSeq(Buf, [$BF, $2A, $00, $00, $00]);
+  finally
+    Buf.Free;
+  end;
+
+  { mov r8d, 1 = 41 B8 01 00 00 00 (REX.B for the extended register). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitMovRegImm32(Buf, X64_R8, 1);
+    CheckSeq(Buf, [$41, $B8, $01, $00, $00, $00]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- frame-relative slot access (SDM: MOV 8B/89 /r, ModRM disp) ---------- }
+
+procedure TX64Tests.TestLoadStoreSlots;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { mov rax, [rbx+8] = 48 8B 43 08 (slot 1). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLoadSlot64(Buf, X64_RAX, 1);
+    CheckSeq(Buf, [$48, $8B, $43, $08]);
+  finally
+    Buf.Free;
+  end;
+
+  { mov rcx, [rbx] = 48 8B 0B (slot 0, disp0 -> mod00). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLoadSlot64(Buf, X64_RCX, 0);
+    CheckSeq(Buf, [$48, $8B, $0B]);
+  finally
+    Buf.Free;
+  end;
+
+  { mov eax, [rbx+16] = 8B 43 10 (32-bit load, zero-extends; slot 2). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLoadSlot32(Buf, X64_RAX, 2);
+    CheckSeq(Buf, [$8B, $43, $10]);
+  finally
+    Buf.Free;
+  end;
+
+  { mov [rbx+24], rdx = 48 89 53 18 (widened store; slot 3). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitStoreSlot64(Buf, X64_RDX, 3);
+    CheckSeq(Buf, [$48, $89, $53, $18]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- ALU (SDM: ADD 01, SUB 29, IMUL 0F AF) ------------------------------ }
+
+procedure TX64Tests.TestAluAddSubImul;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { add eax, ecx = 01 C8 ; add rax, rcx = 48 01 C8. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitAluRegReg(Buf, $01, False, X64_RAX, X64_RCX);
+    X64EmitAluRegReg(Buf, $01, True, X64_RAX, X64_RCX);
+    CheckSeq(Buf, [$01, $C8, $48, $01, $C8]);
+  finally
+    Buf.Free;
+  end;
+
+  { sub eax, ecx = 29 C8 ; imul eax, ecx = 0F AF C1 ; imul rax,rcx = 48 0F AF C1. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitAluRegReg(Buf, $29, False, X64_RAX, X64_RCX);
+    X64EmitImul(Buf, False, X64_RAX, X64_RCX);
+    X64EmitImul(Buf, True, X64_RAX, X64_RCX);
+    CheckSeq(Buf, [$29, $C8, $0F, $AF, $C1, $48, $0F, $AF, $C1]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- cmp / test / shift-by-CL (SDM: CMP 39, TEST 85, D3 /subop) --------- }
+
+procedure TX64Tests.TestCmpTestShift;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { cmp eax, ecx = 39 C8 ; cmp rax, r14 = 4C 39 F0 ; test eax, eax = 85 C0. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitAluRegReg(Buf, $39, False, X64_RAX, X64_RCX);
+    X64EmitAluRegReg(Buf, $39, True, X64_RAX, X64_R14);
+    X64EmitAluRegReg(Buf, $85, False, X64_RAX, X64_RAX);
+    CheckSeq(Buf, [$39, $C8, $4C, $39, $F0, $85, $C0]);
+  finally
+    Buf.Free;
+  end;
+
+  { shl eax,cl = D3 E0 ; shr eax,cl = D3 E8 ; sar rax,cl = 48 D3 F8 ;
+    rol eax,cl = D3 C0 ; ror eax,cl = D3 C8. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitShiftCl(Buf, 4, False, X64_RAX);
+    X64EmitShiftCl(Buf, 5, False, X64_RAX);
+    X64EmitShiftCl(Buf, 7, True, X64_RAX);
+    X64EmitShiftCl(Buf, 0, False, X64_RAX);
+    X64EmitShiftCl(Buf, 1, False, X64_RAX);
+    CheckSeq(Buf, [$D3, $E0, $D3, $E8, $48, $D3, $F8, $D3, $C0, $D3, $C8]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- setcc / movzx / cmov (SDM: 0F 90+cc, 0F B6, 0F 40+cc) -------------- }
+
+procedure TX64Tests.TestSetccMovzxCmov;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { sete al = 0F 94 C0 ; movzx eax,al = 0F B6 C0 ; cmove rax,rcx = 48 0F 44 C1. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitSetccAl(Buf, X64_CC_E);
+    X64EmitMovzxEaxAl(Buf);
+    X64EmitCmovcc(Buf, X64_CC_E, True, X64_RAX, X64_RCX);
+    CheckSeq(Buf, [$0F, $94, $C0, $0F, $B6, $C0, $48, $0F, $44, $C1]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- push / pop / rsp adjust (SDM: 50+rd, 58+rd, 83 /0|/5) -------------- }
+
+procedure TX64Tests.TestPushPopRsp;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { push rbx = 53 ; push r12 = 41 54 ; pop r14 = 41 5E ; pop rbx = 5B. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPushReg(Buf, X64_RBX);
+    X64EmitPushReg(Buf, X64_R12);
+    X64EmitPopReg(Buf, X64_R14);
+    X64EmitPopReg(Buf, X64_RBX);
+    CheckSeq(Buf, [$53, $41, $54, $41, $5E, $5B]);
+  finally
+    Buf.Free;
+  end;
+
+  { sub rsp, 8 = 48 83 EC 08 ; add rsp, 8 = 48 83 C4 08. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitSubRsp(Buf, 8);
+    X64EmitAddRsp(Buf, 8);
+    CheckSeq(Buf, [$48, $83, $EC, $08, $48, $83, $C4, $08]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestCallRet;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { call rax = FF D0 ; ret = C3. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitCallReg(Buf, X64_RAX);
+    X64EmitRet(Buf);
+    CheckSeq(Buf, [$FF, $D0, $C3]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- lea (SDM: 8D /r), including the r12/rsp SIB base ------------------- }
+
+procedure TX64Tests.TestLea;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { lea r13, [r12] = 4D 8D 2C 24 (r12 base forces SIB; r13 dest). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLea(Buf, X64_R13, X64_R12, 0);
+    CheckSeq(Buf, [$4D, $8D, $2C, $24]);
+  finally
+    Buf.Free;
+  end;
+
+  { lea rdx, [rsp+16] = 48 8D 54 24 10 (rsp base forces SIB; disp8). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLea(Buf, X64_RDX, X64_RSP, 16);
+    CheckSeq(Buf, [$48, $8D, $54, $24, $10]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- branch placeholders + rel32 patching (SDM: E9 cd, 0F 80+cc cd) ----- }
+
+procedure TX64Tests.TestBranchPlaceholders;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { jmp rel32 placeholder = E9 00 00 00 00. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    X64EmitJmpTo(Buf, 0);
+    CheckSeq(Buf, [$E9, $00, $00, $00, $00]);
+    Expect<Integer>(Buf.PatchCount).ToBe(1);
+  finally
+    Buf.Free;
+  end;
+
+  { je rel32 placeholder = 0F 84 00 00 00 00. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    X64EmitJccTo(Buf, X64_CC_E, 0);
+    CheckSeq(Buf, [$0F, $84, $00, $00, $00, $00]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestResolvePatchRel32;
+var
+  Buf: TWasmCodeBuffer;
+  Rel: Integer;
+begin
+  { A forward jmp whose target label binds 5 bytes past the jmp end must patch
+    rel32 = 0. A jmp to a target 3 bytes after the end must patch rel32 = 3.
+    Build: label0 at 0; emit a 3-byte filler (ret + 2 nops via bytes), then a
+    jmp to a label bound right after it. Simpler: emit jmp to label, bind label
+    immediately after -> rel32 = 0 (target - (site+5) = 0). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;                 { label 0 }
+    X64EmitJmpTo(Buf, 0);         { site 0, 5 bytes }
+    Buf.BindLabel(0);             { target offset = 5 }
+    X64ResolvePatches(Buf);
+    { rel32 field is the last 4 bytes; target(5) - site(0) - len(5) = 0. }
+    Rel := Integer(Buf.ByteAt(1)) or (Integer(Buf.ByteAt(2)) shl 8)
+      or (Integer(Buf.ByteAt(3)) shl 16) or (Integer(Buf.ByteAt(4)) shl 24);
+    Expect<Integer>(Rel).ToBe(0);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
+
+procedure TX64Tests.TestPrologueBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { push rbx; push r12; push r13; push r14; sub rsp,8; mov rbx,rdi; mov r12,rsi.
+    53 | 41 54 | 41 55 | 41 56 | 48 83 EC 08 | 48 89 FB | 49 89 F4. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPrologue(Buf);
+    CheckSeq(Buf, [$53, $41, $54, $41, $55, $41, $56,
+      $48, $83, $EC, $08, $48, $89, $FB, $49, $89, $F4]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestEpilogueBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { add rsp,8; pop r14; pop r13; pop r12; pop rbx; ret.
+    48 83 C4 08 | 41 5E | 41 5D | 41 5C | 5B | C3. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitEpilogue(Buf);
+    CheckSeq(Buf, [$48, $83, $C4, $08, $41, $5E, $41, $5D, $41, $5C, $5B, $C3]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestEpochCaptureBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { lea r13, [r12+8]  = 4D 8D 6C 24 08 ; mov r14, [r12+16] = 4D 8B 74 24 10.
+    (StoreEpoch=8, StoreEpochSnapshot=16 chosen for the byte assertion.) }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitEpochCapture(Buf, 8, 16);
+    CheckSeq(Buf, [$4D, $8D, $6C, $24, $08, $4D, $8B, $74, $24, $10]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestEpochCheckCoreBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { The epoch check's load+compare core (the branch/trap tail patches at
+    resolve time): mov rax,[r13] = 49 8B 45 00 ; cmp rax,r14 = 4C 39 F0. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLoadMem64(Buf, X64_RAX, X64_R13, 0);
+    X64EmitAluRegReg(Buf, $39, True, X64_RAX, X64_R14);
+    CheckSeq(Buf, [$49, $8B, $45, $00, $4C, $39, $F0]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestRuntimeCallMarshalBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { The store+regbase marshaling every memory/table/ref/global/GC and v128
+    helper call emits: mov rdi,r12 = 4C 89 E7 ; mov rsi,rbx = 48 89 DE. (The
+    following movabs @instruction / movabs @dispatcher carry runtime addresses,
+    not portably byte-assertable; the VM differential run covers them.) }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitMovRegReg(Buf, X64_RDI, X64_R12);
+    X64EmitMovRegReg(Buf, X64_RSI, X64_RBX);
+    CheckSeq(Buf, [$4C, $89, $E7, $48, $89, $DE]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestSlotOffset;
+begin
+  Expect<UInt32>(X64SlotByteOffset(0)).ToBe(0);
+  Expect<UInt32>(X64SlotByteOffset(5)).ToBe(40);
+end;
+
+{ --- compile predicate (the scope fence, §10.3) ------------------------- }
+
+procedure TX64Tests.TestPredicateCoversWaves;
+begin
+  { Representative ops from every wave must be compilable (only EH is declined,
+    like the aarch64 backend). }
+  Expect<Boolean>(X64CanEmitOp(iroI32Add)).ToBe(True);       { Wave 2 inline }
+  Expect<Boolean>(X64CanEmitOp(iroI32Clz)).ToBe(True);       { leaf on x86-64 }
+  Expect<Boolean>(X64CanEmitOp(iroF64Add)).ToBe(True);       { Wave 2 leaf }
+  Expect<Boolean>(X64CanEmitOp(iroCall)).ToBe(True);         { Wave 3 }
+  Expect<Boolean>(X64CanEmitOp(iroReturnCall)).ToBe(True);
+  Expect<Boolean>(X64CanEmitOp(iroI32Load)).ToBe(True);      { Wave 4 }
+  Expect<Boolean>(X64CanEmitOp(iroStructNew)).ToBe(True);    { Wave 5 }
+  Expect<Boolean>(X64CanEmitOp(iroV128Load)).ToBe(True);     { Wave 6 }
+  Expect<Boolean>(X64CanEmitOp(iroI32x4Add)).ToBe(True);
+  Expect<Boolean>(X64CanEmitOp(iroArrayFillVec)).ToBe(True); { last vec op }
+end;
+
+procedure TX64Tests.TestPredicateDeclinesEh;
+begin
+  { Exception-handling ops are never compiled (§8.3, §10.2). }
+  Expect<Boolean>(X64CanEmitOp(iroThrow)).ToBe(False);
+  Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(False);
+end;
+
+procedure TX64Tests.TestCallArityFence;
+var
+  Ins: TWasmIrInstr;
+  Aux: TWasmIrAuxU32;
+begin
+  { A call whose arg+result slot count exceeds the marshal cap declines at the
+    instruction level, so the whole function stays interpreted (§4.4). With an
+    empty aux the counts are 0, so it passes. }
+  Ins.Op := iroCall;
+  Ins.Dest := 0;
+  Ins.A := 0;
+  Ins.B := 0;
+  Ins.Imm := 0;
+  Aux := nil;
+  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
+end;
+
+procedure TX64Tests.TestExecPlaceholder;
+begin
+  { Executable proof runs only on a real x86-64 host (the amd64 VM differential
+    run via Wasm.Jit.Test + wasmspec --tier=jit). Inert here on aarch64. }
+  {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUX86_64)}
+  Expect<Boolean>(JitExecMemSupported).ToBe(True);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TX64Tests.SetupTests;
+begin
+  Test('mov reg,reg emits the asserted bytes', TestMovRegReg);
+  Test('mov reg,imm (movabs / imm32) emits the asserted bytes', TestMovImm);
+  Test('frame-relative slot load/store emit the asserted bytes',
+    TestLoadStoreSlots);
+  Test('add/sub/imul emit the asserted bytes', TestAluAddSubImul);
+  Test('cmp/test/shift-by-cl emit the asserted bytes', TestCmpTestShift);
+  Test('setcc/movzx/cmov emit the asserted bytes', TestSetccMovzxCmov);
+  Test('push/pop/rsp-adjust emit the asserted bytes', TestPushPopRsp);
+  Test('call reg / ret emit the asserted bytes', TestCallRet);
+  Test('lea with SIB base emits the asserted bytes', TestLea);
+  Test('jmp/jcc rel32 placeholders emit the asserted bytes',
+    TestBranchPlaceholders);
+  Test('rel32 patch resolves to target - site - instrlen',
+    TestResolvePatchRel32);
+  Test('the prologue emits the asserted byte sequence', TestPrologueBytes);
+  Test('the epilogue emits the asserted byte sequence', TestEpilogueBytes);
+  Test('the epoch capture emits the asserted bytes', TestEpochCaptureBytes);
+  Test('the epoch-check load+compare core emits the asserted bytes',
+    TestEpochCheckCoreBytes);
+  Test('the runtime/vec helper-call marshaling emits the asserted bytes',
+    TestRuntimeCallMarshalBytes);
+  Test('slot byte offset is register*8', TestSlotOffset);
+  Test('predicate covers waves 2-6 (only EH is declined)',
+    TestPredicateCoversWaves);
+  Test('predicate declines exception-handling ops', TestPredicateDeclinesEh);
+  Test('the call-site arity fence admits a zero-slot call', TestCallArityFence);
+  Test('executable proof is gated to a real x86-64 host', TestExecPlaceholder);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TX64Tests.Create('Wasm.Jit.X64'));
+  TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
+end.

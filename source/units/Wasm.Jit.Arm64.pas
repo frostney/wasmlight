@@ -48,15 +48,40 @@
   mechanically by the differential harness (§11): the compiled op diverges from
   the interpreter on the first input that exercises it, or the code faults.
 
+  WAVE 3 — THE CALL FAMILY (§4.4, §4.5). A compiled call emits only
+  marshal -> helper -> unmarshal; the tier decision, the call_indirect / ref
+  resolution, and the tail-call frame replacement are Pascal, reusing the
+  interpreter's own seam. See the block comment above TArm64CompiledEntry for
+  the design, and Arm64InvokeCompiled for the tail-call trampoline loop that
+  gives `return_call*` its O(1) native-stack property.
+
+  UNCONFIRMED (epoch, §6): a compiled function calling an INTERPRETED one
+  re-enters through Store.TierInvoke, which re-seeds Store.EpochSnapshot
+  because its usual caller is an outermost guest entry. Arm64CallInterpreted
+  restores the outer snapshot afterwards, so the compiled caller (which holds
+  its own snapshot in x22) is unaffected; but WITHIN that nested interpreted
+  callee the snapshot is the freshly read epoch, so an epoch bump that
+  happened before the call is observed at the CALLER's next back-edge instead
+  of inside the callee. The trap is delayed, never invented, and never lost
+  while any back-edge remains. Closing it needs one interp-side change (seed
+  the snapshot only when the GC frame chain is empty, or expose a nested
+  interpreted-invoke entry point) and is out of this unit's ownership.
+
   Depends on Wasm.Jit.CodeBuffer and Wasm.Ir (§12.1) plus — new in Wave 2 —
   Wasm.Interp.Numeric and Wasm.Runtime.Traps, the leaves and trap helper the
-  templates call (§1.4). No cycle: Numeric uses only Traps.
+  templates call (§1.4), and — new in Wave 3 — Wasm.Runtime.Store /
+  Wasm.Runtime.Values / Wasm.Interp, the store and the shared frame helpers
+  the call helpers reach. No cycle: none of those knows about the JIT.
 
   Spec pin: wasm-mcp 0.2.16, spec/main
   d7b37e4170d8315f2f1283aed4e8076591a9a333 (ADR-0004). }
 unit Wasm.Jit.Arm64;
 
 {$I Shared.inc}
+{ The Wave-3 call helpers copy flat slot blocks addressed as AArgs[i], which is
+  pointer arithmetic on PWasmValue — the same convention Wasm.Interp uses for
+  the register file it hands over. }
+{$POINTERMATH ON}
 
 interface
 
@@ -65,7 +90,9 @@ uses
 
   Wasm.Core,
   Wasm.Ir,
-  Wasm.Jit.CodeBuffer;
+  Wasm.Jit.CodeBuffer,
+  Wasm.Runtime.Store,
+  Wasm.Runtime.Values;
 
 type
   { A branch displacement that does not fit its A64 immediate field (imm26 for
@@ -87,6 +114,11 @@ const
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
   ARM64_REG_LR = 30;       { x30, the link register }
   ARM64_REG_ZR = 31;       { in data-processing, 31 encodes the zero register }
+  { The SAME encoding 31 means SP in load/store (unsigned offset) and in the
+    add/sub-immediate forms — which is exactly how the call templates reach
+    their native-stack marshaling scratch (jit-spec §4.4). Named separately
+    from ARM64_REG_ZR so a reader sees which meaning is intended. }
+  ARM64_REG_SP = 31;
 
   { The interpreter frame slot is 8 bytes (Wasm.Runtime.Values.TWasmValue). The
     co-located test cross-checks this against
@@ -100,6 +132,14 @@ const
     the driver declines the function (JitCanCompile) and it runs interpreted —
     always correct. }
   ARM64_MAX_SLOT = 2047;
+
+  { The per-call-site marshaling cap (jit-spec §4.4). A compiled call reserves
+    (args + results) slots of native-stack scratch with a single
+    `sub sp,sp,#imm12`, and a pending tail call copies its argument slots into
+    a fixed thread-local buffer — so both are bounded. A call site above the
+    cap makes JitCanCompile DECLINE the whole function, which then runs
+    interpreted (always correct). Comfortably above real function arities. }
+  ARM64_MAX_CALL_SLOTS = 256;
 
   { AArch64 condition codes (C1.2.4). Only the ones the relop templates use. }
   ARM64_COND_EQ = 0;
@@ -183,8 +223,13 @@ function Arm64MovzX(const ARd: Byte; const AImm16: UInt16; const AHw: Byte): UIn
 function Arm64MovkX(const ARd: Byte; const AImm16: UInt16; const AHw: Byte): UInt32;
 
 { ADD Xd,Xn,#imm12 (unsigned immediate, no shift): the epoch-word address
-  computation x21 := x20 + StoreEpoch. }
+  computation x21 := x20 + StoreEpoch. With ARn = ARM64_REG_SP this is also
+  `mov Xd, sp` (imm 0) and the scratch-slice address `add Xd, sp, #off`, and
+  with ARd = ARn = ARM64_REG_SP it grows/shrinks the call scratch. }
 function Arm64AddImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
+{ SUB Xd,Xn,#imm12 (unsigned immediate, no shift). Used as
+  `sub sp, sp, #frame` to reserve the call-marshaling scratch (§4.4). }
+function Arm64SubImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 
 { BLR Xn — branch with link to register (C6.2.35). Clobbers x30. }
 function Arm64Blr(const ARn: Byte): UInt32;
@@ -273,13 +318,37 @@ function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32): Boolean;
 
+{ The INSTRUCTION-level half of the compile predicate (§4.4). Arm64CanEmitOp
+  answers "is there a template for this op"; this answers "can this particular
+  instruction's template be emitted", which for the call family means "does the
+  call site's argument + result marshaling fit ARM64_MAX_CALL_SLOTS". True for
+  every non-call op. The driver calls BOTH per instruction; either False
+  declines the whole function, which then runs interpreted. }
+function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
+  const AAux: TWasmIrAuxU32): Boolean;
+
+{ The compiled-entry invocation trampoline (jit-spec §4.5, §5.2) — what the
+  driver's JitInvokeCompiled hook delegates to. Builds the callee's frame
+  through the SHARED Wasm.Interp helpers, runs the machine code, marshals the
+  results out; and, when the compiled body ended in a `return_call*`, LOOPS:
+  it pops the frame and re-dispatches the replacement callee in this Pascal
+  loop rather than by a native call, so a chain of N tail calls costs N
+  iterations and ZERO native-stack growth — the O(1) property (§13 item 5).
+  A tail callee that is interpreted or a host function is dispatched here too,
+  so every tail target is reachable and the loop always terminates. }
+procedure Arm64InvokeCompiled(const AStore: TWasmStore;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue);
+
 { The byte offset of register/slot k from the register-file base. }
 function Arm64SlotByteOffset(const AReg: UInt32): UInt32;
 
 implementation
 
 uses
+  Wasm.Interp,
   Wasm.Interp.Numeric,
+  Wasm.Interp.Vector,
+  Wasm.Runtime.Gc,
   Wasm.Runtime.Traps;
 
 { ===================================================================== }
@@ -412,6 +481,1434 @@ end;
 procedure JitTrapKind(const AKind: PtrUInt); cdecl;
 begin
   TrapNow(TWasmTrapKind(AKind));
+end;
+
+{ ===================================================================== }
+{  Wave 3 — the CALL family (jit-spec §4.4, §4.5, §5)                    }
+{ ===================================================================== }
+
+{ THE DESIGN, in one paragraph. A compiled call does NOT re-implement calling.
+  The emitted sequence is only marshal -> call helper -> unmarshal: it copies
+  the IR's argument registers into a flat slot buffer on the native stack,
+  calls one of the cdecl helpers below, and copies the helper's flat result
+  buffer back into the IR's destination registers. The FLAT SLOT BUFFER IS THE
+  SEAM: the IR's argument/result aux blocks already list one register per
+  SLOT (a v128 operand contributes its low and high halves as two separate
+  entries), which is exactly the flat block the interpreter's CompiledCall /
+  HostCall / JitEnterFrame speak — so the emitted marshaling is a plain
+  slot-for-slot copy with no v128 special case, and it is bit-identical to the
+  interpreter's. Everything subtle then lives in Pascal: the helper resolves
+  the callee and dispatches host / compiled / interpreted in the interpreter's
+  EnterCall order, so compiled<->interpreted<->host interop is automatic and
+  observationally identical (§13). }
+
+type
+  { The compiled entry's ABI, mirroring Wasm.Jit.TWasmJitCompiledEntry (kept
+    local so this unit stays below the driver). }
+  TArm64CompiledEntry = procedure(const ARegBase: PWasmValue;
+    const AStore: TWasmStore); cdecl;
+
+  { The pending tail-call request a compiled body leaves behind before it
+    returns to Arm64InvokeCompiled's trampoline loop (§4.5). The arguments are
+    COPIED here because the body's native-stack scratch dies with its frame,
+    and because the frame replacement that follows overwrites the registers
+    they came from — the same reason the interpreter's ReplaceWasmFrame
+    collects into a stack-local Tmp before it pops. }
+  PArm64TailCall = ^TArm64TailCall;
+
+  TArm64TailCall = record
+    Pending: Boolean;
+    Addr: TWasmFuncAddr;
+    ArgCount: UInt32;
+    Args: array[0 .. ARM64_MAX_CALL_SLOTS - 1] of TWasmValue;
+  end;
+
+threadvar
+  { One pending slot per THREAD. A store is confined to one thread (ADR-0008)
+    and only one tail call can be in flight on a thread at a time — the
+    trampoline consumes the request before the next body runs, and a nested
+    dispatch always returns with Pending clear — but two stores on two threads
+    would race a plain global, so this is thread-local. }
+  GArm64TailCall: TArm64TailCall;
+
+{ The instance whose index spaces a call immediate is resolved against: the
+  CURRENT (top) activation's, which is the compiled frame JitEnterFrame pushed
+  and which is still on top while a helper runs. The interpreter resolves
+  against Act^.Instance in exactly the same way. }
+function Arm64CallerInstance(const AStore: TWasmStore): TWasmModuleInstance;
+var
+  Ctx: PWasmInterpContext;
+begin
+  Ctx := InterpContextFor(AStore);
+  Result := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+end;
+
+{ Run an INTERPRETED callee as one nested invocation over the shared context.
+  TierInvoke is the interpreter's entry: it carves the callee's frame through
+  the same JitEnterFrame the compiled path uses, runs it, and delivers the
+  flat results — so params/results marshal identically either way.
+
+  THE EPOCH SNAPSHOT is saved and restored around it (ADR-0006, §6): the
+  snapshot is a per-INVOCATION value seeded at the outermost guest entry, and
+  TierInvoke re-seeds it because its normal caller IS an outermost entry. A
+  nested wasm->wasm call must not disturb it, so the original is put back. See
+  the UNCONFIRMED note in the unit header for the residue this cannot fix. }
+procedure Arm64CallInterpreted(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AArgs, AResults: PWasmValue);
+var
+  Saved: UInt64;
+begin
+  Saved := AStore.EpochSnapshot;
+  AStore.TierInvoke(AStore, AAddr, AArgs, AResults);
+  AStore.EpochSnapshot := Saved;
+end;
+
+{ The ONE tier decision for a wasm->wasm call from compiled code (§4.4), in
+  the interpreter's EnterCall order: host first, then a compiled callee
+  through the store's hook, else the interpreter. }
+procedure Arm64DispatchCall(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AArgs, AResults: PWasmValue);
+begin
+  if AStore.Funcs[AAddr].Kind = wfkHost then
+    AStore.Funcs[AAddr].Callback(AStore, AStore.Funcs[AAddr].HostData,
+      AArgs, AResults)
+  else if Assigned(AStore.JitInvokeCompiled) and
+    (AStore.Funcs[AAddr].CompiledEntry <> nil) then
+    AStore.JitInvokeCompiled(AStore, AAddr, AArgs, AResults)
+  else
+    { TierInvoke bumps CallCount for an interpreted entry, exactly as
+      EnterCall does for an interpreted callee — so the hot counter is not
+      double-counted here. }
+    Arm64CallInterpreted(AStore, AAddr, AArgs, AResults);
+end;
+
+{ call_indirect resolution, mirroring Wasm.Interp.ResolveIndirect INSTRUCTION
+  FOR INSTRUCTION — most of all its CHECK ORDER, which is observable through
+  which message a bad table entry produces (§13 item 2, exec-call_indirect):
+
+    1. index >= table length      -> 'undefined element'
+    2. element is null            -> 'uninitialized element <index>'
+    3. runtime type not a subtype -> 'indirect call type mismatch'
+
+  The width of the index operand is the TABLE's address type, and the type
+  check is engine-level subtyping (actual <: expected), not id equality — a
+  proper subtype must dispatch. Every trap goes through the same TrapNow /
+  TrapNowDetail the interpreter uses, so the messages are identical by
+  construction rather than by being spelled twice. }
+function Arm64ResolveIndirect(const AStore: TWasmStore; const APacked: UInt64;
+  const AIndexBits: UInt64): TWasmFuncAddr;
+var
+  TypeIdx, TableIdx: UInt32;
+  Inst: TWasmModuleInstance;
+  TableAddr: TWasmTableAddr;
+  Idx: UInt64;
+  R: TWasmRef;
+  FuncAddr: TWasmFuncAddr;
+  Expected: TWasmEngineTypeId;
+begin
+  IrUnpack(Int64(APacked), TypeIdx, TableIdx);
+  Inst := Arm64CallerInstance(AStore);
+  TableAddr := Inst.TableAddrs[TableIdx];
+
+  if AStore.Tables[TableAddr].TableType.Limits.AddrType = watI64 then
+    Idx := AIndexBits
+  else
+    Idx := UInt32(AIndexBits);
+
+  if Idx >= UInt64(Length(AStore.Tables[TableAddr].Elems)) then
+    TrapNow(wtkUndefinedElement);
+
+  R := AStore.Tables[TableAddr].Elems[Idx];
+  if RefIsNull(R) then
+    TrapNowDetail(wtkUninitializedElement, UInt32(Idx));
+
+  FuncAddr := AStore.FuncRefAddr(R);
+  Expected := Inst.EngineTypeIds[TypeIdx];
+  if not AStore.Engine.Matches(AStore.Funcs[FuncAddr].TypeId, Expected) then
+    TrapNow(wtkIndirectCallTypeMismatch);
+
+  Result := FuncAddr;
+end;
+
+{ call_ref's null check, the interpreter's iroCallRef arm verbatim. }
+function Arm64ResolveRef(const AStore: TWasmStore;
+  const ARefBits: PtrUInt): TWasmFuncAddr;
+var
+  R: TWasmRef;
+begin
+  R := TWasmRef(ARefBits);
+  if RefIsNull(R) then
+    TrapNow(wtkNullFuncReference);
+  Result := AStore.FuncRefAddr(R);
+end;
+
+{ Record a resolved tail target + its collected arguments for the trampoline
+  loop, and return to the compiled body (which then runs its epilogue). No
+  frame work happens here: the loop owns the pop/push so the replacement costs
+  no native stack (§4.5). }
+procedure Arm64SetPendingTail(const AAddr: TWasmFuncAddr;
+  const AArgs: PWasmValue; const ACount: UInt32);
+var
+  P: PArm64TailCall;
+  I: UInt32;
+begin
+  P := @GArm64TailCall;
+  if ACount > ARM64_MAX_CALL_SLOTS then
+    raise EWasmError.Create(
+      'internal: JIT tail-call arity exceeds the marshal cap');
+  I := 0;
+  while I < ACount do
+  begin
+    P^.Args[I] := AArgs[I];
+    Inc(I);
+  end;
+  P^.Addr := AAddr;
+  P^.ArgCount := ACount;
+  P^.Pending := True;
+end;
+
+{ --- the six cdecl helpers the emitted call sequences call --------------- }
+
+procedure JitCallHelper(const AStore: TWasmStore; const AFuncIdx: PtrUInt;
+  const AArgs, AResults: PWasmValue); cdecl;
+begin
+  Arm64DispatchCall(AStore,
+    Arm64CallerInstance(AStore).FuncAddrs[UInt32(AFuncIdx)], AArgs, AResults);
+end;
+
+procedure JitCallIndirectHelper(const AStore: TWasmStore;
+  const APacked: PtrUInt; const AIndexBits: UInt64;
+  const AArgs, AResults: PWasmValue); cdecl;
+begin
+  Arm64DispatchCall(AStore,
+    Arm64ResolveIndirect(AStore, UInt64(APacked), AIndexBits), AArgs, AResults);
+end;
+
+procedure JitCallRefHelper(const AStore: TWasmStore; const ARefBits: PtrUInt;
+  const AArgs, AResults: PWasmValue); cdecl;
+begin
+  Arm64DispatchCall(AStore, Arm64ResolveRef(AStore, ARefBits), AArgs, AResults);
+end;
+
+procedure JitReturnCallHelper(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs: PWasmValue;
+  const ACount: PtrUInt); cdecl;
+begin
+  Arm64SetPendingTail(Arm64CallerInstance(AStore).FuncAddrs[UInt32(AFuncIdx)],
+    AArgs, UInt32(ACount));
+end;
+
+procedure JitReturnCallIndirectHelper(const AStore: TWasmStore;
+  const APacked: PtrUInt; const AIndexBits: UInt64; const AArgs: PWasmValue;
+  const ACount: PtrUInt); cdecl;
+begin
+  Arm64SetPendingTail(Arm64ResolveIndirect(AStore, UInt64(APacked), AIndexBits),
+    AArgs, UInt32(ACount));
+end;
+
+procedure JitReturnCallRefHelper(const AStore: TWasmStore;
+  const ARefBits: PtrUInt; const AArgs: PWasmValue;
+  const ACount: PtrUInt); cdecl;
+begin
+  Arm64SetPendingTail(Arm64ResolveRef(AStore, ARefBits), AArgs,
+    UInt32(ACount));
+end;
+
+{ --- the trampoline loop (§4.5, §5.2) ----------------------------------- }
+
+procedure Arm64InvokeCompiled(const AStore: TWasmStore;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue);
+var
+  Ctx: PWasmInterpContext;
+  Pend: PArm64TailCall;
+  Base: PWasmValue;
+  Entry: TArm64CompiledEntry;
+  CurAddr: TWasmFuncAddr;
+  CurArgs: PWasmValue;
+begin
+  Ctx := InterpContextFor(AStore);
+  Pend := @GArm64TailCall;
+  CurAddr := AFuncAddr;
+  CurArgs := AParams;
+  while True do
+  begin
+    { A tail target may be a host function: do the host call and let its
+      results BE this invocation's results — the interpreter's ReturnHostCall
+      shape, with no wasm frame added (§4.5). Unreachable on the first
+      iteration, where the caller already established a wasm callee. }
+    if AStore.Funcs[CurAddr].Kind = wfkHost then
+    begin
+      AStore.Funcs[CurAddr].Callback(AStore, AStore.Funcs[CurAddr].HostData,
+        CurArgs, AResults);
+      Exit;
+    end;
+    { A tail target that is not compiled runs interpreted, and continues ITS
+      tail chain inside the interpreter's own O(1) frame replacement. }
+    if AStore.Funcs[CurAddr].CompiledEntry = nil then
+    begin
+      Arm64CallInterpreted(AStore, CurAddr, CurArgs, AResults);
+      Exit;
+    end;
+
+    { Carve + zero + marshal params + push the GC frame through the SHARED
+      helper, so the frame, the exhaustion threshold and the GC contract are
+      the interpreter's (§5.1). CurArgs is consumed here, BEFORE the body can
+      overwrite the pending buffer it may point into. }
+    Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults);
+    Pend^.Pending := False;
+    Entry := TArm64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
+    Entry(Base, AStore);
+
+    { Pop. On the tail-call path the body wrote no results, so the result
+      marshal copies the zeroed result registers into AResults and the NEXT
+      iteration (or the host/interpreted arm above) overwrites them — the pop
+      is what is wanted, and reusing it keeps ONE frame-teardown path. Popping
+      first also puts ValueTop back at this frame's Base, so the replacement
+      frame is carved at the SAME base with the same exhaustion test the
+      interpreter's ReplaceWasmFrame applies, and Depth is unchanged across an
+      iteration: the O(1) property. }
+    JitLeaveFrame(Ctx);
+    if not Pend^.Pending then
+      Exit;
+    Pend^.Pending := False;
+    CurAddr := Pend^.Addr;
+    CurArgs := @Pend^.Args[0];
+  end;
+end;
+
+{ ===================================================================== }
+{  Waves 4 & 5 — memory / table / reference / global / GC (jit-spec §7,  }
+{  §8, §9, §12.3 Waves 4-5)                                              }
+{ ===================================================================== }
+
+{ THE PATTERN, and why it is the whole of these two waves. Every memory,
+  table, reference, global and GC op is a HELPER CALL, exactly as jit-spec
+  §1.4 prescribes ("if the interpreter dispatches to a store/heap method for
+  an op, the JIT emits a call to that same function"). The emitted template is
+  UNIFORM and tiny — marshal the store, the register-file base and a pointer
+  to the IR instruction into x0/x1/x2, then `blr` a single cdecl dispatcher
+  (JitRtDispatch) — and every subtlety lives in Pascal:
+
+    - MEMORY goes through the ONE chokepoint Store.MemAddressAt / MemRangeAt
+      (AGENTS.md's named top failure mode). The baseline emits NO raw
+      memory-base arithmetic and does NOT rely on guard-page faults; the
+      chokepoint runs the explicit full-precision bounds check and traps
+      'out of bounds memory access' via the same TrapNow the interpreter uses
+      (jit-spec §7.1 form 1).
+    - TABLE reference stores go through the barriered store methods
+      (TableSet/Fill/Grow/Init/Copy); reads are the free functions. Traps are
+      'out of bounds table access' / 'undefined element' — the store's, not
+      re-spelled here.
+    - GC struct/array/i31 go through Store.Heap (Wasm.Runtime.Gc), which owns
+      layout, packing, the split null traps and the write barrier.
+    - GLOBAL ref writes take the same empty-but-present write barrier the
+      interpreter takes.
+
+  Because the dispatcher reproduces the interpreter's Exec* bodies verbatim,
+  calling the identical runtime primitives, the trap kind, message, order and
+  the final memory/table/global/GC-heap state are the interpreter's BY
+  CONSTRUCTION (§13) — the differential harness (§11) is what proves it.
+
+  THE GC SAFEPOINT (§9). struct.new / array.new* ALLOCATE, and a collection
+  may run inside the helper. The frame is walkable because JitEnterFrame
+  pushed the compiled frame's TWasmGcFrame with Slots = @Values[Base] (the
+  in-memory register file the templates read and write) and RefRegBits over
+  the ref slots; the baseline stores every value to its slot before any op
+  boundary, so at the helper call every live ref is in a slot the collector
+  traces and NONE is only in a machine register. The dispatcher inherits the
+  interpreter's publish-first discipline (write the fresh aggregate into its
+  Dest slot before filling), so a mid-fill collection finds it rooted. No
+  per-safepoint liveness map is needed — the memory-register-file choice pays
+  this off for free (§9.3).
+
+  TRAP-1 (interp-spec §1.4). Every helper below is a leaf whose locals are all
+  plain pointers/scalars/records with no managed fields (no strings, dynamic
+  arrays, interfaces), so a chokepoint/heap TrapNow's LongJmp to the
+  per-invocation trampoline abandons nothing.
+
+  THE INSTRUCTION POINTER. Arm64EmitOp receives the instruction as
+  `const AIns: TWasmIrInstr`; a const record that size is passed BY REFERENCE
+  (the assumption Wasm.Ir itself documents and relies on), so `@AIns` is the
+  address of the live IR instruction (AFn^.Code[i]). The IR is borrowed and
+  outlives the code block (jit-spec §3.4), so the compiled code may hold that
+  raw pointer for its whole life and hand it to the dispatcher, which reads
+  the op's Dest/A/B/Imm fields exactly as the interpreter does. }
+
+{ The current (top) activation — the compiled frame JitEnterFrame pushed and
+  which is still on top while a helper runs (the same invariant
+  Arm64CallerInstance relies on). Gives the op its index spaces (Instance) and
+  its aux blocks (Fn). }
+function Arm64TopActivation(const AStore: TWasmStore): PWasmActivation;
+var
+  Ctx: PWasmInterpContext;
+begin
+  Ctx := InterpContextFor(AStore);
+  Result := @Ctx^.Acts[Ctx^.Depth - 1];
+end;
+
+{ The interpreter's MemLoad / MemStore leaves, reproduced (they are
+  implementation-only in Wasm.Interp). Both reach memory ONLY through
+  Store.MemAddressAt — the chokepoint — which bounds-checks and traps
+  'out of bounds memory access'. Little-endian, unaligned-safe. }
+function JitMemLoadBytes(const AStore: TWasmStore; const AMemAddr: TWasmMemAddr;
+  const AIndex, AOffset: UInt64; const ASize: NativeUInt): UInt64;
+var
+  P: PByte;
+begin
+  P := AStore.MemAddressAt(AMemAddr, AIndex, AOffset, ASize);
+  Result := 0;
+  Move(P^, Result, ASize);
+end;
+
+procedure JitMemStoreBytes(const AStore: TWasmStore;
+  const AMemAddr: TWasmMemAddr; const AIndex, AOffset: UInt64;
+  const ASize: NativeUInt; const AValue: UInt64);
+var
+  P: PByte;
+  V: UInt64;
+begin
+  P := AStore.MemAddressAt(AMemAddr, AIndex, AOffset, ASize);
+  V := AValue;
+  Move(V, P^, ASize);
+end;
+
+{ --- memory (ExecLoad/ExecStore/size/grow/init/copy/fill/data.drop) ------ }
+procedure JitDoMem(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  Inst: TWasmModuleInstance;
+  MemAddr, DstMemAddr, SrcMemAddr: TWasmMemAddr;
+  Raw: UInt64;
+  MemIdx, DataIdx, DstMem, SrcMem: UInt32;
+  DataAddr: TWasmDataAddr;
+  DstIdx, SrcOff, SrcIdx, Count, DataSize: UInt64;
+  DstPtr, SrcPtr: PByte;
+begin
+  Reg := AReg;
+  Inst := AAct^.Instance;
+  case AIns^.Op of
+    { --- loads (B = mem index, A = index reg, Imm = static offset) ------- }
+    iroI32Load:
+      Reg[AIns^.Dest].Bits := UInt64(UInt32(JitMemLoadBytes(AStore,
+        Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64, UInt64(AIns^.Imm), 4)));
+    iroI64Load:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore,
+        Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64, UInt64(AIns^.Imm), 8);
+    iroF32Load:
+      Reg[AIns^.Dest].Bits := UInt64(UInt32(JitMemLoadBytes(AStore,
+        Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64, UInt64(AIns^.Imm), 4)));
+    iroF64Load:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore,
+        Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64, UInt64(AIns^.Imm), 8);
+    iroI32Load8S:
+      begin
+        Raw := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+          Reg[AIns^.A].U64, UInt64(AIns^.Imm), 1);
+        Reg[AIns^.Dest].Bits := UInt64(UInt32(Int32(ShortInt(Byte(Raw)))));
+      end;
+    iroI32Load8U:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+        Reg[AIns^.A].U64, UInt64(AIns^.Imm), 1);
+    iroI32Load16S:
+      begin
+        Raw := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+          Reg[AIns^.A].U64, UInt64(AIns^.Imm), 2);
+        Reg[AIns^.Dest].Bits := UInt64(UInt32(Int32(SmallInt(Word(Raw)))));
+      end;
+    iroI32Load16U:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+        Reg[AIns^.A].U64, UInt64(AIns^.Imm), 2);
+    iroI64Load8S:
+      begin
+        Raw := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+          Reg[AIns^.A].U64, UInt64(AIns^.Imm), 1);
+        Reg[AIns^.Dest].Bits := UInt64(Int64(ShortInt(Byte(Raw))));
+      end;
+    iroI64Load8U:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+        Reg[AIns^.A].U64, UInt64(AIns^.Imm), 1);
+    iroI64Load16S:
+      begin
+        Raw := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+          Reg[AIns^.A].U64, UInt64(AIns^.Imm), 2);
+        Reg[AIns^.Dest].Bits := UInt64(Int64(SmallInt(Word(Raw))));
+      end;
+    iroI64Load16U:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+        Reg[AIns^.A].U64, UInt64(AIns^.Imm), 2);
+    iroI64Load32S:
+      begin
+        Raw := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+          Reg[AIns^.A].U64, UInt64(AIns^.Imm), 4);
+        Reg[AIns^.Dest].Bits := UInt64(Int64(Int32(UInt32(Raw))));
+      end;
+    iroI64Load32U:
+      Reg[AIns^.Dest].Bits := JitMemLoadBytes(AStore, Inst.MemAddrs[AIns^.B],
+        Reg[AIns^.A].U64, UInt64(AIns^.Imm), 4);
+
+    { --- stores (Dest = value reg, A = index reg, B = mem index) --------- }
+    iroI32Store, iroF32Store:
+      JitMemStoreBytes(AStore, Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64,
+        UInt64(AIns^.Imm), 4, Reg[AIns^.Dest].U64);
+    iroI64Store, iroF64Store:
+      JitMemStoreBytes(AStore, Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64,
+        UInt64(AIns^.Imm), 8, Reg[AIns^.Dest].U64);
+    iroI32Store8, iroI64Store8:
+      JitMemStoreBytes(AStore, Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64,
+        UInt64(AIns^.Imm), 1, Reg[AIns^.Dest].U64);
+    iroI32Store16, iroI64Store16:
+      JitMemStoreBytes(AStore, Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64,
+        UInt64(AIns^.Imm), 2, Reg[AIns^.Dest].U64);
+    iroI64Store32:
+      JitMemStoreBytes(AStore, Inst.MemAddrs[AIns^.B], Reg[AIns^.A].U64,
+        UInt64(AIns^.Imm), 4, Reg[AIns^.Dest].U64);
+
+    { --- size / grow (grow never traps, never collects; -1 on failure) -- }
+    iroMemorySize:
+      Reg[AIns^.Dest].Bits := AStore.MemoryPages(Inst.MemAddrs[UInt32(AIns^.Imm)]);
+    iroMemoryGrow:
+      begin
+        MemAddr := Inst.MemAddrs[UInt32(AIns^.Imm)];
+        if AStore.MemoryAddrType(MemAddr) = watI64 then
+          Reg[AIns^.Dest].Bits :=
+            UInt64(AStore.MemoryGrow(MemAddr, Reg[AIns^.A].U64))
+        else
+          Reg[AIns^.Dest].Bits :=
+            UInt64(UInt32(AStore.MemoryGrow(MemAddr, Reg[AIns^.A].U64)));
+      end;
+
+    { --- bulk (range-checked through the chokepoint; write nothing on trap) }
+    iroMemoryInit:
+      begin
+        IrUnpack(AIns^.Imm, MemIdx, DataIdx);
+        MemAddr := Inst.MemAddrs[MemIdx];
+        DataAddr := Inst.DataAddrs[DataIdx];
+        DstIdx := Reg[AIns^.Dest].U64;
+        SrcOff := Reg[AIns^.A].U64;
+        Count := Reg[AIns^.B].U64;
+        DstPtr := AStore.MemRangeAt(MemAddr, DstIdx, Count);
+        DataSize := UInt64(AStore.Datas[DataAddr].Size);
+        if (SrcOff > DataSize) or (Count > DataSize - SrcOff) then
+          TrapNow(wtkMemoryOutOfBounds);
+        if Count > 0 then
+        begin
+          SrcPtr := AStore.Datas[DataAddr].Data;
+          Inc(SrcPtr, SrcOff);
+          Move(SrcPtr^, DstPtr^, NativeUInt(Count));
+        end;
+      end;
+    iroMemoryCopy:
+      begin
+        IrUnpack(AIns^.Imm, DstMem, SrcMem);
+        DstIdx := Reg[AIns^.Dest].U64;
+        SrcIdx := Reg[AIns^.A].U64;
+        Count := Reg[AIns^.B].U64;
+        DstMemAddr := Inst.MemAddrs[DstMem];
+        SrcMemAddr := Inst.MemAddrs[SrcMem];
+        DstPtr := AStore.MemRangeAt(DstMemAddr, DstIdx, Count);
+        SrcPtr := AStore.MemRangeAt(SrcMemAddr, SrcIdx, Count);
+        if Count > 0 then
+          Move(SrcPtr^, DstPtr^, NativeUInt(Count));
+      end;
+    iroMemoryFill:
+      begin
+        DstIdx := Reg[AIns^.Dest].U64;
+        Count := Reg[AIns^.B].U64;
+        DstPtr := AStore.MemRangeAt(Inst.MemAddrs[UInt32(AIns^.Imm)],
+          DstIdx, Count);
+        if Count > 0 then
+          FillChar(DstPtr^, NativeUInt(Count), Byte(Reg[AIns^.A].U32 and $FF));
+      end;
+    iroDataDrop:
+      begin
+        DataAddr := Inst.DataAddrs[UInt32(AIns^.Imm)];
+        AStore.Datas[DataAddr].Dropped := True;
+        AStore.Datas[DataAddr].Size := 0;
+        AStore.Datas[DataAddr].Data := nil;
+      end;
+  end;
+end;
+
+{ --- table (interp-spec §3.8): reference stores are barriered store methods,
+  reads are free functions ------------------------------------------------- }
+procedure JitDoTable(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  Inst: TWasmModuleInstance;
+  Addr: TWasmTableAddr;
+  U1, U2: UInt32;
+begin
+  Reg := AReg;
+  Inst := AAct^.Instance;
+  case AIns^.Op of
+    iroTableGet:
+      Reg[AIns^.Dest].Bits := UInt64(TableGet(
+        AStore.Tables[Inst.TableAddrs[UInt32(AIns^.Imm)]], Reg[AIns^.A].U64));
+    iroTableSet:
+      AStore.TableSet(Inst.TableAddrs[UInt32(AIns^.Imm)],
+        Reg[AIns^.A].U64, Reg[AIns^.B].Ref);
+    iroTableSize:
+      Reg[AIns^.Dest].Bits := TableSize(
+        AStore.Tables[Inst.TableAddrs[UInt32(AIns^.Imm)]]);
+    iroTableGrow:
+      begin
+        Addr := Inst.TableAddrs[UInt32(AIns^.Imm)];
+        if AStore.Tables[Addr].TableType.Limits.AddrType = watI64 then
+          Reg[AIns^.Dest].Bits :=
+            UInt64(AStore.TableGrow(Addr, Reg[AIns^.B].U64, Reg[AIns^.A].Ref))
+        else
+          Reg[AIns^.Dest].Bits := UInt64(UInt32(
+            AStore.TableGrow(Addr, Reg[AIns^.B].U64, Reg[AIns^.A].Ref)));
+      end;
+    iroTableFill:
+      AStore.TableFill(Inst.TableAddrs[UInt32(AIns^.Imm)],
+        Reg[AIns^.Dest].U64, Reg[AIns^.B].U64, Reg[AIns^.A].Ref);
+    iroTableInit:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        AStore.TableInitFromElem(Inst.TableAddrs[U1], Reg[AIns^.Dest].U64,
+          AStore.Elems[Inst.ElemAddrs[U2]].Refs, Reg[AIns^.A].U64,
+          Reg[AIns^.B].U64);
+      end;
+    iroTableCopy:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        AStore.TableCopy(Inst.TableAddrs[U1], Reg[AIns^.Dest].U64,
+          Inst.TableAddrs[U2], Reg[AIns^.A].U64, Reg[AIns^.B].U64);
+      end;
+    iroElemDrop:
+      begin
+        AStore.Elems[Inst.ElemAddrs[UInt32(AIns^.Imm)]].Refs := nil;
+        AStore.Elems[Inst.ElemAddrs[UInt32(AIns^.Imm)]].Dropped := True;
+      end;
+  end;
+end;
+
+{ ref.test / ref.cast / br_on_cast* runtime match — the interpreter's
+  MatchesAuxRefType leaf (reftype in Fn^.AuxRefTypes[Imm], module space,
+  converted to engine space, then the store's O(1) subtype check). }
+function JitMatchesAuxRefType(const AStore: TWasmStore;
+  const AAct: PWasmActivation; const ARef: TWasmRef;
+  const AAuxIdx: UInt32): Boolean;
+var
+  EngRt: TWasmRefType;
+begin
+  EngRt := EngineRefType(AAct^.Fn^.AuxRefTypes[AAuxIdx],
+    AAct^.Instance.EngineTypeIds);
+  Result := IsRefOfRefType(AStore.Engine, ARef, EngRt);
+end;
+
+{ --- reference (interp-spec §3.9), the non-branch forms ------------------ }
+procedure JitDoRef(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  Inst: TWasmModuleInstance;
+begin
+  Reg := AReg;
+  Inst := AAct^.Instance;
+  case AIns^.Op of
+    iroRefNull:
+      Reg[AIns^.Dest].Bits := UInt64(WASM_REF_NULL);
+    iroRefIsNull:
+      ValueSetI32(Reg[AIns^.Dest], Ord(RefIsNull(Reg[AIns^.A].Ref)));
+    iroRefFunc:
+      Reg[AIns^.Dest].Bits := UInt64(
+        AStore.Funcs[Inst.FuncAddrs[UInt32(AIns^.Imm)]].RefObject);
+    iroRefEq:
+      ValueSetI32(Reg[AIns^.Dest], Ord(Reg[AIns^.A].Ref = Reg[AIns^.B].Ref));
+    iroRefAsNonNull:
+      begin
+        if RefIsNull(Reg[AIns^.A].Ref) then
+          TrapNow(wtkNullReference);
+        Reg[AIns^.Dest].Bits := Reg[AIns^.A].Bits;
+      end;
+    iroRefTest:
+      ValueSetI32(Reg[AIns^.Dest], Ord(JitMatchesAuxRefType(AStore, AAct,
+        Reg[AIns^.A].Ref, UInt32(AIns^.Imm))));
+    iroRefCast:
+      if JitMatchesAuxRefType(AStore, AAct, Reg[AIns^.A].Ref,
+        UInt32(AIns^.Imm)) then
+        Reg[AIns^.Dest].Bits := Reg[AIns^.A].Bits
+      else
+        TrapNow(wtkCastFailure);
+  end;
+end;
+
+{ --- global (a v128 global is iroGlobalGetVec/SetVec — declined, Wave 6) -- }
+procedure JitDoGlobal(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  Addr: TWasmGlobalAddr;
+begin
+  Reg := AReg;
+  Addr := AAct^.Instance.GlobalAddrs[UInt32(AIns^.Imm)];
+  case AIns^.Op of
+    iroGlobalGet:
+      Reg[AIns^.Dest].Bits := AStore.Globals[Addr].Value.Bits;
+    iroGlobalSet:
+      begin
+        if AStore.Globals[Addr].GlobalType.ValueType.Kind = wvkRef then
+          { The v1 write barrier is empty, so the old-value argument is null —
+            the interpreter's exact call (a non-empty barrier would first read
+            the cell's current ref, see the interp note). }
+          AStore.Heap.WriteBarrier(WASM_REF_NULL, Reg[AIns^.A].Ref);
+        AStore.Globals[Addr].Value.Bits := Reg[AIns^.A].Bits;
+      end;
+  end;
+end;
+
+{ --- GC: struct / array / i31 (interp-spec §3.10) ------------------------
+  Publish-first is preserved verbatim: the fresh aggregate is written into its
+  Dest ref slot (RefRegBits-covered) BEFORE any field/element write that could
+  allocate, so a collection during the fill finds it rooted (§9.3). }
+procedure JitDoGc(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  Inst: TWasmModuleInstance;
+  Fn: PWasmIrFunction;
+  Obj: TWasmRef;
+  N, I, U1, U2, TypeIdx, DataIdx, ElemIdx, Aux: UInt32;
+  ElemOffset, Count, SrcLen: UInt32;
+  DataAddr: TWasmDataAddr;
+  ElemAddr: TWasmElemAddr;
+begin
+  Reg := AReg;
+  Inst := AAct^.Instance;
+  Fn := AAct^.Fn;
+  case AIns^.Op of
+    iroStructNew:
+      begin
+        Obj := AStore.Heap.AllocStruct(Inst.EngineTypeIds[UInt32(AIns^.Imm)]);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);            { publish before fill }
+        N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
+        I := 0;
+        while I < N do
+        begin
+          AStore.Heap.StructSet(Obj, I,
+            Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+          Inc(I);
+        end;
+      end;
+    iroStructNewDefault:
+      begin
+        Obj := AStore.Heap.AllocStruct(Inst.EngineTypeIds[UInt32(AIns^.Imm)]);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);
+        AStore.Heap.StructSetDefaults(Obj);
+      end;
+    iroStructGet:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);   { U2 = field index }
+        Reg[AIns^.Dest] := AStore.Heap.StructGet(Reg[AIns^.A].Ref, U2);
+      end;
+    iroStructGetS:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        ValueSetI32(Reg[AIns^.Dest],
+          AStore.Heap.StructGetSigned(Reg[AIns^.A].Ref, U2));
+      end;
+    iroStructGetU:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        ValueSetU32(Reg[AIns^.Dest],
+          AStore.Heap.StructGetUnsigned(Reg[AIns^.A].Ref, U2));
+      end;
+    iroStructSet:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        AStore.Heap.StructSet(Reg[AIns^.A].Ref, U2, Reg[AIns^.B]);
+      end;
+
+    iroArrayNew:
+      begin
+        Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[UInt32(AIns^.Imm)],
+          Reg[AIns^.B].U32);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);
+        AStore.Heap.ArrayFill(Obj, Reg[AIns^.A]);
+      end;
+    iroArrayNewDefault:
+      begin
+        Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[UInt32(AIns^.Imm)],
+          Reg[AIns^.A].U32);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);
+        AStore.Heap.ArraySetDefaults(Obj);
+      end;
+    iroArrayNewFixed:
+      begin
+        N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
+        Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[UInt32(AIns^.Imm)], N);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);
+        I := 0;
+        while I < N do
+        begin
+          AStore.Heap.ArraySet(Obj, I,
+            Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+          Inc(I);
+        end;
+      end;
+    iroArrayNewData:
+      begin
+        IrUnpack(AIns^.Imm, TypeIdx, DataIdx);
+        Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[TypeIdx],
+          Reg[AIns^.B].U32);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);
+        DataAddr := Inst.DataAddrs[DataIdx];
+        AStore.Heap.ArrayInitFromData(Obj, 0, AStore.Datas[DataAddr].Data,
+          AStore.Datas[DataAddr].Size, Reg[AIns^.A].U64, Reg[AIns^.B].U32);
+      end;
+    iroArrayNewElem:
+      begin
+        IrUnpack(AIns^.Imm, TypeIdx, ElemIdx);
+        ElemAddr := Inst.ElemAddrs[ElemIdx];
+        { The element-segment source range is checked BEFORE allocating, so an
+          overflowing count traps 'out of bounds table access' rather than
+          'out of memory' (interp-spec, corpus array.wast:283). }
+        ElemOffset := Reg[AIns^.A].U32;
+        Count := Reg[AIns^.B].U32;
+        SrcLen := UInt32(Length(AStore.Elems[ElemAddr].Refs));
+        if (ElemOffset > SrcLen) or (Count > SrcLen - ElemOffset) then
+          TrapNow(wtkTableOutOfBounds);
+        Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[TypeIdx], Count);
+        Reg[AIns^.Dest].Bits := UInt64(Obj);
+        AStore.Heap.ArrayInitFromElem(Obj, 0, AStore.Elems[ElemAddr].Refs,
+          ElemOffset, Count);
+      end;
+    iroArrayGet:
+      Reg[AIns^.Dest] :=
+        AStore.Heap.ArrayGet(Reg[AIns^.A].Ref, Reg[AIns^.B].U32);
+    iroArrayGetS:
+      ValueSetI32(Reg[AIns^.Dest],
+        AStore.Heap.ArrayGetSigned(Reg[AIns^.A].Ref, Reg[AIns^.B].U32));
+    iroArrayGetU:
+      ValueSetU32(Reg[AIns^.Dest],
+        AStore.Heap.ArrayGetUnsigned(Reg[AIns^.A].Ref, Reg[AIns^.B].U32));
+    iroArraySet:
+      AStore.Heap.ArraySet(Reg[AIns^.Dest].Ref, Reg[AIns^.A].U32,
+        Reg[AIns^.B]);
+    iroArrayLen:
+      ValueSetU32(Reg[AIns^.Dest], AStore.Heap.ArrayLength(Reg[AIns^.A].Ref));
+    iroArrayFill:
+      begin
+        Aux := AIns^.A;   { aux [ref, index, value, count] }
+        AStore.Heap.ArrayFill(
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 0)].Ref,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 1)].U32,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 3)].U32,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 2)]);
+      end;
+    iroArrayCopy:
+      begin
+        Aux := AIns^.A;   { aux [dstRef, dstIdx, srcRef, srcIdx, count] }
+        AStore.Heap.ArrayCopy(
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 0)].Ref,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 1)].U32,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 2)].Ref,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 3)].U32,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 4)].U32);
+      end;
+    iroArrayInitData:
+      begin
+        Aux := AIns^.A;   { aux [destRef, destIdx, srcByteOffset, count] }
+        IrUnpack(AIns^.Imm, TypeIdx, DataIdx);
+        DataAddr := Inst.DataAddrs[DataIdx];
+        AStore.Heap.ArrayInitFromData(
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 0)].Ref,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 1)].U32,
+          AStore.Datas[DataAddr].Data, AStore.Datas[DataAddr].Size,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 2)].U64,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 3)].U32);
+      end;
+    iroArrayInitElem:
+      begin
+        Aux := AIns^.A;   { aux [destRef, destIdx, srcElemOffset, count] }
+        IrUnpack(AIns^.Imm, TypeIdx, ElemIdx);
+        ElemAddr := Inst.ElemAddrs[ElemIdx];
+        AStore.Heap.ArrayInitFromElem(
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 0)].Ref,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 1)].U32,
+          AStore.Elems[ElemAddr].Refs,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 2)].U32,
+          Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 3)].U32);
+      end;
+
+    { extern.convert_any / any.convert_extern: identity on the representation
+      (KNOWN LIMITATION M7 — matches the interpreter exactly, which is what the
+      differential oracle requires). }
+    iroAnyConvertExtern, iroExternConvertAny:
+      Reg[AIns^.Dest].Bits := Reg[AIns^.A].Bits;
+    iroRefI31:
+      Reg[AIns^.Dest].Bits := UInt64(MakeI31Ref(Reg[AIns^.A].I32));
+    iroI31GetS:
+      begin
+        if RefIsNull(Reg[AIns^.A].Ref) then
+          TrapNow(wtkNullI31Reference);
+        ValueSetI32(Reg[AIns^.Dest], I31GetSigned(Reg[AIns^.A].Ref));
+      end;
+    iroI31GetU:
+      begin
+        if RefIsNull(Reg[AIns^.A].Ref) then
+          TrapNow(wtkNullI31Reference);
+        ValueSetU32(Reg[AIns^.Dest], I31GetUnsigned(Reg[AIns^.A].Ref));
+      end;
+  end;
+end;
+
+{ The single cdecl dispatcher every non-branch memory/table/ref/global/GC
+  template calls: (store, register-file base, IR-instruction pointer). It
+  derives the current activation for the op's index spaces and aux blocks, and
+  runs the interpreter's exact logic. cdecl = AAPCS64, so the emitted call
+  sequence (x0..x2, x19..x28 preserved) is fully specified. }
+procedure JitRtDispatch(const AStore: TWasmStore; const ARegBase: PWasmValue;
+  const AIns: PWasmIrInstr); cdecl;
+var
+  Act: PWasmActivation;
+begin
+  Act := Arm64TopActivation(AStore);
+  case AIns^.Op of
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16, iroI64Store32,
+    iroMemorySize, iroMemoryGrow, iroMemoryInit, iroMemoryCopy, iroMemoryFill,
+    iroDataDrop:
+      JitDoMem(AStore, ARegBase, Act, AIns);
+
+    iroTableGet, iroTableSet, iroTableSize, iroTableGrow, iroTableFill,
+    iroTableInit, iroTableCopy, iroElemDrop:
+      JitDoTable(AStore, ARegBase, Act, AIns);
+
+    iroRefNull, iroRefIsNull, iroRefFunc, iroRefEq, iroRefAsNonNull,
+    iroRefTest, iroRefCast:
+      JitDoRef(AStore, ARegBase, Act, AIns);
+
+    iroGlobalGet, iroGlobalSet:
+      JitDoGlobal(AStore, ARegBase, Act, AIns);
+  else
+    JitDoGc(AStore, ARegBase, Act, AIns);
+  end;
+end;
+
+{ The ref-branch predicate helper (br_on_null/non_null/cast/cast_fail). Returns
+  the PRIMITIVE predicate P — RefIsNull for the null forms, the runtime cast
+  match for the cast forms — and the emitted code chooses the taken polarity
+  (cbnz when the branch is taken on P, cbz when on not-P) and threads the
+  fall-through refinement, mirroring the interpreter's arms exactly. }
+function JitRefBranchPredicate(const AStore: TWasmStore;
+  const ARegBase: PWasmValue; const AIns: PWasmIrInstr): PtrUInt; cdecl;
+var
+  Act: PWasmActivation;
+  Reg: PWasmValue;
+begin
+  Act := Arm64TopActivation(AStore);
+  Reg := ARegBase;
+  case AIns^.Op of
+    iroBrOnNull, iroBrOnNonNull:
+      Result := PtrUInt(Ord(RefIsNull(Reg[AIns^.A].Ref)));
+  else
+    { iroBrOnCast / iroBrOnCastFail }
+    Result := PtrUInt(Ord(JitMatchesAuxRefType(AStore, Act, Reg[AIns^.A].Ref,
+      UInt32(AIns^.Imm))));
+  end;
+end;
+
+{ ===================================================================== }
+{  Wave 6 — v128 SIMD via the Wasm.Interp.Vector leaves (jit-spec §10.1) }
+{ ===================================================================== }
+
+{ THE PATTERN, and why it is the whole of this wave. Every v128 op is the SAME
+  uniform three-argument helper call the Wave 4/5 runtime ops use (store,
+  register-file base, IR-instruction pointer), dispatched by JitVecDispatch to
+  JitDoVec — which reproduces the interpreter's v128 arms VERBATIM, calling the
+  identical Wasm.Interp.Vector leaves. So the per-lane NaN discipline, the
+  saturating/narrowing arithmetic, pmin/pmax's payload-preserving selection,
+  and the relaxed-SIMD deterministic profile (R=0) are the interpreter's exact
+  bits BY CONSTRUCTION (simd-spec §9, jit-spec §13) — the JIT computes no vector
+  arithmetic of its own.
+
+  THE 2-SLOT REGISTER FILE IS TRANSPARENT. A v128 register k occupies the two
+  adjacent 8-byte slots k and k+1 (simd-spec §1.3); VecAt(Reg, k) aliases the
+  pair as a TWasmV128. Because the dispatcher reads and writes the in-memory
+  register file directly through x19 (never marshaling operands into machine
+  registers), the two-slot layout needs NO special case — it is inherited from
+  the interpreter's own VecAt addressing, exactly as jit-spec §10.1 states. The
+  register file is 16-byte aligned at every even slot (Wasm.Interp's context
+  over-aligns the reservation), and the IR guarantees a v128 register lands on
+  an even slot, so VecAt's pointer is always 16-aligned.
+
+  THE CHOKEPOINT (§7). The SIMD load/store family (plain, packed, splat, zero,
+  and the lane forms) reaches memory ONLY through Store.MemAddressAt — the one
+  bounds-checked chokepoint — so a v128 access traps 'out of bounds memory
+  access' at the same index with the same message as the interpreter, and a
+  trapping store writes nothing (the range is checked before any byte moves).
+
+  GC SAFEPOINT / TRAP-1. The v128 GC ops (struct/array field get/set/fill) go
+  through the same Store.Heap methods the interpreter uses; every helper here is
+  a leaf whose locals are plain scalars/records with no managed fields, so a
+  chokepoint/heap TrapNow's LongJmp to the trampoline abandons nothing. }
+
+{ The interpreter's MemLoadV128 / MemStoreV128 leaves, reproduced (they are
+  implementation-only in Wasm.Interp). Reg is the register-file base the
+  dispatcher already holds; AAct gives the aux block (lane forms) and the
+  memory index space. Every access is the chokepoint Store.MemAddressAt. }
+procedure JitMemLoadV128(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  MemAddr: TWasmMemAddr;
+  Index, Offset: UInt64;
+  MemIdx, Lane: UInt32;
+  Dst: PWasmV128;
+  P: PByte;
+begin
+  Reg := AReg;
+  Index := Reg[AIns^.A].U64;
+  Dst := VecAt(Reg, AIns^.Dest);
+  case AIns^.Op of
+    iroV128Load8Lane, iroV128Load16Lane, iroV128Load32Lane, iroV128Load64Lane:
+      IrAuxReadLaneMemArg(AAct^.Fn^.AuxU32, UInt32(AIns^.Imm),
+        MemIdx, Offset, Lane);
+  else
+    MemIdx := AIns^.B;
+    Offset := UInt64(AIns^.Imm);
+    Lane := 0;
+  end;
+  MemAddr := AAct^.Instance.MemAddrs[MemIdx];
+  case AIns^.Op of
+    iroV128Load:
+      V128Load(AStore.MemAddressAt(MemAddr, Index, Offset, 16), Dst);
+    iroV128Load8x8S:
+      V128Load8x8S(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load8x8U:
+      V128Load8x8U(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load16x4S:
+      V128Load16x4S(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load16x4U:
+      V128Load16x4U(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load32x2S:
+      V128Load32x2S(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load32x2U:
+      V128Load32x2U(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load8Splat:
+      V128Load8Splat(AStore.MemAddressAt(MemAddr, Index, Offset, 1), Dst);
+    iroV128Load16Splat:
+      V128Load16Splat(AStore.MemAddressAt(MemAddr, Index, Offset, 2), Dst);
+    iroV128Load32Splat:
+      V128Load32Splat(AStore.MemAddressAt(MemAddr, Index, Offset, 4), Dst);
+    iroV128Load64Splat:
+      V128Load64Splat(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load32Zero:
+      V128Load32Zero(AStore.MemAddressAt(MemAddr, Index, Offset, 4), Dst);
+    iroV128Load64Zero:
+      V128Load64Zero(AStore.MemAddressAt(MemAddr, Index, Offset, 8), Dst);
+    iroV128Load8Lane:
+      begin
+        P := AStore.MemAddressAt(MemAddr, Index, Offset, 1);
+        V128Load8Lane(P, VecAt(Reg, AIns^.B), Lane, Dst);
+      end;
+    iroV128Load16Lane:
+      begin
+        P := AStore.MemAddressAt(MemAddr, Index, Offset, 2);
+        V128Load16Lane(P, VecAt(Reg, AIns^.B), Lane, Dst);
+      end;
+    iroV128Load32Lane:
+      begin
+        P := AStore.MemAddressAt(MemAddr, Index, Offset, 4);
+        V128Load32Lane(P, VecAt(Reg, AIns^.B), Lane, Dst);
+      end;
+    iroV128Load64Lane:
+      begin
+        P := AStore.MemAddressAt(MemAddr, Index, Offset, 8);
+        V128Load64Lane(P, VecAt(Reg, AIns^.B), Lane, Dst);
+      end;
+  end;
+end;
+
+procedure JitMemStoreV128(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  MemAddr: TWasmMemAddr;
+  Index, Offset: UInt64;
+  MemIdx, Lane: UInt32;
+  Src: PWasmV128;
+begin
+  Reg := AReg;
+  Index := Reg[AIns^.A].U64;
+  Src := VecAt(Reg, AIns^.Dest);   { the value register (ifkSrcReg in Dest) }
+  case AIns^.Op of
+    iroV128Store8Lane, iroV128Store16Lane, iroV128Store32Lane,
+    iroV128Store64Lane:
+      IrAuxReadLaneMemArg(AAct^.Fn^.AuxU32, UInt32(AIns^.Imm),
+        MemIdx, Offset, Lane);
+  else
+    MemIdx := AIns^.B;
+    Offset := UInt64(AIns^.Imm);
+    Lane := 0;
+  end;
+  MemAddr := AAct^.Instance.MemAddrs[MemIdx];
+  case AIns^.Op of
+    iroV128Store:
+      V128Store(Src, AStore.MemAddressAt(MemAddr, Index, Offset, 16));
+    iroV128Store8Lane:
+      V128Store8Lane(Src, Lane, AStore.MemAddressAt(MemAddr, Index, Offset, 1));
+    iroV128Store16Lane:
+      V128Store16Lane(Src, Lane, AStore.MemAddressAt(MemAddr, Index, Offset, 2));
+    iroV128Store32Lane:
+      V128Store32Lane(Src, Lane, AStore.MemAddressAt(MemAddr, Index, Offset, 4));
+    iroV128Store64Lane:
+      V128Store64Lane(Src, Lane, AStore.MemAddressAt(MemAddr, Index, Offset, 8));
+  end;
+end;
+
+{ The v128 op body — the interpreter's SIMD arms reproduced VERBATIM, calling
+  the identical Wasm.Interp.Vector leaves (jit-spec §10.1, §13). Reads and
+  writes go through VecAt(Reg, k) / Reg[k] over the in-memory register file, so
+  the 2-slot v128 layout is transparent and the result is bit-identical to the
+  interpreter, per lane, including canonical NaNs and the relaxed R=0 profile. }
+procedure JitDoVec(const AStore: TWasmStore; const AReg: PWasmValue;
+  const AAct: PWasmActivation; const AIns: PWasmIrInstr);
+var
+  Reg: PWasmValue;
+  Fn: PWasmIrFunction;
+  Inst: TWasmModuleInstance;
+  VTmp: TWasmV128;
+  U1, U2: UInt32;
+begin
+  Reg := AReg;
+  Fn := AAct^.Fn;
+  Inst := AAct^.Instance;
+  case AIns^.Op of
+    { --- SIMD memory loads / stores: one chokepoint, explicit bounds check }
+    iroV128Load, iroV128Load8x8S, iroV128Load8x8U, iroV128Load16x4S,
+    iroV128Load16x4U, iroV128Load32x2S, iroV128Load32x2U, iroV128Load8Splat,
+    iroV128Load16Splat, iroV128Load32Splat, iroV128Load64Splat,
+    iroV128Load32Zero, iroV128Load64Zero, iroV128Load8Lane, iroV128Load16Lane,
+    iroV128Load32Lane, iroV128Load64Lane:
+      JitMemLoadV128(AStore, Reg, AAct, AIns);
+    iroV128Store, iroV128Store8Lane, iroV128Store16Lane, iroV128Store32Lane,
+    iroV128Store64Lane:
+      JitMemStoreV128(AStore, Reg, AAct, AIns);
+
+    { --- const / shuffle (16-byte immediate) ------------------------- }
+    iroV128Const:
+      IrAuxReadV128(Fn^.AuxU32, UInt32(AIns^.Imm), VecAt(Reg, AIns^.Dest)^);
+    iroI8x16Shuffle:
+      begin
+        IrAuxReadV128(Fn^.AuxU32, UInt32(AIns^.Imm), VTmp);
+        I8x16Shuffle(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), @VTmp.B[0],
+          VecAt(Reg, AIns^.Dest));
+      end;
+    iroI8x16Swizzle: I8x16Swizzle(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+
+    { --- splat ------------------------------------------------------- }
+    iroI8x16Splat: I8x16Splat(Reg[AIns^.A].U32, VecAt(Reg, AIns^.Dest));
+    iroI16x8Splat: I16x8Splat(Reg[AIns^.A].U32, VecAt(Reg, AIns^.Dest));
+    iroI32x4Splat: I32x4Splat(Reg[AIns^.A].U32, VecAt(Reg, AIns^.Dest));
+    iroI64x2Splat: I64x2Splat(Reg[AIns^.A].U64, VecAt(Reg, AIns^.Dest));
+    iroF32x4Splat: F32x4Splat(Reg[AIns^.A].U32, VecAt(Reg, AIns^.Dest));
+    iroF64x2Splat: F64x2Splat(Reg[AIns^.A].U64, VecAt(Reg, AIns^.Dest));
+
+    { --- extract / replace lane -------------------------------------- }
+    iroI8x16ExtractLaneS: ValueSetU32(Reg[AIns^.Dest], I8x16ExtractLaneS(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm)));
+    iroI8x16ExtractLaneU: ValueSetU32(Reg[AIns^.Dest], I8x16ExtractLaneU(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm)));
+    iroI8x16ReplaceLane: I8x16ReplaceLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtractLaneS: ValueSetU32(Reg[AIns^.Dest], I16x8ExtractLaneS(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm)));
+    iroI16x8ExtractLaneU: ValueSetU32(Reg[AIns^.Dest], I16x8ExtractLaneU(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm)));
+    iroI16x8ReplaceLane: I16x8ReplaceLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtractLane: ValueSetU32(Reg[AIns^.Dest], I32x4ExtractLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm)));
+    iroI32x4ReplaceLane: I32x4ReplaceLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtractLane: Reg[AIns^.Dest].Bits := I64x2ExtractLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm));
+    iroI64x2ReplaceLane: I64x2ReplaceLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm), Reg[AIns^.B].U64, VecAt(Reg, AIns^.Dest));
+    iroF32x4ExtractLane: ValueSetU32(Reg[AIns^.Dest], F32x4ExtractLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm)));
+    iroF32x4ReplaceLane: F32x4ReplaceLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroF64x2ExtractLane: Reg[AIns^.Dest].Bits := F64x2ExtractLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm));
+    iroF64x2ReplaceLane: F64x2ReplaceLane(VecAt(Reg, AIns^.A), UInt32(AIns^.Imm), Reg[AIns^.B].U64, VecAt(Reg, AIns^.Dest));
+
+    { --- comparisons ------------------------------------------------- }
+    iroI8x16Eq: I8x16Eq(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16Ne: I8x16Ne(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16LtS: I8x16LtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16LtU: I8x16LtU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16GtS: I8x16GtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16GtU: I8x16GtU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16LeS: I8x16LeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16LeU: I8x16LeU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16GeS: I8x16GeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16GeU: I8x16GeU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8Eq: I16x8Eq(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8Ne: I16x8Ne(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8LtS: I16x8LtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8LtU: I16x8LtU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8GtS: I16x8GtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8GtU: I16x8GtU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8LeS: I16x8LeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8LeU: I16x8LeU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8GeS: I16x8GeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8GeU: I16x8GeU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4Eq: I32x4Eq(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4Ne: I32x4Ne(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4LtS: I32x4LtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4LtU: I32x4LtU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4GtS: I32x4GtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4GtU: I32x4GtU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4LeS: I32x4LeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4LeU: I32x4LeU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4GeS: I32x4GeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4GeU: I32x4GeU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Eq: F32x4Eq(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Ne: F32x4Ne(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Lt: F32x4Lt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Gt: F32x4Gt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Le: F32x4Le(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Ge: F32x4Ge(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Eq: F64x2Eq(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Ne: F64x2Ne(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Lt: F64x2Lt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Gt: F64x2Gt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Le: F64x2Le(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Ge: F64x2Ge(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+
+    { --- bitwise and the whole-vector test --------------------------- }
+    iroV128Not: V128Not(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroV128And: V128And(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroV128Andnot: V128Andnot(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroV128Or: V128Or(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroV128Xor: V128Xor(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroV128Bitselect: V128Bitselect(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroV128AnyTrue: ValueSetU32(Reg[AIns^.Dest], V128AnyTrue(VecAt(Reg, AIns^.A)));
+
+    { --- float conversions ------------------------------------------- }
+    iroF32x4DemoteF64x2Zero: F32x4DemoteF64x2Zero(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2PromoteLowF32x4: F64x2PromoteLowF32x4(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+
+    { --- i8x16 unary / narrow / rounding / arith --------------------- }
+    iroI8x16Abs: I8x16Abs(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI8x16Neg: I8x16Neg(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI8x16Popcnt: I8x16Popcnt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI8x16AllTrue: ValueSetU32(Reg[AIns^.Dest], I8x16AllTrue(VecAt(Reg, AIns^.A)));
+    iroI8x16Bitmask: ValueSetU32(Reg[AIns^.Dest], I8x16Bitmask(VecAt(Reg, AIns^.A)));
+    iroI8x16NarrowI16x8S: I8x16NarrowI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16NarrowI16x8U: I8x16NarrowI16x8U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Ceil: F32x4Ceil(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4Floor: F32x4Floor(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4Trunc: F32x4Trunc(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4Nearest: F32x4Nearest(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI8x16Shl: I8x16Shl(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI8x16ShrS: I8x16ShrS(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI8x16ShrU: I8x16ShrU(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI8x16Add: I8x16Add(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16AddSatS: I8x16AddSatS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16AddSatU: I8x16AddSatU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16Sub: I8x16Sub(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16SubSatS: I8x16SubSatS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16SubSatU: I8x16SubSatU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Ceil: F64x2Ceil(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2Floor: F64x2Floor(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI8x16MinS: I8x16MinS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16MinU: I8x16MinU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16MaxS: I8x16MaxS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI8x16MaxU: I8x16MaxU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Trunc: F64x2Trunc(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI8x16AvgrU: I8x16AvgrU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtaddPairwiseI8x16S: I16x8ExtaddPairwiseI8x16S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtaddPairwiseI8x16U: I16x8ExtaddPairwiseI8x16U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtaddPairwiseI16x8S: I32x4ExtaddPairwiseI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtaddPairwiseI16x8U: I32x4ExtaddPairwiseI16x8U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+
+    { --- i16x8 ------------------------------------------------------- }
+    iroI16x8Abs: I16x8Abs(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8Neg: I16x8Neg(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8Q15mulrSatS: I16x8Q15mulrSatS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8AllTrue: ValueSetU32(Reg[AIns^.Dest], I16x8AllTrue(VecAt(Reg, AIns^.A)));
+    iroI16x8Bitmask: ValueSetU32(Reg[AIns^.Dest], I16x8Bitmask(VecAt(Reg, AIns^.A)));
+    iroI16x8NarrowI32x4S: I16x8NarrowI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8NarrowI32x4U: I16x8NarrowI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtendLowI8x16S: I16x8ExtendLowI8x16S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtendHighI8x16S: I16x8ExtendHighI8x16S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtendLowI8x16U: I16x8ExtendLowI8x16U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtendHighI8x16U: I16x8ExtendHighI8x16U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8Shl: I16x8Shl(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI16x8ShrS: I16x8ShrS(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI16x8ShrU: I16x8ShrU(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI16x8Add: I16x8Add(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8AddSatS: I16x8AddSatS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8AddSatU: I16x8AddSatU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8Sub: I16x8Sub(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8SubSatS: I16x8SubSatS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8SubSatU: I16x8SubSatU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Nearest: F64x2Nearest(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI16x8Mul: I16x8Mul(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8MinS: I16x8MinS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8MinU: I16x8MinU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8MaxS: I16x8MaxS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8MaxU: I16x8MaxU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8AvgrU: I16x8AvgrU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtmulLowI8x16S: I16x8ExtmulLowI8x16S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtmulHighI8x16S: I16x8ExtmulHighI8x16S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtmulLowI8x16U: I16x8ExtmulLowI8x16U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8ExtmulHighI8x16U: I16x8ExtmulHighI8x16U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+
+    { --- i32x4 ------------------------------------------------------- }
+    iroI32x4Abs: I32x4Abs(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4Neg: I32x4Neg(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4AllTrue: ValueSetU32(Reg[AIns^.Dest], I32x4AllTrue(VecAt(Reg, AIns^.A)));
+    iroI32x4Bitmask: ValueSetU32(Reg[AIns^.Dest], I32x4Bitmask(VecAt(Reg, AIns^.A)));
+    iroI32x4ExtendLowI16x8S: I32x4ExtendLowI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtendHighI16x8S: I32x4ExtendHighI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtendLowI16x8U: I32x4ExtendLowI16x8U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtendHighI16x8U: I32x4ExtendHighI16x8U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4Shl: I32x4Shl(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI32x4ShrS: I32x4ShrS(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI32x4ShrU: I32x4ShrU(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI32x4Add: I32x4Add(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4Sub: I32x4Sub(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4Mul: I32x4Mul(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4MinS: I32x4MinS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4MinU: I32x4MinU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4MaxS: I32x4MaxS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4MaxU: I32x4MaxU(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4DotI16x8S: I32x4DotI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtmulLowI16x8S: I32x4ExtmulLowI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtmulHighI16x8S: I32x4ExtmulHighI16x8S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtmulLowI16x8U: I32x4ExtmulLowI16x8U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4ExtmulHighI16x8U: I32x4ExtmulHighI16x8U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+
+    { --- i64x2 ------------------------------------------------------- }
+    iroI64x2Abs: I64x2Abs(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI64x2Neg: I64x2Neg(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI64x2AllTrue: ValueSetU32(Reg[AIns^.Dest], I64x2AllTrue(VecAt(Reg, AIns^.A)));
+    iroI64x2Bitmask: ValueSetU32(Reg[AIns^.Dest], I64x2Bitmask(VecAt(Reg, AIns^.A)));
+    iroI64x2ExtendLowI32x4S: I64x2ExtendLowI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtendHighI32x4S: I64x2ExtendHighI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtendLowI32x4U: I64x2ExtendLowI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtendHighI32x4U: I64x2ExtendHighI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI64x2Shl: I64x2Shl(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI64x2ShrS: I64x2ShrS(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI64x2ShrU: I64x2ShrU(VecAt(Reg, AIns^.A), Reg[AIns^.B].U32, VecAt(Reg, AIns^.Dest));
+    iroI64x2Add: I64x2Add(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2Sub: I64x2Sub(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2Mul: I64x2Mul(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2Eq: I64x2Eq(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2Ne: I64x2Ne(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2LtS: I64x2LtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2GtS: I64x2GtS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2LeS: I64x2LeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2GeS: I64x2GeS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtmulLowI32x4S: I64x2ExtmulLowI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtmulHighI32x4S: I64x2ExtmulHighI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtmulLowI32x4U: I64x2ExtmulLowI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI64x2ExtmulHighI32x4U: I64x2ExtmulHighI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+
+    { --- f32x4 / f64x2 arithmetic ------------------------------------ }
+    iroF32x4Abs: F32x4Abs(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4Neg: F32x4Neg(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4Sqrt: F32x4Sqrt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4Add: F32x4Add(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Sub: F32x4Sub(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Mul: F32x4Mul(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Div: F32x4Div(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Min: F32x4Min(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Max: F32x4Max(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Pmin: F32x4Pmin(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4Pmax: F32x4Pmax(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Abs: F64x2Abs(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2Neg: F64x2Neg(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2Sqrt: F64x2Sqrt(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2Add: F64x2Add(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Sub: F64x2Sub(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Mul: F64x2Mul(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Div: F64x2Div(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Min: F64x2Min(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Max: F64x2Max(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Pmin: F64x2Pmin(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2Pmax: F64x2Pmax(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+
+    { --- conversions ------------------------------------------------- }
+    iroI32x4TruncSatF32x4S: I32x4TruncSatF32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4TruncSatF32x4U: I32x4TruncSatF32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4ConvertI32x4S: F32x4ConvertI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4ConvertI32x4U: F32x4ConvertI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4TruncSatF64x2SZero: I32x4TruncSatF64x2SZero(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4TruncSatF64x2UZero: I32x4TruncSatF64x2UZero(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2ConvertLowI32x4S: F64x2ConvertLowI32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF64x2ConvertLowI32x4U: F64x2ConvertLowI32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+
+    { --- relaxed SIMD (deterministic R=0 profile, the interpreter's) - }
+    iroI8x16RelaxedSwizzle: I8x16RelaxedSwizzle(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4RelaxedTruncF32x4S: I32x4RelaxedTruncF32x4S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4RelaxedTruncF32x4U: I32x4RelaxedTruncF32x4U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4RelaxedTruncF64x2S: I32x4RelaxedTruncF64x2S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroI32x4RelaxedTruncF64x2U: I32x4RelaxedTruncF64x2U(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.Dest));
+    iroF32x4RelaxedMadd: F32x4RelaxedMadd(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroF32x4RelaxedNmadd: F32x4RelaxedNmadd(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroF64x2RelaxedMadd: F64x2RelaxedMadd(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroF64x2RelaxedNmadd: F64x2RelaxedNmadd(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroI8x16RelaxedLaneselect: I8x16RelaxedLaneselect(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroI16x8RelaxedLaneselect: I16x8RelaxedLaneselect(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroI32x4RelaxedLaneselect: I32x4RelaxedLaneselect(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroI64x2RelaxedLaneselect: I64x2RelaxedLaneselect(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+    iroF32x4RelaxedMin: F32x4RelaxedMin(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF32x4RelaxedMax: F32x4RelaxedMax(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2RelaxedMin: F64x2RelaxedMin(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroF64x2RelaxedMax: F64x2RelaxedMax(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8RelaxedQ15mulrS: I16x8RelaxedQ15mulrS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI16x8RelaxedDotI8x16I7x16S: I16x8RelaxedDotI8x16I7x16S(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, AIns^.Dest));
+    iroI32x4RelaxedDotI8x16I7x16AddS: I32x4RelaxedDotI8x16I7x16AddS(VecAt(Reg, AIns^.A), VecAt(Reg, AIns^.B), VecAt(Reg, UInt32(AIns^.Imm)), VecAt(Reg, AIns^.Dest));
+
+    { --- IR-only vector ops (simd-spec §2.4) ------------------------- }
+    iroMoveVec:
+      VecAt(Reg, AIns^.Dest)^ := VecAt(Reg, AIns^.A)^;
+    iroSelectVec:
+      { Condition register rides in Imm (ifkSrcRegImm); 16-byte copy. }
+      if Reg[UInt32(AIns^.Imm)].I32 <> 0 then
+        VecAt(Reg, AIns^.Dest)^ := VecAt(Reg, AIns^.A)^
+      else
+        VecAt(Reg, AIns^.Dest)^ := VecAt(Reg, AIns^.B)^;
+    iroGlobalGetVec:
+      VecAt(Reg, AIns^.Dest)^ :=
+        AStore.Globals[Inst.GlobalAddrs[UInt32(AIns^.Imm)]].Vec;
+    iroGlobalSetVec:
+      AStore.Globals[Inst.GlobalAddrs[UInt32(AIns^.Imm)]].Vec :=
+        VecAt(Reg, AIns^.A)^;
+    iroStructGetVec:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        AStore.Heap.StructGetVec(Reg[AIns^.A].Ref, U2, VecAt(Reg, AIns^.Dest));
+      end;
+    iroStructSetVec:
+      begin
+        IrUnpack(AIns^.Imm, U1, U2);
+        AStore.Heap.StructSetVec(Reg[AIns^.A].Ref, U2, VecAt(Reg, AIns^.B));
+      end;
+    iroArrayGetVec:
+      AStore.Heap.ArrayGetVec(Reg[AIns^.A].Ref, Reg[AIns^.B].U32,
+        VecAt(Reg, AIns^.Dest));
+    iroArraySetVec:
+      AStore.Heap.ArraySetVec(Reg[AIns^.Dest].Ref, Reg[AIns^.A].U32,
+        VecAt(Reg, AIns^.B));
+    iroArrayFillVec:
+      AStore.Heap.ArrayFillVec(
+        Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, 0)].Ref,
+        Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, 1)].U32,
+        Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, 3)].U32,
+        VecAt(Reg, IrAuxBlockItem(Fn^.AuxU32, AIns^.A, 2)));
+  end;
+end;
+
+{ The cdecl dispatcher every v128 template calls (store, register-file base,
+  IR-instruction pointer) — the same three-argument shape JitRtDispatch uses,
+  routed to JitDoVec so no memory/table/GC op ever lands in the vector body.
+  cdecl = AAPCS64. }
+procedure JitVecDispatch(const AStore: TWasmStore; const ARegBase: PWasmValue;
+  const AIns: PWasmIrInstr); cdecl;
+begin
+  JitDoVec(AStore, ARegBase, Arm64TopActivation(AStore), AIns);
 end;
 
 { ===================================================================== }
@@ -635,6 +2132,12 @@ end;
 function Arm64AddImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 begin
   Result := $91000000 or ((AImm12 and $FFF) shl 10) or (UInt32(ARn) shl 5)
+    or ARd;
+end;
+
+function Arm64SubImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
+begin
+  Result := $D1000000 or ((AImm12 and $FFF) shl 10) or (UInt32(ARn) shl 5)
     or ARd;
 end;
 
@@ -1052,6 +2555,302 @@ begin
   StX(ABuf, ARM64_REG_T0, AIns.Dest);
 end;
 
+{ --- the call templates (§4.4/§4.5): marshal -> helper -> unmarshal ------
+
+  Layout of the native-stack scratch a call site reserves:
+
+      sp + 0                 .. arg slot 0 .. arg slot (ArgN-1)
+      sp + ArgN*8            .. result slot 0 .. result slot (ResN-1)
+      total rounded up to 16 (AAPCS64 keeps sp 16-byte aligned at all times;
+      SP is also the base register of the marshaling stores, which faults if
+      misaligned)
+
+  The scratch is released BEFORE the epilogue, because the epilogue addresses
+  the prologue's saves off sp. A trap inside the helper never returns here;
+  the trampoline's LongJmp restores sp from the invocation setjmp (ADR-0009),
+  so the un-executed `add sp` is harmless. }
+
+function Arm64Align16(const AValue: UInt32): UInt32;
+begin
+  Result := (AValue + 15) and not UInt32(15);
+end;
+
+{ The scratch frame a call site needs: args then results, never zero (so the
+  two buffer pointers are always valid distinct addresses). }
+function Arm64CallFrameBytes(const AArgSlots, AResultSlots: UInt32): UInt32;
+begin
+  Result := Arm64Align16((AArgSlots + AResultSlots) * ARM64_SLOT_SIZE);
+  if Result = 0 then
+    Result := 16;
+end;
+
+{ Copy the IR's argument registers into the flat scratch, one slot per aux
+  entry — the block already spells a v128's two halves separately, so this is
+  the interpreter's flat block with no vector special case. }
+procedure EmitMarshalArgs(const ABuf: TWasmCodeBuffer;
+  const AAux: TWasmIrAuxU32; const ABlock, ACount: UInt32);
+var
+  I: UInt32;
+begin
+  I := 0;
+  while I < ACount do
+  begin
+    LdX(ABuf, ARM64_REG_T0, IrAuxBlockItem(AAux, ABlock, I));
+    Arm64EmitStrX(ABuf, ARM64_REG_T0, ARM64_REG_SP, I * ARM64_SLOT_SIZE);
+    Inc(I);
+  end;
+end;
+
+{ The mirror image, after the helper returns: flat result slots back into the
+  IR's destination registers. }
+procedure EmitUnmarshalResults(const ABuf: TWasmCodeBuffer;
+  const AAux: TWasmIrAuxU32; const ABlock, ACount, AOffset: UInt32);
+var
+  I: UInt32;
+begin
+  I := 0;
+  while I < ACount do
+  begin
+    Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_SP,
+      AOffset + I * ARM64_SLOT_SIZE);
+    StX(ABuf, ARM64_REG_T0, IrAuxBlockItem(AAux, ABlock, I));
+    Inc(I);
+  end;
+end;
+
+{ iroCall / iroCallIndirect / iroCallRef. x0 is always the store (pinned in
+  x20); the callee selector differs per form (funcidx immediate / packed
+  type+table immediate plus the index operand / the funcref operand), and the
+  last two arguments are always the arg and result scratch pointers. }
+procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
+  const AAux: TWasmIrAuxU32);
+var
+  ArgN, ResN, ArgBytes, FrameBytes: UInt32;
+begin
+  ArgN := IrAuxBlockCount(AAux, AIns.A);
+  ResN := IrAuxBlockCount(AAux, AIns.B);
+  ArgBytes := ArgN * ARM64_SLOT_SIZE;
+  FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
+
+  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+
+  case AIns.Op of
+    iroCall:
+      begin
+        Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
+        ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitCallHelper));
+      end;
+    iroCallIndirect:
+      begin
+        Arm64EmitLoadImm64(ABuf, 1, UInt64(AIns.Imm));
+        { The table-index operand rides in Dest (ifkSrcReg); pass the whole
+          slot and let the helper narrow it by the table's address type. }
+        LdX(ABuf, 2, AIns.Dest);
+        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, 0));
+        ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, ArgBytes));
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitCallIndirectHelper));
+      end;
+  else
+    { iroCallRef: the funcref operand rides in Dest. }
+    LdX(ABuf, 1, AIns.Dest);
+    ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+    ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitCallRefHelper));
+  end;
+
+  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+  EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+end;
+
+{ iroReturnCall / iroReturnCallIndirect / iroReturnCallRef. Same marshal, but
+  the helper only RECORDS the resolved target and its arguments; the body then
+  releases its scratch and runs the epilogue, returning to the trampoline loop
+  which does the frame replacement and re-dispatch. That is what makes the
+  tail call cost no native stack (§4.5, §13 item 5). There is no result
+  unmarshal: the callee's results become this frame's results. }
+procedure EmitReturnCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
+  const AAux: TWasmIrAuxU32);
+var
+  ArgN, FrameBytes: UInt32;
+begin
+  ArgN := IrAuxBlockCount(AAux, AIns.A);
+  FrameBytes := Arm64CallFrameBytes(ArgN, 0);
+
+  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+
+  case AIns.Op of
+    iroReturnCall:
+      begin
+        Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
+        ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+        Arm64EmitLoadImm32(ABuf, 3, ArgN);
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitReturnCallHelper));
+      end;
+    iroReturnCallIndirect:
+      begin
+        Arm64EmitLoadImm64(ABuf, 1, UInt64(AIns.Imm));
+        LdX(ABuf, 2, AIns.Dest);
+        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, 0));
+        Arm64EmitLoadImm32(ABuf, 4, ArgN);
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0,
+          PtrUInt(@JitReturnCallIndirectHelper));
+      end;
+  else
+    { iroReturnCallRef }
+    LdX(ABuf, 1, AIns.Dest);
+    ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+    Arm64EmitLoadImm32(ABuf, 3, ArgN);
+    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitReturnCallRefHelper));
+  end;
+
+  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  Arm64EmitEpilogue(ABuf);
+end;
+
+{ --- Waves 4/5 templates: the uniform helper call (jit-spec §7/§8/§9) -----
+
+  Every memory/table/ref/global/GC op is the SAME three-argument helper call:
+  the store (pinned x20), the register-file base (pinned x19), and a pointer to
+  the IR instruction. `@AIns` is the address of Arm64EmitOp's const-record
+  parameter, which — a const record being passed BY REFERENCE — is the live IR
+  instruction AFn^.Code[i] (borrowed and outliving the code block, jit-spec
+  §3.4), so the dispatcher reads the op's fields exactly as the interpreter
+  does. No operand marshaling and no result unmarshal is emitted: the helper
+  reads and writes the in-memory register file directly through x19. }
+procedure EmitRuntimeOp(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+begin
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));      { x0 := store }
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
+  Arm64EmitLoadImm64(ABuf, 2, PtrUInt(@AIns));        { x2 := @instruction }
+  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitRtDispatch));
+  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+end;
+
+{ Wave 6 — every v128 op is the SAME uniform three-argument helper call, but to
+  JitVecDispatch (jit-spec §10.1): the store (pinned x20), the register-file
+  base (pinned x19), and a pointer to the live IR instruction. The dispatcher
+  reads and writes the in-memory register file directly through x19, so a v128's
+  two adjacent slots need no operand marshaling — the 2-slot handling is
+  inherited from the interpreter's own VecAt addressing. }
+procedure EmitVecOp(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+begin
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));      { x0 := store }
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
+  Arm64EmitLoadImm64(ABuf, 2, PtrUInt(@AIns));        { x2 := @instruction }
+  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitVecDispatch));
+  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+end;
+
+{ br_on_null / br_on_non_null / br_on_cast / br_on_cast_fail. Call the
+  predicate helper (w0 = P: RefIsNull for the null forms, the cast match for
+  the cast forms), branch to the target label on the op's taken polarity, then
+  — on the fall-through (not-taken) edge — thread the refined value into Dest
+  when present, exactly as the interpreter's arms do (interp-spec §3.9). }
+procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+begin
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));      { x0 := store }
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
+  Arm64EmitLoadImm64(ABuf, 2, PtrUInt(@AIns));        { x2 := @instruction }
+  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitRefBranchPredicate));
+  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));               { w0 := P (1/0) }
+  case AIns.Op of
+    iroBrOnNull, iroBrOnCast:
+      { taken when P holds (null / cast succeeds) }
+      EmitCbnzTo(ABuf, 0, AIns.B);
+  else
+    { iroBrOnNonNull / iroBrOnCastFail: taken when P does NOT hold }
+    EmitCbzTo(ABuf, 0, AIns.B);
+  end;
+  { Fall-through = the not-taken edge: refine Dest := A when present. }
+  if AIns.Dest <> IR_NO_REG then
+  begin
+    LdX(ABuf, ARM64_REG_T0, AIns.A);
+    StX(ABuf, ARM64_REG_T0, AIns.Dest);
+  end;
+end;
+
+{ True for a memory/table/reference/global/GC op that JitRtDispatch handles as
+  a plain helper call (the non-branch forms). The v128-typed variants
+  (iroGlobalGetVec/SetVec, iroStructGetVec/SetVec, iroArrayGetVec/SetVec,
+  iroArrayFillVec) are DELIBERATELY absent here — they are Wave 6 and are
+  matched by Arm64VecOp instead, dispatched to JitDoVec (which reads/writes the
+  16-byte register slots), never to JitRtDispatch. }
+function Arm64RuntimeOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    { memory }
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16, iroI64Store32,
+    iroMemorySize, iroMemoryGrow, iroMemoryInit, iroMemoryCopy, iroMemoryFill,
+    iroDataDrop,
+    { table }
+    iroTableGet, iroTableSet, iroTableSize, iroTableGrow, iroTableFill,
+    iroTableInit, iroTableCopy, iroElemDrop,
+    { reference (non-branch) }
+    iroRefNull, iroRefIsNull, iroRefFunc, iroRefEq, iroRefAsNonNull,
+    iroRefTest, iroRefCast,
+    { global }
+    iroGlobalGet, iroGlobalSet,
+    { GC struct / array / i31 }
+    iroStructNew, iroStructNewDefault, iroStructGet, iroStructGetS,
+    iroStructGetU, iroStructSet,
+    iroArrayNew, iroArrayNewDefault, iroArrayNewFixed, iroArrayNewData,
+    iroArrayNewElem, iroArrayGet, iroArrayGetS, iroArrayGetU, iroArraySet,
+    iroArrayLen, iroArrayFill, iroArrayCopy, iroArrayInitData, iroArrayInitElem,
+    iroAnyConvertExtern, iroExternConvertAny,
+    iroRefI31, iroI31GetS, iroI31GetU:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+{ True for a v128 op EmitVecOp / JitDoVec handles (jit-spec §10.1). The vector
+  ops form one contiguous enum run — every wasm $FD op (iroV128Load..
+  iroI32x4RelaxedDotI8x16I7x16AddS) plus the nine IR-only vector ops
+  (iroMoveVec..iroArrayFillVec) — so the predicate is a single range test.
+  This is what stops declining v128 functions (Wave 6): with it, the ONLY ops
+  the backend still declines are the EH ops, which the driver fences off. }
+function Arm64VecOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := (Ord(AOp) >= Ord(iroV128Load))
+    and (Ord(AOp) <= Ord(iroArrayFillVec));
+end;
+
+{ True for a reference-branch op EmitBranchRef handles. }
+function Arm64BranchRefOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    iroBrOnNull, iroBrOnNonNull, iroBrOnCast, iroBrOnCastFail:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function Arm64CallOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    iroCall, iroCallIndirect, iroCallRef,
+    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 function Arm64LeafBinaryOp(const AOp: TWasmIrOp): Boolean;
 begin
   case AOp of
@@ -1121,7 +2920,24 @@ end;
 function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 begin
   Result := Arm64InlineOp(AOp) or Arm64LeafBinaryOp(AOp)
-    or Arm64LeafUnaryOp(AOp);
+    or Arm64LeafUnaryOp(AOp) or Arm64CallOp(AOp)
+    or Arm64RuntimeOp(AOp) or Arm64BranchRefOp(AOp)
+    or Arm64VecOp(AOp);
+end;
+
+function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
+  const AAux: TWasmIrAuxU32): Boolean;
+begin
+  Result := True;
+  case AIns.Op of
+    iroCall, iroCallIndirect, iroCallRef:
+      Result := (IrAuxBlockCount(AAux, AIns.A)
+        + IrAuxBlockCount(AAux, AIns.B)) <= ARM64_MAX_CALL_SLOTS;
+    { A tail call marshals arguments only — the callee's results are this
+      frame's, so there is no result block to size. }
+    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
+      Result := IrAuxBlockCount(AAux, AIns.A) <= ARM64_MAX_CALL_SLOTS;
+  end;
 end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
@@ -1164,6 +2980,11 @@ begin
         Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitTrapKind));
         ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
       end;
+
+    { --- calls (Wave 3) ------------------------------------------------ }
+    iroCall, iroCallIndirect, iroCallRef: EmitCall(ABuf, AIns, AAux);
+    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
+      EmitReturnCall(ABuf, AIns, AAux);
 
     { --- parametric --------------------------------------------------- }
     iroSelect: EmitSelect(ABuf, AIns);
@@ -1277,6 +3098,17 @@ begin
       EmitLeafBinary(ABuf, AIns)
     else if Arm64LeafUnaryOp(AIns.Op) then
       EmitLeafUnary(ABuf, AIns)
+    else if Arm64RuntimeOp(AIns.Op) then
+      { memory / table / reference / global / GC — the uniform helper call
+        (Waves 4-5), reached only after the inlined-op cases above so no op
+        with a dedicated template lands here. }
+      EmitRuntimeOp(ABuf, AIns)
+    else if Arm64BranchRefOp(AIns.Op) then
+      EmitBranchRef(ABuf, AIns)
+    else if Arm64VecOp(AIns.Op) then
+      { v128 via the Wasm.Interp.Vector leaves — the uniform helper call
+        (Wave 6), reached only after every dedicated template above. }
+      EmitVecOp(ABuf, AIns)
     else
       Result := False;
   end;

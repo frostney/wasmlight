@@ -33,6 +33,14 @@ program Wasm.Wast.Runner.Test;
 {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
   {$DEFINE WASM_JIT_ARM64}
 {$ENDIF}
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUX86_64)}
+  {$DEFINE WASM_JIT_X64}
+{$ENDIF}
+{ A JIT backend exists for this target; the --tier=jit assertions that a
+  function actually compiles gate on this, not on a specific arch. }
+{$IF DEFINED(WASM_JIT_ARM64) OR DEFINED(WASM_JIT_X64)}
+  {$DEFINE WASM_JIT_BACKEND}
+{$ENDIF}
 
 uses
   SysUtils,
@@ -1085,7 +1093,7 @@ begin
     Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
-    {$IFDEF WASM_JIT_ARM64}
+    {$IFDEF WASM_JIT_BACKEND}
     { The function was ACTUALLY compiled — CompiledEntry set (§12.2). }
     Expect<Integer>(Run.CompiledFuncCount).ToBe(1);
     {$ELSE}
@@ -1112,7 +1120,7 @@ begin
     Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
-    {$IFDEF WASM_JIT_ARM64}
+    {$IFDEF WASM_JIT_BACKEND}
     { At least the "add" function compiled; it coexists with the interpreted
       "seven" (or, once coverage grows, both compile — still >= 1). }
     Expect<Boolean>(Run.CompiledFuncCount >= 1).ToBe(True);

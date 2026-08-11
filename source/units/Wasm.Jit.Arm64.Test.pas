@@ -52,6 +52,7 @@ type
     procedure TestBranchPlaceholderBits;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWave2;
+    procedure TestCallArityFence;
     procedure TestBranchOffsetRangeGuard;
 
     procedure TestExecAddTemplate;
@@ -111,6 +112,18 @@ begin
   Expect<UInt32>(Arm64AddImmX(21, 20, 8)).ToBe($91002295);
   Expect<UInt32>(Arm64Blr(9)).ToBe($D63F0120);
   Expect<UInt32>(Arm64MovReg(19, 0)).ToBe($AA0003F3);
+
+  { Wave-3 call scratch (jit-spec §4.4). Register field 31 means SP — not the
+    zero register — in the add/sub-immediate and the scaled load/store forms,
+    which is the whole mechanism by which a call site reserves and addresses
+    its marshaling buffer. These four are the load-bearing words. }
+  Expect<UInt32>(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 32))
+    .ToBe($D10083FF);                                    { sub sp,sp,#32 }
+  Expect<UInt32>(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 32))
+    .ToBe($910083FF);                                    { add sp,sp,#32 }
+  Expect<UInt32>(Arm64AddImmX(2, ARM64_REG_SP, 0)).ToBe($910003E2); { mov x2,sp }
+  Expect<UInt32>(Arm64StrX(9, ARM64_REG_SP, 8)).ToBe($F90007E9); { str x9,[sp,#8] }
+  Expect<UInt32>(Arm64LdrX(9, ARM64_REG_SP, 8)).ToBe($F94007E9); { ldr x9,[sp,#8] }
 end;
 
 procedure TArm64Tests.TestFrameWordBits;
@@ -156,12 +169,85 @@ begin
   Expect<Boolean>(Arm64CanEmitOp(iroUnreachable)).ToBe(True);
   Expect<Boolean>(Arm64CanEmitOp(iroI32TruncSatF32S)).ToBe(True);
 
-  { Still declined -> the function runs interpreted (Wave 3/4/5/6). }
-  Expect<Boolean>(Arm64CanEmitOp(iroGlobalGet)).ToBe(False);
-  Expect<Boolean>(Arm64CanEmitOp(iroCall)).ToBe(False);
+  { Wave 3: the whole call family now has templates. }
+  Expect<Boolean>(Arm64CanEmitOp(iroCall)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroCallIndirect)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroCallRef)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroReturnCall)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroReturnCallIndirect)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroReturnCallRef)).ToBe(True);
+
+  { Waves 4 & 5 add the memory / table / reference / global / GC op families as
+    uniform helper-call templates (§7-§9), so they now compile. }
+  Expect<Boolean>(Arm64CanEmitOp(iroI32Load)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32Store8)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroMemoryGrow)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroTableGet)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroGlobalGet)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroGlobalSet)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroRefFunc)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroRefCast)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroBrOnCast)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroStructNew)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroArrayGet)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroRefI31)).ToBe(True);
+
+  { Wave 6 accepts the whole v128 op set — the $FD ops and the IR-only v128
+    variants — so the predicate now covers them too (dispatched via JitDoVec). }
+  Expect<Boolean>(Arm64CanEmitOp(iroV128Load)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroV128Const)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32x4Add)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroF32x4Pmin)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI8x16Shuffle)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroI32x4RelaxedDotI8x16I7x16AddS)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroMoveVec)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroSelectVec)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroGlobalGetVec)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroStructGetVec)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroArrayFillVec)).ToBe(True);
+
+  { The ONLY ops still declined are the EH ops — after Wave 6 a function is
+    compilable iff it contains no exception-handling op (§10.2). }
   Expect<Boolean>(Arm64CanEmitOp(iroThrow)).ToBe(False);
-  Expect<Boolean>(Arm64CanEmitOp(iroI32Load)).ToBe(False);
-  Expect<Boolean>(Arm64CanEmitOp(iroV128Load)).ToBe(False);
+  Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(False);
+end;
+
+{ The instruction-level half of the predicate (jit-spec §4.4): a call site's
+  argument + result marshaling must fit the backend's native-stack scratch, so
+  an over-wide call declines the whole function rather than reserving a frame
+  its `sub sp,#imm12` cannot encode. Non-call instructions always pass. }
+procedure TArm64Tests.TestCallArityFence;
+var
+  Aux: TWasmIrAuxU32;
+  Instr: TWasmIrInstr;
+  I: Integer;
+begin
+  { Two aux blocks, each [count, items...]: block 0 holds 2 argument
+    registers, block 3 holds 1 destination register. }
+  SetLength(Aux, 5);
+  Aux[0] := 2;
+  Aux[1] := 0;
+  Aux[2] := 1;
+  Aux[3] := 1;
+  Aux[4] := 2;
+
+  FillChar(Instr, SizeOf(Instr), 0);
+  Instr.Op := iroCall;
+  Instr.A := 0;
+  Instr.B := 3;
+  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
+
+  Instr.Op := iroI32Add;
+  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
+
+  { An argument block one past the cap declines. }
+  SetLength(Aux, ARM64_MAX_CALL_SLOTS + 2);
+  Aux[0] := ARM64_MAX_CALL_SLOTS + 1;
+  for I := 1 to ARM64_MAX_CALL_SLOTS + 1 do
+    Aux[I] := 0;
+  Instr.Op := iroReturnCall;
+  Instr.A := 0;
+  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(False);
 end;
 
 { The branch-displacement range guard (jit-spec §4.3). Arm64ResolvePatches masks
@@ -388,7 +474,10 @@ begin
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
   Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
   Test('slot byte offset is register*8', TestSlotOffset);
-  Test('predicate covers the Wave-2 op set', TestPredicateCoversWave2);
+  Test('predicate covers waves 2-6 (only EH is declined)',
+    TestPredicateCoversWave2);
+  Test('the call-site arity fence declines an over-wide call',
+    TestCallArityFence);
   Test('branch-offset range guard fits imm19/imm26 at the boundaries',
     TestBranchOffsetRangeGuard);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);

@@ -1,6 +1,118 @@
 # Handoff
 
-Updated: 2026-08-10 (Track I — baseline JIT: foundation + numeric/control spine)
+Updated: 2026-08-10 (Track I — baseline JIT: BOTH backends complete +
+cross-arch proven via an OrbStack amd64 VM)
+
+## Track I is now cross-architecture complete (aarch64 + x86-64)
+
+- **Both JIT backends implemented and differentially proven byte-
+  identical to the interpreter.** aarch64 (Waves 1-6) and x86-64 (Wave 7,
+  Wasm.Jit.X64) each compile the full non-EH op set. `--tier=jit` corpus:
+  arm64 compiled=8562 / x86-64 compiled=8563, both pass=65184 fail=408 —
+  identical to the interpreter, zero divergence, on both arches.
+- **The x86-64 backend is proven in an OrbStack amd64 Linux VM** (the
+  user's idea), Rosetta-accelerated. Setup: `orb create -a amd64 ubuntu
+  wasmx64`; FPC 3.2.2 via apt + lwpt 0.4.0 linux-x64 (checksum-verified)
+  in ~/.local/bin; the mac repo is mounted at the same path, rsync'd to
+  ~/wasmlight (VM-local, excluding build/.git/tmp) to build+test without
+  polluting the mac tree. `lwpt build` → x86-64 ELF; `./build/wasmspec
+  --tier=jit tests/spec/testsuite` is the differential proof.
+  Re-run: `orb -m wasmx64 bash -lc 'export PATH=$HOME/.local/bin:$PATH;
+  rsync -a --exclude build/ --exclude .git/ --exclude .lwpt/tmp/
+  /Users/jstein/Documents/GitHub/wasmlight/ ~/wasmlight/; cd ~/wasmlight;
+  lwpt build && ./build/wasmspec --tier=jit tests/spec/testsuite'`.
+- **The VM immediately caught + we FIXED a real cross-arch bug:**
+  f32/f64.convert_i64_u rounded wrong on x86-64 (FPC's UInt64->float
+  drops the sticky bit for high-bit-set values; arm64 ucvtf is fine). A
+  wasm result must not depend on host arch. Fixed in Wasm.Interp.Numeric
+  with the shift-with-sticky halving sequence (`(A shr 1) or (A and 1)`,
+  convert signed, double); regression tests for the exact conversions.wast
+  522/523/537/538 values, verified on BOTH arches. x86-64 interp corpus
+  is now 65184, matching arm64.
+- **Fixed JIT test portability**: the test programs hardcoded/only-defined
+  WASM_JIT_ARM64, so on x86-64 the differential tests took the "no
+  backend" branch and failed. Now they derive WASM_JIT_X64 too and gate
+  the (arch-agnostic) differential assertions on WASM_JIT_BACKEND
+  (Wasm.Jit.Test.pas, Wasm.Wast.Runner.Test.pas). Arch-specific byte
+  tests stay in Wasm.Jit.{Arm64,X64}.Test gated on their arch.
+- Mac (arm64): 42 suites green, format + frozen clean. VM (x86-64):
+  41 pass / 1 fail — the sole failure is the guard-page-fault forked-
+  child test under ROSETTA (in-process SIGSEGV->siglongjmp->trampoline
+  doesn't survive binary translation; the corpus proves memory access is
+  correct via explicit checks; it passes on real x86-64 CI hardware). Not
+  a bug — a documented emulation limitation of that one test.
+
+## Cross-check bonus: the interpreter is now proven on x86-64 too
+
+Before this, only arm64 was tested. The VM ran the full interpreter
+corpus + unit suites on x86-64 — after the convert fix, everything
+passes identically, confirming the whole runtime (decode/validate/
+instantiate/interpret) is host-arch-independent.
+
+## (prior) Track I aarch64 status: op-complete, corpus-proven
+
+## Track I aarch64 status: op-complete, corpus-proven
+
+- The aarch64 baseline JIT now compiles the **full non-EH op set**
+  (Waves 1-6: numeric/control/variable, calls + O(1) tail calls,
+  memory/table/ref/global, GC, v128-via-leaves). `./build/wasmspec
+  --tier=jit tests/spec/testsuite` → **compiled=8562**, verdicts
+  BYTE-IDENTICAL to `--tier=interp` (65184 pass / 408 fail, zero
+  divergence). 41 suites green, frozen clean.
+- Only exception-handling functions stay interpreted (iroThrow/
+  iroThrowRef declined ops; a function with a try_table handler declined;
+  a conservative fence declines call-bearing functions when the store has
+  tags — see the review findings below).
+
+## Review of Waves 3-6 (Opus-5) — 4 non-corpus-reachable findings
+
+The corpus (8562 funcs, byte-identical) is a comprehensive behavior
+oracle; the review targeted edges it can't reach. Verified CLEAN: the
+call ABI, self/mutual-COMPILED tail calls (genuinely O(1)), publish-first
+during allocating helpers, call_indirect/memory.init trap order, v128
+chokepoint, teardown ordering, epoch pinned-reg survival, iroThrow
+declined independently of the fences. Four findings, ALL non-corpus-
+reachable, a fix wave for them was DRAFTED then HELD (it rewrites the
+verified-clean exception unwind — deferred pending a decision):
+
+1. **(Medium) cross-tier tail loop grows the stack — O(1) violation.**
+   A compiled↔interpreted ALTERNATING tail chain (needs one non-
+   compilable partner, e.g. it has EH) accumulates native frames; the
+   JIT config traps 'call stack exhausted'/crashes where the interpreter
+   keeps it O(1). Same-tier tail chains ARE O(1) (proven, 1e6 loop).
+2. **(Medium, soundness) EH fence residue.** A store that gains its
+   FIRST tag AFTER a call-bearing function was compiled: a throw
+   propagating through that compiled seam frame surfaces as 'uncaught
+   exception' where an outer try_table would catch it. Reachable only via
+   a shared store across modules where a later module adds a tag (the
+   runner shares one store per .wast script; the corpus EH files have
+   tags present before compile, so it doesn't trigger). The compile-time
+   fence is sound for the corpus + the common single-module case.
+3. **(Low) epoch interrupt LOST (not just delayed)** across a nested
+   interpreted callee that never returns: compiled A calls interp B
+   (infinite loop) after an epoch bump predating the call → B's fresh
+   snapshot misses it → interrupt lost under JIT, caught under interp.
+   Fix: don't re-seed Store.EpochSnapshot on nested wasm→wasm re-entry
+   (only at the outermost guest entry — reuse the GC-chain-empty check).
+4. **(Low, latent) @AIns const-record-by-reference** baked as a runtime
+   pointer in the mem/table/GC/v128/branch-ref templates; relies on FPC
+   passing the const record by reference through the forwarding hops.
+   Holds empirically (8562 funcs, fails loudly not silently). Fix: pass
+   the IR index + re-derive @Fn^.Code[i], or a startup assertion.
+
+The clean unifying fix for #1 and #2 is making the JIT seam frames
+TRANSPARENT to the unwind (pop-through) and to the tail-call trampoline
+(cross-tier hand-back via a shared loop), which also retires the
+over-broad tag fence and lets MORE functions compile. It touches the
+Track-H-verified-clean unwind, so it needs care + the full EH corpus as
+a regression net. #3 and #4 are small and low-risk. DECISION PENDING:
+(a) do the seam-transparency hardening, (b) do only #3+#4 (low risk),
+(c) defer all four as documented opt-in-JIT limitations and move to
+Wave 7 (x86-64) or Track J (AOT).
+
+---
+
+## (prior) Handoff — Track I foundation + numeric/control spine
 
 ## Current state
 

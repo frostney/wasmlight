@@ -551,6 +551,18 @@ begin
   Expect<UInt64>(F64ConvertI64S(UInt64(Int64(-1)))).ToBe(F64ToBits(-1.0));
   Expect<UInt64>(F64ConvertI32U(UInt32($FFFFFFFF)))
     .ToBe(F64ToBits(4294967295.0)); { exact in f64 }
+  { Round-to-nearest-even at the top of the u64 range — the sticky-bit
+    cases FPC's x86-64 UInt64->float got wrong (it truncated). All are
+    just past the halfway point, so they must round UP. conversions.wast
+    522/523 (f32), 537/538 (f64). Host-arch-independent after the fix. }
+  Expect<UInt32>(F32ConvertI64U(UInt64($8000008000000001)))
+    .ToBe(UInt32($5F000001)); { 2^63 + 2^39 + 1 -> 0x1.000002p+63 }
+  Expect<UInt32>(F32ConvertI64U(UInt64($FFFFFE8000000001)))
+    .ToBe(UInt32($5F7FFFFF)); { -> 0x1.fffffep+63 }
+  Expect<UInt64>(F64ConvertI64U(UInt64($8000000000000401)))
+    .ToBe(UInt64($43E0000000000001)); { 2^63 + 1025 -> 0x1.0..1p+63 }
+  Expect<UInt64>(F64ConvertI64U(UInt64($8000000000000402)))
+    .ToBe(UInt64($43E0000000000001));
 end;
 
 procedure TInterpNumericTests.TestDemotePromote;

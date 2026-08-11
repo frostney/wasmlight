@@ -34,6 +34,18 @@
   saved x19 (surviving helper calls) and the store in x20 (for the epoch word),
   and the epilogue restores them before returning to JitLeaveFrame.
 
+  WAVE 3 CHANGES EXACTLY TWO THINGS HERE. (1) JitDispatch delegates to the
+  backend's Arm64InvokeCompiled, because a compiled body may end in a
+  `return_call*` and the frame replacement has to run in a LOOP rather than a
+  native call to keep tail calls O(1) (§4.5) — the frame is still built and torn
+  down by the shared Wasm.Interp helpers, so the hand-off contract above is
+  unchanged. (2) The predicate gains two EH fences: a function carrying a
+  `try_table` handler table declines (JitCanCompile), and — where the store has
+  tags at all — a function containing a CALL declines (ForceCompile). Both exist
+  because exception delivery is an explicit unwind over the activation stack
+  that cannot pass a tier-seam frame; see the comment on the second fence for
+  the interp-side change that would retire them.
+
   TIERING. The baseline compiles on-hot in principle (§4.2), but the milestone
   and the differential harness FORCE compilation (§11.1): JitForceCompile
   compiles a named function regardless of CallCount so the diff runner can drive
@@ -67,6 +79,15 @@ unit Wasm.Jit;
 {$ENDIF}
 {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
   {$DEFINE WASM_JIT_ARM64}
+{$ENDIF}
+{$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUX86_64)}
+  {$DEFINE WASM_JIT_X64}
+{$ENDIF}
+{ One symbol for the backend-agnostic driver logic (frame carve, label map,
+  patch resolve, compile predicate): defined when EITHER backend is active, so
+  the shared code selects Arm64* vs X64* calls with a nested backend ifdef. }
+{$IF DEFINED(WASM_JIT_ARM64) OR DEFINED(WASM_JIT_X64)}
+  {$DEFINE WASM_JIT_BACKEND}
 {$ENDIF}
 
 interface
@@ -129,7 +150,7 @@ function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
 
 { The compile predicate and scope fence (§10.3): True only if the active backend
   can emit EVERY op in the function AND the frame fits the backend's addressing.
-  False for any un-templated op (EH, v128, un-implemented ops), an over-large
+  False for any un-templated op (EH ops, un-implemented ops), an over-large
   frame, or an unsupported target — the function then runs interpreted. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
@@ -143,6 +164,9 @@ uses
   {$IFDEF WASM_JIT_ARM64}
   Wasm.Jit.Arm64,
   {$ENDIF}
+  {$IFDEF WASM_JIT_X64}
+  Wasm.Jit.X64,
+  {$ENDIF}
   Wasm.Runtime.Traps;
 
 { --- the compiled-function dispatcher (the JitInvokeCompiled hook) --------
@@ -155,46 +179,90 @@ uses
   over the in-memory register file, marshals the results out. }
 procedure JitDispatch(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
   const AParams: PWasmValue; const AResults: PWasmValue);
+{$IFDEF WASM_JIT_BACKEND}
+begin
+  { Wave 3: the backend owns the invocation, because a compiled body may end
+    in a `return_call*` and the frame replacement + re-dispatch has to happen
+    in a LOOP rather than by a native call to keep tail calls O(1) in native
+    stack (jit-spec §4.5/§5.2). The loop still builds and tears down every
+    frame through the SHARED Wasm.Interp helpers, so the hand-off contract
+    described in this unit's header is unchanged — only the "run it once"
+    became "run it until no tail call is pending". }
+  {$IFDEF WASM_JIT_ARM64}
+  Arm64InvokeCompiled(AStore, AFuncAddr, AParams, AResults);
+  {$ENDIF}
+  {$IFDEF WASM_JIT_X64}
+  X64InvokeCompiled(AStore, AFuncAddr, AParams, AResults);
+  {$ENDIF}
+end;
+{$ELSE}
 var
   Ctx: PWasmInterpContext;
   Base: PWasmValue;
   Entry: TWasmJitCompiledEntry;
 begin
+  { No backend on this target, so nothing is ever compiled and this is
+    unreachable; kept as the plain single-shot hand-off so the unit still
+    compiles and documents the contract. }
   Ctx := InterpContextFor(AStore);
-  { Carve + zero + marshal params + push the GC frame; returns the register-file
-    base. Identical to the interpreter's own entry (both call this). }
   Base := JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults);
-  { Run the native code. It reads params from slots, writes the result
-    register(s), and returns — touching ONLY the in-memory register file, so the
-    frame + GC contract is exactly the interpreter's. }
   Entry := TWasmJitCompiledEntry(AStore.Funcs[AFuncAddr].CompiledEntry);
   Entry(Base, AStore);
-  { Marshal the result slots into AResults and pop the frame (the same
-    result-marshal/pop iroReturn uses on an entry frame). }
   JitLeaveFrame(Ctx);
 end;
+{$ENDIF}
 
 { --- the predicate (§10.3) ----------------------------------------------- }
 
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
-{$IFDEF WASM_JIT_ARM64}
+{$IFDEF WASM_JIT_BACKEND}
 var
   I: Integer;
 {$ENDIF}
 begin
-  {$IFDEF WASM_JIT_ARM64}
+  {$IFDEF WASM_JIT_BACKEND}
   Result := False;
   if AFn = nil then
     Exit;
-  { The frame must fit the backend's scaled-offset addressing (§10.3). }
+  { The frame must fit the backend's slot addressing (§10.3). }
+  {$IFDEF WASM_JIT_ARM64}
   if AFn^.RegisterCount > ARM64_MAX_SLOT then
     Exit;
-  { Every op must have a template. The FIRST un-templated op declines the whole
-    function — the scope fence that keeps the baseline shippable while op
-    coverage is partial. }
+  {$ENDIF}
+  {$IFDEF WASM_JIT_X64}
+  if AFn^.RegisterCount > X64_MAX_SLOT then
+    Exit;
+  {$ENDIF}
+  { EXCEPTION HANDLING IS NEVER COMPILED (§8.3, §10.2) — and a `try_table`
+    emits NO instruction: the validator lowers it to the static handler table
+    hanging off the function, so the per-op predicate cannot see it. Before
+    Wave 3 that was invisible (a handler-bearing function is only interesting
+    when something inside it can throw, which needs a call), but a compiled
+    body consults no handler table, so an exception thrown under it would
+    escape a try_table the interpreter catches. Any handler declines the
+    function, which then runs interpreted and catches exactly as before. }
+  if Length(AFn^.Handlers) > 0 then
+    Exit;
+  { Every op must have a template, and every instruction must be one this
+    template can actually emit (a call site's marshaling has to fit the
+    backend's scratch, §4.4). The FIRST failure declines the whole function —
+    the scope fence that keeps the baseline shippable while op coverage is
+    partial. }
   for I := 0 to High(AFn^.Code) do
+  begin
+    {$IFDEF WASM_JIT_ARM64}
     if not Arm64CanEmitOp(AFn^.Code[I].Op) then
       Exit;
+    if not Arm64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
+      Exit;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    if not X64CanEmitOp(AFn^.Code[I].Op) then
+      Exit;
+    if not X64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
+      Exit;
+    {$ENDIF}
+  end;
   Result := True;
   {$ELSE}
   { No backend for this target: everything runs interpreted (§2.2). AFn is a
@@ -203,24 +271,43 @@ begin
   {$ENDIF}
 end;
 
+{ True if the function contains any call op — the one thing that can put
+  another frame (and therefore a `throw`) beneath a compiled frame. Read by
+  the EH-transparency fence in ForceCompile. }
+function FunctionHasCall(const AFn: PWasmIrFunctionRec): Boolean;
+var
+  I: Integer;
+begin
+  Result := True;
+  for I := 0 to High(AFn^.Code) do
+    case AFn^.Code[I].Op of
+      iroCall, iroCallIndirect, iroCallRef,
+      iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
+        Exit;
+    end;
+  Result := False;
+end;
+
 { --- compilation --------------------------------------------------------- }
 
-{$IFDEF WASM_JIT_ARM64}
+{$IFDEF WASM_JIT_BACKEND}
 { Single-pass template walk (§1.1/§4.3/§5). Emit the Wave-2 frame prologue and
   the epoch snapshot capture (§6), then walk Fn^.Code once emitting each op's
   template. Control flow is resolved with the CodeBuffer label map: one label
   per IR instruction, bound (in order) at the native offset where that
   instruction's code begins, so the branch templates can reference a target
   instruction's label by its IR index directly — forward and backward branches
-  alike. After the walk every label is bound; Arm64ResolvePatches back-patches
-  the branch words while the buffer is still writable; then it is made
-  executable. iroReturn emits the epilogue, so the prologue's saves are always
-  balanced by a restore. }
+  alike. After the walk every label is bound; the backend's ResolvePatches
+  back-patches the branch words while the buffer is still writable; then it is
+  made executable. iroReturn emits the epilogue, so the prologue's saves are
+  always balanced by a restore. The Arm64* / X64* calls are the only
+  backend-specific part; everything else is shared. }
 function JitCompileToBuffer(const AFn: PWasmIrFunctionRec;
   const AEpochOffset, ASnapshotOffset: NativeUInt): TWasmCodeBuffer;
 var
   I: Integer;
   Buf: TWasmCodeBuffer;
+  Emitted: Boolean;
 begin
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
@@ -230,13 +317,25 @@ begin
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
 
+    {$IFDEF WASM_JIT_ARM64}
     Arm64EmitPrologue(Buf);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    X64EmitPrologue(Buf);
+    X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    {$ENDIF}
 
     for I := 0 to High(AFn^.Code) do
     begin
       Buf.BindLabel(TWasmJitLabel(I));
-      if not Arm64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32) then
+      {$IFDEF WASM_JIT_ARM64}
+      Emitted := Arm64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32);
+      {$ENDIF}
+      {$IFDEF WASM_JIT_X64}
+      Emitted := X64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32);
+      {$ENDIF}
+      if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
           internal inconsistency, not a fall-back path. }
         raise EWasmError.CreateFmt(
@@ -244,7 +343,12 @@ begin
           [Ord(AFn^.Code[I].Op)]);
     end;
 
+    {$IFDEF WASM_JIT_ARM64}
     Arm64ResolvePatches(Buf);
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    X64ResolvePatches(Buf);
+    {$ENDIF}
     Buf.MakeExecutable;
   except
     Result.Free;
@@ -302,7 +406,7 @@ end;
 function TWasmJitContext.ForceCompile(const AAddr: TWasmFuncAddr): Boolean;
 var
   Fn: PWasmIrFunctionRec;
-  {$IFDEF WASM_JIT_ARM64}
+  {$IFDEF WASM_JIT_BACKEND}
   N: Integer;
   {$ENDIF}
 begin
@@ -322,8 +426,31 @@ begin
   Fn := IrFunctionFor(AAddr);
   if not JitCanCompile(Fn) then
     Exit;
+  { THE EH-TRANSPARENCY FENCE (§8.3, §10.2), the store-dependent companion to
+    JitCanCompile's handler fence. The interpreter delivers a `throw` by an
+    EXPLICIT unwind over the activation stack, and it stops at the first frame
+    whose RetKind is rtEntry — an invocation boundary it cannot resume past. A
+    compiled frame, and any interpreted callee a compiled frame enters, is such
+    a frame (both are carved by JitEnterFrame / TierInvoke), so an exception
+    raised beneath a compiled frame would surface as 'uncaught exception' where
+    the interpreter would have found a handler further out.
 
-  {$IFDEF WASM_JIT_ARM64}
+    A throw needs a TAG, so a store with no tag instances can raise no wasm
+    exception at all and a compiled frame there can never be unwound through.
+    That is the exact condition checked here: where the store has tags, a
+    function containing a CALL stays interpreted (a call-free compiled body can
+    never have an exception raised beneath it). Everything else compiles.
+
+    RESIDUE, documented rather than hidden: a store that gains its FIRST tag
+    after a call-bearing function was already compiled is not covered, because
+    the check is made once, at compile time. Closing that — and lifting the
+    fence entirely — is one interp-side change: give the tier seam's frames a
+    RetKind the unwind treats as transparent (continue into the caller and
+    re-raise into the enclosing Run) instead of as an invocation boundary. }
+  if (Length(FStore.Tags) > 0) and FunctionHasCall(Fn) then
+    Exit;
+
+  {$IFDEF WASM_JIT_BACKEND}
   N := Length(FBuffers);
   SetLength(FBuffers, N + 1);
   FBuffers[N] := nil;

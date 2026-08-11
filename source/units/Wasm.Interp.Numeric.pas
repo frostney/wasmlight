@@ -1263,7 +1263,21 @@ function F32ConvertI64U(const A: UInt64): UInt32;
 var
   R: Single;
 begin
-  R := A;
+  { FPC's UInt64->Single is correct on aarch64 (ucvtf) but rounds wrong on
+    x86-64 for values with the high bit set (it drops the sticky bit,
+    truncating instead of round-to-nearest-even). A wasm result must not
+    depend on host arch, so convert explicitly: for A < 2^63 the signed
+    conversion is exact-valued and the FPU rounds it correctly; for
+    A >= 2^63 halve with a sticky low bit ((A shr 1) or (A and 1)), convert
+    the now-signed-range value, then double (exact) — the classic
+    round-to-nearest-even u64->float sequence. conversions.wast:522-523. }
+  if A < (UInt64(1) shl 63) then
+    R := Int64(A)
+  else
+  begin
+    R := Int64((A shr 1) or (A and 1));
+    R := R * 2.0;
+  end;
   Result := F32ToBits(R);
 end;
 
@@ -1295,7 +1309,17 @@ function F64ConvertI64U(const A: UInt64): UInt64;
 var
   R: Double;
 begin
-  R := A;
+  { See F32ConvertI64U: FPC's UInt64->Double truncates instead of rounding
+    on x86-64 for A >= 2^63. Convert explicitly with the round-to-nearest-
+    even u64->float sequence so the result is host-arch-independent.
+    conversions.wast:537-538. }
+  if A < (UInt64(1) shl 63) then
+    R := Int64(A)
+  else
+  begin
+    R := Int64((A shr 1) or (A and 1));
+    R := R * 2.0;
+  end;
   Result := F64ToBits(R);
 end;
 
