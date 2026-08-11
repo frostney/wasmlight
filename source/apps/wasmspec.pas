@@ -287,13 +287,15 @@ begin
       'One line per command, including passes and skips');
     FailuresOnlyOpt := Options.AddFlag('failures-only',
       'Only failure lines and the totals');
-    { The tier the corpus runs under (jit-spec §11, §12.3). interp is the tier
-      of record and the default — omitting the flag leaves every number exactly
-      as before. jit registers the baseline JIT and force-compiles every
-      compilable function, turning the corpus into the JIT's conformance net:
-      the tally MUST match an interp run, or a compiled function diverged. }
+    { The tier the corpus runs under (jit-spec §11, §12.3; aot-spec §5.1).
+      interp is the tier of record and the default — omitting the flag leaves
+      every number exactly as before. jit registers the baseline JIT and
+      force-compiles every compilable function; aot AOT-compiles each module,
+      serializes it to a `.waot` buffer, and loads it back through the real
+      artifact round-trip before running the assertions. Either way the tally
+      MUST match an interp run, or a compiled/loaded function diverged. }
     TierOpt := Options.AddString('tier',
-      'Execution tier: interp (default) or jit');
+      'Execution tier: interp (default), jit, or aot');
     HelpOpt := Options.AddFlag('help', 'Show usage');
 
     try
@@ -331,12 +333,14 @@ begin
     begin
       if TierOpt.Value = 'jit' then
         Mode := wtmJit
+      else if TierOpt.Value = 'aot' then
+        Mode := wtmAot
       else if TierOpt.Value = 'interp' then
         Mode := wtmInterp
       else
       begin
         WriteLn(ErrOutput, TOOL_NAME, ': unknown --tier "', TierOpt.Value,
-          '" (expected interp or jit)');
+          '" (expected interp, jit, or aot)');
         ExitCode := 1;
         Exit;
       end;

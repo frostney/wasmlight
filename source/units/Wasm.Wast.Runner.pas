@@ -69,6 +69,7 @@ interface
 uses
   SysUtils,
 
+  Wasm.Aot,
   Wasm.Core,
   Wasm.Decoder,
   Wasm.Interp,
@@ -137,8 +138,25 @@ type
     tally identical to a wtmInterp run over the same scripts, because the
     compiled functions match the spec and the declined rest ARE the interpreter.
     Any divergence is a JIT bug the corpus surfaces as a fail with file:line +
-    expected/actual. }
-  TWastTierMode = (wtmInterp, wtmJit);
+    expected/actual.
+
+    wtmAot is the third tier (aot-spec §5.1). It does NOT re-run the JIT and
+    rename it: per built module it AotCompileModule's every compilable function
+    to position-independent bytes, SERIALIZES them into a `.waot` byte buffer,
+    then in the SAME per-script store AotLoadAndWire's that buffer — re-checking
+    every guard (irVer/arch/abi/checksum/moduleHash), mapping the code
+    executable, and wiring each CompiledEntry from the loaded bytes. So the
+    assertions that follow route through code that made the full
+    serialize -> parse+guard -> map -> execute round-trip, not a live JIT
+    compile — a serialization/format bug would surface here. The artifact is
+    compiled from and re-validated against the SAME IR the runner already
+    decoded+validated (the security boundary is the runner's own decode+validate,
+    aot-spec §2.4/§8), so in-process the moduleHash guard passes trivially while
+    the CODE PATH is the real one. Like wtmJit, a wtmAot run MUST produce a tally
+    identical to wtmInterp, and the loaded-function count MUST equal wtmJit's
+    compiled count (the same predicate compiles the same functions); any
+    divergence is an AOT serialize/load bug. }
+  TWastTierMode = (wtmInterp, wtmJit, wtmAot);
 
   { Which error class a module attempt produced. The hierarchy is
     load-bearing (AGENTS.md): malformed and invalid are different answers.
@@ -341,6 +359,7 @@ begin
   case AMode of
     wtmInterp: Result := 'interp';
     wtmJit: Result := 'jit';
+    wtmAot: Result := 'aot';
   else
     Result := '?';
   end;
@@ -673,10 +692,15 @@ type
     FBuffers: array of TWasmBytes;
     { The tier this script runs. wtmInterp leaves FJit nil and touches
       nothing; wtmJit registers the baseline JIT below and force-compiles each
-      module's functions after it instantiates. }
+      module's functions after it instantiates; wtmAot AOT-compiles each module,
+      serializes it, and loads it back — see FAotJits. }
     FMode: TWastTierMode;
     FJit: TWasmJitContext;           { OWNED, nil unless wtmJit }
-    FCompiledCount: Integer;         { distinct functions actually compiled }
+    { The AOT load contexts, one per module loaded in wtmAot mode (AotLoadAndWire
+      mints a fresh context per load). OWNED — freed before the store, the same
+      teardown discipline as FJit; empty in the other modes. }
+    FAotJits: array of TWasmJitContext;
+    FCompiledCount: Integer;         { distinct functions compiled OR AOT-loaded }
   public
     constructor Create; overload;
     constructor Create(const AMode: TWastTierMode); overload;
@@ -695,6 +719,16 @@ type
       when the compile predicate declines every op the function uses — in which
       case the function stays interpreted, which is correct and identical. }
     procedure ForceCompileInstance(const AInst: TWasmModuleInstance);
+    { In wtmAot mode, AOT-compile AInst's module (AIr freshly validated, ABytes
+      the source it was validated from) to a `.waot` byte buffer, then load that
+      buffer back into the store and wire each compiled function's CompiledEntry
+      from it (aot-spec §5.1). Every guard is re-checked and the code makes the
+      full serialize -> parse -> map round-trip through the real artifact bytes,
+      so this is not a JIT compile in disguise. A no-op in the other modes or if
+      a guard rejects (the functions then stay interpreted, which is correct and
+      shows up as a lower loaded count). }
+    procedure AotLoadInstance(const AInst: TWasmModuleInstance;
+      const AIr: TWasmIrModule; const ABytes: TWasmBytes);
 
     property Engine: TWasmEngine read FEngine;
     property Store: TWasmStore read FStore;
@@ -733,12 +767,14 @@ destructor TWastRunner.Destroy;
 var
   I: Integer;
 begin
-  { The JIT context owns the code blocks and points the store's hook at its
-    dispatcher; free it BEFORE the store (jit-spec §3.4 ownership) so it can
-    clear the CompiledEntry pointers and the hook while the store is still
+  { The JIT/AOT contexts own the code blocks and point the store's hook at the
+    dispatcher; free them BEFORE the store (jit-spec §3.4 ownership) so each can
+    clear its CompiledEntry pointers and the hook while the store is still
     whole. Then the store owns the instances, which borrow the IR, which
     borrows the buffer — so free in that order. }
   FJit.Free;
+  for I := High(FAotJits) downto 0 do
+    FAotJits[I].Free;
   FStore.Free;
   FEngine.Free;
   for I := 0 to High(FIrs) do
@@ -768,6 +804,64 @@ begin
       Continue;
     WasCompiled := FStore.Funcs[Addr].CompiledEntry <> nil;
     if FJit.ForceCompile(Addr) and (not WasCompiled)
+      and (FStore.Funcs[Addr].CompiledEntry <> nil) then
+      Inc(FCompiledCount);
+  end;
+end;
+
+procedure TWastRunner.AotLoadInstance(const AInst: TWasmModuleInstance;
+  const AIr: TWasmIrModule; const ABytes: TWasmBytes);
+var
+  Artifact: TWasmBytes;
+  Jit: TWasmJitContext;
+  LoadRes: TWasmAotLoadResult;
+  I, N: Integer;
+  Addr: TWasmFuncAddr;
+  WasNil: array of Boolean;
+  BytesPtr: PByte;
+begin
+  if (FMode <> wtmAot) or (AInst = nil) then
+    Exit;
+
+  { Record which of the instance's wasm functions are not yet compiled, so a
+    newly-wired one is counted exactly once — mirroring ForceCompileInstance, so
+    the loaded count is comparable to wtmJit's compiled count. An imported
+    function already wired when its own module loaded is not nil here and so is
+    not double-counted. }
+  SetLength(WasNil, Length(AInst.FuncAddrs));
+  for I := 0 to High(AInst.FuncAddrs) do
+  begin
+    Addr := AInst.FuncAddrs[I];
+    WasNil[I] := (Addr <= High(FStore.Funcs))
+      and (FStore.Funcs[Addr].Kind = wfkWasm)
+      and (FStore.Funcs[Addr].CompiledEntry = nil);
+  end;
+
+  if Length(ABytes) > 0 then
+    BytesPtr := @ABytes[0]
+  else
+    BytesPtr := nil;
+
+  { SERIALIZE: stage every compilable function to position-independent bytes and
+    write the real `.waot` container to memory. LOAD: parse it, re-check every
+    guard, map the code executable, and wire each CompiledEntry from the parsed
+    bytes — the full round-trip a deployed artifact takes. A guard rejection
+    leaves Jit nil and the functions interpreted (still correct); the loaded
+    count then drops, which is visible in the tally. }
+  Artifact := AotCompileModuleIr(FStore, AIr, BytesPtr, NativeUInt(Length(ABytes)));
+  Jit := AotLoadAndWireIr(FStore, AIr, BytesPtr, NativeUInt(Length(ABytes)),
+    AInst, Artifact, LoadRes);
+  if Jit = nil then
+    Exit;
+
+  N := Length(FAotJits);
+  SetLength(FAotJits, N + 1);
+  FAotJits[N] := Jit;
+
+  for I := 0 to High(AInst.FuncAddrs) do
+  begin
+    Addr := AInst.FuncAddrs[I];
+    if WasNil[I] and (Addr <= High(FStore.Funcs))
       and (FStore.Funcs[Addr].CompiledEntry <> nil) then
       Inc(FCompiledCount);
   end;
@@ -1363,8 +1457,12 @@ begin
     ARunner.BindNamed(Id, Inst);
   { In wtmJit mode, tier every compilable function of this instance up NOW, so
     the assert_return/assert_trap invokes that follow route through the compiled
-    code via the CompiledEntry seam. A no-op in the default interpreter mode. }
+    code via the CompiledEntry seam. A no-op in the default interpreter mode.
+    In wtmAot mode, AOT-compile the module, serialize it, and load it back —
+    wiring the same functions through the real artifact round-trip instead. Both
+    are no-ops in the other mode. }
   ARunner.ForceCompileInstance(Inst);
+  ARunner.AotLoadInstance(Inst, Ir, Bytes);
   AResult.Status := wrsPass;
 end;
 

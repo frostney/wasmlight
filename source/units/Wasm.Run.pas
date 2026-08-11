@@ -51,8 +51,10 @@ interface
 uses
   SysUtils,
 
+  Wasm.Aot,
   Wasm.Core,
   Wasm.Engine,
+  Wasm.Jit,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values,
   Wasm.Wasi,
@@ -81,10 +83,18 @@ const
 type
   { The outcome of a run: the process exit code and an optional diagnostic the
     caller prints to stderr (never stdout — stdout is the guest's). Diagnostic
-    is '' on a clean run or a plain proc_exit. }
+    is '' on a clean run or a plain proc_exit.
+
+    AotStatus is a PURELY INFORMATIONAL note about the ahead-of-time artifact
+    (aot-spec §4.5): '' when no artifact was offered, otherwise "loaded" or a
+    transparent fall-back reason. It NEVER affects ExitCode — a run with a
+    matching artifact and a run without one produce the same code and output;
+    the artifact only supplies pre-compiled code, re-checked against the fresh
+    decode+validate. The caller may print this at a verbose level. }
   TWasmRunResult = record
     ExitCode: Integer;
     Diagnostic: string;
+    AotStatus: string;
   end;
 
   { --- real-OS stdio streams (embedding-spec.md §4.5) --------------------
@@ -137,6 +147,28 @@ function RunModuleBytes(const ABytes: TWasmBytes;
   loaded module's bytes, ADR-0003). }
 function RunLoadedModule(const ALoaded: TWasmLoadedModule;
   const AConfig: TWasmWasiConfig): TWasmRunResult;
+
+{ The AOT-aware variants (aot-spec §4). AArtifact is a `.waot` byte buffer for
+  the SAME module; before running _start the run tries to AotLoadAndWire it
+  against the FRESHLY decode+validated module, and — only if every guard passes
+  (IR version, arch, ABI fingerprint, self-checksum, module hash) — the exports
+  run through the AOT-loaded native code for instant startup. If the artifact is
+  ABSENT (AArtifact empty), stale, wrong-arch, hash-mismatched, or otherwise
+  rejected, the run TRANSPARENTLY falls back to the interpreter and still runs
+  correctly — a bad artifact only loses the speedup, it never changes the
+  outcome. The SECURITY INVARIANT holds: the module is always decoded+validated
+  regardless of the artifact (that fresh validation is the safety oracle); the
+  artifact only supplies pre-compiled code that is re-checked. The exit code and
+  captured output are IDENTICAL whether AOT-loaded or interpreted; AotStatus
+  records which happened. AArtifact/ALoaded/AConfig are BORROWED. }
+function RunLoadedModuleAot(const ALoaded: TWasmLoadedModule;
+  const AConfig: TWasmWasiConfig; const AArtifact: TWasmBytes): TWasmRunResult;
+
+function RunModuleBytesAot(const ABytes: TWasmBytes;
+  const AConfig: TWasmWasiConfig; const AArtifact: TWasmBytes): TWasmRunResult;
+
+function RunConfiguredModuleAot(const APath: string;
+  const AConfig: TWasmWasiConfig; const AArtifact: TWasmBytes): TWasmRunResult;
 
 implementation
 
@@ -207,20 +239,44 @@ begin
   Result := AInstance.FindExportFunc('_initialize', Fn);
 end;
 
-function RunLoadedModule(const ALoaded: TWasmLoadedModule;
-  const AConfig: TWasmWasiConfig): TWasmRunResult;
+{ A one-line, human-readable note for an AOT load outcome (aot-spec §4.5) — a
+  distinct phrase per reason so a verbose log says exactly why the cache was or
+  was not used. Informational only. }
+function AotLoadResultText(const AResult: TWasmAotLoadResult): string;
+begin
+  case AResult of
+    alrLoaded: Result := 'loaded';
+    alrBadMagic: Result := 'not a .waot file';
+    alrBadFormatVer: Result := 'unsupported artifact container version';
+    alrBadChecksum: Result := 'corrupt or truncated artifact';
+    alrMalformed: Result := 'malformed artifact';
+    alrIrVersionMismatch: Result := 'IR format version mismatch';
+    alrArchMismatch: Result := 'artifact built for a different CPU';
+    alrAbiMismatch: Result := 'artifact built by a different wasmlight build';
+    alrModuleHashMismatch: Result := 'stale artifact for a since-changed module';
+    alrNoBackend: Result := 'no AOT backend on this host';
+  else
+    Result := 'rejected';
+  end;
+end;
+
+function RunLoadedModuleAot(const ALoaded: TWasmLoadedModule;
+  const AConfig: TWasmWasiConfig; const AArtifact: TWasmBytes): TWasmRunResult;
 var
   Engine: TWasmEngine;
   Store: TWasmStore;
   Linker: TWasmLinker;
   Context: TWasmWasiContext;
   Instance: TWasmInstance;
+  Jit: TWasmJitContext;
+  LoadRes: TWasmAotLoadResult;
   Mem: TWasmMemoryRef;
   StartFn: TWasmFunc;
   NoArgs, NoResults: array of TWasmValue;
 begin
   Result.ExitCode := 0;
   Result.Diagnostic := '';
+  Result.AotStatus := '';
 
   if (AConfig = nil) or (ALoaded = nil) then
   begin
@@ -234,6 +290,7 @@ begin
   Linker := nil;
   Context := nil;
   Instance := nil;
+  Jit := nil;
   try
     Engine := TWasmEngine.Create;
     Store := TWasmStore.Create(Engine);
@@ -280,6 +337,27 @@ begin
       else
         Result.Diagnostic := 'not a command module: no "_start" export';
       Exit;
+    end;
+
+    { OPTIONAL AOT LOAD (aot-spec §4). If the caller offered a `.waot` buffer,
+      try to wire its pre-compiled code onto this store's func insts BEFORE the
+      first call — instant startup, no compilation. The module has ALREADY been
+      decode+validated (ALoaded), and THAT is the safety oracle; AotLoadAndWire
+      re-checks the artifact's IR version, arch, ABI, self-checksum, and module
+      hash, and only wires the code when every guard passes. Any rejection (a
+      stale, wrong-arch, hash-mismatched, or corrupt artifact — or none at all)
+      leaves every CompiledEntry nil, so the run falls back TRANSPARENTLY to the
+      interpreter and still produces the identical outcome; only the speedup is
+      lost. Jit (when non-nil) owns the loaded code and MUST be freed before the
+      store (the JIT's teardown discipline), handled in the finally below. }
+    if Length(AArtifact) > 0 then
+    begin
+      Jit := AotLoadAndWire(Store, ALoaded, Instance.Raw, AArtifact, LoadRes);
+      if Jit <> nil then
+        Result.AotStatus := 'aot: ' + AotLoadResultText(LoadRes)
+      else
+        Result.AotStatus := 'aot: fell back to interpreter ('
+          + AotLoadResultText(LoadRes) + ')';
     end;
 
     { Run the module start function (if any), then _start, through the
@@ -333,10 +411,14 @@ begin
     end;
   finally
     { The store owns the underlying instance and borrows the loaded module's
-      bytes (ADR-0003), so it is torn down first; then the context (owns
-      nothing), the linker, and the engine last. The loaded module and the
-      config are the caller's. }
+      bytes (ADR-0003), so the instance handle is dropped first; then the AOT/JIT
+      context, which reaches back into the STILL-WHOLE store to clear the
+      compiled entries and the hook, so it MUST precede the store (jit-spec §3.4
+      teardown order); then the context (owns nothing), the linker, the store,
+      and the engine last. The loaded module and the config are the caller's.
+      Jit is nil when no artifact was offered or none loaded — Free is a no-op. }
     Instance.Free;
+    Jit.Free;
     Context.Free;
     Linker.Free;
     FreeAndNil(Store);
@@ -344,9 +426,16 @@ begin
   end;
 end;
 
-{ Load ABytes (decode + validate) then run. }
-function RunModuleBytes(const ABytes: TWasmBytes;
+{ The plain (no-artifact) core: run purely interpreted. }
+function RunLoadedModule(const ALoaded: TWasmLoadedModule;
   const AConfig: TWasmWasiConfig): TWasmRunResult;
+begin
+  Result := RunLoadedModuleAot(ALoaded, AConfig, nil);
+end;
+
+{ Load ABytes (decode + validate) then run, with an optional AOT artifact. }
+function RunModuleBytesAot(const ABytes: TWasmBytes;
+  const AConfig: TWasmWasiConfig; const AArtifact: TWasmBytes): TWasmRunResult;
 var
   Loaded: TWasmLoadedModule;
 begin
@@ -358,20 +447,29 @@ begin
     begin
       Result.ExitCode := WASM_RUN_EXIT_ERROR;
       Result.Diagnostic := E.ClassName + ': ' + E.Message;
+      Result.AotStatus := '';
       Exit;
     end;
   end;
   try
-    Result := RunLoadedModule(Loaded, AConfig);
+    Result := RunLoadedModuleAot(Loaded, AConfig, AArtifact);
   finally
     Loaded.Free;
   end;
 end;
 
-{ Read APath then run. A file that cannot be read is EWasmDecodeError (the
-  honest class for "there is no module here") — exit 1 with the message. }
-function RunConfiguredModule(const APath: string;
+function RunModuleBytes(const ABytes: TWasmBytes;
   const AConfig: TWasmWasiConfig): TWasmRunResult;
+begin
+  Result := RunModuleBytesAot(ABytes, AConfig, nil);
+end;
+
+{ Read APath then run, with an optional AOT artifact. A file that cannot be read
+  is EWasmDecodeError (the honest class for "there is no module here") — exit 1
+  with the message. The module is always decode+validated here regardless of the
+  artifact (the security oracle); AArtifact only supplies re-checked code. }
+function RunConfiguredModuleAot(const APath: string;
+  const AConfig: TWasmWasiConfig; const AArtifact: TWasmBytes): TWasmRunResult;
 var
   Loaded: TWasmLoadedModule;
 begin
@@ -383,14 +481,21 @@ begin
     begin
       Result.ExitCode := WASM_RUN_EXIT_ERROR;
       Result.Diagnostic := E.ClassName + ': ' + E.Message;
+      Result.AotStatus := '';
       Exit;
     end;
   end;
   try
-    Result := RunLoadedModule(Loaded, AConfig);
+    Result := RunLoadedModuleAot(Loaded, AConfig, AArtifact);
   finally
     Loaded.Free;
   end;
+end;
+
+function RunConfiguredModule(const APath: string;
+  const AConfig: TWasmWasiConfig): TWasmRunResult;
+begin
+  Result := RunConfiguredModuleAot(APath, AConfig, nil);
 end;
 
 end.

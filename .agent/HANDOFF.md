@@ -3,7 +3,73 @@
 Updated: 2026-08-10 (Track I COMPLETE — both backends, cross-arch proven,
 all 4 review findings fixed; Track J AOT is next)
 
-## Track J (AOT) STARTED — Wave 0 (position-independent codegen) DONE
+## THE ENTIRE ROADMAP (Tracks A-J) IS DELIVERED.
+
+Decode (A), validate + register IR (B), the .wast harness + wat assembler
+(C), runtime + precise GC (D), interpreter (E), embedding API + WASI
+preview1 (F), SIMD (G), exception handling (H), baseline JIT — aarch64 +
+x86-64 (I), AOT + artifact cache (J) — all shipped and proven. The
+runtime decodes, validates, instantiates, and EXECUTES the complete core
+wasm 3.0 instruction set on two architectures via three interchangeable,
+observationally-identical tiers (interpreter / baseline JIT / AOT), runs
+real WASI programs under deny-by-default sandboxing, and is conformance-
+tested byte-for-byte against the upstream corpus (65,184 pass) in every
+tier on both arches.
+
+## Track J (AOT) — COMPLETE (all 6 waves, both arches, CLI).
+
+- Wave 5 (the last): `wasmlight aot <mod.wasm> [-o <art.waot>]` compiles
+  ahead of time; `wasmlight run --aot <art.waot> [--] <mod.wasm> [args]`
+  (+ sibling <mod>.waot auto-detect, `--no-aot`) loads it for instant
+  startup, transparently FALLING BACK to interpret if the artifact is
+  absent/stale/wrong-arch/hash-mismatch (a stale artifact never breaks a
+  run, only loses the speedup). --aot composes with --dir/--env/--.
+  wasmbench BenchStartup measures aot-load (~110us) vs jit-warmup
+  (~112us) vs interpret (~220us) — MEASUREMENT ONLY. Also fixed a
+  pre-existing wasmbench BenchDecodeModule crash (strict decoder rejects
+  its synthetic junk sections) → made crash-safe.
+- Verified end-to-end on BOTH arches: `aot` then `run --aot` prints
+  hello / exit 0 identically to a plain run; arm64 44 suites green,
+  format+frozen clean.
+
+## AOT internals (Waves 0-4)
+
+- **AOT works end-to-end on BOTH arches.** compile-a-function-to-machine-
+  code at build time -> serialize to a .waot artifact -> load in a fresh
+  process/store (re-decode+re-validate first) -> map+fill-helper-table+
+  wire CompiledEntry from the artifact bytes -> run. Proven NOT a
+  re-JIT: the load path reads the artifact bytes and the AOT-loaded
+  executable memory is byte-identical to a fresh JIT compile.
+- **Three-tier corpus byte-identical on both arches:**
+  arm64: interp/jit/aot all pass=65184 fail=408; aot loaded=8562.
+  x86-64: interp/jit/aot all pass=65184 fail=408; aot loaded=8563.
+  Wave 4 (x86-64 loader) needed ZERO x86-64-specific work — the Wave-0
+  position-independent code + the arch-generic load path just worked.
+- Units: Wasm.Aot.Artifact (.waot read/write, FNV-1a-128 moduleHash,
+  self-checksum, the guards), Wasm.Aot (AotCompileModule over every
+  function via JitCanCompile + JitStageFunctionBytes; AotLoadAndWire =
+  re-validate -> guard(magic/aotVer/irVer=2/arch/abiFingerprint/
+  moduleHash/checksum, each a distinct reject reason) -> LoadPrecompiled).
+  --tier=aot in Wasm.Wast.Runner + wasmspec (round-trips through real
+  artifact bytes, not JIT-in-disguise).
+- Wave 1 accessors added to Wasm.Jit.pas: JitCompileToBuffer(AFinalize),
+  JitStageFunctionBytes, TWasmJitContext.LoadPrecompiled. CodeBuffer:
+  SnapshotBytes/SnapshotRelocs (Wave 0).
+- SECURITY INVARIANT (coded + honest comment): always re-decode+
+  re-validate; the artifact is used only if all guards match the
+  freshly-validated module. moduleHash binds artifact<->module (a stale/
+  wrong-module artifact is rejected). A same-module tampered blob would
+  run, but artifact + runtime share one trust domain (content-integrity,
+  not authentication) — stated honestly, not oversold.
+
+## AOT remaining: Wave 5 (the CLI + measurement) ONLY
+`wasmlight aot <module.wasm> -o <artifact.waot>` (compile-ahead) and
+`wasmlight run --aot <artifact.waot> [--] <module.wasm> [args]` (load for
+instant startup, fall back to interpret/JIT if the artifact is absent/
+stale/wrong-arch); a wasmbench startup measurement (AOT instant-start vs
+JIT-warmup vs interp) — MEASUREMENT ONLY, never a CI assertion.
+
+## (Wave 0 detail) position-independent codegen
 
 - The AOT prerequisite is complete and cross-arch proven: both JIT
   backends now emit POSITION-INDEPENDENT machine code, so the generated

@@ -128,6 +128,21 @@ type
       backend then cannot emit). }
     function ForceCompile(const AAddr: TWasmFuncAddr): Boolean;
 
+    { Adopt already-compiled, position-independent machine code (aot-spec §4.2
+      step 4/5) instead of compiling it here: map ACode executable through the
+      SAME Wasm.Jit.CodeBuffer W^X + cache-flush path a JIT compile uses, then
+      wire the function's CompiledEntry to the loaded region's entry
+      (EntryPoint + AEntryOffset). The bytes are the artifact's — the AOT loader
+      produced them by serializing exactly what JitCompileToBuffer would have
+      emitted (the unified emitter, §1.2/§1.3), so the loaded code runs through
+      the same JitDispatch / *InvokeCompiled path with the same helper table and
+      pinned IR base. Returns True when wired. Idempotent per address (a second
+      call for an already-compiled addr is a no-op that returns True). Off the
+      backend / on an unsupported host it returns False and the function stays
+      interpreted, which is always correct. }
+    function LoadPrecompiled(const AAddr: TWasmFuncAddr;
+      const ACode: TWasmBytes; const AEntryOffset: NativeUInt): Boolean;
+
     property Store: TWasmStore read FStore;
   end;
 
@@ -160,6 +175,19 @@ function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 { Convenience wrapper: force-compile AAddr on AJit (delegates to the method). }
 function JitForceCompile(const AJit: TWasmJitContext;
   const AAddr: TWasmFuncAddr): Boolean;
+
+{ Compile AFn to its finalized, branch-resolved, POSITION-INDEPENDENT code bytes
+  WITHOUT mapping them executable (aot-spec §3.2) — the blob the AOT artifact
+  writer serializes. Returns the bytes (SnapshotBytes), the entry stub's byte
+  offset within them (0 — the prologue is first), and the frame's slot count
+  (AFn^.RegisterCount, stored so the loader can cross-check the fresh IR). The
+  same compilation driver the JIT uses produces these bytes, so AOT-loaded code
+  IS the JIT's code. Returns nil (declined) off the backend, for a nil function,
+  or when the emitter cannot fit the branch displacements — the caller records
+  the function un-compiled, exactly as the on-hot JIT would decline it. }
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
 
 implementation
 
@@ -299,7 +327,8 @@ end;
   always balanced by a restore. The Arm64* / X64* calls are the only
   backend-specific part; everything else is shared. }
 function JitCompileToBuffer(const AFn: PWasmIrFunctionRec;
-  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt): TWasmCodeBuffer;
+  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
+  const AFinalize: Boolean = True): TWasmCodeBuffer;
 var
   I: Integer;
   Buf: TWasmCodeBuffer;
@@ -351,7 +380,12 @@ begin
     {$IFDEF WASM_JIT_X64}
     X64ResolvePatches(Buf);
     {$ENDIF}
-    Buf.MakeExecutable;
+    { AOT staging (aot-spec §3.2) stops HERE, before MakeExecutable: the caller
+      wants the finalized, branch-resolved, position-independent BYTES
+      (SnapshotBytes), not an executable mapping in this process. The JIT path
+      passes AFinalize = True and maps + flushes as before. }
+    if AFinalize then
+      Buf.MakeExecutable;
   except
     Result.Free;
     raise;
@@ -479,7 +513,100 @@ begin
   {$ENDIF}
 end;
 
+function TWasmJitContext.LoadPrecompiled(const AAddr: TWasmFuncAddr;
+  const ACode: TWasmBytes; const AEntryOffset: NativeUInt): Boolean;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Buf: TWasmCodeBuffer;
+  N: Integer;
+{$ENDIF}
+begin
+  Result := False;
+  if AAddr > High(FStore.Funcs) then
+    Exit;
+  if FStore.Funcs[AAddr].Kind <> wfkWasm then
+    Exit;
+  { Already wired (by an earlier record or a prior JIT compile) — idempotent. }
+  if FStore.Funcs[AAddr].CompiledEntry <> nil then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if Length(ACode) = 0 then
+    Exit;
+  {$IFDEF WASM_JIT_BACKEND}
+  N := Length(FBuffers);
+  SetLength(FBuffers, N + 1);
+  FBuffers[N] := nil;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    { Stage the pre-made bytes and flip to executable through the same W^X +
+      I-cache-flush machinery a JIT compile finalizes with — the ONLY difference
+      from JitCompileToBuffer is the bytes were emitted in another process/run
+      and travel in the artifact rather than being emitted here (aot-spec §4.2). }
+    Buf.EmitBytes(ACode);
+    Buf.MakeExecutable;
+  except
+    Buf.Free;
+    SetLength(FBuffers, N);
+    Exit;
+  end;
+  FBuffers[N] := Buf;
+  { The entry point of the LOADED region, offset to the entry stub. For the
+    unified emitter the prologue is at offset 0, so AEntryOffset is 0; the field
+    is honoured for a future layout that prefixes the code. }
+  FStore.Funcs[AAddr].CompiledEntry :=
+    Pointer(PtrUInt(Buf.EntryPoint) + AEntryOffset);
+
+  N := Length(FCompiledAddrs);
+  SetLength(FCompiledAddrs, N + 1);
+  FCompiledAddrs[N] := AAddr;
+  Result := True;
+  {$ELSE}
+  { No backend on this target: the executable-memory path is unavailable, so the
+    function stays interpreted (AThe tier of record), which is correct. }
+  {$ENDIF}
+end;
+
 { --- registration -------------------------------------------------------- }
+
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Buf: TWasmCodeBuffer;
+{$ENDIF}
+begin
+  Result := nil;
+  AEntryOffset := 0;
+  ARegisterCount := 0;
+  if AFn = nil then
+    Exit;
+  ARegisterCount := AFn^.RegisterCount;
+  {$IFDEF WASM_JIT_BACKEND}
+  try
+    Buf := JitCompileToBuffer(AFn, WasmJitOffsets(AStore).StoreEpoch,
+      WasmJitOffsets(AStore).StoreEpochSnapshot,
+      WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
+  except
+    { A function whose branch displacements overflow the backend's immediate
+      fields is declined (nil), exactly as ForceCompile declines it; it is then
+      recorded un-compiled in the artifact and runs interpreted at load. }
+    on EWasmJitBranchRange do
+      Exit;
+  end;
+  try
+    Result := Buf.SnapshotBytes;
+    AEntryOffset := 0;
+  finally
+    Buf.Free;
+  end;
+  {$ELSE}
+  { No backend: nothing to stage; Result stays nil (declined). }
+  if AStore = nil then;   { AStore/AFn are const params, silence unused hints }
+  {$ENDIF}
+end;
 
 function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
 begin

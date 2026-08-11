@@ -252,6 +252,12 @@ type
     procedure TestJitModeCompilesAndPasses;
     procedure TestJitModeMixedTiersCoexist;
     procedure TestJitTallyIdenticalToInterp;
+
+    { AOT corpus mode (Track J, aot-spec §5.1) }
+    procedure TestAotModeLoadsAndPasses;
+    procedure TestAotModeMixedTiersCoexist;
+    procedure TestAotTallyIdenticalToInterp;
+    procedure TestAotLoadedCountMatchesJit;
   end;
 
 function TWastRunnerTests.StatusSignature(const ASource: string): string;
@@ -1050,6 +1056,7 @@ begin
     in the TOTAL line. }
   Expect<string>(WastTierModeName(wtmInterp)).ToBe('interp');
   Expect<string>(WastTierModeName(wtmJit)).ToBe('jit');
+  Expect<string>(WastTierModeName(wtmAot)).ToBe('aot');
 end;
 
 procedure TWastRunnerTests.TestDefaultModeCompilesNothing;
@@ -1171,6 +1178,148 @@ begin
   end;
 end;
 
+{ --- AOT corpus mode (Track J, aot-spec §5.1) --------------------------- }
+
+procedure TWastRunnerTests.TestAotModeLoadsAndPasses;
+var
+  Run: TWastRunResult;
+begin
+  { Under --tier=aot the compilable function is AOT-compiled, SERIALIZED to a
+    `.waot` buffer, and LOADED back — its CompiledEntry wired from the parsed
+    artifact bytes, not a live JIT compile — before the invokes run. Both
+    assert_returns judge against the SPEC's expecteds, so a pass means the
+    AOT-loaded code matched the interpreter through the full round-trip. On the
+    backend leg exactly one function is loaded; off it the predicate declines and
+    the function interprets (count 0) — still a pass. }
+  Run := RunWastSource(MODULE_JIT_ADD + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 17) (i32.const 25)) '
+    + '(i32.const 42))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const -1) (i32.const 1)) '
+    + '(i32.const 0))', wtmAot);
+  try
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    {$IFDEF WASM_JIT_BACKEND}
+    { The function was ACTUALLY AOT-loaded — CompiledEntry set from the
+      artifact. }
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(1);
+    {$ELSE}
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
+    {$ENDIF}
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
+const
+  { A compilable "add" and a DECLINED "declined" (it owns a try_table handler
+    table, which JitCanCompile — and so AOT — refuses). The try body is empty and
+    nothing throws, so "declined" simply returns 7 interpreted. Under --tier=aot
+    the artifact records "add" compiled and "declined" declined, and the load
+    wires only "add": compiled AOT code and interpreted code coexist behind the
+    seam within one instance, and both invokes return the right value. }
+  MODULE_AOT_MIXED =
+    '(module'
+    + ' (func (export "add") (param i32 i32) (result i32)'
+    + '   (i32.add (local.get 0) (local.get 1)))'
+    + ' (func (export "declined") (result i32)'
+    + '   (block $h (try_table (catch_all $h)))'
+    + '   (i32.const 7)))';
+var
+  Run: TWastRunResult;
+begin
+  Run := RunWastSource(MODULE_AOT_MIXED + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 40) (i32.const 2)) '
+    + '(i32.const 42))' + sLineBreak
+    + '(assert_return (invoke "declined") (i32.const 7))', wtmAot);
+  try
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    {$IFDEF WASM_JIT_BACKEND}
+    { Exactly one function AOT-loaded ("add"); "declined" stays interpreted. }
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(1);
+    {$ELSE}
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
+    {$ENDIF}
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestAotTallyIdenticalToInterp;
+const
+  { The same one-pass/one-deliberately-wrong script the JIT identity test uses:
+    the wrong expected is a SCRIPT mismatch, not an AOT divergence, so both tiers
+    must fail it identically. If the AOT round-trip ever corrupted the code, the
+    pass would flip to a fail here and the tallies would differ. }
+  Src =
+    '(module (func (export "add") (param i32 i32) (result i32)'
+    + ' (i32.add (local.get 0) (local.get 1))))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 1) (i32.const 2)) '
+    + '(i32.const 3))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 1) (i32.const 2)) '
+    + '(i32.const 999))';
+var
+  InterpRun, AotRun: TWastRunResult;
+begin
+  InterpRun := RunWastSource(Src, wtmInterp);
+  try
+    AotRun := RunWastSource(Src, wtmAot);
+    try
+      { Verdict-for-verdict identity: the AOT round-trip changed no outcome. }
+      Expect<Integer>(AotRun.Tally.Pass).ToBe(InterpRun.Tally.Pass);
+      Expect<Integer>(AotRun.Tally.Fail).ToBe(InterpRun.Tally.Fail);
+      Expect<Integer>(AotRun.Tally.Skip).ToBe(InterpRun.Tally.Skip);
+      Expect<Integer>(AotRun.Tally.Staged).ToBe(InterpRun.Tally.Staged);
+      Expect<Integer>(InterpRun.Tally.Pass).ToBe(2);
+      Expect<Integer>(InterpRun.Tally.Fail).ToBe(1);
+    finally
+      AotRun.Free;
+    end;
+  finally
+    InterpRun.Free;
+  end;
+end;
+
+procedure TWastRunnerTests.TestAotLoadedCountMatchesJit;
+const
+  Src =
+    '(module'
+    + ' (func (export "add") (param i32 i32) (result i32)'
+    + '   (i32.add (local.get 0) (local.get 1)))'
+    + ' (func (export "seven") (result i32) (i32.const 7)))' + sLineBreak
+    + '(assert_return (invoke "add" (i32.const 40) (i32.const 2)) '
+    + '(i32.const 42))' + sLineBreak
+    + '(assert_return (invoke "seven") (i32.const 7))';
+var
+  JitRun, AotRun: TWastRunResult;
+begin
+  { The same predicate compiles the same functions, so the number AOT LOADS must
+    equal the number the JIT COMPILES — the corpus-wide loaded=N == compiled=N
+    claim (aot-spec §5.1) at unit scale. }
+  JitRun := RunWastSource(Src, wtmJit);
+  try
+    AotRun := RunWastSource(Src, wtmAot);
+    try
+      Expect<Integer>(AotRun.CompiledFuncCount).ToBe(JitRun.CompiledFuncCount);
+      {$IFDEF WASM_JIT_BACKEND}
+      { Both "add" and "seven" are compilable, so the count is a positive 2 on
+        the backend leg — not a vacuous 0 = 0. }
+      Expect<Integer>(AotRun.CompiledFuncCount).ToBe(2);
+      {$ELSE}
+      Expect<Integer>(AotRun.CompiledFuncCount).ToBe(0);
+      {$ENDIF}
+    finally
+      AotRun.Free;
+    end;
+  finally
+    JitRun.Free;
+  end;
+end;
+
 procedure TWastRunnerTests.SetupTests;
 begin
   Test('assert_malformed passes on a prefix match',
@@ -1272,6 +1421,15 @@ begin
     TestJitModeMixedTiersCoexist);
   Test('the --tier=jit tally is identical to the interpreter tally',
     TestJitTallyIdenticalToInterp);
+
+  Test('--tier=aot serializes, loads, and passes against the spec',
+    TestAotModeLoadsAndPasses);
+  Test('--tier=aot lets AOT-loaded and interpreted functions coexist',
+    TestAotModeMixedTiersCoexist);
+  Test('the --tier=aot tally is identical to the interpreter tally',
+    TestAotTallyIdenticalToInterp);
+  Test('the --tier=aot loaded count equals the --tier=jit compiled count',
+    TestAotLoadedCountMatchesJit);
 end;
 
 begin

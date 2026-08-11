@@ -37,8 +37,11 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Wasm.Aot,
   Wasm.Core,
+  Wasm.Engine,
   Wasm.Run,
+  Wasm.Runtime.Store,
   Wasm.Wasi,
   Wasm.Wat.Assembler;
 
@@ -102,6 +105,33 @@ begin
     + IntToStr(ACode) + '))))';
 end;
 
+{ Build a REAL `.waot` artifact for ABYTES on THIS host (aot-spec §3): decode +
+  validate the module, then AOT-compile every compilable function to the
+  fixed-width artifact buffer. The moduleHash is over ABytes, so running the
+  SAME ABytes through the AOT-aware run matches the hash and the code is used;
+  a different module's bytes mismatch and fall back. Hermetic — no file, no
+  network — the whole round-trip is in memory. }
+function BuildArtifactFromBytes(const ABytes: TWasmBytes): TWasmBytes;
+var
+  Loaded: TWasmLoadedModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+begin
+  Loaded := nil;
+  Engine := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(ABytes);
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Result := AotCompileModule(Store, Loaded);
+  finally
+    FreeAndNil(Store);
+    Engine.Free;
+    Loaded.Free;
+  end;
+end;
+
 type
   TRunTests = class(TTestSuite)
   private
@@ -117,6 +147,9 @@ type
     function RunFile(const APath: string): TWasmRunResult;
     { Everything the default stdout buffer captured, as a string. }
     function CapturedStdout: string;
+    { The captured stdout of an arbitrary config (for a side-by-side compare of
+      an interpreted run against an AOT-loaded one). }
+    function StdoutOf(const AConfig: TWasmWasiConfig): string;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -133,6 +166,15 @@ type
     procedure TestMissingMemoryIsError;
     procedure TestNonWasiImportFailsToLink;
     procedure TestGarbageBytesIsError;
+
+    { AOT-load (aot-spec §4): the outcome is identical whether a module runs
+      interpreted or through a matching AOT artifact, and a stale/garbage/absent
+      artifact falls back transparently and still runs. }
+    procedure TestAotMatchingArtifactMatchesInterpreter;
+    procedure TestAotProcExitWithArtifact;
+    procedure TestAotStaleArtifactFallsBack;
+    procedure TestAotGarbageArtifactFallsBack;
+    procedure TestAotNoArtifactInterprets;
   end;
 
 procedure TRunTests.BeforeEach;
@@ -159,12 +201,17 @@ begin
 end;
 
 function TRunTests.CapturedStdout: string;
+begin
+  Result := StdoutOf(FConfig);
+end;
+
+function TRunTests.StdoutOf(const AConfig: TWasmWasiConfig): string;
 var
   Bytes: TBytes;
   Index: Integer;
 begin
   Result := '';
-  Bytes := TWasmWasiBufferStream(FConfig.Stdout).WrittenBytes;
+  Bytes := TWasmWasiBufferStream(AConfig.Stdout).WrittenBytes;
   SetLength(Result, Length(Bytes));
   for Index := 0 to High(Bytes) do
     Result[Index + 1] := Chr(Bytes[Index]);
@@ -280,6 +327,132 @@ begin
   Expect<Boolean>(Length(Res.Diagnostic) > 0).ToBe(True);
 end;
 
+{ --- AOT-load tests ------------------------------------------------------ }
+
+procedure TRunTests.TestAotMatchingArtifactMatchesInterpreter;
+var
+  Bytes, Artifact: TWasmBytes;
+  ResPlain, ResAot: TWasmRunResult;
+  PlainCfg: TWasmWasiConfig;
+  PlainOut: string;
+begin
+  { The hello command, and a real `.waot` compiled for it on this host. }
+  Bytes := AssembleWatText(HELLO_WAT);
+  Artifact := BuildArtifactFromBytes(Bytes);
+
+  { Baseline: the same module run purely interpreted. }
+  PlainCfg := TWasmWasiConfig.Create;
+  try
+    ResPlain := RunModuleBytes(Bytes, PlainCfg);
+    PlainOut := StdoutOf(PlainCfg);
+  finally
+    PlainCfg.Free;
+  end;
+
+  { With the matching artifact: the exports run through AOT-loaded native code,
+    yet the outcome — exit code AND stdout — is IDENTICAL to the interpreted
+    run. That equivalence is the whole point of the tier. }
+  FConfig := TWasmWasiConfig.Create;
+  ResAot := RunModuleBytesAot(Bytes, FConfig, Artifact);
+
+  Expect<Integer>(ResAot.ExitCode).ToBe(ResPlain.ExitCode);
+  Expect<Boolean>(CapturedStdout = PlainOut).ToBe(True);
+  Expect<Boolean>(CapturedStdout = 'hello' + #10).ToBe(True);
+  { An artifact was offered and processed: the hash/arch/abi all match (built on
+    this host for these exact bytes), so on a backend host it loads; the status
+    is non-empty either way. }
+  Expect<Boolean>(Length(ResAot.AotStatus) > 0).ToBe(True);
+end;
+
+procedure TRunTests.TestAotProcExitWithArtifact;
+var
+  Bytes, Artifact: TWasmBytes;
+  ResPlain, ResAot: TWasmRunResult;
+  PlainCfg: TWasmWasiConfig;
+begin
+  { A compute-then-proc_exit(42) command: _start is AOT-compilable, so this
+    exercises the exit-code path through the AOT tier. }
+  Bytes := AssembleWatText(ExitWat(42));
+  Artifact := BuildArtifactFromBytes(Bytes);
+
+  PlainCfg := TWasmWasiConfig.Create;
+  try
+    ResPlain := RunModuleBytes(Bytes, PlainCfg);
+  finally
+    PlainCfg.Free;
+  end;
+
+  FConfig := TWasmWasiConfig.Create;
+  ResAot := RunModuleBytesAot(Bytes, FConfig, Artifact);
+
+  Expect<Integer>(ResPlain.ExitCode).ToBe(42);
+  Expect<Integer>(ResAot.ExitCode).ToBe(42);
+end;
+
+procedure TRunTests.TestAotStaleArtifactFallsBack;
+var
+  HelloBytes, ExitBytes, WrongArtifact: TWasmBytes;
+  Res: TWasmRunResult;
+begin
+  { An artifact compiled for a DIFFERENT module (the proc_exit command) is
+    offered when running the hello command. Its moduleHash does not match the
+    hello bytes, so the load is rejected and the run falls back to the
+    interpreter — hello still prints "hello\n" and exits 0. A stale artifact
+    only loses the speedup; it never breaks the run or runs wrong-module code. }
+  HelloBytes := AssembleWatText(HELLO_WAT);
+  ExitBytes := AssembleWatText(ExitWat(9));
+  WrongArtifact := BuildArtifactFromBytes(ExitBytes);
+
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunModuleBytesAot(HelloBytes, FConfig, WrongArtifact);
+
+  Expect<Integer>(Res.ExitCode).ToBe(0);
+  Expect<Boolean>(CapturedStdout = 'hello' + #10).ToBe(True);
+  Expect<Boolean>(Pos('fell back', Res.AotStatus) > 0).ToBe(True);
+end;
+
+procedure TRunTests.TestAotGarbageArtifactFallsBack;
+var
+  Bytes, Garbage: TWasmBytes;
+  Res: TWasmRunResult;
+begin
+  { Bytes that are not a `.waot` at all (bad magic): the guard rejects them and
+    the run falls back to the interpreter, still correct. }
+  Bytes := AssembleWatText(HELLO_WAT);
+  SetLength(Garbage, 8);
+  Garbage[0] := Ord('n');
+  Garbage[1] := Ord('o');
+  Garbage[2] := Ord('p');
+  Garbage[3] := Ord('e');
+  Garbage[4] := 0;
+  Garbage[5] := 1;
+  Garbage[6] := 2;
+  Garbage[7] := 3;
+
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunModuleBytesAot(Bytes, FConfig, Garbage);
+
+  Expect<Integer>(Res.ExitCode).ToBe(0);
+  Expect<Boolean>(CapturedStdout = 'hello' + #10).ToBe(True);
+  Expect<Boolean>(Pos('fell back', Res.AotStatus) > 0).ToBe(True);
+end;
+
+procedure TRunTests.TestAotNoArtifactInterprets;
+var
+  Bytes: TWasmBytes;
+  Res: TWasmRunResult;
+begin
+  { No artifact offered (empty buffer): the run is pure interpreter, exactly as
+    before AOT existed, and AotStatus stays empty (nothing was attempted). }
+  Bytes := AssembleWatText(HELLO_WAT);
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunModuleBytesAot(Bytes, FConfig, nil);
+
+  Expect<Integer>(Res.ExitCode).ToBe(0);
+  Expect<Boolean>(CapturedStdout = 'hello' + #10).ToBe(True);
+  Expect<Boolean>(Res.AotStatus = '').ToBe(True);
+end;
+
 procedure TRunTests.SetupTests;
 begin
   Test('hello-world: a WASI command writes "hello\n" to captured stdout, exit 0',
@@ -297,6 +470,16 @@ begin
     TestNonWasiImportFailsToLink);
   Test('garbage bytes are a decode error, exit 1, not a crash',
     TestGarbageBytesIsError);
+  Test('a matching AOT artifact gives the SAME exit code + stdout as interpreted',
+    TestAotMatchingArtifactMatchesInterpreter);
+  Test('proc_exit(42) through a matching AOT artifact still maps to exit 42',
+    TestAotProcExitWithArtifact);
+  Test('a stale AOT artifact (wrong module) falls back and still runs correctly',
+    TestAotStaleArtifactFallsBack);
+  Test('a garbage AOT artifact falls back and still runs correctly',
+    TestAotGarbageArtifactFallsBack);
+  Test('no AOT artifact runs purely interpreted, AotStatus empty',
+    TestAotNoArtifactInterprets);
 end;
 
 begin

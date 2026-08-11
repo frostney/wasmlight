@@ -23,17 +23,81 @@ uses
   CLI.Options,
   CLI.Subcommands,
 
+  Wasm.Aot,
+  Wasm.Aot.Artifact,
   Wasm.Core,
   Wasm.Decoder,
+  Wasm.Engine,
   Wasm.Ir,
   Wasm.Module,
   Wasm.Run,
+  Wasm.Runtime.Store,
   Wasm.Validator,
   Wasm.Wasi;
 
 function ErrPrefix(const ASubcommand: string): string; inline;
 begin
   Result := PROGRAM_NAME + ' ' + ASubcommand + ': ';
+end;
+
+{ --- byte file IO (aot artifacts) --------------------------------------- }
+
+{ Write ABytes verbatim to APath (the `.waot` writer's output; the artifact is
+  a fixed-width binary blob, so it goes out byte-for-byte). Raises on an IO
+  error, which the `aot` command reports as a failure. }
+procedure WriteBytesToFile(const APath: string; const ABytes: TWasmBytes);
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if Length(ABytes) > 0 then
+      Stream.WriteBuffer(ABytes[0], Length(ABytes));
+  finally
+    Stream.Free;
+  end;
+end;
+
+{ Read APath into ABytes. Returns False (never raises) when the file is absent
+  or unreadable — the `run` path treats that as "no artifact" and falls back to
+  the interpreter transparently, so a missing sibling `.waot` is never an error. }
+function TryReadBytesFromFile(const APath: string;
+  out ABytes: TWasmBytes): Boolean;
+var
+  Stream: TFileStream;
+begin
+  ABytes := nil;
+  Result := False;
+  if not FileExists(APath) then
+    Exit;
+  try
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+    try
+      SetLength(ABytes, Stream.Size);
+      if Stream.Size > 0 then
+        Stream.ReadBuffer(ABytes[0], Stream.Size);
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: EStreamError do
+    begin
+      ABytes := nil;
+      Result := False;
+    end;
+  end;
+end;
+
+{ The human-readable name of an AOT target-arch id (Wasm.Aot.Artifact). }
+function AotArchName(const AArch: Byte): string;
+begin
+  case AArch of
+    WAOT_ARCH_AARCH64: Result := 'aarch64';
+    WAOT_ARCH_X64: Result := 'x86-64';
+  else
+    Result := 'unknown';
+  end;
 end;
 
 { --- inspect ------------------------------------------------------------- }
@@ -237,6 +301,109 @@ begin
   end;
 end;
 
+{ --- aot ----------------------------------------------------------------- }
+
+{ `wasmlight aot <module.wasm> [-o <artifact.waot>]` — compile every compilable
+  function of a module AHEAD OF TIME into a `.waot` artifact for instant startup
+  (aot-spec §3, §7 Wave 5). It decode+validates the module (the same error
+  classes as `validate` — a module that does not decode or validate is not
+  compilable and the command exits non-zero, never a stale artifact), then drives
+  the HOST backend over every function (JitCanCompile decides; declined functions
+  are recorded and run interpreted at load), and writes the fixed-width artifact.
+
+  The artifact is ARCH-SPECIFIC: it carries the host CPU's machine code and is
+  rejected by `run` on a different CPU (a transparent fall-back, never a wrong
+  run). -o names the output; omitted, it defaults to a sibling `<module>.waot`. }
+function HandleAot(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  OutputOpt: TStringOption;
+  ModulePath, OutPath: string;
+  Loaded: TWasmLoadedModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Compiled, Declined, I: Integer;
+begin
+  if APositionals.Count < 1 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('aot'), 'expected <module.wasm>');
+    Exit(1);
+  end;
+  ModulePath := APositionals[0];
+
+  OutputOpt := TStringOption(AOptions[0]);
+  if OutputOpt.Present and (OutputOpt.Value <> '') then
+    OutPath := OutputOpt.Value
+  else
+    OutPath := ChangeFileExt(ModulePath, '.waot');
+
+  Loaded := nil;
+  Engine := nil;
+  Store := nil;
+  try
+    try
+      { Decode + validate on the source bytes — the same trust boundary a load
+        re-runs. EWasmDecodeError vs EWasmValidationError stay distinct, exactly
+        as `validate` reports them. }
+      Loaded := LoadModuleFromFile(ModulePath);
+    except
+      on E: EWasmError do
+      begin
+        WriteLn(ErrOutput, ErrPrefix('aot'), ModulePath, ': ', E.ClassName,
+          ': ', E.Message);
+        Exit(1);
+      end;
+      on E: Exception do
+      begin
+        WriteLn(ErrOutput, ErrPrefix('aot'), ModulePath, ': internal error: ',
+          E.ClassName, ': ', E.Message);
+        Exit(1);
+      end;
+    end;
+
+    { A store supplies the record-layout offsets the code bakes; it need not be
+      instantiated, and no interpreter/JIT need be registered just to stage. }
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Artifact := AotCompileModule(Store, Loaded);
+
+    try
+      WriteBytesToFile(OutPath, Artifact);
+    except
+      on E: EStreamError do
+      begin
+        WriteLn(ErrOutput, ErrPrefix('aot'), 'cannot write "', OutPath, '": ',
+          E.Message);
+        Exit(1);
+      end;
+    end;
+
+    { Re-parse the written bytes to report the truth of what was compiled
+      (a function can be declined LATE by the backend, invisible to a pre-count).
+      A well-formed artifact we just wrote always parses. }
+    Compiled := 0;
+    Declined := 0;
+    if ParseAotArtifact(Artifact, Parsed) = aprOk then
+      for I := 0 to High(Parsed.Funcs) do
+        if Parsed.Funcs[I].Compiled then
+          Inc(Compiled)
+        else
+          Inc(Declined);
+
+    WriteLn(OutPath, ': aot artifact for ', AotArchName(AotHostArch), ', ',
+      Compiled, '/', Compiled + Declined, ' function(s) compiled (', Declined,
+      ' declined), IR format version ', Loaded.Ir.FormatVersion, ', ',
+      Length(Artifact), ' bytes');
+    Result := 0;
+  finally
+    FreeAndNil(Store);
+    Engine.Free;
+    Loaded.Free;
+  end;
+end;
+
 { --- run ----------------------------------------------------------------- }
 
 { `wasmlight run [--dir GUEST=HOST]... [--env KEY=VALUE]... <module.wasm>
@@ -292,6 +459,7 @@ end;
   guest argument). }
 function ParseRunArgs(const ADirOpt, AEnvOpt: TRepeatableOption;
   out AModulePath: string; const AGuestArgs: TStringList;
+  out AAotPath: string; out ANoAot: Boolean;
   out AWantsHelp: Boolean; out AError: string): Boolean;
 var
   I, EqPos: Integer;
@@ -299,6 +467,8 @@ var
   HasEquals, SepSeen, ModuleFound: Boolean;
 begin
   AModulePath := '';
+  AAotPath := '';
+  ANoAot := False;
   AError := '';
   AWantsHelp := False;
   SepSeen := False;
@@ -350,7 +520,14 @@ begin
           Value := '';
           HasEquals := False;
         end;
-        if (Name = 'dir') or (Name = 'env') then
+        { --no-aot is a flag: never load an artifact for this run. }
+        if Name = 'no-aot' then
+        begin
+          ANoAot := True;
+          Inc(I);
+          Continue;
+        end;
+        if (Name = 'dir') or (Name = 'env') or (Name = 'aot') then
         begin
           if not HasEquals then
           begin
@@ -364,8 +541,13 @@ begin
           end;
           if Name = 'dir' then
             ADirOpt.Apply(Value)
+          else if Name = 'env' then
+            AEnvOpt.Apply(Value)
           else
-            AEnvOpt.Apply(Value);
+            { --aot <path>: load THIS artifact (last one wins). The path is
+              captured directly here, like the module path — the pre-scan owns
+              the wasmlight/guest split (embedding-spec.md §4.2). }
+            AAotPath := Value;
           Inc(I);
           Continue;
         end;
@@ -401,6 +583,9 @@ var
   Argv: array of string;
   RunRes: TWasmRunResult;
   I: Integer;
+  AotPath, SiblingPath, AotNote: string;
+  NoAot, AotExplicit: Boolean;
+  ArtifactBytes: TWasmBytes;
 begin
   Sub := ARegistry.Find('run');
   DirOpt := TRepeatableOption(Sub.Options[0]);
@@ -408,8 +593,8 @@ begin
 
   GuestArgs := TStringList.Create;
   try
-    if not ParseRunArgs(DirOpt, EnvOpt, ModulePath, GuestArgs, WantsHelp,
-      ErrMsg) then
+    if not ParseRunArgs(DirOpt, EnvOpt, ModulePath, GuestArgs, AotPath, NoAot,
+      WantsHelp, ErrMsg) then
     begin
       WriteLn(ErrOutput, ErrPrefix('run'), ErrMsg);
       Exit(1);
@@ -458,11 +643,48 @@ begin
       for I := 0 to EnvOpt.Values.Count - 1 do
         Config.AddEnv(EnvOpt.Values[I]);
 
-      RunRes := RunConfiguredModule(ModulePath, Config);
+      { Resolve the optional AOT artifact (aot-spec §4, §8). --no-aot suppresses
+        it entirely. An explicit --aot names the artifact; otherwise a sibling
+        `<module>.waot` is auto-detected if present. A missing/unreadable
+        artifact is NEVER fatal — the module always decode+validates and runs,
+        AOT only saves the compile. The module is re-validated by Wasm.Run
+        regardless of the artifact (the security oracle); the artifact only
+        supplies pre-compiled code that is re-checked against that validation. }
+      ArtifactBytes := nil;
+      AotNote := '';
+      AotExplicit := AotPath <> '';
+      if not NoAot then
+      begin
+        if AotExplicit then
+        begin
+          if not TryReadBytesFromFile(AotPath, ArtifactBytes) then
+            AotNote := 'aot: cannot read artifact "' + AotPath
+              + '", running interpreted';
+        end
+        else
+        begin
+          SiblingPath := ChangeFileExt(ModulePath, '.waot');
+          if FileExists(SiblingPath) then
+            TryReadBytesFromFile(SiblingPath, ArtifactBytes);
+        end;
+      end;
+
+      RunRes := RunConfiguredModuleAot(ModulePath, Config, ArtifactBytes);
       { Diagnostics go to stderr, never stdout — stdout is the guest's
         (embedding-spec.md §6). }
       if RunRes.Diagnostic <> '' then
         WriteLn(ErrOutput, ErrPrefix('run'), RunRes.Diagnostic);
+      { The AOT note is verbose feedback: printed only when the user OPTED IN
+        with an explicit --aot (so they asked to know whether the cache loaded),
+        never for a silent sibling auto-detect, keeping ordinary `run` output
+        clean. It never affects the exit code. }
+      if AotExplicit then
+      begin
+        if AotNote <> '' then
+          WriteLn(ErrOutput, ErrPrefix('run'), AotNote)
+        else if RunRes.AotStatus <> '' then
+          WriteLn(ErrOutput, ErrPrefix('run'), RunRes.AotStatus);
+      end;
       Result := RunRes.ExitCode;
     finally
       Config.Free;
@@ -539,7 +761,8 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   Registry: TSubcommandRegistry;
-  InspectOpts, ValidateOpts, RunOpts: TOptionArray;
+  InspectOpts, ValidateOpts, RunOpts, AotOpts: TOptionArray;
+  AotOutputOpt: TStringOption;
 begin
   { A `run` invocation forwards its own argv tail to the guest, where `-v` is a
     guest flag, not a request for wasmlight's version. }
@@ -564,19 +787,39 @@ begin
       '<module.wasm> [<module.wasm>...]',
       @HandleValidate, ValidateOpts));
 
+    { `aot` compiles the module ahead of time into a `.waot` artifact for instant
+      startup (aot-spec §3). -o/--output names the artifact; omitted, a sibling
+      `<module>.waot`. A normal subcommand — dispatched through Registry.Run. }
+    SetLength(AotOpts, 1);
+    AotOutputOpt := TStringOption.Create('output',
+      'write the artifact to this path (default: <module>.waot)');
+    AotOutputOpt.ShortName := 'o';
+    AotOpts[0] := AotOutputOpt;
+    Registry.Add(TSubcommand.Create('aot',
+      'Ahead-of-time compile a module to a .waot artifact for instant startup',
+      '<module.wasm> [-o <artifact.waot>]',
+      @HandleAot, AotOpts));
+
     { --dir and --env are repeatable and are the ONLY host capabilities `run`
-      grants beyond stdio (deny-by-default). The registry owns these option
-      objects; RunCommand reads them back out of it, and `run --help` renders
-      from them. RunCommand is dispatched directly (below), not via
-      Registry.Run, so its guest-argv pre-scan can see the whole tail. }
-    SetLength(RunOpts, 2);
+      grants beyond stdio (deny-by-default). --aot/--no-aot select the optional
+      AOT artifact (parsed by RunCommand's own pre-scan, but declared here so
+      `run --help` documents them and the registry stays the source of truth).
+      The registry owns these option objects; RunCommand reads --dir/--env back
+      out of it. RunCommand is dispatched directly (below), not via Registry.Run,
+      so its guest-argv pre-scan can see the whole tail. }
+    SetLength(RunOpts, 4);
     RunOpts[0] := TRepeatableOption.Create('dir',
       'grant a preopened directory as GUEST=HOST (repeatable)');
     RunOpts[1] := TRepeatableOption.Create('env',
       'set an environment variable KEY=VALUE (repeatable)');
+    RunOpts[2] := TStringOption.Create('aot',
+      'load a precompiled .waot artifact for instant startup (falls back if stale)');
+    RunOpts[3] := TFlagOption.Create('no-aot',
+      'never load a .waot artifact; always interpret (disables sibling auto-detect)');
     Registry.Add(TSubcommand.Create('run',
       'Run a WASI preview1 command module (_start) to a process exit code',
-      '[--dir GUEST=HOST]... [--env KEY=VALUE]... <module.wasm> [args...]',
+      '[--dir GUEST=HOST]... [--env KEY=VALUE]... [--aot <artifact.waot>] '
+      + '[--no-aot] <module.wasm> [args...]',
       nil, RunOpts));
 
     if WantsTopLevelHelp then
