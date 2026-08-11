@@ -1,7 +1,86 @@
 # Handoff
 
-Updated: 2026-08-10 (Track I — baseline JIT: BOTH backends complete +
-cross-arch proven via an OrbStack amd64 VM)
+Updated: 2026-08-10 (Track I COMPLETE — both backends, cross-arch proven,
+all 4 review findings fixed; Track J AOT is next)
+
+## Track J (AOT) STARTED — Wave 0 (position-independent codegen) DONE
+
+- The AOT prerequisite is complete and cross-arch proven: both JIT
+  backends now emit POSITION-INDEPENDENT machine code, so the generated
+  code can be serialized + reloaded in another process (the basis of an
+  AOT artifact). Design doc: .agent/design/aot-spec.md.
+- How (aot-spec §1.2-1.4): (a) helper calls go through a per-process
+  INDIRECT TABLE — a TWasmAotHelper enum (12 helpers) indexes
+  Store.JitHelperTable (filled at RegisterJit); the code emits
+  `ldr x9,[x24,#k*8];blr x9` (aarch64) / `call [r15+k*8]` (x86-64), so
+  only the stable INDEX is baked, not the address. (b) the IR Code base
+  is passed to the compiled entry in a pinned register (x23 / rbp) and
+  @Fn^.Code[i] is computed `base + i*24` — no baked IR pointer (also
+  subsumes the old Fix-C @AIns concern). (c) an ABI FINGERPRINT
+  (WasmAotAbiFingerprint, FNV-1a-64 over all WasmJit*Offsets +
+  SizeOf(TWasmIrInstr/TWasmValue) + helper count + AOT_ABI_REVISION)
+  guards the baked ABI constants against a different wasmlight build.
+- x86-64 pin map (6 callee-saved all pinned): rbx=regfile, r12=store,
+  r13=&Epoch, r14=snapshot, r15=helper-table, rbp=IR-base (rbp is a
+  general pin here, not a frame pointer — locals off rbx, scratch off
+  rsp, longjmp restores it).
+- CodeBuffer gained SnapshotBytes (branch-resolved bytes, no
+  MakeExecutable) + SnapshotRelocs (empty — the unified emitter bakes no
+  absolute; the reloc format exists for future ops).
+- VERIFIED BOTH ARCHES: --tier=jit corpus byte-identical to the
+  interpreter (arm64 8562, x86-64 8563, both pass=65184 fail=408), zero
+  behavior change from the refactor. arm64 42 suites green; x86-64 VM 41
+  pass / 1 fail (only the FpFork/Rosetta artifact).
+
+## AOT remaining waves (aot-spec §7)
+
+1. **Wave 1** — Wasm.Aot.Artifact (.waot format read/write, FNV-1a-128
+   module hash, self-checksum, the ABI/IR-version/arch guards) + the
+   FIRST milestone: AOT-compile i32.add → serialize → load in a fresh
+   store → fill helper table + pass IR base → run → diff vs interp.
+2. **Wave 2** — AotCompileModule over every function (drive JitCanCompile,
+   record declined); --tier=aot over a corpus subset.
+3. **Wave 3** — full corpus --tier=aot on aarch64 (byte-diff vs interp) +
+   the JIT-vs-AOT round-trip identity test. The aarch64 deliverable.
+4. **Wave 4** — x86-64 (targetArch id, the X64 loader/entry-ABI, --tier=aot
+   in the amd64 VM).
+5. **Wave 5** — CLI (wasmlight aot <mod> -o <artifact>; run --aot) +
+   wasmbench startup measurement (measurement only).
+SECURITY INVARIANT (hard): AOT always re-decodes + re-validates the
+module at load; the artifact is a perf cache, NEVER a trust bypass — its
+code is used only if module-hash + IR-version + arch + ABI-fingerprint +
+checksum all match the freshly-validated module.
+
+## Track I is DONE. The 4 non-corpus review findings (#48-51) are FIXED.
+
+- **Fix A (seam-transparent unwind + O(1) cross-tier tail).** New RetKind
+  rtCompiledSeam: JIT-dispatch seam frames are TRANSPARENT to the
+  exception unwind (a throw from a compiled callee reaches an outer
+  interpreted try_table instead of surfacing as 'uncaught') and the
+  tail-call trampoline hands cross-tier tails back to a shared loop (an
+  alternating compiled<->interpreted 1e6 tail loop runs in bounded stack).
+  Fence 2 (decline call-bearing funcs when store has tags) retired; fence
+  1 (try_table-handler funcs) + iroThrow/iroThrowRef decline stay.
+  KEY DISCOVERY: a Pascal `raise` cannot unwind across a JIT native frame
+  (no unwind tables on aarch64-darwin, same reason traps use LongJmp), so
+  the seam hop uses LongJmp to a SetJmp seam-catch stack integrated with
+  WasmInvoke's trampoline (a small, flagged +49-line change to
+  Wasm.Runtime.Traps.pas so a trap resets the seam stack — load-bearing,
+  traps-in-compiled-funcs are corpus-reachable).
+- **Fix B (epoch reseed).** Store.EpochSnapshot seeded only at the
+  outermost guest entry (Heap.CurrentFrame=nil), not on nested re-entry —
+  a pre-call epoch bump is now observed in a nested callee, matching the
+  interpreter. Differential test both tiers trap 'interrupt'.
+- **Fix C (@AIns ABI).** Eliminated the const-record-by-ref assumption:
+  the emitters take @Fn^.Code[i] (stable IR location) instead of @AIns.
+  Both backends.
+- **Verified on BOTH arches:** arm64 42 suites green, format+frozen clean;
+  x86-64 VM 41 pass / 1 fail (only the FpFork/Rosetta artifact, unrelated
+  — see honest status below). Both corpus tiers byte-identical on both
+  arches (interp 65184, jit arm64 8562 / x86-64 8563, all pass=65184);
+  EH corpus green both tiers. Zero regression from the delicate change.
+
+## Track I is now cross-architecture complete (aarch64 + x86-64)
 
 ## Track I is now cross-architecture complete (aarch64 + x86-64)
 
@@ -36,11 +115,28 @@ cross-arch proven via an OrbStack amd64 VM)
   (Wasm.Jit.Test.pas, Wasm.Wast.Runner.Test.pas). Arch-specific byte
   tests stay in Wasm.Jit.{Arm64,X64}.Test gated on their arch.
 - Mac (arm64): 42 suites green, format + frozen clean. VM (x86-64):
-  41 pass / 1 fail — the sole failure is the guard-page-fault forked-
-  child test under ROSETTA (in-process SIGSEGV->siglongjmp->trampoline
-  doesn't survive binary translation; the corpus proves memory access is
-  correct via explicit checks; it passes on real x86-64 CI hardware). Not
-  a bug — a documented emulation limitation of that one test.
+  41 pass / 1 fail — TestGuardFaultTrapsInAForkedChild
+  (Wasm.Runtime.Memory.Test).
+- **HONEST STATUS of that 1 failure (an earlier claim was corrected):**
+  it is NOT root-caused and is UNVERIFIED on native x86-64 (we have none
+  — only arm64 + this Rosetta-emulated amd64 VM). What is known:
+  - It fails on the parent's FIRST assertion `Pid > 0` in ~1ms → FpFork
+    appears to return <= 0 in the wasmlight process.
+  - A standalone C probe (fork + PROT_NONE mmap + SIGSEGV + siglongjmp +
+    waitpid) WORKS under this same Rosetta VM (`normal=1 exit=0`). So the
+    signal/guard/longjmp MECHANISM is fine under emulation — the earlier
+    "signal delivery doesn't survive translation" explanation was WRONG.
+  - So the failure is specific to FpFork/the FPC+fault-handler runtime
+    state under Rosetta (plausibly forking a Rosetta-JIT'd process that
+    has already installed the guard signal handler + altstack), NOT a
+    wasm-visible correctness issue: the interp AND jit corpora pass
+    65184 identically on x86-64, and memory access uses explicit bounds
+    checks (the guard-fault path this test exercises is a narrow
+    mechanism the tiers don't rely on).
+  - It was deliberately NOT given a skip-under-emulation guard — that
+    would hide an unexplained failure. It stands red in the VM until
+    either root-caused or run on native x86-64 (CI). Do not re-describe
+    it as a "documented benign limitation" without that evidence.
 
 ## Cross-check bonus: the interpreter is now proven on x86-64 too
 

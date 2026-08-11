@@ -1144,6 +1144,7 @@ type
     procedure TestBrTable;
     procedure TestUnreachable;
     procedure TestEpochInterruptDifferential;
+    procedure TestEpochInterruptAcrossSeamToInterpCallee;
 
     { --- Wave 3: the call family ------------------------------------- }
     procedure TestCallCompiledToCompiled;
@@ -1157,9 +1158,10 @@ type
     procedure TestHostCallInterop;
     procedure TestTailCallSelfIsBounded;
     procedure TestTailCallMutual;
+    procedure TestTailCallCrossTierBounded;
     procedure TestTailCallToHost;
     procedure TestDeepRecursionExhausts;
-    procedure TestThrowAcrossCompiledFrameFenced;
+    procedure TestThrowAcrossCompiledFrameCaught;
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
@@ -2104,6 +2106,114 @@ begin
 end;
 
 
+procedure TJitTests.TestEpochInterruptAcrossSeamToInterpCallee;
+
+  { Fix B, the OTHER seam direction from TestEpochInterruptDifferential: force-
+    compile the CALLER ($run) and leave the callee ($leaf) interpreted, so the
+    compiled caller reaches the interpreted leaf across the seam through
+    Arm64/X64CallInterpreted -> TierInvoke -> InterpTierInvoke. The epoch is
+    bumped (by the host $run calls first) BETWEEN the outermost entry and the
+    leaf's loop. Before Fix B, InterpTierInvoke re-seeded EpochSnapshot on that
+    nested re-entry to the just-bumped value, so the leaf's back-edge saw
+    Epoch = Snapshot and the interrupt was LOST. Seeding only at the outermost
+    entry makes the leaf inherit the pre-bump snapshot and trap 'interrupt' —
+    identically to the fully interpreted oracle. }
+  function RunOnce(const ACompileRun: Boolean): TCallOutcome;
+  var
+    Bytes: TWasmBytes;
+    Module: TWasmModule;
+    Ir: TWasmIrModule;
+    Engine: TWasmEngine;
+    Store: TWasmStore;
+    Imports: TWasmImports;
+    Instance: TWasmModuleInstance;
+    Jit: TWasmJitContext;
+    Canon, TypeIds: TWasmEngineTypeIds;
+    HostAddr, LeafAddr, RunAddr: TWasmFuncAddr;
+    Kind: TWasmExternKind;
+    Addr: UInt32;
+    Res: array[0 .. 0] of TWasmValue;
+  begin
+    Result.Trapped := False;
+    Result.Msg := '';
+    Result.Bits := 0;
+    Bytes := EpochModuleBytes;
+    Module := TWasmModule.Create;
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Ir := nil;
+    Jit := nil;
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    try
+      DecodeModule(Bytes, Module);
+      Ir := ValidateModule(Module, Bytes);
+      Engine.InternModule(Ir, Canon, TypeIds);
+      HostAddr := Store.AddHostFunc(TypeIds[0], @JitBumpEpochCallback, nil);
+      SetLength(Imports.Funcs, 1);
+      Imports.Funcs[0] := HostAddr;
+      Instance := InstantiateModule(Store, Ir, @Bytes[0],
+        NativeUInt(Length(Bytes)), Imports);
+      RegisterInterpreter(Store);
+      if not Instance.FindExport('leaf', Kind, Addr) then
+        raise EWasmError.Create('no export named leaf');
+      LeafAddr := Addr;
+      if not Instance.FindExport('run', Kind, Addr) then
+        raise EWasmError.Create('no export named run');
+      RunAddr := Addr;
+
+      if ACompileRun then
+      begin
+        Jit := RegisterJit(Store);
+        { Only the CALLER is compiled; the leaf stays interpreted and is reached
+          across the tier seam — the nested re-entry that must NOT re-seed. }
+        Expect<Boolean>(Jit.ForceCompile(RunAddr)).ToBe(True);
+        Expect<Boolean>(Store.Funcs[LeafAddr].CompiledEntry = nil).ToBe(True);
+      end;
+
+      Store.Epoch := 0;
+      Store.EpochSnapshot := 0;
+      Res[0].Bits := 0;
+      try
+        InterpInvoke(Store, RunAddr, nil, @Res[0]);
+      except
+        on E: EWasmTrap do
+        begin
+          Result.Trapped := True;
+          Result.Msg := E.Message;
+        end;
+      end;
+    finally
+      FreeAndNil(Jit);
+      FreeAndNil(Store);
+      FreeAndNil(Engine);
+      FreeAndNil(Ir);
+      FreeAndNil(Module);
+    end;
+  end;
+
+var
+  InterpOut, JitOut: TCallOutcome;
+begin
+  InterpOut := RunOnce(False);
+  Expect<Boolean>(InterpOut.Trapped).ToBe(True);
+  Expect<Boolean>(Pos('interrupt', InterpOut.Msg) > 0).ToBe(True);
+
+  JitOut := RunOnce(True);
+  {$IFDEF WASM_JIT_BACKEND}
+  Expect<Boolean>(JitOut.Trapped).ToBe(True);
+  Expect<Boolean>(Pos('interrupt', JitOut.Msg) > 0).ToBe(True);
+  Expect<string>(JitOut.Msg).ToBe(InterpOut.Msg);
+  {$ELSE}
+  Expect<Boolean>(JitOut.Trapped).ToBe(InterpOut.Trapped);
+  Expect<string>(JitOut.Msg).ToBe(InterpOut.Msg);
+  {$ENDIF}
+end;
+
+
 function TJitTests.TrapMessageOf(const ABytes: TWasmBytes;
   const AExport: string; const AParams: array of TWasmValue): string;
 var
@@ -2308,6 +2418,22 @@ begin
     [MakeValueI64(100000)])).ToBe(True);
 end;
 
+procedure TJitTests.TestTailCallCrossTierBounded;
+begin
+  { Fix A (Finding 1) — the CROSS-TIER O(1) acceptance test. Force-compile ONLY
+    $a, so the alternating chain $a(compiled) -> $b(interpreted) -> $a(compiled)
+    crosses the tier seam on EVERY tail. Before the fix each cross-tier tail
+    NESTED a native invocation (the compiled trampoline running the interpreted
+    callee to completion, whose own tail re-entered the compiled trampoline), so
+    the 8 MiB native stack was exhausted within tens of thousands of iterations.
+    With the shared pending-tail channel + the interpreter's entry-level BOUNCE
+    back to the loop, a million alternating tails run in BOUNDED native stack —
+    completing IS the proof — and yield the same result as the interpreter. }
+  CompileExports(['a']);
+  Expect<Boolean>(DiffModule(TailMutualModuleBytes, 'a',
+    [MakeValueI64(1000000)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
 procedure TJitTests.TestTailCallToHost;
 begin
   { return_call to a HOST function: the host's results become this frame's
@@ -2348,19 +2474,21 @@ begin
   end;
 end;
 
-procedure TJitTests.TestThrowAcrossCompiledFrameFenced;
+procedure TJitTests.TestThrowAcrossCompiledFrameCaught;
 begin
-  { $middle passes the op predicate (a call and a const), so ONLY the fence
-    keeps it interpreted — and it must, because the handler that catches the
-    throw lives in its caller. Asserting the decline pins the fence; DiffModule
-    then asserts the outcome is identical either way, which is what would fail
-    if the fence were ever removed without the interpreter learning to unwind
-    through a tier-seam frame. }
+  { Fix A (Finding 3), the soundness regression test. $middle is a call-bearing
+    function in a module that HAS a tag — exactly what fence 2 used to decline.
+    Fence 2 is retired, so $middle COMPILES, and the throw raised by the inner
+    (interpreted, iroThrow) callee must unwind ACROSS $middle's compiled seam
+    frame to reach the interpreted try_table in $outer. DiffModule force-compiles
+    $middle (True = it really compiled) and asserts the outcome is byte-identical
+    under both tiers — which is what would fail if the compiled seam frame
+    incorrectly swallowed the exception as 'uncaught'. }
   CompileExports(['middle']);
   Expect<Boolean>(DiffModule(ThrowAcrossCallModuleBytes, 'outer',
-    [MakeValueI32(7)])).ToBe(False);
+    [MakeValueI32(7)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 
-  { The oracle: the exception really is caught, and yields the payload. }
+  { The oracle: the exception really is caught (no trap), yielding the payload. }
   Expect<string>(TrapMessageOf(ThrowAcrossCallModuleBytes, 'outer',
     [MakeValueI32(7)])).ToBe('');
 end;
@@ -2662,6 +2790,8 @@ begin
   Test('unreachable traps identically', TestUnreachable);
   Test('a shared epoch snapshot traps interrupt in a compiled leaf identically',
     TestEpochInterruptDifferential);
+  Test('a compiled caller''s interrupt reaches an interpreted callee across the seam',
+    TestEpochInterruptAcrossSeamToInterpCallee);
 
   Test('a compiled function calling a compiled function matches',
     TestCallCompiledToCompiled);
@@ -2680,11 +2810,13 @@ begin
     TestTailCallSelfIsBounded);
   Test('mutual return_call recursion runs in bounded native stack',
     TestTailCallMutual);
+  Test('1e6 alternating compiled<->interpreted return_calls run in bounded stack',
+    TestTailCallCrossTierBounded);
   Test('return_call to a host function matches', TestTailCallToHost);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
-  Test('a throw crossing a would-be compiled frame is fenced off',
-    TestThrowAcrossCompiledFrameFenced);
+  Test('a throw crosses a compiled seam frame and is caught by the interp handler',
+    TestThrowAcrossCompiledFrameCaught);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);

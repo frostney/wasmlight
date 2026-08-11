@@ -1247,6 +1247,16 @@ begin
   ExpectCount('StoreEpoch probe',
     Integer(PtrUInt(@FStore.Epoch) - PtrUInt(Pointer(FStore))),
     Integer(Off.StoreEpoch));
+
+  { The per-process helper-table base (aot-spec §1.2/§4.3): pointer-aligned, past
+    the header, and the accessor agrees with a live probe — the position-
+    independent prologue loads it at this exact offset. }
+  Expect<Boolean>(Off.StoreJitHelperTable > 0).ToBe(True);
+  Expect<Boolean>((Off.StoreJitHelperTable and (SizeOf(Pointer) - 1)) = 0)
+    .ToBe(True);
+  ExpectCount('StoreJitHelperTable probe',
+    Integer(PtrUInt(@FStore.JitHelperTable) - PtrUInt(Pointer(FStore))),
+    Integer(Off.StoreJitHelperTable));
 end;
 
 procedure TRuntimeStoreTests.SetupTests;

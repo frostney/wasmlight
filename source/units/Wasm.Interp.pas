@@ -58,6 +58,7 @@ interface
 uses
   SysUtils,
 
+  Wasm.Core,
   Wasm.Ir,
   Wasm.Runtime.Gc,
   Wasm.Runtime.Store,
@@ -74,7 +75,26 @@ type
 
   PWasmActivation = ^TWasmActivation;
 
-  TWasmRetKind = (rtCaller, rtEntry);
+  { How a frame's results are delivered, and — crucially for Track H's unwind —
+    what an escaping exception does when it reaches this frame (Fix A).
+      rtCaller       — a wasm->wasm call inside ONE Run: results go to the
+                       caller's dest registers; the exception unwind pops it and
+                       keeps scanning in the SAME Run (transparent, same native
+                       context).
+      rtCompiledSeam — a TIER-SEAM entry: the frame JitEnterFrame carved for a
+                       compiled body, or for an interpreted callee reached ACROSS
+                       the seam from compiled code (a nested native invocation).
+                       Results go to EntryResults (like rtEntry). The exception
+                       unwind pops it and LongJmps (SeamHop) to the innermost
+                       seam catch of the enclosing native invocation, which re-enters
+                       the unwind — so a throw crosses a compiled frame to reach
+                       an interpreted try_table further out (Finding 3). NOT an
+                       invocation boundary.
+      rtEntry        — the GENUINE outermost guest entry of this trampoline
+                       (empty GC chain at entry, or a host->guest re-entry).
+                       Results go to EntryResults. An uncaught exception here
+                       RaiseUncaughts (EWasmException) — the true boundary. }
+  TWasmRetKind = (rtCaller, rtEntry, rtCompiledSeam);
 
   { One live wasm frame (interp-spec §1.2). Its register file is the slice
     Values[Base .. Base+Fn^.RegisterCount) of the context's value stack, so
@@ -179,6 +199,64 @@ procedure ResetInterpContext(const AStore: TWasmStore);
   bit-identical across tiers. }
 function InterpContextFor(const AStore: TWasmStore): PWasmInterpContext;
 
+const
+  { Cap on a cross-tier pending tail's argument slots — the same marshal cap the
+    interpreter's own call paths use. }
+  WASM_TIER_TAIL_CAP = 1024;
+
+type
+  { The cross-tier pending-tail channel (Fix A, Finding 1). One per thread (a
+    store is single-threaded, ADR-0008). Written by BOTH a compiled body's
+    return_call* helper AND the interpreter's Run when an ENTRY-level tail
+    crosses tiers; read by the backend trampoline loop, which re-dispatches the
+    target with ZERO native-stack growth so an alternating compiled<->interp
+    tail chain stays O(1). }
+  PWasmTierTail = ^TWasmTierTail;
+
+  TWasmTierTail = record
+    Pending: Boolean;
+    Addr: TWasmFuncAddr;
+    ArgCount: UInt32;
+    Args: array[0 .. WASM_TIER_TAIL_CAP - 1] of TWasmValue;
+  end;
+
+{ @GTierTail (the per-thread pending-tail slot) so the backend loops and the
+  interpreter share ONE channel. }
+function TierTailSlot: PWasmTierTail;
+
+{ Record a resolved cross-tier tail target + its collected argument slots into
+  the shared channel. Args are COPIED because the frame they came from is about
+  to be torn down. Raises on an over-cap arity. }
+procedure SetTierPendingTail(const AAddr: TWasmFuncAddr;
+  const AArgs: PWasmValue; const ACount: UInt32);
+
+{ The seam-reentry flag (Fix A). A tier-seam launcher (interp->compiled,
+  compiled->interp, compiled->compiled) calls MarkJitSeamReentry immediately
+  before crossing a fixed-signature dispatch hook; the tier-entry it reaches
+  (InterpTierInvoke, or a backend InvokeCompiled) calls ConsumeJitSeamReentry
+  once at entry to learn whether its frame is a nested seam (rtCompiledSeam) or
+  a genuine outermost entry (rtEntry). Defaults cleared, so with no JIT every
+  frame is rtEntry and the unwind behaves exactly as before. }
+procedure MarkJitSeamReentry;
+function ConsumeJitSeamReentry: TWasmRetKind;
+
+{ Mark the next tier entry as a trampoline-driven interpreted TAIL target (Fix
+  A, Finding 1): the backend loop calls this before running an interpreted tail
+  target so that target's Run may BOUNCE a cross-tier tail back to the loop
+  (O(1)) rather than nesting a native invocation. }
+procedure MarkTierTailTarget;
+
+{ The unwind entry point, exposed so a seam catch can CONTINUE the unwind in its
+  own native context after a rtCompiledSeam hop (Fix A). AThrowFrame is True only
+  when called straight from iroThrow/iroThrowRef (the top frame is the throwing
+  frame, scanned at its own IP); a seam catch passes False (the top frame is a
+  caller suspended at a call site, scanned at IP-1). Either resumes a matching
+  handler (some frame's IP is set; returns), or SeamHops to the innermost
+  seam catch to hop further out, or raises EWasmException (genuinely uncaught at
+  the outermost entry). }
+procedure UnwindException(const ACtx: PWasmInterpContext; const AExn: TWasmRef;
+  const AThrowFrame: Boolean);
+
 { Prologue. Exhaustion-check both caps (-> TrapNow(wtkStackExhausted), the
   same threshold every path uses); carve the register file at ValueTop; zero
   every slot (a ref reads null, a numeric local defaults 0); marshal the FLAT
@@ -186,9 +264,13 @@ function InterpContextFor(const AStore: TWasmStore): PWasmInterpContext;
   consecutive flat slots); wire the frame to deliver its results to the flat
   AResults; push the TWasmGcFrame before the first safepoint; Inc(Depth).
   Returns @Values[Base], the register-file base the compiled body reads and
-  writes. AParams may be nil for a 0-parameter function. }
+  writes. AParams may be nil for a 0-parameter function. ARetKind is the frame's
+  return/unwind kind (Fix A): rtEntry for a genuine outermost guest entry,
+  rtCompiledSeam for a nested tier-seam entry (a compiled body, or an
+  interpreted callee reached across the seam). }
 function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
-  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue): PWasmValue;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue;
+  const ARetKind: TWasmRetKind): PWasmValue;
 
 { Epilogue. The compiled body has written its result registers; marshal them
   into the AResults handed to JitEnterFrame and pop the frame — identical to
@@ -199,10 +281,28 @@ procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
   above). Layout-only; the co-located test asserts them. }
 function WasmJitFrameOffsets: TWasmJitFrameOffsets;
 
+const
+  { The AOT ABI revision (aot-spec §1.4). A hand-bumped integer for any emitter
+    change the fingerprint's structural inputs cannot otherwise see — a
+    template's byte layout, a pinned-register reassignment, the entry-ABI shape.
+    Bump it whenever position-independent codegen changes in a way that would
+    make an existing artifact's bytes wrong. }
+  AOT_ABI_REVISION = 1;
+
+{ A deterministic 64-bit fingerprint over everything a serialized artifact's
+  code bakes as a constant and the loading runtime must therefore agree on
+  (aot-spec §1.4): all WasmJitOffsets fields, all WasmJitFrameOffsets fields,
+  SizeOf(TWasmIrInstr) (the pinned-IR-base stride), SizeOf(TWasmValue) (the slot
+  stride), the helper-table slot count, and AOT_ABI_REVISION. The AOT loader
+  recomputes this from the LIVE runtime and rejects an artifact on mismatch —
+  the "same build/ABI" guard beside the IR-version and arch guards. Wave 0
+  ships the compute function; the AOT tier consumes it in Wave 1. Needs a live
+  store because StoreEpoch et al. are measured from the object reference. }
+function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+
 implementation
 
 uses
-  Wasm.Core,
   Wasm.Interp.Numeric,
   Wasm.Interp.Vector,
   Wasm.Runtime.Traps;
@@ -215,6 +315,74 @@ const
     limits; a module exceeding it raises a loud internal error rather than
     misbehaving. }
   WASM_INTERP_MAX_MARSHAL = 1024;
+
+threadvar
+  { Fix A. See the interface comments. All default cleared per thread, so with
+    no JIT registered none is ever set and every tier entry is rtEntry with no
+    tail bounce. }
+  GJitSeamReentry: Boolean;
+  { Set by the backend trampoline loop's interpreted arm before it runs an
+    interpreted TAIL target (Fix A, Finding 1): tells that target's Run it may
+    hand a cross-tier tail back to the loop (BOUNCE) instead of nesting. A plain
+    (non-tail) compiled->interp call never sets it, so the callee completes
+    normally and its results flow to the caller. }
+  GTierTailTarget: Boolean;
+  GTierTail: TWasmTierTail;
+
+function TierTailSlot: PWasmTierTail;
+begin
+  Result := @GTierTail;
+end;
+
+procedure SetTierPendingTail(const AAddr: TWasmFuncAddr;
+  const AArgs: PWasmValue; const ACount: UInt32);
+var
+  I: UInt32;
+begin
+  if ACount > WASM_TIER_TAIL_CAP then
+    raise EWasmError.Create(
+      'internal: cross-tier tail-call arity exceeds the marshal cap');
+  I := 0;
+  while I < ACount do
+  begin
+    GTierTail.Args[I] := AArgs[I];
+    Inc(I);
+  end;
+  GTierTail.Addr := AAddr;
+  GTierTail.ArgCount := ACount;
+  GTierTail.Pending := True;
+end;
+
+procedure MarkJitSeamReentry;
+begin
+  GJitSeamReentry := True;
+end;
+
+function ConsumeJitSeamReentry: TWasmRetKind;
+begin
+  if GJitSeamReentry then
+    Result := rtCompiledSeam
+  else
+    Result := rtEntry;
+  GJitSeamReentry := False;
+end;
+
+{ Mark / consume the tail-target flag (Fix A, Finding 1). Interface-exposed via
+  the two procs below so the backend trampoline loops can set it. }
+procedure MarkTierTailTarget;
+begin
+  GTierTailTarget := True;
+end;
+
+function ConsumeTierTailTarget: Boolean;
+begin
+  Result := GTierTailTarget;
+  GTierTailTarget := False;
+end;
+
+{ Forward decls — the seam catches in CompiledCall / ReturnCompiledCall use
+  these unwind leaves, which are defined later beside Run (Fix A). }
+procedure RaiseUncaught(const AExn: TWasmRef; const ATagAddr: UInt32); forward;
 
 { TWasmActivation, TWasmInterpContext and the IR pointer types now live in
   the interface (moved for O-J2 so the JIT can build a frame through the
@@ -359,7 +527,9 @@ begin
   Fn := ATop^.Fn;
   FrameBase := Frame(ACtx^.Values, ATop^.Base);
   FlatCur := 0;
-  if ATop^.RetKind = rtEntry then
+  { rtCompiledSeam delivers to EntryResults exactly as rtEntry: both are frames
+    JitEnterFrame carved with EntryResults set and no caller-register wiring. }
+  if ATop^.RetKind <> rtCaller then
   begin
     K := 0;
     while K < Fn^.ResultCount do
@@ -654,6 +824,7 @@ procedure CompiledCall(const ACtx: PWasmInterpContext;
 var
   CallerRegs: PWasmValue;
   ArgN, ResN, I: UInt32;
+  Seam: TWasmSeamCatch;
   ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
 begin
   ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
@@ -669,7 +840,27 @@ begin
     Inc(I);
   end;
 
-  ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0]);
+  { Fix A: the compiled callee's frame is a tier seam. An exception thrown
+    beneath it LongJmps up to THIS seam catch (a Pascal raise cannot cross the
+    callee's native frame on this target). On the hop, CONTINUE the unwind in
+    this caller's context (the caller frame is on top now that the callee's
+    frames were popped as the unwind climbed). If a handler in this Run matches,
+    ResumeAtClause set its IP and the unwind returned — we Exit and the dispatch
+    loop's LoadTop resumes it (the result scatter is correctly skipped). If no
+    handler matches, UnwindException SeamHops further out / RaiseUncaughts, so
+    control never returns here. }
+  MarkJitSeamReentry;
+  Seam.Prev := CurrentSeamCatch;
+  CurrentSeamCatch := @Seam;
+  if SetJmp(Seam.JmpBuf) = 0 then
+    ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0])
+  else
+  begin
+    CurrentSeamCatch := Seam.Prev;
+    UnwindException(ACtx, TWasmRef(Seam.ExnRef), False);
+    Exit;
+  end;
+  CurrentSeamCatch := Seam.Prev;
 
   { The value stack is fixed, so CallerRegs is still valid even if the
     compiled callee re-entered guest code (the guarantee HostCall relies on). }
@@ -691,6 +882,8 @@ procedure ReturnCompiledCall(const ACtx: PWasmInterpContext;
 var
   TopRegs: PWasmValue;
   ArgN, ResN, I: UInt32;
+  Seam: TWasmSeamCatch;
+  ExnR: TWasmRef;
   ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
 begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
@@ -706,7 +899,37 @@ begin
     Inc(I);
   end;
 
+  { Fix A: a return_call ERASES the current frame's handlers (eh-spec §6.3) — a
+    throw beneath the tail callee must not be caught by THIS frame's try_table.
+    On the seam hop, pop THIS frame WITHOUT scanning its handlers, then continue
+    the unwind from its caller (rtCaller) or hop/uncaught (seam/entry). The
+    non-throwing path is unchanged: scatter results + DoReturn. }
+  MarkJitSeamReentry;
+  Seam.Prev := CurrentSeamCatch;
+  CurrentSeamCatch := @Seam;
+  if SetJmp(Seam.JmpBuf) <> 0 then
+  begin
+    CurrentSeamCatch := Seam.Prev;
+    ExnR := TWasmRef(Seam.ExnRef);
+    ACtx^.Store.Heap.PopFrame;
+    ACtx^.ValueTop := ATop^.Base;
+    Dec(ACtx^.Depth);
+    case ATop^.RetKind of
+      rtCompiledSeam:
+        if CurrentSeamCatch <> nil then
+          SeamHop(NativeUInt(ExnR))
+        else
+          RaiseUncaught(ExnR, ACtx^.Store.Heap.ExnTagAddr(ExnR));
+      rtEntry:
+        RaiseUncaught(ExnR, ACtx^.Store.Heap.ExnTagAddr(ExnR));
+    else
+      { rtCaller: keep scanning this frame's caller in the same Run. }
+      UnwindException(ACtx, ExnR, False);
+    end;
+    Exit;
+  end;
   ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0]);
+  CurrentSeamCatch := Seam.Prev;
 
   { ResBuf is the flat result block; scatter it into this frame's padded
     result registers so DoReturn reads it back pad-aware, exactly as
@@ -749,6 +972,53 @@ begin
     Inc(ACtx^.Store.Funcs[AAddr].CallCount);
     ReplaceWasmFrame(ACtx, ATop, AArgAux, AAddr);
   end;
+end;
+
+{ True if AAddr is a COMPILED wasm callee — the cross-tier tail case a trampoline
+  -driven interpreted tail target hands back to the backend loop (Fix A). Host
+  and interpreted tails are NOT bounced (host completes in place; interp stays
+  O(1) via ReplaceWasmFrame in this same Run). }
+function IsCompiledCrossTier(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr): Boolean;
+begin
+  Result := (AStore.Funcs[AAddr].Kind <> wfkHost)
+    and Assigned(AStore.JitInvokeCompiled)
+    and (AStore.Funcs[AAddr].CompiledEntry <> nil);
+end;
+
+{ Hand an ENTRY-level cross-tier tail back to the backend trampoline loop (Fix A,
+  Finding 1): gather the tail args from this (entry) frame, publish them in the
+  shared channel, and pop the frame — WITHOUT running the callee. The backend
+  loop that drove this interpreted tail target re-dispatches the pending target
+  with zero native-stack growth, so an alternating compiled<->interp tail chain
+  is O(1). The callee inherits this frame's EntryResults because the loop passes
+  the SAME results buffer on the next iteration. }
+procedure BouncePendingTail(const ACtx: PWasmInterpContext;
+  const ATop: PWasmActivation; const AArgAux: UInt32;
+  const AAddr: TWasmFuncAddr);
+var
+  TopRegs: PWasmValue;
+  ArgN, I: UInt32;
+begin
+  ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
+  if ArgN > WASM_TIER_TAIL_CAP then
+    raise EWasmError.Create(
+      'internal: cross-tier tail-call arity exceeds the marshal cap');
+  TopRegs := Frame(ACtx^.Values, ATop^.Base);
+  I := 0;
+  while I < ArgN do
+  begin
+    GTierTail.Args[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
+    Inc(I);
+  end;
+  GTierTail.Addr := AAddr;
+  GTierTail.ArgCount := ArgN;
+  GTierTail.Pending := True;
+  { Pop the entry frame (drop its GcFrame, reset the cursors) — the same pop
+    DoReturn performs, minus the result delivery the callee will do instead. }
+  ACtx^.Store.Heap.PopFrame;
+  ACtx^.ValueTop := ATop^.Base;
+  Dec(ACtx^.Depth);
 end;
 
 { --- memory access: everything through the chokepoint (interp-spec §3.7) ---
@@ -1384,11 +1654,177 @@ begin
   raise EWasmError.Create('internal: unhandled IR op ' + IrOpMnemonic(AOp));
 end;
 
+{ --- exception delivery + the explicit unwind (eh-spec §2.3) -------------
+  Lifted to unit level (Fix A) so a tier-seam catch — a compiled body run in a
+  backend InvokeCompiled, or a CompiledCall / ReturnCompiledCall launcher — can
+  RE-ENTER the unwind in its own native context after a rtCompiledSeam hop.
+  ResumeAtClause and the pop/scan logic are byte-for-byte the Track-H originals;
+  the ONLY additions are the rtCompiledSeam arm and the AThrowFrame parameter. }
+
+{ Deliver a matched exception to a clause: write its payload into the target
+  label's merge registers and set the frame's IP to the clause target. The epoch
+  poll reads ACtx^.Store.EpochSnapshot — the shared per-invocation snapshot Run
+  also seeds its EpochCache from (equal by construction after Fix B), so the
+  resume-time interrupt check is unchanged. }
+procedure ResumeAtClause(const ACtx: PWasmInterpContext;
+  const ATop: PWasmActivation; const AClause: TWasmIrCatchClause;
+  const AExn: TWasmRef);
+var
+  Store: TWasmStore;
+  ClauseRegs: PWasmValue;
+  ArgC, I, Dst: UInt32;
+begin
+  Store := ACtx^.Store;
+  ClauseRegs := Frame(ACtx^.Values, ATop^.Base);
+  ArgC := Store.Heap.ExnArgCount(AExn);
+  case AClause.Kind of
+    wickCatch:
+      begin
+        I := 0;
+        while I < ArgC do
+        begin
+          ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
+            Store.Heap.ExnArg(AExn, I);
+          Inc(I);
+        end;
+      end;
+    wickCatchRef:
+      begin
+        I := 0;
+        while I < ArgC do
+        begin
+          ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
+            Store.Heap.ExnArg(AExn, I);
+          Inc(I);
+        end;
+        { The exnref follows the payload. Canonical whole-slot ref write
+          (.Bits := 0 then .Ref) so the collector's root scan never reads a
+          stale high half (runtime-spec §1.1). }
+        Dst := IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, ArgC);
+        ClauseRegs[Dst].Bits := 0;
+        ClauseRegs[Dst].Ref := AExn;
+      end;
+    wickCatchAll:;   { nothing delivered }
+    wickCatchAllRef:
+      begin
+        Dst := IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, 0);
+        ClauseRegs[Dst].Bits := 0;
+        ClauseRegs[Dst].Ref := AExn;
+      end;
+  end;
+  { EPOCH obligation (ADR-0006; Wasm.Ir TWasmIrHandlers comment). Resuming at
+    TargetInstr bypasses the safepoint-flagged iroJump that every other path to
+    a loop header runs, so poll the epoch here before resuming. }
+  if Store.Epoch <> Store.EpochSnapshot then
+    TrapNow(wtkEpochInterrupt);
+  ATop^.IP := AClause.TargetInstr;
+end;
+
+procedure UnwindException(const ACtx: PWasmInterpContext; const AExn: TWasmRef;
+  const AThrowFrame: Boolean);
+var
+  Store: TWasmStore;
+  Top: PWasmActivation;
+  Fn2: PWasmIrFunction;
+  TagAddr, Ip, H, C: UInt32;
+  Matched, ThrowFrame: Boolean;
+  Clause: TWasmIrCatchClause;
+begin
+  Store := ACtx^.Store;
+  { The thrown tag's store ADDRESS. Matching is by address, never by tag type
+    (eh-spec §2.3/§4): this is what makes catch-imported-alias catch and
+    imported-mismatch fall through. }
+  TagAddr := Store.Heap.ExnTagAddr(AExn);
+  ThrowFrame := AThrowFrame;
+  while True do
+  begin
+    Top := @ACtx^.Acts[ACtx^.Depth - 1];
+    Fn2 := Top^.Fn;
+    { Which instruction is this frame "at"? The throwing frame published the
+      throw's own index (always inside its try_table range). An unwound-through
+      CALLER — including one re-entered from a seam catch (AThrowFrame False) —
+      was suspended at a call and holds the RESUME IP = callsite+1; scan it at
+      IP-1, the call site. (See the Track-H note on test-throw-1-2.) }
+    if ThrowFrame or (Top^.IP = 0) then
+      { A throwing frame is scanned at its own IP. A compiled seam frame's IP is
+        always 0 (native code never advances Act^.IP) and it carries no handler
+        table anyway, so scanning at 0 finds nothing and — crucially — avoids the
+        0-1 underflow that a checked build traps as a range error (Fix A). }
+      Ip := Top^.IP
+    else
+      Ip := Top^.IP - 1;
+
+    { Scan the static handler table IN ORDER (inner appended before outer). A
+      covering entry whose clauses do not match must NOT stop the scan — keep
+      going to the next-outer covering entry in this same frame. A compiled
+      frame carries an empty Handlers table (fence 1 declines handler-bearing
+      functions), so this loop simply finds nothing for it and falls through to
+      the rtCompiledSeam hop below — the frame is transparent to the unwind. }
+    H := 0;
+    while H < UInt32(Length(Fn2^.Handlers)) do
+    begin
+      if (Ip >= Fn2^.Handlers[H].StartInstr) and
+        (Ip < Fn2^.Handlers[H].EndInstr) then
+      begin
+        C := 0;
+        while C < Fn2^.Handlers[H].ClauseCount do
+        begin
+          Clause := Fn2^.HandlerClauses[Fn2^.Handlers[H].ClauseStart + C];
+          case Clause.Kind of
+            wickCatch, wickCatchRef:
+              Matched := Top^.Instance.TagAddrs[Clause.TagIndex] = TagAddr;
+          else
+            Matched := True;
+          end;
+          if Matched then
+          begin
+            ResumeAtClause(ACtx, Top, Clause, AExn);
+            Exit;   { back to the dispatch loop (or the seam catch's caller) }
+          end;
+          Inc(C);
+        end;
+      end;
+      Inc(H);
+    end;
+
+    { No clause in this frame matched. Pop it (PopFrame unregisters the GC frame;
+      ValueTop resets to the popped frame's Base — the pop DoReturn performs) and
+      continue per its RetKind. }
+    Store.Heap.PopFrame;
+    ACtx^.ValueTop := Top^.Base;
+    Dec(ACtx^.Depth);
+    case Top^.RetKind of
+      rtCaller:
+        { A same-Run call frame: keep scanning the caller in THIS context. }
+        ThrowFrame := False;
+      rtCompiledSeam:
+        { A tier-seam entry: hop to the innermost seam catch (a compiled body's
+          wrapper, or an interp->compiled launcher) via a LongJmp — NOT a Pascal
+          raise, which cannot unwind across a JIT body's native frame on this
+          target. The catch re-enters this unwind (AThrowFrame False) to scan the
+          frame(s) below the seam. A rtCompiledSeam frame exists only beneath a
+          compiled body, so a seam catch is always installed; the nil guard is
+          defensive. }
+        if CurrentSeamCatch <> nil then
+          SeamHop(NativeUInt(AExn))
+        else
+          RaiseUncaught(AExn, TagAddr);
+      else
+        { rtEntry — the genuine outermost boundary: uncaught (eh-spec §2.4). }
+        RaiseUncaught(AExn, TagAddr);
+    end;
+  end;
+end;
+
 { --- the dispatch loop (interp-spec §1.3) -------------------------------- }
 
 { One flat loop, no Pascal recursion per wasm call. Runs until the top-level
-  invoke's entry frame returns — i.e. Depth drops back to AStopDepth. }
-procedure Run(const ACtx: PWasmInterpContext; const AStopDepth: NativeUInt);
+  invoke's entry frame returns — i.e. Depth drops back to AStopDepth. AAllowBounce
+  (Fix A) is set only when the backend trampoline drives this Run as a tail
+  target: it lets an ENTRY-level cross-tier tail hand back to that loop (O(1))
+  instead of nesting. }
+procedure Run(const ACtx: PWasmInterpContext; const AStopDepth: NativeUInt;
+  const AAllowBounce: Boolean);
 var
   Act: PWasmActivation;
   Fn: PWasmIrFunction;
@@ -1419,159 +1855,6 @@ var
     Reg := Frame(ACtx^.Values, Act^.Base);
     IP := Act^.IP;
     Code := @Fn^.Code[0];
-  end;
-
-  { --- exception delivery (eh-spec §2.3) --------------------------------- }
-
-  { Deliver a matched exception to a clause: write its payload into the target
-    label's merge registers and set the frame's IP to the clause target, so the
-    dispatch loop's next LoadTop resumes there. PayloadAux is a length-prefixed
-    AuxU32 block of those merge registers, resolved by the validator against the
-    label's types (HandleTryTable), so the delivery is a blind write — the merge
-    registers ARE the destinations, no stub and no moves (eh-spec §1.4). }
-  procedure ResumeAtClause(const ATop: PWasmActivation;
-    const AClause: TWasmIrCatchClause; const AExn: TWasmRef);
-  var
-    ClauseRegs: PWasmValue;
-    ArgC, I, Dst: UInt32;
-  begin
-    ClauseRegs := Frame(ACtx^.Values, ATop^.Base);
-    ArgC := Store.Heap.ExnArgCount(AExn);
-    case AClause.Kind of
-      wickCatch:
-        begin
-          I := 0;
-          while I < ArgC do
-          begin
-            ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
-              Store.Heap.ExnArg(AExn, I);
-            Inc(I);
-          end;
-        end;
-      wickCatchRef:
-        begin
-          I := 0;
-          while I < ArgC do
-          begin
-            ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
-              Store.Heap.ExnArg(AExn, I);
-            Inc(I);
-          end;
-          { The exnref follows the payload. Canonical whole-slot ref write
-            (.Bits := 0 then .Ref) so the collector's root scan never reads a
-            stale high half (runtime-spec §1.1). }
-          Dst := IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, ArgC);
-          ClauseRegs[Dst].Bits := 0;
-          ClauseRegs[Dst].Ref := AExn;
-        end;
-      wickCatchAll:;   { nothing delivered }
-      wickCatchAllRef:
-        begin
-          Dst := IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, 0);
-          ClauseRegs[Dst].Bits := 0;
-          ClauseRegs[Dst].Ref := AExn;
-        end;
-    end;
-    { EPOCH obligation (ADR-0006; Wasm.Ir TWasmIrHandlers comment). Resuming at
-      TargetInstr bypasses the safepoint-flagged iroJump that every other path
-      to a loop header runs, so poll the epoch here before resuming. }
-    if Store.Epoch <> EpochCache then
-      TrapNow(wtkEpochInterrupt);
-    ATop^.IP := AClause.TargetInstr;
-  end;
-
-  { The explicit unwind over the activation stack (eh-spec §2.3, the crux). NOT
-    a Pascal raise and NOT a longjmp: it is ordinary interpreter control flow.
-    Either it resumes at a matching clause (some frame's IP is set, and it
-    returns — the caller does LoadTop) or, reaching this invocation's entry
-    frame with no match, it raises EWasmException (the sole uncaught case). }
-  procedure UnwindException(const AExn: TWasmRef);
-  var
-    Top: PWasmActivation;
-    Fn2: PWasmIrFunction;
-    TagAddr, Ip, H, C: UInt32;
-    Matched, ThrowFrame: Boolean;
-    Clause: TWasmIrCatchClause;
-  begin
-    { The thrown tag's store ADDRESS. Matching is by address, never by tag type
-      (eh-spec §2.3/§4): this is what makes catch-imported-alias catch and
-      imported-mismatch fall through. }
-    TagAddr := Store.Heap.ExnTagAddr(AExn);
-    ThrowFrame := True;
-    while True do
-    begin
-      Top := @ACtx^.Acts[ACtx^.Depth - 1];
-      Fn2 := Top^.Fn;
-      { Which instruction is this frame "at"? The throwing frame published the
-        throw's own index (always inside its try_table range). An unwound-
-        through CALLER, though, was suspended at a call and holds the RESUME
-        IP = callsite+1; its enclosing try_table protects the CALL SITE, and
-        for an empty-result try_table (no trailing merge moves) EndInstr equals
-        callsite+1, so callsite+1 is one past the range. Scan the caller at its
-        call site, IP-1 — the standard return-address-vs-call-site rule.
-        (DEVIATION from eh-spec §2.3, which scans every frame at Top^.IP and
-        asserts callsite+1 stays in range; that holds only when the try_table
-        has results. The corpus's test-throw-1-2 — a bare call in a
-        result-less try_table — requires the call-site scan.) }
-      if ThrowFrame then
-        Ip := Top^.IP
-      else
-        Ip := Top^.IP - 1;
-
-      { Scan the static handler table IN ORDER. Inner handlers were appended
-        before outer ones, so the first covering entry is the innermost; a
-        covering entry whose clauses do not match must NOT stop the scan — keep
-        going to the next-outer covering entry in this same frame (eh-spec
-        §2.3: catchless-try, catch-complex). }
-      H := 0;
-      while H < UInt32(Length(Fn2^.Handlers)) do
-      begin
-        if (Ip >= Fn2^.Handlers[H].StartInstr) and
-          (Ip < Fn2^.Handlers[H].EndInstr) then
-        begin
-          C := 0;
-          while C < Fn2^.Handlers[H].ClauseCount do
-          begin
-            Clause := Fn2^.HandlerClauses[Fn2^.Handlers[H].ClauseStart + C];
-            case Clause.Kind of
-              wickCatch, wickCatchRef:
-                { The clause's TagIndex is a MODULE tag index; resolve it
-                  through the UNWINDING frame's own TagAddrs — a handler names
-                  its own module's tags — and compare addresses. }
-                Matched := Top^.Instance.TagAddrs[Clause.TagIndex] = TagAddr;
-            else
-              { wickCatchAll / wickCatchAllRef: catch any tag. }
-              Matched := True;
-            end;
-            if Matched then
-            begin
-              ResumeAtClause(Top, Clause, AExn);
-              Exit;   { back to the dispatch loop; caller does LoadTop }
-            end;
-            Inc(C);
-          end;
-        end;
-        Inc(H);
-      end;
-
-      { No clause in this frame matched. Pop it and continue in the caller.
-        PopFrame unregisters the GC frame; ValueTop resets to the popped frame's
-        Base — the same pop DoReturn performs. The unwind allocates nothing, so
-        AExn stays live in its bare local across the pop (eh-spec §2.5). }
-      if Top^.RetKind = rtEntry then
-      begin
-        { Uncaught in this invocation: pop the entry frame, then leave the
-          interpreter as a real Pascal exception (eh-spec §2.4). }
-        Store.Heap.PopFrame;
-        ACtx^.ValueTop := Top^.Base;
-        Dec(ACtx^.Depth);
-        RaiseUncaught(AExn, TagAddr);
-      end;
-      Store.Heap.PopFrame;
-      ACtx^.ValueTop := Top^.Base;
-      Dec(ACtx^.Depth);
-      ThrowFrame := False;   { the next frame up was suspended at a call }
-    end;
   end;
 
 begin
@@ -1658,6 +1941,12 @@ begin
       iroReturnCall:
         begin
           Addr := Act^.Instance.FuncAddrs[UInt32(Ins^.Imm)];
+          if AAllowBounce and (ACtx^.Depth = AStopDepth + 1) and
+            IsCompiledCrossTier(Store, Addr) then
+          begin
+            BouncePendingTail(ACtx, Act, Ins^.A, Addr);
+            Exit;   { the backend loop re-dispatches the pending target O(1) }
+          end;
           EnterTailCall(ACtx, Act, Ins^.A, Addr);
           if ACtx^.Depth = AStopDepth then   { host tail from the entry frame }
             Exit;
@@ -1666,6 +1955,12 @@ begin
       iroReturnCallIndirect:
         begin
           Addr := ResolveIndirect(ACtx, Act, Reg, Ins);
+          if AAllowBounce and (ACtx^.Depth = AStopDepth + 1) and
+            IsCompiledCrossTier(Store, Addr) then
+          begin
+            BouncePendingTail(ACtx, Act, Ins^.A, Addr);
+            Exit;
+          end;
           EnterTailCall(ACtx, Act, Ins^.A, Addr);
           if ACtx^.Depth = AStopDepth then
             Exit;
@@ -1677,6 +1972,12 @@ begin
           if RefIsNull(R) then
             TrapNow(wtkNullFuncReference);
           Addr := Store.FuncRefAddr(R);
+          if AAllowBounce and (ACtx^.Depth = AStopDepth + 1) and
+            IsCompiledCrossTier(Store, Addr) then
+          begin
+            BouncePendingTail(ACtx, Act, Ins^.A, Addr);
+            Exit;
+          end;
           EnterTailCall(ACtx, Act, Ins^.A, Addr);
           if ACtx^.Depth = AStopDepth then
             Exit;
@@ -2049,7 +2350,8 @@ begin
               Reg[IrAuxBlockItem(Fn^.AuxU32, Ins^.A, U2)]);
             Inc(U2);
           end;
-          UnwindException(Exn);   { resumes a frame, or raises EWasmException }
+          { AThrowFrame True: scan the top (throwing) frame at its own IP. }
+          UnwindException(ACtx, Exn, True);   { resumes, or raises to leave Run }
           LoadTop;                { the catching frame may be an ancestor }
         end;
       iroThrowRef:
@@ -2061,7 +2363,7 @@ begin
             (siglongjmp), NOT the exception route. }
           if RefIsNull(R) then
             TrapNow(wtkNullReference);
-          UnwindException(R);
+          UnwindException(ACtx, R, True);
           LoadTop;
         end;
 
@@ -2780,7 +3082,8 @@ end;
 { --- the shared tier-seam frame helpers (O-J2) --------------------------- }
 
 function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
-  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue): PWasmValue;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue;
+  const ARetKind: TWasmRetKind): PWasmValue;
 var
   Inst: TWasmModuleInstance;
   Fn: PWasmIrFunction;
@@ -2817,7 +3120,10 @@ begin
     (ParamCount = 0 skips the loop). }
   ScatterParamsFlat(Fn, Slots, AParams);
 
-  Entry^.RetKind := rtEntry;
+  { Fix A: rtEntry for a genuine outermost entry, rtCompiledSeam for a nested
+    tier-seam entry (a compiled body, or a cross-seam interpreted callee) — this
+    is what makes the frame transparent-to or a boundary-for the unwind. }
+  Entry^.RetKind := ARetKind;
   { RetCount is a SLOT count so a v128 result flows into two flat AResults
     slots (simd-spec §1.6); DoReturn's per-slot copy then needs no change. }
   Entry^.RetCount := ResultSlotCount(Fn);
@@ -2858,14 +3164,85 @@ begin
   Result.GcFrameRegisterCount := PtrUInt(@G.RegisterCount) - PtrUInt(@G);
 end;
 
+{ FNV-1a hashing wraps modulo 2^64 by design, so overflow/range checks must be
+  off for the multiply below (they are on project-wide via Shared.inc). }
+{$push}{$Q-}{$R-}
+function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+var
+  H: UInt64;
+  JO: TWasmJitOffsets;
+  FO: TWasmJitFrameOffsets;
+
+  { FNV-1a-64 fold of one 64-bit datum: enough to make an accidental ABI drift
+    change the fingerprint deterministically (this is an identity guard, not a
+    cryptographic one). }
+  procedure Fold(const AValue: UInt64);
+  var
+    I: Integer;
+    V: UInt64;
+  begin
+    V := AValue;
+    for I := 0 to 7 do
+    begin
+      H := H xor (V and $FF);
+      H := H * UInt64($00000100000001B3);
+      V := V shr 8;
+    end;
+  end;
+
+begin
+  JO := WasmJitOffsets(AStore);
+  FO := WasmJitFrameOffsets;
+  H := UInt64($CBF29CE484222325);   { FNV-1a-64 offset basis }
+
+  Fold(JO.StoreEpoch);
+  Fold(JO.StoreEpochSnapshot);
+  Fold(JO.StoreJitHelperTable);
+  Fold(JO.FuncInstStride);
+  Fold(JO.FuncKind);
+  Fold(JO.FuncCompiledEntry);
+  Fold(JO.FuncCallCount);
+  Fold(JO.MemInstStride);
+  Fold(JO.MemBase);
+  Fold(JO.MemByteSize);
+
+  Fold(FO.ValueSlotSize);
+  Fold(FO.CtxValues);
+  Fold(FO.CtxValueTop);
+  Fold(FO.CtxValueCap);
+  Fold(FO.CtxDepth);
+  Fold(FO.ActStride);
+  Fold(FO.ActBase);
+  Fold(FO.GcFrameSlots);
+  Fold(FO.GcFrameRefRegBits);
+  Fold(FO.GcFrameRegisterCount);
+
+  Fold(SizeOf(TWasmIrInstr));
+  Fold(SizeOf(TWasmValue));
+  Fold(AOT_HELPER_COUNT);
+  Fold(AOT_ABI_REVISION);
+
+  Result := H;
+end;
+{$pop}
+
 procedure InterpTierInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
   const AParams: PWasmValue; const AResults: PWasmValue);
 var
   Ctx: PWasmInterpContext;
   SavedDepth, SavedTop: NativeUInt;
+  RetKind: TWasmRetKind;
+  AllowBounce: Boolean;
 begin
   AStore.CheckThread;                     { ADR-0008 }
   Ctx := InterpContextFor(AStore);
+
+  { Fix A: learn whether this entry is a nested tier seam (rtCompiledSeam) or a
+    genuine outermost entry (rtEntry), and whether the backend loop drives it as
+    a tail target that may bounce a cross-tier tail. Consume BOTH once, up front,
+    so neither leaks past a host early-return. }
+  RetKind := ConsumeJitSeamReentry;
+  AllowBounce := ConsumeTierTailTarget;
 
   { Wasm float ops never trap: mask the FPU on whatever thread runs guest
     code (Wasm.Interp.Numeric masked only its init thread). }
@@ -2875,11 +3252,29 @@ begin
     top level — either a fresh invoke or a prior trap whose unwind dropped
     the chain via Heap.ResetFrames, leaving Ctx cursors stale. A nested
     host->guest re-entry always has the outer frames on the chain, so its
-    cursors are trusted. }
+    cursors are trusted.
+
+    ADR-0006 / jit-spec §6 (Fix B): capture the epoch snapshot ONCE, HERE, at
+    the genuine OUTERMOST guest entry — the empty-GC-chain case — and NOT on a
+    nested re-entry. This is the ONE fix for a lost interrupt across the tier
+    seam: a compiled caller reaches an interpreted callee through
+    Arm64/X64CallInterpreted -> TierInvoke -> InterpTierInvoke, i.e. this
+    function IS re-entered on a nested wasm->wasm call. Re-seeding there would
+    reset the snapshot to the just-read (already-bumped) Store.Epoch, so a
+    pre-call epoch bump would go UNOBSERVED inside the nested callee (its
+    back-edge sees Epoch = Snapshot). The interpreter-only path keeps ONE
+    shared EpochCache across a nested call (nested interp calls stay in the
+    same Run and never re-enter here), so seeding only at the outermost entry
+    is what makes both tiers observe the interrupt identically. Both tiers read
+    this shared slot: Run seeds its EpochCache from it, and a compiled entry's
+    prologue loads it into x22/its snapshot register. A top-level compiled
+    entry (the JitInvokeCompiled dispatch below) is also covered because it too
+    runs only after this outermost seed. }
   if AStore.Heap.CurrentFrame = nil then
   begin
     Ctx^.Depth := 0;
     Ctx^.ValueTop := 0;
+    AStore.EpochSnapshot := AStore.Epoch;
   end;
 
   if AStore.Funcs[AFuncAddr].Kind = wfkHost then
@@ -2888,18 +3283,6 @@ begin
     Exit;
   end;
 
-  { ADR-0006 / jit-spec §6: capture the epoch snapshot ONCE, here at the
-    outermost guest-entry (the ONLY site that begins a guest invocation —
-    every host->guest re-entry re-enters through here, and every nested
-    wasm->wasm call, compiled or interpreted, is dispatched WITHOUT passing
-    through here, so it never re-seeds). Both tiers read this shared slot: the
-    interpreter's Run seeds its EpochCache from it, and a compiled entry's
-    prologue loads it into its snapshot register. Setting it before the
-    compiled-dispatch check below covers a top-level compiled entry too. A
-    mid-invocation epoch bump is thus observed as an interrupt at the next
-    back-edge under BOTH tiers, identically. }
-  AStore.EpochSnapshot := AStore.Epoch;
-
   { O-J1 tier check at the top-level entry: if the JIT compiled this function,
     dispatch to it through the same flat seam an interpreted entry uses, so
     the params/results marshal identically. Assigned() first keeps the no-JIT
@@ -2907,6 +3290,10 @@ begin
   if Assigned(AStore.JitInvokeCompiled) and
     (AStore.Funcs[AFuncAddr].CompiledEntry <> nil) then
   begin
+    { Propagate a nested seam through the fixed-signature hook so the backend
+      marks the compiled frame rtCompiledSeam too (Fix A). }
+    if RetKind = rtCompiledSeam then
+      MarkJitSeamReentry;
     AStore.JitInvokeCompiled(AStore, AFuncAddr, AParams, AResults);
     Exit;
   end;
@@ -2919,10 +3306,12 @@ begin
   SavedTop := Ctx^.ValueTop;
 
   { Build the entry frame through the SAME helper the JIT uses (O-J2), then
-    run the interpreter loop over it. }
-  JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults);
+    run the interpreter loop over it. AllowBounce lets an entry-level cross-tier
+    tail hand back to the backend loop (O(1), Fix A) — only ever set when the
+    backend drives this as a tail target. }
+  JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults, RetKind);
 
-  Run(Ctx, SavedDepth);
+  Run(Ctx, SavedDepth, AllowBounce);
 
   { Clean return: DoReturn already popped the entry frame. Restore the
     nesting cursors so an outer invocation is undisturbed. A trap unwinds

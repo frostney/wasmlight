@@ -87,6 +87,11 @@ uses
   Wasm.Runtime.Values;
 
 type
+  { The borrowed IR-instruction pointer the helper-call templates bake (Fix C);
+    the same shape Wasm.Interp exports, redeclared here so it is visible in this
+    unit's interface without a circular use. }
+  PWasmIrInstr = ^TWasmIrInstr;
+
   { A branch displacement that does not fit its rel32 field. Raised by
     X64ResolvePatches so the driver ABANDONS the compile and leaves the
     function interpreted (AAlways correct). A distinct class so the driver
@@ -111,12 +116,21 @@ const
   X64_R12 = 12;
   X64_R13 = 13;
   X64_R14 = 14;
+  X64_R15 = 15;
 
-  { --- pins (jit-spec §5.3) ---------------------------------------------- }
+  { --- pins (jit-spec §5.3, aot-spec §1.2/§1.3/§4.3) --------------------- }
+  { The x86-64 callee-saved set is rbx, rbp, r12-r15. All six are pinned: the
+    four Wave-2 roles below plus the two position-independence pins (the
+    helper-table base and the IR-code base). rbp is used as a general pinned
+    register, NOT a frame pointer — this JIT addresses locals off rbx and native
+    scratch off rsp, and a trap unwinds through setjmp/longjmp (which restores
+    rbp), so no frame-pointer chain is needed. Scratch stays rax/rcx/rdx. }
   X64_REG_REGFILE = X64_RBX;    { rbx = @Values[Base] }
   X64_REG_STORE = X64_R12;      { r12 = the store pointer }
   X64_REG_EPOCHADDR = X64_R13;  { r13 = &Store.Epoch }
   X64_REG_EPOCH = X64_R14;      { r14 = the epoch captured at frame entry }
+  X64_REG_HELPERTABLE = X64_R15;{ r15 = the per-process helper-table base }
+  X64_REG_IRBASE = X64_RBP;     { rbp = @Fn^.Code[0], the IR-code base }
   X64_REG_T0 = X64_RAX;         { rax/eax scratch }
   X64_REG_T1 = X64_RCX;         { rcx/ecx scratch (also CL for variable shifts) }
   X64_REG_T2 = X64_RDX;         { rdx/edx scratch }
@@ -235,9 +249,29 @@ procedure X64EmitJccTo(const ABuf: TWasmCodeBuffer; const ACc: Byte;
 
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
 procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer);
+{ Pin the per-process helper-table base in r15 (aot-spec §1.2/§4.3): loads it
+  from the store field (r12 + AHelperTableOffset) ONCE. Emitted by the driver
+  right after the prologue; the exec-only encoder tests skip it. }
+procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
+  const AHelperTableOffset: NativeUInt);
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer);
+
+{ Emit an indirect call to helper slot AHelper through the pinned helper table:
+  `call qword [r15 + Ord(AHelper)*8]` (aot-spec §1.2) — position-independent. }
+procedure X64EmitCallHelper(const ABuf: TWasmCodeBuffer;
+  const AHelper: TWasmAotHelper);
+
+{ Compute @Fn^.Code[AInsIndex] into ADestReg from the pinned IR base rbp
+  (aot-spec §1.3): `lea rDest, [rbp + i*stride]`. No baked IR pointer. }
+procedure X64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
+  const AInsIndex: UInt32);
+
+{ The per-process helper table for this backend (aot-spec §4.3): an
+  array[TWasmAotHelper] of live helper addresses, returned by base pointer for
+  RegisterJit to store in Store.JitHelperTable. }
+function X64GetHelperTable: PPointer;
 
 { Resolve every branch placeholder on ABuf's patch list into its final rel32.
   Call once, after the whole function is emitted and every label bound, while
@@ -246,8 +280,12 @@ procedure X64ResolvePatches(const ABuf: TWasmCodeBuffer);
 
 { --- the per-op template layer (the driver walks the IR and calls this) --- }
 function X64CanEmitOp(const AOp: TWasmIrOp): Boolean;
+{ AInsIndex is the instruction's IR index (aot-spec §1.3): the runtime-op
+  templates compute @Fn^.Code[i] from the pinned IR base rbp plus
+  AInsIndex*SizeOf(TWasmIrInstr), so nothing is baked. }
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32): Boolean;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32): Boolean;
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -414,23 +452,17 @@ end;
 { ===================================================================== }
 
 type
-  { The compiled entry's ABI (regbase in rdi, store in rsi), cdecl = SysV. }
+  { The compiled entry's ABI (aot-spec §1.3/§4.3): regbase in rdi, store in rsi,
+    IR-code base @Fn^.Code[0] in rdx; cdecl = SysV. The prologue pins them in
+    rbx / r12 / rbp, and pins the helper-table base (r15) off the store. }
   TX64CompiledEntry = procedure(const ARegBase: PWasmValue;
-    const AStore: TWasmStore); cdecl;
+    const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
-  PX64TailCall = ^TX64TailCall;
-
-  TX64TailCall = record
-    Pending: Boolean;
-    Addr: TWasmFuncAddr;
-    ArgCount: UInt32;
-    Args: array[0 .. X64_MAX_CALL_SLOTS - 1] of TWasmValue;
-  end;
-
-threadvar
-  { One pending tail-call slot per thread (a store is confined to one thread,
-    ADR-0008; the trampoline consumes the request before the next body runs). }
-  GX64TailCall: TX64TailCall;
+{ Fix A: the pending tail channel is the SHARED Wasm.Interp.GTierTail
+  (TierTailSlot), written by both a compiled body's return_call* helper and the
+  interpreter's cross-tier tail bounce, read by the loop below — so alternating
+  compiled<->interpreted tails re-dispatch through ONE loop with no native-stack
+  growth (Finding 1). The old backend-local slot is gone. }
 
 function X64CallerInstance(const AStore: TWasmStore): TWasmModuleInstance;
 var
@@ -467,9 +499,18 @@ begin
       AArgs, AResults)
   else if Assigned(AStore.JitInvokeCompiled) and
     (AStore.Funcs[AAddr].CompiledEntry <> nil) then
-    AStore.JitInvokeCompiled(AStore, AAddr, AArgs, AResults)
+  begin
+    { Fix A: a nested compiled seam — its frame is rtCompiledSeam. }
+    MarkJitSeamReentry;
+    AStore.JitInvokeCompiled(AStore, AAddr, AArgs, AResults);
+  end
   else
+  begin
+    { A NON-tail interpreted callee reached from compiled code is a nested seam;
+      its frame is rtCompiledSeam (but not a tail target — it completes). }
+    MarkJitSeamReentry;
     X64CallInterpreted(AStore, AAddr, AArgs, AResults);
+  end;
 end;
 
 { call_indirect resolution, mirroring Wasm.Interp.ResolveIndirect check order
@@ -524,23 +565,9 @@ end;
 
 procedure X64SetPendingTail(const AAddr: TWasmFuncAddr;
   const AArgs: PWasmValue; const ACount: UInt32);
-var
-  P: PX64TailCall;
-  I: UInt32;
 begin
-  P := @GX64TailCall;
-  if ACount > X64_MAX_CALL_SLOTS then
-    raise EWasmError.Create(
-      'internal: JIT tail-call arity exceeds the marshal cap');
-  I := 0;
-  while I < ACount do
-  begin
-    P^.Args[I] := AArgs[I];
-    Inc(I);
-  end;
-  P^.Addr := AAddr;
-  P^.ArgCount := ACount;
-  P^.Pending := True;
+  { Publish into the SHARED cross-tier channel (Fix A). }
+  SetTierPendingTail(AAddr, AArgs, ACount);
 end;
 
 { --- the six cdecl helpers the emitted call sequences call --------------- }
@@ -593,14 +620,20 @@ procedure X64InvokeCompiled(const AStore: TWasmStore;
   const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue);
 var
   Ctx: PWasmInterpContext;
-  Pend: PX64TailCall;
+  Pend: PWasmTierTail;
   Base: PWasmValue;
   Entry: TX64CompiledEntry;
   CurAddr: TWasmFuncAddr;
   CurArgs: PWasmValue;
+  RetKind: TWasmRetKind;
+  Seam: TWasmSeamCatch;
+  IrFn: PWasmIrFunction;
+  IrBase: PWasmIrInstr;
 begin
   Ctx := InterpContextFor(AStore);
-  Pend := @GX64TailCall;
+  { Fix A: one return/unwind kind for the whole chain (see the aarch64 twin). }
+  RetKind := ConsumeJitSeamReentry;
+  Pend := TierTailSlot;
   CurAddr := AFuncAddr;
   CurArgs := AParams;
   while True do
@@ -611,16 +644,46 @@ begin
         CurArgs, AResults);
       Exit;
     end;
+    { Interpreted tail target: drive it as a bounceable tail target (Fix A). }
     if AStore.Funcs[CurAddr].CompiledEntry = nil then
     begin
+      if RetKind = rtCompiledSeam then
+        MarkJitSeamReentry;
+      MarkTierTailTarget;
       X64CallInterpreted(AStore, CurAddr, CurArgs, AResults);
-      Exit;
+      if not Pend^.Pending then
+        Exit;
+      Pend^.Pending := False;
+      CurAddr := Pend^.Addr;
+      CurArgs := @Pend^.Args[0];
+      Continue;
     end;
 
-    Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults);
+    Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults, RetKind);
     Pend^.Pending := False;
     Entry := TX64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
-    Entry(Base, AStore);
+    { The freshly-decoded IR base @Fn^.Code[0] the body pins in rbp to compute
+      @Fn^.Code[i] (aot-spec §1.3) — a live per-invocation pointer, never baked. }
+    IrFn := @AStore.Funcs[CurAddr].Instance.Ir.Functions[
+      AStore.Funcs[CurAddr].FuncIrIndex];
+    if Length(IrFn^.Code) > 0 then
+      IrBase := @IrFn^.Code[0]
+    else
+      IrBase := nil;
+    { Fix A (Finding 3): the compiled body is a native barrier; a wasm exception
+      thrown beneath it LongJmps up to this seam catch (a Pascal raise cannot
+      cross the native frame). Continue the unwind (pops this frame, hops further
+      out, or RaiseUncaughts at a genuine outermost rtEntry). }
+    Seam.Prev := CurrentSeamCatch;
+    CurrentSeamCatch := @Seam;
+    if SetJmp(Seam.JmpBuf) <> 0 then
+    begin
+      CurrentSeamCatch := Seam.Prev;
+      UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
+      Exit;
+    end;
+    Entry(Base, AStore, IrBase);
+    CurrentSeamCatch := Seam.Prev;
 
     JitLeaveFrame(Ctx);
     if not Pend^.Pending then
@@ -1882,6 +1945,25 @@ begin
   ABuf.EmitByte($D0 or (AReg and 7));
 end;
 
+procedure X64EmitCallHelper(const ABuf: TWasmCodeBuffer;
+  const AHelper: TWasmAotHelper);
+begin
+  { CALL r/m64 = FF /2, memory form: call qword [r15 + k*8]. r15 needs REX.B; the
+    reg field is /2. Position-independent — the code holds only the slot index. }
+  X64EmitRex(ABuf, 0, 0, 0, X64_REG_HELPERTABLE shr 3);
+  ABuf.EmitByte($FF);
+  EmitMemOperand(ABuf, 2, X64_REG_HELPERTABLE, Int32(Ord(AHelper)) * 8);
+end;
+
+procedure X64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
+  const AInsIndex: UInt32);
+begin
+  { lea rDest, [rbp + i*stride] — rbp base always encodes an explicit disp
+    (EmitMemOperand forces it), so disp 0 (i=0) is not misread as RIP-relative. }
+  X64EmitLea(ABuf, ADestReg, X64_REG_IRBASE,
+    Int32(AInsIndex * UInt32(SizeOf(TWasmIrInstr))));
+end;
+
 procedure X64EmitJmpTo(const ABuf: TWasmCodeBuffer; const ATarget: UInt32);
 var
   Site: Integer;
@@ -1916,11 +1998,23 @@ begin
   X64EmitPushReg(ABuf, X64_R12);
   X64EmitPushReg(ABuf, X64_R13);
   X64EmitPushReg(ABuf, X64_R14);
-  { Four 8-byte pushes leave rsp 8 mod 16 (entry is 8 mod 16); the pad restores
+  X64EmitPushReg(ABuf, X64_R15);
+  X64EmitPushReg(ABuf, X64_RBP);
+  { Six 8-byte pushes leave rsp 8 mod 16 (entry is 8 mod 16); the pad restores
     16-alignment so every CALL below sees an aligned stack (SysV §3.2.2). }
   X64EmitSubRsp(ABuf, 8);
   X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RDI);   { rbx := regbase (arg0) }
   X64EmitMovRegReg(ABuf, X64_REG_STORE, X64_RSI);     { r12 := store (arg1) }
+  X64EmitMovRegReg(ABuf, X64_REG_IRBASE, X64_RDX);    { rbp := IR base (arg2) }
+end;
+
+procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
+  const AHelperTableOffset: NativeUInt);
+begin
+  { r15 := Store.JitHelperTable — the per-process helper-table base, loaded once
+    and held callee-saved so every helper call is `call [r15 + k*8]`. }
+  X64EmitLoadMem64(ABuf, X64_REG_HELPERTABLE, X64_REG_STORE,
+    Int32(AHelperTableOffset));
 end;
 
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
@@ -1937,6 +2031,8 @@ end;
 procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 begin
   X64EmitAddRsp(ABuf, 8);            { undo the alignment pad }
+  X64EmitPopReg(ABuf, X64_RBP);
+  X64EmitPopReg(ABuf, X64_R15);
   X64EmitPopReg(ABuf, X64_R14);
   X64EmitPopReg(ABuf, X64_R13);
   X64EmitPopReg(ABuf, X64_R12);
@@ -1973,8 +2069,7 @@ end;
 procedure EmitTrapCall(const ABuf: TWasmCodeBuffer; const AKind: TWasmTrapKind);
 begin
   X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(AKind)));
-  X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64TrapKind));
-  X64EmitCallReg(ABuf, X64_RAX);      { does not return }
+  X64EmitCallHelper(ABuf, aohTrapKind);   { does not return }
 end;
 
 { The back-edge epoch check (§6): if [r13] (live Store.Epoch) <> r14 (snapshot),
@@ -2145,8 +2240,7 @@ begin
   X64EmitLoadSlot64(ABuf, X64_ARG1, AIns.A);
   X64EmitLoadSlot64(ABuf, X64_ARG2, AIns.B);
   X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(AIns.Op)));
-  X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64OpBinary));
-  X64EmitCallReg(ABuf, X64_RAX);
+  X64EmitCallHelper(ABuf, aohOpBinary);
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
 end;
 
@@ -2154,41 +2248,41 @@ procedure EmitLeafUnary(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
 begin
   X64EmitLoadSlot64(ABuf, X64_ARG1, AIns.A);
   X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(AIns.Op)));
-  X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64OpUnary));
-  X64EmitCallReg(ABuf, X64_RAX);
+  X64EmitCallHelper(ABuf, aohOpUnary);
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
 end;
 
 { The uniform three-argument runtime/vector helper call: store (r12), regbase
-  (rbx), and a pointer to the live IR instruction. `@AIns` is the address of a
-  const-record parameter passed BY REFERENCE, hence AFn^.Code[i] (borrowed,
-  outliving the code block, §3.4). No operand marshaling: the dispatcher reads
-  and writes the in-memory register file directly through rbx. }
-procedure EmitRuntimeOp(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+  (rbx), and a pointer to the live IR instruction. Fix C: the baked pointer is
+  AInsPtr = @Fn^.Code[i], the driver's guaranteed-stable location in the
+  borrowed IR (outliving the code block, §3.4) — NOT @AIns, which would rely on
+  FPC passing the const record by reference through every forwarding hop. No
+  operand marshaling: the dispatcher reads and writes the in-memory register
+  file directly through rbx. AInsPtr is nil only for the exec-only unit tests,
+  which never drive a runtime template. }
+procedure EmitRuntimeOp(const ABuf: TWasmCodeBuffer; const AInsIndex: UInt32);
 begin
   X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
   X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_REGFILE);
-  X64EmitMovRegImm64(ABuf, X64_ARG2, PtrUInt(@AIns));
-  X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64RtDispatch));
-  X64EmitCallReg(ABuf, X64_RAX);
+  X64EmitIrInsPtr(ABuf, X64_ARG2, AInsIndex);          { rdx := @Fn^.Code[i] }
+  X64EmitCallHelper(ABuf, aohRtDispatch);
 end;
 
-procedure EmitVecOp(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+procedure EmitVecOp(const ABuf: TWasmCodeBuffer; const AInsIndex: UInt32);
 begin
   X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
   X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_REGFILE);
-  X64EmitMovRegImm64(ABuf, X64_ARG2, PtrUInt(@AIns));
-  X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64VecDispatch));
-  X64EmitCallReg(ABuf, X64_RAX);
+  X64EmitIrInsPtr(ABuf, X64_ARG2, AInsIndex);          { rdx := @Fn^.Code[i] }
+  X64EmitCallHelper(ABuf, aohVecDispatch);
 end;
 
-procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
+  const AInsIndex: UInt32);
 begin
   X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
   X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_REGFILE);
-  X64EmitMovRegImm64(ABuf, X64_ARG2, PtrUInt(@AIns));
-  X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64RefBranchPredicate));
-  X64EmitCallReg(ABuf, X64_RAX);                       { eax := P (1/0) }
+  X64EmitIrInsPtr(ABuf, X64_ARG2, AInsIndex);          { rdx := @Fn^.Code[i] }
+  X64EmitCallHelper(ABuf, aohRefBranchPredicate);      { eax := P (1/0) }
   X64EmitAluRegReg(ABuf, $85, False, X64_RAX, X64_RAX);   { test eax, eax }
   case AIns.Op of
     iroBrOnNull, iroBrOnCast:
@@ -2267,7 +2361,7 @@ begin
         X64EmitMovRegImm32(ABuf, X64_ARG1, UInt32(AIns.Imm));    { funcidx }
         X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);                  { args }
         X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));    { results }
-        X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64CallHelper));
+        X64EmitCallHelper(ABuf, aohCall);
       end;
     iroCallIndirect:
       begin
@@ -2275,17 +2369,16 @@ begin
         X64EmitLoadSlot64(ABuf, X64_ARG2, AIns.Dest);            { index }
         X64EmitLea(ABuf, X64_ARG3, X64_RSP, 0);                  { args }
         X64EmitLea(ABuf, X64_ARG4, X64_RSP, Int32(ArgBytes));    { results }
-        X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64CallIndirectHelper));
+        X64EmitCallHelper(ABuf, aohCallIndirect);
       end;
   else
     { iroCallRef }
     X64EmitLoadSlot64(ABuf, X64_ARG1, AIns.Dest);               { funcref }
     X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);
     X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));
-    X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64CallRefHelper));
+    X64EmitCallHelper(ABuf, aohCallRef);
   end;
 
-  X64EmitCallReg(ABuf, X64_RAX);
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
 end;
@@ -2308,7 +2401,7 @@ begin
         X64EmitMovRegImm32(ABuf, X64_ARG1, UInt32(AIns.Imm));
         X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);
         X64EmitMovRegImm32(ABuf, X64_ARG3, ArgN);
-        X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64ReturnCallHelper));
+        X64EmitCallHelper(ABuf, aohReturnCall);
       end;
     iroReturnCallIndirect:
       begin
@@ -2316,17 +2409,16 @@ begin
         X64EmitLoadSlot64(ABuf, X64_ARG2, AIns.Dest);
         X64EmitLea(ABuf, X64_ARG3, X64_RSP, 0);
         X64EmitMovRegImm32(ABuf, X64_ARG4, ArgN);
-        X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64ReturnCallIndirectHelper));
+        X64EmitCallHelper(ABuf, aohReturnCallIndirect);
       end;
   else
     { iroReturnCallRef }
     X64EmitLoadSlot64(ABuf, X64_ARG1, AIns.Dest);
     X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);
     X64EmitMovRegImm32(ABuf, X64_ARG3, ArgN);
-    X64EmitMovRegImm64(ABuf, X64_RAX, PtrUInt(@X64ReturnCallRefHelper));
+    X64EmitCallHelper(ABuf, aohReturnCallRef);
   end;
 
-  X64EmitCallReg(ABuf, X64_RAX);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
   X64EmitEpilogue(ABuf);
 end;
@@ -2483,7 +2575,8 @@ begin
 end;
 
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32): Boolean;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32): Boolean;
 begin
   Result := True;
   case AIns.Op of
@@ -2578,14 +2671,43 @@ begin
     else if X64LeafUnaryOp(AIns.Op) then
       EmitLeafUnary(ABuf, AIns)
     else if X64RuntimeOp(AIns.Op) then
-      EmitRuntimeOp(ABuf, AIns)
+      EmitRuntimeOp(ABuf, AInsIndex)
     else if X64BranchRefOp(AIns.Op) then
-      EmitBranchRef(ABuf, AIns)
+      EmitBranchRef(ABuf, AIns, AInsIndex)
     else if X64VecOp(AIns.Op) then
-      EmitVecOp(ABuf, AIns)
+      EmitVecOp(ABuf, AInsIndex)
     else
       Result := False;
   end;
+end;
+
+{ ===================================================================== }
+{  the per-process helper table (aot-spec §1.2/§4.3)                     }
+{ ===================================================================== }
+
+var
+  GX64HelperTable: array[TWasmAotHelper] of Pointer;
+  GX64HelperTableFilled: Boolean = False;
+
+function X64GetHelperTable: PPointer;
+begin
+  if not GX64HelperTableFilled then
+  begin
+    GX64HelperTable[aohTrapKind] := @X64TrapKind;
+    GX64HelperTable[aohOpBinary] := @X64OpBinary;
+    GX64HelperTable[aohOpUnary] := @X64OpUnary;
+    GX64HelperTable[aohRtDispatch] := @X64RtDispatch;
+    GX64HelperTable[aohVecDispatch] := @X64VecDispatch;
+    GX64HelperTable[aohRefBranchPredicate] := @X64RefBranchPredicate;
+    GX64HelperTable[aohCall] := @X64CallHelper;
+    GX64HelperTable[aohCallIndirect] := @X64CallIndirectHelper;
+    GX64HelperTable[aohCallRef] := @X64CallRefHelper;
+    GX64HelperTable[aohReturnCall] := @X64ReturnCallHelper;
+    GX64HelperTable[aohReturnCallIndirect] := @X64ReturnCallIndirectHelper;
+    GX64HelperTable[aohReturnCallRef] := @X64ReturnCallRefHelper;
+    GX64HelperTableFilled := True;
+  end;
+  Result := @GX64HelperTable[aohTrapKind];
 end;
 
 end.

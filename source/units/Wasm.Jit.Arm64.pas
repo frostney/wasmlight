@@ -95,6 +95,11 @@ uses
   Wasm.Runtime.Values;
 
 type
+  { The borrowed IR-instruction pointer the helper-call templates bake (Fix C);
+    the same shape Wasm.Interp exports, redeclared here so it is visible in this
+    unit's interface without a circular use. }
+  PWasmIrInstr = ^TWasmIrInstr;
+
   { A branch displacement that does not fit its A64 immediate field (imm26 for
     B, imm19 for B.cond/CBZ/CBNZ). Raised by Arm64ResolvePatches so the driver
     ABANDONS the compile and leaves the function interpreted (always correct)
@@ -109,6 +114,9 @@ const
   ARM64_REG_STORE = 20;    { x20 = the store pointer (for the epoch word) }
   ARM64_REG_EPOCHADDR = 21;{ x21 = &Store.Epoch }
   ARM64_REG_EPOCH = 22;    { x22 = the epoch captured at frame entry }
+  { --- position-independent pins (aot-spec §1.2/§1.3/§4.3) --------------- }
+  ARM64_REG_IRBASE = 23;   { x23 = @Fn^.Code[0], the IR-code base (entry arg x2) }
+  ARM64_REG_HELPERTABLE = 24;  { x24 = the per-process helper-table base }
   ARM64_REG_T0 = 9;        { x9/w9 scratch }
   ARM64_REG_T1 = 10;       { x10/w10 scratch }
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
@@ -236,13 +244,16 @@ function Arm64Blr(const ARn: Byte): UInt32;
 { RET (Xn) — return to Xn (default x30). ret = 0xD65F03C0. }
 function Arm64Ret: UInt32;
 
-{ The Wave-2 frame save/restore words (jit-spec §5.3). The prologue saves the
-  four pinned callee-saved registers plus x30 in a 48-byte frame; the epilogue
-  restores them. Provided as builders so the encoder test can assert the bytes. }
-function Arm64StpX19X20PreIndex48: UInt32;   { stp x19,x20,[sp,#-48]! }
+{ The frame save/restore words. The position-independent prologue saves the SIX
+  pinned callee-saved registers (x19..x24) plus x30 in a 64-byte frame; the
+  epilogue restores them. Provided as builders so the encoder test can assert
+  the bytes. }
+function Arm64StpX19X20PreIndex64: UInt32;   { stp x19,x20,[sp,#-64]! }
 function Arm64StpX21X22Off16: UInt32;        { stp x21,x22,[sp,#16] }
+function Arm64StpX23X24Off32: UInt32;        { stp x23,x24,[sp,#32] }
+function Arm64LdpX23X24Off32: UInt32;        { ldp x23,x24,[sp,#32] }
 function Arm64LdpX21X22Off16: UInt32;        { ldp x21,x22,[sp,#16] }
-function Arm64LdpX19X20PostIndex48: UInt32;  { ldp x19,x20,[sp],#48 }
+function Arm64LdpX19X20PostIndex64: UInt32;  { ldp x19,x20,[sp],#64 }
 
 { True iff AValue fits a two's-complement signed field of ABits bits, i.e.
   -2^(ABits-1) <= AValue <= 2^(ABits-1)-1. The branch-displacement range guard
@@ -294,9 +305,34 @@ procedure Arm64EmitLoadImm64(const ABuf: TWasmCodeBuffer; const ARd: Byte;
   offset; ASnapshotOffset is Store.EpochSnapshot's. Arm64EmitEpilogue restores
   the set and returns (iroReturn emits it). }
 procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
+{ Pin the per-process helper-table base in x24 (aot-spec §1.2/§4.3): loads it
+  from the store field (x20 + AHelperTableOffset) ONCE, so every subsequent
+  helper call is `ldr xT,[x24,#k*8]; blr xT`. Emitted by the driver right after
+  the prologue, before the epoch capture; the exec-only encoder tests skip it
+  (they emit no helper call), so the store is only dereferenced on the real
+  compile path. AHelperTableOffset is WasmJitOffsets.StoreJitHelperTable. }
+procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
+  const AHelperTableOffset: NativeUInt);
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
+
+{ Emit an indirect call to helper slot AHelper through the pinned helper table:
+  `ldr x9,[x24,#Ord(AHelper)*8]; blr x9` (aot-spec §1.2). Position-independent —
+  the code names a stable slot index, never a baked address. }
+procedure Arm64EmitCallHelper(const ABuf: TWasmCodeBuffer;
+  const AHelper: TWasmAotHelper);
+
+{ Compute @Fn^.Code[AInsIndex] into ADestReg from the pinned IR base x23
+  (aot-spec §1.3): `add xDest,x23,#(i*stride)` when the offset fits ADD's imm12,
+  else materialise the offset and add as a register. No baked IR pointer. }
+procedure Arm64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
+  const AInsIndex: UInt32);
+
+{ The per-process helper table for this backend: an array[TWasmAotHelper] of the
+  live helper addresses, filled once (lazily) and returned by base pointer for
+  RegisterJit to store in Store.JitHelperTable (aot-spec §4.3). }
+function Arm64GetHelperTable: PPointer;
 
 { Resolve every forward/backward branch placeholder recorded on ABuf's patch
   list into its final A64 branch word. Call once, after the whole function is
@@ -313,10 +349,21 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
   target IR-instruction's label — the driver binds one label per instruction, in
   order, so the label id equals the IR index (AIns's target fields are used as
   label ids directly). br_table reads its target list from AAux (the function's
-  AuxU32 block); pass the compiling function's AuxU32. }
+  AuxU32 block); pass the compiling function's AuxU32.
+
+  Position-independent IR pointer (aot-spec §1.3). The helper-call templates
+  (memory / table / ref / global / GC / v128 / ref-branch) hand the runtime
+  dispatcher a pointer to the live IR instruction so it can read its fields.
+  Rather than BAKE @Fn^.Code[i] as an absolute immediate (a heap address, wrong
+  on any reload), the template computes it at run time from the pinned IR base
+  x23 plus AInsIndex*SizeOf(TWasmIrInstr). The driver passes the instruction's
+  IR index; @Fn^.Code[0] reaches the code through the entry's third argument,
+  freshly per invocation — so nothing about the host process is ever baked, and
+  this also subsumes the old Fix-C @AIns-by-reference concern. }
 function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32): Boolean;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32): Boolean;
 
 { The INSTRUCTION-level half of the compile predicate (§4.4). Arm64CanEmitOp
   answers "is there a template for this op"; this answers "can this particular
@@ -504,32 +551,21 @@ end;
 
 type
   { The compiled entry's ABI, mirroring Wasm.Jit.TWasmJitCompiledEntry (kept
-    local so this unit stays below the driver). }
+    local so this unit stays below the driver). THREE arguments now
+    (aot-spec §1.3/§4.3): the register-file base (x0 -> pinned x19), the store
+    (x1 -> pinned x20, from which the prologue pins &Epoch, the snapshot, and
+    the helper-table base), and the IR-code base @Fn^.Code[0] (x2 -> pinned x23),
+    from which every runtime-op template computes @Fn^.Code[i]. The IR base is a
+    live per-invocation value, never baked, which is what makes the code
+    position-independent. }
   TArm64CompiledEntry = procedure(const ARegBase: PWasmValue;
-    const AStore: TWasmStore); cdecl;
+    const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
-  { The pending tail-call request a compiled body leaves behind before it
-    returns to Arm64InvokeCompiled's trampoline loop (§4.5). The arguments are
-    COPIED here because the body's native-stack scratch dies with its frame,
-    and because the frame replacement that follows overwrites the registers
-    they came from — the same reason the interpreter's ReplaceWasmFrame
-    collects into a stack-local Tmp before it pops. }
-  PArm64TailCall = ^TArm64TailCall;
-
-  TArm64TailCall = record
-    Pending: Boolean;
-    Addr: TWasmFuncAddr;
-    ArgCount: UInt32;
-    Args: array[0 .. ARM64_MAX_CALL_SLOTS - 1] of TWasmValue;
-  end;
-
-threadvar
-  { One pending slot per THREAD. A store is confined to one thread (ADR-0008)
-    and only one tail call can be in flight on a thread at a time — the
-    trampoline consumes the request before the next body runs, and a nested
-    dispatch always returns with Pending clear — but two stores on two threads
-    would race a plain global, so this is thread-local. }
-  GArm64TailCall: TArm64TailCall;
+{ Fix A: the pending tail-call channel is now the SHARED Wasm.Interp.GTierTail
+  (TierTailSlot), written by BOTH a compiled body's return_call* helper AND the
+  interpreter's cross-tier tail bounce, and read by the loop below — so an
+  alternating compiled<->interpreted tail chain re-dispatches through ONE loop
+  with no native-stack growth (Finding 1). The old backend-local slot is gone. }
 
 { The instance whose index spaces a call immediate is resolved against: the
   CURRENT (top) activation's, which is the compiled frame JitEnterFrame pushed
@@ -574,12 +610,21 @@ begin
       AArgs, AResults)
   else if Assigned(AStore.JitInvokeCompiled) and
     (AStore.Funcs[AAddr].CompiledEntry <> nil) then
-    AStore.JitInvokeCompiled(AStore, AAddr, AArgs, AResults)
+  begin
+    { Fix A: a compiled callee reached from compiled code is a nested tier seam
+      — mark it so its frame is rtCompiledSeam (transparent to a throw). }
+    MarkJitSeamReentry;
+    AStore.JitInvokeCompiled(AStore, AAddr, AArgs, AResults);
+  end
   else
-    { TierInvoke bumps CallCount for an interpreted entry, exactly as
-      EnterCall does for an interpreted callee — so the hot counter is not
-      double-counted here. }
+  begin
+    { An interpreted callee reached from compiled code (a NON-tail call) is a
+      nested seam too; mark it so its frame is rtCompiledSeam. NOT a tail target,
+      so it completes normally and its results flow back. TierInvoke bumps
+      CallCount for the interpreted entry, as EnterCall does. }
+    MarkJitSeamReentry;
     Arm64CallInterpreted(AStore, AAddr, AArgs, AResults);
+  end;
 end;
 
 { call_indirect resolution, mirroring Wasm.Interp.ResolveIndirect INSTRUCTION
@@ -648,23 +693,9 @@ end;
   no native stack (§4.5). }
 procedure Arm64SetPendingTail(const AAddr: TWasmFuncAddr;
   const AArgs: PWasmValue; const ACount: UInt32);
-var
-  P: PArm64TailCall;
-  I: UInt32;
 begin
-  P := @GArm64TailCall;
-  if ACount > ARM64_MAX_CALL_SLOTS then
-    raise EWasmError.Create(
-      'internal: JIT tail-call arity exceeds the marshal cap');
-  I := 0;
-  while I < ACount do
-  begin
-    P^.Args[I] := AArgs[I];
-    Inc(I);
-  end;
-  P^.Addr := AAddr;
-  P^.ArgCount := ACount;
-  P^.Pending := True;
+  { Publish into the SHARED cross-tier channel (Fix A). }
+  SetTierPendingTail(AAddr, AArgs, ACount);
 end;
 
 { --- the six cdecl helpers the emitted call sequences call --------------- }
@@ -720,53 +751,91 @@ procedure Arm64InvokeCompiled(const AStore: TWasmStore;
   const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue);
 var
   Ctx: PWasmInterpContext;
-  Pend: PArm64TailCall;
+  Pend: PWasmTierTail;
   Base: PWasmValue;
   Entry: TArm64CompiledEntry;
   CurAddr: TWasmFuncAddr;
   CurArgs: PWasmValue;
+  RetKind: TWasmRetKind;
+  Seam: TWasmSeamCatch;
+  IrFn: PWasmIrFunction;
+  IrBase: PWasmIrInstr;
 begin
   Ctx := InterpContextFor(AStore);
-  Pend := @GArm64TailCall;
+  { Fix A: this whole invocation's frames share ONE return/unwind kind — rtEntry
+    at a genuine outermost compiled entry, rtCompiledSeam when a launcher marked
+    a nested seam. A tail replacement preserves the original return target, so
+    every iteration carves with the SAME RetKind. }
+  RetKind := ConsumeJitSeamReentry;
+  Pend := TierTailSlot;
   CurAddr := AFuncAddr;
   CurArgs := AParams;
   while True do
   begin
-    { A tail target may be a host function: do the host call and let its
-      results BE this invocation's results — the interpreter's ReturnHostCall
-      shape, with no wasm frame added (§4.5). Unreachable on the first
-      iteration, where the caller already established a wasm callee. }
+    { A tail target may be a host function: do the host call and let its results
+      BE this invocation's results (§4.5). Unreachable on the first iteration. }
     if AStore.Funcs[CurAddr].Kind = wfkHost then
     begin
       AStore.Funcs[CurAddr].Callback(AStore, AStore.Funcs[CurAddr].HostData,
         CurArgs, AResults);
       Exit;
     end;
-    { A tail target that is not compiled runs interpreted, and continues ITS
-      tail chain inside the interpreter's own O(1) frame replacement. }
+    { A tail target that is not compiled runs INTERPRETED. Fix A: drive it as a
+      tail target (MarkTierTailTarget) and propagate this chain's kind, so its
+      Run may BOUNCE a cross-tier tail back to THIS loop (O(1)) instead of
+      nesting. If it bounces, GTierTail is pending and we loop; otherwise it ran
+      to completion and delivered its results. }
     if AStore.Funcs[CurAddr].CompiledEntry = nil then
     begin
+      if RetKind = rtCompiledSeam then
+        MarkJitSeamReentry;
+      MarkTierTailTarget;
       Arm64CallInterpreted(AStore, CurAddr, CurArgs, AResults);
-      Exit;
+      if not Pend^.Pending then
+        Exit;
+      Pend^.Pending := False;
+      CurAddr := Pend^.Addr;
+      CurArgs := @Pend^.Args[0];
+      Continue;
     end;
 
     { Carve + zero + marshal params + push the GC frame through the SHARED
-      helper, so the frame, the exhaustion threshold and the GC contract are
-      the interpreter's (§5.1). CurArgs is consumed here, BEFORE the body can
-      overwrite the pending buffer it may point into. }
-    Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults);
+      helper (§5.1). CurArgs is consumed here, BEFORE the body can overwrite the
+      pending buffer it may point into. }
+    Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults, RetKind);
     Pend^.Pending := False;
     Entry := TArm64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
-    Entry(Base, AStore);
+    { The IR-code base @Fn^.Code[0] the compiled body pins in x23 to compute
+      @Fn^.Code[i] (aot-spec §1.3). It is the FRESHLY-decoded IR of the current
+      callee — a live per-invocation pointer, passed in, never baked. }
+    IrFn := @AStore.Funcs[CurAddr].Instance.Ir.Functions[
+      AStore.Funcs[CurAddr].FuncIrIndex];
+    if Length(IrFn^.Code) > 0 then
+      IrBase := @IrFn^.Code[0]
+    else
+      IrBase := nil;
+    { Fix A (Finding 3): the compiled body is a native barrier. A wasm exception
+      thrown beneath it LongJmps up to THIS seam catch (a Pascal raise cannot
+      cross the native frame on this target). On the hop, re-enter the unwind: it
+      pops this compiled frame (transparent, no handlers) and hops further out —
+      or, at a genuine outermost rtEntry, RaiseUncaughts. It never resumes here
+      (a compiled frame carries no handler), so control never returns to the
+      normal path; the Exit is defensive. }
+    Seam.Prev := CurrentSeamCatch;
+    CurrentSeamCatch := @Seam;
+    if SetJmp(Seam.JmpBuf) <> 0 then
+    begin
+      CurrentSeamCatch := Seam.Prev;
+      UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
+      Exit;
+    end;
+    Entry(Base, AStore, IrBase);
+    CurrentSeamCatch := Seam.Prev;
 
-    { Pop. On the tail-call path the body wrote no results, so the result
-      marshal copies the zeroed result registers into AResults and the NEXT
-      iteration (or the host/interpreted arm above) overwrites them — the pop
-      is what is wanted, and reusing it keeps ONE frame-teardown path. Popping
-      first also puts ValueTop back at this frame's Base, so the replacement
-      frame is carved at the SAME base with the same exhaustion test the
-      interpreter's ReplaceWasmFrame applies, and Depth is unchanged across an
-      iteration: the O(1) property. }
+    { Pop (reuses ONE frame-teardown path; on a tail the body wrote no results,
+      and the NEXT iteration overwrites them). Popping resets ValueTop to this
+      frame's Base, so the replacement is carved at the SAME base and Depth is
+      unchanged across an iteration: the O(1) property. }
     JitLeaveFrame(Ctx);
     if not Pend^.Pending then
       Exit;
@@ -2151,9 +2220,9 @@ begin
   Result := $D65F03C0;
 end;
 
-function Arm64StpX19X20PreIndex48: UInt32;
+function Arm64StpX19X20PreIndex64: UInt32;
 begin
-  Result := $A9BD53F3;   { stp x19, x20, [sp, #-48]! }
+  Result := $A9BC53F3;   { stp x19, x20, [sp, #-64]! }
 end;
 
 function Arm64StpX21X22Off16: UInt32;
@@ -2161,14 +2230,24 @@ begin
   Result := $A9015BF5;   { stp x21, x22, [sp, #16] }
 end;
 
+function Arm64StpX23X24Off32: UInt32;
+begin
+  Result := $A90263F7;   { stp x23, x24, [sp, #32] }
+end;
+
+function Arm64LdpX23X24Off32: UInt32;
+begin
+  Result := $A94263F7;   { ldp x23, x24, [sp, #32] }
+end;
+
 function Arm64LdpX21X22Off16: UInt32;
 begin
   Result := $A9415BF5;   { ldp x21, x22, [sp, #16] }
 end;
 
-function Arm64LdpX19X20PostIndex48: UInt32;
+function Arm64LdpX19X20PostIndex64: UInt32;
 begin
-  Result := $A8C353F3;   { ldp x19, x20, [sp], #48 }
+  Result := $A8C453F3;   { ldp x19, x20, [sp], #64 }
 end;
 
 function Arm64SignedImmFits(const AValue: Integer; const ABits: Byte): Boolean;
@@ -2270,11 +2349,58 @@ end;
 
 procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
 begin
-  ABuf.EmitU32(Arm64StpX19X20PreIndex48);      { stp x19,x20,[sp,#-48]! }
+  ABuf.EmitU32(Arm64StpX19X20PreIndex64);      { stp x19,x20,[sp,#-64]! }
   ABuf.EmitU32(Arm64StpX21X22Off16);           { stp x21,x22,[sp,#16] }
-  ABuf.EmitU32(Arm64StrX(ARM64_REG_LR, ARM64_REG_ZR, 32)); { str x30,[sp,#32] }
+  ABuf.EmitU32(Arm64StpX23X24Off32);           { stp x23,x24,[sp,#32] }
+  ABuf.EmitU32(Arm64StrX(ARM64_REG_LR, ARM64_REG_ZR, 48)); { str x30,[sp,#48] }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_REGFILE, 0));  { mov x19,x0 (regbase) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_STORE, 1));    { mov x20,x1 (store) }
+  ABuf.EmitU32(Arm64MovReg(ARM64_REG_IRBASE, 2));   { mov x23,x2 (IR base) }
+end;
+
+procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
+  const AHelperTableOffset: NativeUInt);
+begin
+  { x24 := Store.JitHelperTable — the per-process helper-table base, loaded once
+    and held callee-saved so every helper call is a single indexed load + blr.
+    The field is pointer-aligned; load it directly when the scaled offset fits
+    LDR's imm12, else form the address in a scratch first. }
+  if ((AHelperTableOffset and 7) = 0) and ((AHelperTableOffset shr 3) < $1000) then
+    Arm64EmitLdrX(ABuf, ARM64_REG_HELPERTABLE, ARM64_REG_STORE,
+      UInt32(AHelperTableOffset))
+  else
+  begin
+    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, UInt64(AHelperTableOffset));
+    ABuf.EmitU32(Arm64AddX(ARM64_REG_T0, ARM64_REG_STORE, ARM64_REG_T0));
+    Arm64EmitLdrX(ABuf, ARM64_REG_HELPERTABLE, ARM64_REG_T0, 0);
+  end;
+end;
+
+procedure Arm64EmitCallHelper(const ABuf: TWasmCodeBuffer;
+  const AHelper: TWasmAotHelper);
+begin
+  { ldr x9,[x24,#k*8]; blr x9 — position-independent: the code holds only the
+    stable slot index k, the table holds the live address. }
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_HELPERTABLE,
+    UInt32(Ord(AHelper)) * 8);
+  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+end;
+
+procedure Arm64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
+  const AInsIndex: UInt32);
+var
+  Offset: UInt64;
+begin
+  Offset := UInt64(AInsIndex) * SizeOf(TWasmIrInstr);
+  if Offset < $1000 then
+    ABuf.EmitU32(Arm64AddImmX(ADestReg, ARM64_REG_IRBASE, UInt32(Offset)))
+  else
+  begin
+    { i*stride exceeds ADD's 12-bit immediate: materialise it (movz/movk into the
+      scratch x9) and add as a register. }
+    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, Offset);
+    ABuf.EmitU32(Arm64AddX(ADestReg, ARM64_REG_IRBASE, ARM64_REG_T0));
+  end;
 end;
 
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
@@ -2310,9 +2436,10 @@ end;
 
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 begin
-  ABuf.EmitU32(Arm64LdrX(ARM64_REG_LR, ARM64_REG_ZR, 32));  { ldr x30,[sp,#32] }
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_LR, ARM64_REG_ZR, 48));  { ldr x30,[sp,#48] }
+  ABuf.EmitU32(Arm64LdpX23X24Off32);           { ldp x23,x24,[sp,#32] }
   ABuf.EmitU32(Arm64LdpX21X22Off16);           { ldp x21,x22,[sp,#16] }
-  ABuf.EmitU32(Arm64LdpX19X20PostIndex48);     { ldp x19,x20,[sp],#48 }
+  ABuf.EmitU32(Arm64LdpX19X20PostIndex64);     { ldp x19,x20,[sp],#64 }
   ABuf.EmitU32(Arm64Ret);
 end;
 
@@ -2474,8 +2601,7 @@ begin
   Cont := ABuf.NewLabel;
   EmitBCondTo(ABuf, ARM64_COND_EQ, Cont);                    { b.eq Cont }
   ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(wtkEpochInterrupt)), 0)); { w0 := kind }
-  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitTrapKind));
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));                      { blr -> no return }
+  Arm64EmitCallHelper(ABuf, aohTrapKind);                    { blr -> no return }
   ABuf.BindLabel(Cont);
 end;
 
@@ -2487,8 +2613,7 @@ begin
   LdX(ABuf, 1, AIns.A);
   LdX(ABuf, 2, AIns.B);
   ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(AIns.Op)), 0));
-  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitOpBinary));
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+  Arm64EmitCallHelper(ABuf, aohOpBinary);
   StX(ABuf, 0, AIns.Dest);
 end;
 
@@ -2496,8 +2621,7 @@ procedure EmitLeafUnary(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
 begin
   LdX(ABuf, 1, AIns.A);
   ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(AIns.Op)), 0));
-  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitOpUnary));
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+  Arm64EmitCallHelper(ABuf, aohOpUnary);
   StX(ABuf, 0, AIns.Dest);
 end;
 
@@ -2642,7 +2766,7 @@ begin
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
-        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitCallHelper));
+        Arm64EmitCallHelper(ABuf, aohCall);
       end;
     iroCallIndirect:
       begin
@@ -2652,17 +2776,16 @@ begin
         LdX(ABuf, 2, AIns.Dest);
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, 0));
         ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, ArgBytes));
-        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitCallIndirectHelper));
+        Arm64EmitCallHelper(ABuf, aohCallIndirect);
       end;
   else
     { iroCallRef: the funcref operand rides in Dest. }
     LdX(ABuf, 1, AIns.Dest);
     ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
     ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
-    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitCallRefHelper));
+    Arm64EmitCallHelper(ABuf, aohCallRef);
   end;
 
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
   ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
 end;
@@ -2691,7 +2814,7 @@ begin
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
         Arm64EmitLoadImm32(ABuf, 3, ArgN);
-        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitReturnCallHelper));
+        Arm64EmitCallHelper(ABuf, aohReturnCall);
       end;
     iroReturnCallIndirect:
       begin
@@ -2699,18 +2822,16 @@ begin
         LdX(ABuf, 2, AIns.Dest);
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, 0));
         Arm64EmitLoadImm32(ABuf, 4, ArgN);
-        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0,
-          PtrUInt(@JitReturnCallIndirectHelper));
+        Arm64EmitCallHelper(ABuf, aohReturnCallIndirect);
       end;
   else
     { iroReturnCallRef }
     LdX(ABuf, 1, AIns.Dest);
     ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
     Arm64EmitLoadImm32(ABuf, 3, ArgN);
-    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitReturnCallRefHelper));
+    Arm64EmitCallHelper(ABuf, aohReturnCallRef);
   end;
 
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
   ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
   Arm64EmitEpilogue(ABuf);
 end;
@@ -2725,13 +2846,12 @@ end;
   §3.4), so the dispatcher reads the op's fields exactly as the interpreter
   does. No operand marshaling and no result unmarshal is emitted: the helper
   reads and writes the in-memory register file directly through x19. }
-procedure EmitRuntimeOp(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+procedure EmitRuntimeOp(const ABuf: TWasmCodeBuffer; const AInsIndex: UInt32);
 begin
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));      { x0 := store }
   ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
-  Arm64EmitLoadImm64(ABuf, 2, PtrUInt(@AIns));        { x2 := @instruction }
-  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitRtDispatch));
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+  Arm64EmitIrInsPtr(ABuf, 2, AInsIndex);              { x2 := @Fn^.Code[i] }
+  Arm64EmitCallHelper(ABuf, aohRtDispatch);
 end;
 
 { Wave 6 — every v128 op is the SAME uniform three-argument helper call, but to
@@ -2740,13 +2860,12 @@ end;
   reads and writes the in-memory register file directly through x19, so a v128's
   two adjacent slots need no operand marshaling — the 2-slot handling is
   inherited from the interpreter's own VecAt addressing. }
-procedure EmitVecOp(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+procedure EmitVecOp(const ABuf: TWasmCodeBuffer; const AInsIndex: UInt32);
 begin
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));      { x0 := store }
   ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
-  Arm64EmitLoadImm64(ABuf, 2, PtrUInt(@AIns));        { x2 := @instruction }
-  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitVecDispatch));
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+  Arm64EmitIrInsPtr(ABuf, 2, AInsIndex);              { x2 := @Fn^.Code[i] }
+  Arm64EmitCallHelper(ABuf, aohVecDispatch);
 end;
 
 { br_on_null / br_on_non_null / br_on_cast / br_on_cast_fail. Call the
@@ -2754,13 +2873,13 @@ end;
   the cast forms), branch to the target label on the op's taken polarity, then
   — on the fall-through (not-taken) edge — thread the refined value into Dest
   when present, exactly as the interpreter's arms do (interp-spec §3.9). }
-procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr);
+procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
+  const AInsIndex: UInt32);
 begin
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));      { x0 := store }
   ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
-  Arm64EmitLoadImm64(ABuf, 2, PtrUInt(@AIns));        { x2 := @instruction }
-  Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitRefBranchPredicate));
-  ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));               { w0 := P (1/0) }
+  Arm64EmitIrInsPtr(ABuf, 2, AInsIndex);              { x2 := @Fn^.Code[i] }
+  Arm64EmitCallHelper(ABuf, aohRefBranchPredicate);   { w0 := P (1/0) }
   case AIns.Op of
     iroBrOnNull, iroBrOnCast:
       { taken when P holds (null / cast succeeds) }
@@ -2941,7 +3060,8 @@ begin
 end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32): Boolean;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32): Boolean;
 begin
   Result := True;
   case AIns.Op of
@@ -2977,8 +3097,7 @@ begin
     iroUnreachable:
       begin
         ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(wtkUnreachable)), 0));
-        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, PtrUInt(@JitTrapKind));
-        ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+        Arm64EmitCallHelper(ABuf, aohTrapKind);
       end;
 
     { --- calls (Wave 3) ------------------------------------------------ }
@@ -3102,16 +3221,48 @@ begin
       { memory / table / reference / global / GC — the uniform helper call
         (Waves 4-5), reached only after the inlined-op cases above so no op
         with a dedicated template lands here. }
-      EmitRuntimeOp(ABuf, AIns)
+      EmitRuntimeOp(ABuf, AInsIndex)
     else if Arm64BranchRefOp(AIns.Op) then
-      EmitBranchRef(ABuf, AIns)
+      EmitBranchRef(ABuf, AIns, AInsIndex)
     else if Arm64VecOp(AIns.Op) then
       { v128 via the Wasm.Interp.Vector leaves — the uniform helper call
         (Wave 6), reached only after every dedicated template above. }
-      EmitVecOp(ABuf, AIns)
+      EmitVecOp(ABuf, AInsIndex)
     else
       Result := False;
   end;
+end;
+
+{ ===================================================================== }
+{  the per-process helper table (aot-spec §1.2/§4.3)                     }
+{ ===================================================================== }
+
+var
+  { Filled once, lazily, with THIS process's live helper addresses. Process-
+    global because the addresses are the same for every store (the helpers are
+    plain unit procedures); a store points its JitHelperTable field at &[0]. }
+  GArm64HelperTable: array[TWasmAotHelper] of Pointer;
+  GArm64HelperTableFilled: Boolean = False;
+
+function Arm64GetHelperTable: PPointer;
+begin
+  if not GArm64HelperTableFilled then
+  begin
+    GArm64HelperTable[aohTrapKind] := @JitTrapKind;
+    GArm64HelperTable[aohOpBinary] := @JitOpBinary;
+    GArm64HelperTable[aohOpUnary] := @JitOpUnary;
+    GArm64HelperTable[aohRtDispatch] := @JitRtDispatch;
+    GArm64HelperTable[aohVecDispatch] := @JitVecDispatch;
+    GArm64HelperTable[aohRefBranchPredicate] := @JitRefBranchPredicate;
+    GArm64HelperTable[aohCall] := @JitCallHelper;
+    GArm64HelperTable[aohCallIndirect] := @JitCallIndirectHelper;
+    GArm64HelperTable[aohCallRef] := @JitCallRefHelper;
+    GArm64HelperTable[aohReturnCall] := @JitReturnCallHelper;
+    GArm64HelperTable[aohReturnCallIndirect] := @JitReturnCallIndirectHelper;
+    GArm64HelperTable[aohReturnCallRef] := @JitReturnCallRefHelper;
+    GArm64HelperTableFilled := True;
+  end;
+  Result := @GArm64HelperTable[aohTrapKind];
 end;
 
 end.

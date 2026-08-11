@@ -530,6 +530,19 @@ type
       follow (Wasm.Runtime.Traps). }
     JitInvokeCompiled: TWasmJitInvokeProc;
 
+    { The per-process AOT/JIT helper table base (aot-spec §1.2/§4.3): a raw
+      pointer to a contiguous array[TWasmAotHelper] of Pointer holding the LIVE
+      addresses of the active backend's runtime helpers (JitTrapKind, JitOpBinary,
+      the call/tail/dispatch thunks). nil until RegisterJit fills it. Every
+      position-independent compiled function pins this base in a callee-saved
+      register and reaches a helper by INDEX (`ldr xT,[base,#k*8]; blr xT` /
+      `call [base+k*8]`), so generated code holds only the stable slot index —
+      never a baked absolute helper address. That is what makes the code
+      relocatable across processes, the prerequisite the AOT tier depends on.
+      Set beside JitInvokeCompiled; a plain pointer, TRAP-1 clean (the addresses
+      are process-global constants). }
+    JitHelperTable: PPointer;
+
     { The tier's per-store execution context (O-10). Opaque here, exactly
       like TierInvoke: nil until Track E's RegisterInterpreter sets it, and
       never interpreted by Track D. The interpreter's TWasmInterpContext —
@@ -866,9 +879,39 @@ function TrampolineStore(const ATrampoline: PWasmTrampoline): TWasmStore;
   as a class pointer), which is why the accessor needs a live store. The
   record offsets are layout-only and independent of AStore. }
 type
+  { The FIXED set of Pascal runtime helpers the position-independent JIT/AOT
+    backends call INDIRECTLY through the per-process helper table
+    (Store.JitHelperTable, aot-spec §1.2). The ORDINAL is the stable slot index
+    baked into generated code (`[base + Ord(h)*8]`); the table maps that index
+    to the helper's live address, filled once at RegisterJit. Both backends
+    share this ordering, and the ABI fingerprint (Wasm.Interp) folds the count
+    in, so a reorder is caught. NEVER reorder without bumping AOT_ABI_REVISION.
+    The twelve entries mirror jit-spec's baked-helper table exactly. }
+  TWasmAotHelper = (
+    aohTrapKind,               { 0  TrapNow(kind) — every trap stub }
+    aohOpBinary,               { 1  binary numeric leaf }
+    aohOpUnary,                { 2  unary numeric leaf }
+    aohRtDispatch,             { 3  mem/table/ref/global/GC uniform dispatch }
+    aohVecDispatch,            { 4  v128 leaf dispatch }
+    aohRefBranchPredicate,     { 5  br_on_null/cast predicate }
+    aohCall,                   { 6  direct call }
+    aohCallIndirect,           { 7  call_indirect }
+    aohCallRef,                { 8  call_ref }
+    aohReturnCall,             { 9  return_call }
+    aohReturnCallIndirect,     { 10 return_call_indirect }
+    aohReturnCallRef           { 11 return_call_ref }
+  );
+
+const
+  { Number of helper-table slots; the array Store.JitHelperTable points at has
+    exactly this many Pointer entries. }
+  AOT_HELPER_COUNT = Ord(High(TWasmAotHelper)) + 1;
+
+type
   TWasmJitOffsets = record
     StoreEpoch: NativeUInt;          { TWasmStore.Epoch, from the object ref }
     StoreEpochSnapshot: NativeUInt;  { TWasmStore.EpochSnapshot, from the object ref }
+    StoreJitHelperTable: NativeUInt; { TWasmStore.JitHelperTable, from the object ref }
     FuncInstStride: NativeUInt;      { SizeOf(TWasmFuncInst) }
     FuncKind: NativeUInt;            { TWasmFuncInst.Kind }
     FuncCompiledEntry: NativeUInt;   { TWasmFuncInst.CompiledEntry }
@@ -2195,6 +2238,8 @@ begin
   Result.StoreEpoch := PtrUInt(@AStore.Epoch) - PtrUInt(Pointer(AStore));
   Result.StoreEpochSnapshot :=
     PtrUInt(@AStore.EpochSnapshot) - PtrUInt(Pointer(AStore));
+  Result.StoreJitHelperTable :=
+    PtrUInt(@AStore.JitHelperTable) - PtrUInt(Pointer(AStore));
   Result.FuncInstStride := SizeOf(TWasmFuncInst);
   Result.FuncKind := PtrUInt(@F.Kind) - PtrUInt(@F);
   Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);

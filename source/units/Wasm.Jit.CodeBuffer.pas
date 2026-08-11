@@ -99,6 +99,22 @@ type
     Kind: Integer;         { encoder-defined discriminator }
   end;
 
+  { A load-time relocation entry (aot-spec §1.5): a site in a function's code
+    blob whose absolute address the AOT loader must patch. In the unified
+    position-independent emitter every helper call is table-indirect and the IR
+    base is register-relative, so NO template emits an absolute host address and
+    this list is EMPTY for the current op set — SnapshotRelocs returns nothing.
+    The record exists so the artifact format is forward-compatible with a future
+    op or the fallback emitter that must bake an absolute. SiteOffset is a byte
+    offset into the finalized code; Kind is the patch encoding; Symbol names the
+    runtime datum. }
+  TWasmJitReloc = record
+    SiteOffset: UInt32;
+    Kind: Byte;
+    Symbol: UInt16;
+  end;
+  TWasmJitRelocs = array of TWasmJitReloc;
+
   { The executable code buffer for one code block (§3.4). Lifecycle: Create,
     emit bytes while writable, MakeExecutable to flip to executable + flush,
     EntryPoint to get the callable pointer, Free to munmap. Owned by the JIT
@@ -151,6 +167,16 @@ type
       the raw material the encoder turns into instruction bits. Requires the
       target label to be bound. }
     function PatchDelta(const AIndex: Integer): Integer;
+
+    { --- AOT capture (aot-spec §3.2) --- }
+    { The finalized, branch-resolved code bytes WITHOUT mapping them executable
+      — the position-independent blob the AOT writer serializes. Call after the
+      backend's ResolvePatches (so intra-function branches are settled) and
+      INSTEAD of MakeExecutable. Returns a fresh copy of FStage[0..FLength). }
+    function SnapshotBytes: TWasmBytes;
+    { The relocation table for the snapshot (aot-spec §1.5). Empty in the unified
+      position-independent emitter — kept for format forward-compatibility. }
+    function SnapshotRelocs: TWasmJitRelocs;
 
     { --- finalize to executable & call --- }
     { Allocate the page-rounded executable region, copy the stage into it under
@@ -431,6 +457,19 @@ begin
   if (AIndex < 0) or (AIndex >= Length(FPatches)) then
     raise EWasmError.Create('patch index out of range');
   Result := LabelOffset(FPatches[AIndex].Target) - FPatches[AIndex].SiteOffset;
+end;
+
+function TWasmCodeBuffer.SnapshotBytes: TWasmBytes;
+begin
+  SetLength(Result, FLength);
+  if FLength > 0 then
+    Move(FStage[0], Result[0], FLength);
+end;
+
+function TWasmCodeBuffer.SnapshotRelocs: TWasmJitRelocs;
+begin
+  { The unified emitter bakes no absolute host address, so nothing to relocate. }
+  Result := nil;
 end;
 
 procedure TWasmCodeBuffer.MakeExecutable;

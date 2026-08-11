@@ -251,6 +251,41 @@ type
 threadvar
   CurrentTrampoline: PWasmTrampoline;
 
+type
+  PWasmSeamCatch = ^TWasmSeamCatch;
+
+  { A tier-seam catch (Fix A / Finding 3). A wasm exception (an uncaught `throw`)
+    is RESUMABLE, so it cannot ride the trap LongJmp all the way to the
+    trampoline; but on FPC/aarch64 a Pascal `raise` cannot unwind across a JIT
+    body's native frame either (no unwind tables — it lands on garbage). So the
+    exception unwind crosses a compiled body's native frame the SAME way a trap
+    does: a LongJmp to a SetJmp buffer the compiled-body wrapper (and the
+    interp->compiled launchers) install just below that native frame. Each
+    rtCompiledSeam frame pairs with one of these on the stack; the unwind pops
+    the frame and LongJmps to the innermost seam catch, which re-enters the
+    unwind in its own (now native-frame-free) context. Living on the launcher's
+    own stack frame — the frame the LongJmp returns to — so, like the trampoline,
+    it holds only plain data (TRAP-1). }
+  TWasmSeamCatch = record
+    JmpBuf: jmp_buf;
+    Prev: PWasmSeamCatch;
+    { The thrown exn handle (a TWasmRef as a raw NativeUInt), handed across the
+      LongJmp so the landing knows what to keep unwinding. }
+    ExnRef: NativeUInt;
+  end;
+
+threadvar
+  { The current thread's innermost seam catch (Fix A). nil when no compiled body
+    is on the stack. Reset by WasmInvoke when a trap unwinds the whole
+    invocation, so a trap never leaves it dangling at a reclaimed frame. }
+  CurrentSeamCatch: PWasmSeamCatch;
+
+{ Transfer control to the innermost seam catch, carrying AExn. Never returns.
+  Must only be called with CurrentSeamCatch <> nil (the unwind guarantees this
+  for a rtCompiledSeam frame — such a frame exists only beneath a compiled body,
+  which installed a catch). }
+procedure SeamHop(const AExn: NativeUInt);
+
 { Record AKind and transfer to the current trampoline. Never returns.
 
   With no trampoline installed there are no guest frames to skip, so the
@@ -745,9 +780,16 @@ begin
   TrapNowDetail(AKind, 0);
 end;
 
+procedure SeamHop(const AExn: NativeUInt);
+begin
+  CurrentSeamCatch^.ExnRef := AExn;
+  LongJmp(CurrentSeamCatch^.JmpBuf, 1);
+end;
+
 procedure WasmInvoke(const AGuest: TWasmGuestProc; const AData: Pointer);
 var
   Trampoline: TWasmTrampoline;
+  SavedSeam: PWasmSeamCatch;
 begin
   { No managed locals here, by TRAP-1: the record is plain data and its
     address is taken, so it is on the stack rather than in a register the
@@ -758,6 +800,11 @@ begin
   Trampoline.HostMsg := nil;
   Trampoline.Context := nil;
   CurrentTrampoline := @Trampoline;
+  { Fix A: seam catches nest within this invocation. A trap LongJmps straight to
+    this trampoline, discarding every seam-catch frame above without popping the
+    stack — so save the pre-invocation value and restore it on BOTH exits, or a
+    later SeamHop would jump into a reclaimed frame. }
+  SavedSeam := CurrentSeamCatch;
 
   if SetJmp(Trampoline.JmpBuf) = 0 then
   begin
@@ -774,6 +821,7 @@ begin
       AGuest(AData);
     finally
       CurrentTrampoline := Trampoline.Prev;
+      CurrentSeamCatch := SavedSeam;
     end;
   end
   else
@@ -781,6 +829,7 @@ begin
     { Ordinary ground again: unwound past every guest frame, so the
       exception below is free to allocate. }
     CurrentTrampoline := Trampoline.Prev;
+    CurrentSeamCatch := SavedSeam;
     RaiseTrapDirect(Trampoline.Kind, Trampoline.Detail, Trampoline.HostMsg);
   end;
 end;

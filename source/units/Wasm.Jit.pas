@@ -131,14 +131,17 @@ type
     property Store: TWasmStore read FStore;
   end;
 
-  { The compiled entry's calling convention (§5.2/§5.3). TWO arguments: the
-    register-file base pointer JitEnterFrame returned (@Values[Base]) and the
-    store. AAPCS64 passes them in x0 and x1; the Wave-2 prologue moves x0 -> x19
-    (the pinned register-file base the templates address as [x19, #k*8]) and
-    x1 -> x20 (the store, for the epoch word, §6). cdecl selects the platform C
-    convention, matching the backend's hand-emitted prologue/epilogue. }
+  { The compiled entry's calling convention (§5.2/§5.3, aot-spec §1.3/§4.3).
+    THREE arguments now: the register-file base pointer JitEnterFrame returned
+    (@Values[Base]), the store, and the IR-code base @Fn^.Code[0]. AAPCS64/SysV
+    pass them in x0/x1/x2 (rdi/rsi/rdx); the prologue pins the register-file base
+    (x19/rbx), the store (x20/r12 — from which it pins &Epoch, the snapshot, and
+    the per-process helper-table base), and the IR base (x23/rbp), from which
+    every runtime-op template computes @Fn^.Code[i] position-independently. cdecl
+    selects the platform C convention, matching the backend's hand-emitted
+    prologue/epilogue. }
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
-    const AStore: TWasmStore); cdecl;
+    const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
 { Register the JIT on AStore: allocate the code cache and point the store's
   JitInvokeCompiled hook at JitDispatch, leaving TierInvoke on the interpreter
@@ -200,14 +203,24 @@ var
   Ctx: PWasmInterpContext;
   Base: PWasmValue;
   Entry: TWasmJitCompiledEntry;
+  Inst: TWasmModuleInstance;
+  Fn: PWasmIrFunctionRec;
+  IrBase: PWasmIrInstr;
 begin
   { No backend on this target, so nothing is ever compiled and this is
     unreachable; kept as the plain single-shot hand-off so the unit still
-    compiles and documents the contract. }
+    compiles and documents the (3-arg, position-independent) contract. }
   Ctx := InterpContextFor(AStore);
-  Base := JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults);
+  Base := JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults,
+    ConsumeJitSeamReentry);
+  Inst := AStore.Funcs[AFuncAddr].Instance;
+  Fn := @Inst.Ir.Functions[AStore.Funcs[AFuncAddr].FuncIrIndex];
+  if Length(Fn^.Code) > 0 then
+    IrBase := @Fn^.Code[0]
+  else
+    IrBase := nil;
   Entry := TWasmJitCompiledEntry(AStore.Funcs[AFuncAddr].CompiledEntry);
-  Entry(Base, AStore);
+  Entry(Base, AStore, IrBase);
   JitLeaveFrame(Ctx);
 end;
 {$ENDIF}
@@ -271,23 +284,6 @@ begin
   {$ENDIF}
 end;
 
-{ True if the function contains any call op — the one thing that can put
-  another frame (and therefore a `throw`) beneath a compiled frame. Read by
-  the EH-transparency fence in ForceCompile. }
-function FunctionHasCall(const AFn: PWasmIrFunctionRec): Boolean;
-var
-  I: Integer;
-begin
-  Result := True;
-  for I := 0 to High(AFn^.Code) do
-    case AFn^.Code[I].Op of
-      iroCall, iroCallIndirect, iroCallRef,
-      iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
-        Exit;
-    end;
-  Result := False;
-end;
-
 { --- compilation --------------------------------------------------------- }
 
 {$IFDEF WASM_JIT_BACKEND}
@@ -303,7 +299,7 @@ end;
   always balanced by a restore. The Arm64* / X64* calls are the only
   backend-specific part; everything else is shared. }
 function JitCompileToBuffer(const AFn: PWasmIrFunctionRec;
-  const AEpochOffset, ASnapshotOffset: NativeUInt): TWasmCodeBuffer;
+  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt): TWasmCodeBuffer;
 var
   I: Integer;
   Buf: TWasmCodeBuffer;
@@ -319,21 +315,27 @@ begin
 
     {$IFDEF WASM_JIT_ARM64}
     Arm64EmitPrologue(Buf);
+    Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     X64EmitPrologue(Buf);
+    X64EmitPinHelperTable(Buf, AHelperTableOffset);
     X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     {$ENDIF}
 
     for I := 0 to High(AFn^.Code) do
     begin
       Buf.BindLabel(TWasmJitLabel(I));
+      { Position-independent IR reference (aot-spec §1.3): pass the instruction
+        INDEX; the runtime-op templates compute @Fn^.Code[i] from the pinned IR
+        base (x23/rbp), which the entry receives freshly per invocation — no
+        heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      Emitted := Arm64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32);
+      Emitted := Arm64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32, UInt32(I));
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
-      Emitted := X64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32);
+      Emitted := X64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32, UInt32(I));
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
@@ -426,30 +428,18 @@ begin
   Fn := IrFunctionFor(AAddr);
   if not JitCanCompile(Fn) then
     Exit;
-  { THE EH-TRANSPARENCY FENCE (§8.3, §10.2), the store-dependent companion to
-    JitCanCompile's handler fence. The interpreter delivers a `throw` by an
-    EXPLICIT unwind over the activation stack, and it stops at the first frame
-    whose RetKind is rtEntry — an invocation boundary it cannot resume past. A
-    compiled frame, and any interpreted callee a compiled frame enters, is such
-    a frame (both are carved by JitEnterFrame / TierInvoke), so an exception
-    raised beneath a compiled frame would surface as 'uncaught exception' where
-    the interpreter would have found a handler further out.
-
-    A throw needs a TAG, so a store with no tag instances can raise no wasm
-    exception at all and a compiled frame there can never be unwound through.
-    That is the exact condition checked here: where the store has tags, a
-    function containing a CALL stays interpreted (a call-free compiled body can
-    never have an exception raised beneath it). Everything else compiles.
-
-    RESIDUE, documented rather than hidden: a store that gains its FIRST tag
-    after a call-bearing function was already compiled is not covered, because
-    the check is made once, at compile time. Closing that — and lifting the
-    fence entirely — is one interp-side change: give the tier seam's frames a
-    RetKind the unwind treats as transparent (continue into the caller and
-    re-raise into the enclosing Run) instead of as an invocation boundary. }
-  if (Length(FStore.Tags) > 0) and FunctionHasCall(Fn) then
-    Exit;
-
+  { FENCE 2 IS RETIRED (Fix A). It used to decline a call-bearing function
+    whenever the store had tags, because a compiled frame between a `throw` and
+    an interpreted `try_table` handler would surface as 'uncaught exception': the
+    unwind stopped at the compiled seam frame (an rtEntry boundary). The interp
+    side now gives tier-seam frames the rtCompiledSeam kind, which the unwind
+    treats as TRANSPARENT — it pops the frame and hops (a LongJmp to a seam
+    catch) across the native barrier to the enclosing invocation's seam catch, continuing the
+    search for a handler further out (Wasm.Interp.UnwindException). So a compiled
+    call-bearing function may correctly sit between a throw and its handler, and
+    more functions compile (compiled=N goes up). Fence 1 (JitCanCompile declines
+    a function that OWNS a try_table handler table, since its handlers are not in
+    machine code) and the iroThrow/iroThrowRef decline STAY. }
   {$IFDEF WASM_JIT_BACKEND}
   N := Length(FBuffers);
   SetLength(FBuffers, N + 1);
@@ -465,7 +455,8 @@ begin
     exception is a genuine internal fault and propagates. }
   try
     FBuffers[N] := JitCompileToBuffer(Fn, WasmJitOffsets(FStore).StoreEpoch,
-      WasmJitOffsets(FStore).StoreEpochSnapshot);
+      WasmJitOffsets(FStore).StoreEpochSnapshot,
+      WasmJitOffsets(FStore).StoreJitHelperTable);
   except
     on EWasmJitBranchRange do
     begin
@@ -502,6 +493,16 @@ begin
     interpreter checks CompiledEntry <> nil AND Assigned(JitInvokeCompiled) at
     every seam, so until a function is actually compiled nothing changes. }
   AStore.JitInvokeCompiled := @JitDispatch;
+  { Fill the per-process helper table with THIS process's live helper addresses
+    and pin its base on the store (aot-spec §1.2/§4.3), so every compiled body's
+    indirect helper calls resolve. The addresses are process-global constants,
+    so a single fill serves every store. }
+  {$IFDEF WASM_JIT_ARM64}
+  AStore.JitHelperTable := Arm64GetHelperTable;
+  {$ENDIF}
+  {$IFDEF WASM_JIT_X64}
+  AStore.JitHelperTable := X64GetHelperTable;
+  {$ENDIF}
   Result.FHookInstalled := True;
 end;
 

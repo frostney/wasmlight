@@ -34,7 +34,8 @@ uses
   Wasm.Core,
   Wasm.Ir,
   Wasm.Jit.Arm64,
-  Wasm.Jit.CodeBuffer;
+  Wasm.Jit.CodeBuffer,
+  Wasm.Runtime.Store;
 
 type
   { The register-file base is the FIRST pointer argument (x0 on AAPCS64); the
@@ -54,6 +55,7 @@ type
     procedure TestPredicateCoversWave2;
     procedure TestCallArityFence;
     procedure TestBranchOffsetRangeGuard;
+    procedure TestPositionIndependentSequences;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -128,14 +130,17 @@ end;
 
 procedure TArm64Tests.TestFrameWordBits;
 begin
-  { The Wave-2 frame save/restore words (jit-spec §5.3). }
-  Expect<UInt32>(Arm64StpX19X20PreIndex48).ToBe($A9BD53F3);
+  { The position-independent frame save/restore words: SIX callee-saved pins
+    (x19..x24) + x30 in a 64-byte frame (aot-spec §1.2/§1.3/§4.3). }
+  Expect<UInt32>(Arm64StpX19X20PreIndex64).ToBe($A9BC53F3);
   Expect<UInt32>(Arm64StpX21X22Off16).ToBe($A9015BF5);
+  Expect<UInt32>(Arm64StpX23X24Off32).ToBe($A90263F7);
+  Expect<UInt32>(Arm64LdpX23X24Off32).ToBe($A94263F7);
   Expect<UInt32>(Arm64LdpX21X22Off16).ToBe($A9415BF5);
-  Expect<UInt32>(Arm64LdpX19X20PostIndex48).ToBe($A8C353F3);
-  { str/ldr x30 at [sp,#32] reuse the scaled LDR/STR builders. }
-  Expect<UInt32>(Arm64StrX(30, 31, 32)).ToBe($F90013FE);
-  Expect<UInt32>(Arm64LdrX(30, 31, 32)).ToBe($F94013FE);
+  Expect<UInt32>(Arm64LdpX19X20PostIndex64).ToBe($A8C453F3);
+  { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
+  Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
+  Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
 end;
 
 procedure TArm64Tests.TestBranchPlaceholderBits;
@@ -276,6 +281,59 @@ begin
   Expect<Boolean>(Arm64SignedImmFits(0, 26)).ToBe(True);
 end;
 
+{ --- position-independent emission (aot-spec §1.2/§1.3) ------------------
+
+  The helper calls and the IR-instruction pointer must be table-indexed /
+  register-relative, NOT baked absolutes — that is what makes the code
+  relocatable for the AOT tier. Assert the exact words each emits against the
+  pure builders, so a regression to a baked movz/movk quad is caught here. }
+function EmittedWord(const ABuf: TWasmCodeBuffer; const AIndex: Integer): UInt32;
+begin
+  Result := UInt32(ABuf.ByteAt(AIndex * 4))
+    or (UInt32(ABuf.ByteAt(AIndex * 4 + 1)) shl 8)
+    or (UInt32(ABuf.ByteAt(AIndex * 4 + 2)) shl 16)
+    or (UInt32(ABuf.ByteAt(AIndex * 4 + 3)) shl 24);
+end;
+
+procedure TArm64Tests.TestPositionIndependentSequences;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { PinHelperTable: ldr x24,[x20,#off] — a single indexed load off the pinned
+    store, no baked address. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitPinHelperTable(Buf, 16);
+    Expect<UInt32>(EmittedWord(Buf, 0))
+      .ToBe(Arm64LdrX(ARM64_REG_HELPERTABLE, ARM64_REG_STORE, 16));
+  finally
+    Buf.Free;
+  end;
+
+  { CallHelper: ldr x9,[x24,#k*8]; blr x9 — the code holds only the slot index. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitCallHelper(Buf, aohRtDispatch);
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
+      Arm64LdrX(ARM64_REG_T0, ARM64_REG_HELPERTABLE,
+        UInt32(Ord(aohRtDispatch)) * 8));
+    Expect<UInt32>(EmittedWord(Buf, 1)).ToBe(Arm64Blr(ARM64_REG_T0));
+  finally
+    Buf.Free;
+  end;
+
+  { IrInsPtr: add x2,x23,#(i*stride) — computed from the pinned IR base, no baked
+    heap pointer. Index 3 stays within ADD's imm12 range. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitIrInsPtr(Buf, 2, 3);
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
+      Arm64AddImmX(2, ARM64_REG_IRBASE, 3 * UInt32(SizeOf(TWasmIrInstr))));
+  finally
+    Buf.Free;
+  end;
+end;
+
 { --- executable proof (aarch64) -----------------------------------------
 
   Each exec test emits: prologue (saves callee-saved, x19 := x0 = base),
@@ -291,7 +349,10 @@ begin
   Buf := TWasmCodeBuffer.Create;
   try
     Arm64EmitPrologue(Buf);
-    Arm64EmitOp(Buf, AIns, nil);
+    { Inline templates use neither the helper table nor the IR base, so the exec
+      harness skips PinHelperTable and passes index 0 — the prologue's x23/x24
+      saves and `mov x23,x2` are harmless with a one-argument call. }
+    Arm64EmitOp(Buf, AIns, nil, 0);
     Arm64EmitEpilogue(Buf);
     Buf.MakeExecutable;
     Fn := TWasmSlotFn(Buf.EntryPoint);
@@ -435,7 +496,7 @@ begin
     Ci.B := 0;
     Ci.Imm := Int64(Integer($ABCD1234));
     Arm64EmitPrologue(Buf);
-    Arm64EmitOp(Buf, Ci, nil);
+    Arm64EmitOp(Buf, Ci, nil, 0);
     Arm64EmitEpilogue(Buf);
     Buf.MakeExecutable;
     Slots[1] := High(UInt64);
@@ -480,6 +541,8 @@ begin
     TestCallArityFence);
   Test('branch-offset range guard fits imm19/imm26 at the boundaries',
     TestBranchOffsetRangeGuard);
+  Test('helper calls and the IR pointer are position-independent',
+    TestPositionIndependentSequences);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);

@@ -242,6 +242,7 @@ type
     procedure TestJitHookDispatchedAtEntry;
     procedure TestJitHookDispatchedForInternalCall;
     procedure TestJitFrameOffsetsMatchLayout;
+    procedure TestAotAbiFingerprintDeterministic;
   end;
 
 { --- host callbacks ------------------------------------------------------ }
@@ -2370,6 +2371,29 @@ begin
   Expect<Boolean>(Off.ActBase < Off.ActStride).ToBe(True);
 end;
 
+procedure TInterpTests.TestAotAbiFingerprintDeterministic;
+var
+  A, B: UInt64;
+  Store2: TWasmStore;
+begin
+  { The AOT ABI fingerprint (aot-spec §1.4) is the "same build" guard: a
+    deterministic hash over the offset records, the IR/value strides, the helper
+    count, and AOT_ABI_REVISION. It must be stable and non-zero for a given
+    build, and independent of WHICH live store computes it (the offsets are
+    object-relative but layout-identical across stores). }
+  A := WasmAotAbiFingerprint(FStore);
+  Expect<Boolean>(A <> 0).ToBe(True);
+  Expect<UInt64>(WasmAotAbiFingerprint(FStore)).ToBe(A);
+
+  Store2 := TWasmStore.Create(FEngine);
+  try
+    B := WasmAotAbiFingerprint(Store2);
+  finally
+    Store2.Free;
+  end;
+  Expect<UInt64>(B).ToBe(A);
+end;
+
 procedure TInterpTests.SetupTests;
 begin
   Test('a numeric add function computes end to end', TestAddFunction);
@@ -2475,6 +2499,8 @@ begin
     TestJitHookDispatchedForInternalCall);
   Test('the JIT register-file and frame offsets match the layout',
     TestJitFrameOffsetsMatchLayout);
+  Test('the AOT ABI fingerprint is deterministic and non-zero',
+    TestAotAbiFingerprintDeterministic);
 end;
 
 begin
