@@ -300,3 +300,7 @@ on the hermetic suites, not on an external corpus.
 - Benchmarks are not tests. `wasmbench` numbers never become CI
   assertions — see the "Honest measurement" principle in
   [VISION.md](../VISION.md).
+- `wasmbench --workload loop|fib|memory|startup --tier interp|jit|aot`
+  isolates one execution workload and tier for profiling. `--samples N`
+  reports the median; selecting a compiled tier does not run the interpreter
+  first.

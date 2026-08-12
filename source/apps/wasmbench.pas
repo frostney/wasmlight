@@ -36,6 +36,17 @@ uses
 const
   DEFAULT_ITERATIONS = 20000;
   DEFAULT_EXECUTION_ITERATIONS = 300000000;
+  DEFAULT_FIB_INPUT = 35;
+  DEFAULT_MEMORY_ITERATIONS = 10000000;
+  DEFAULT_SAMPLES = 1;
+
+type
+  TExecutionTier = (etInterp, etJit, etAot);
+  TExecutionTiers = set of TExecutionTier;
+  TBenchmarkWorkload = (bwDecode, bwLeb128, bwStartup, bwLoop, bwFib,
+    bwMemory);
+  TBenchmarkWorkloads = set of TBenchmarkWorkload;
+  TInt64Samples = array of Int64;
 
 { A module with enough sections to exercise the walk without being
   dominated by any single one: a run of known sections in id order plus
@@ -320,64 +331,140 @@ begin
 end;
 
 procedure ReportStartup(const AName: string; const AIterations: Int64;
-  const AElapsedMs: Int64);
+  const AElapsedMs: Int64; const ASamples: Integer = 1);
 var
   NsPerOp: Double;
+  SampleSuffix: string;
 begin
   if AIterations > 0 then
     NsPerOp := (AElapsedMs * 1000000.0) / AIterations
   else
     NsPerOp := 0;
-  WriteLn(Format('%-24s %10d iter %8d ms %12.1f ns/op', [AName, AIterations,
-    AElapsedMs, NsPerOp]));
+  if ASamples > 1 then
+    SampleSuffix := Format('  median of %d samples', [ASamples])
+  else
+    SampleSuffix := '';
+  WriteLn(Format('%-24s %10d iter %8d ms %12.1f ns/op%s', [AName,
+    AIterations, AElapsedMs, NsPerOp, SampleSuffix]));
 end;
 
-procedure BenchStartup(const AIterations: Integer);
+function Median(const ASamples: TInt64Samples): Int64;
+var
+  Sorted: TInt64Samples;
+  I, J: Integer;
+  Value: Int64;
+begin
+  if Length(ASamples) = 0 then
+    Exit(0);
+  Sorted := Copy(ASamples);
+  for I := 1 to High(Sorted) do
+  begin
+    Value := Sorted[I];
+    J := I - 1;
+    while (J >= 0) and (Sorted[J] > Value) do
+    begin
+      Sorted[J + 1] := Sorted[J];
+      Dec(J);
+    end;
+    Sorted[J + 1] := Value;
+  end;
+  if Odd(Length(Sorted)) then
+    Result := Sorted[Length(Sorted) div 2]
+  else
+    Result := (Sorted[Length(Sorted) div 2 - 1] +
+      Sorted[Length(Sorted) div 2]) div 2;
+end;
+
+function TierName(const ATier: TExecutionTier): string;
+begin
+  case ATier of
+    etInterp:
+      Result := 'interpret';
+    etJit:
+      Result := 'jit';
+    etAot:
+      Result := 'aot';
+  end;
+end;
+
+function MeasureStartup(const ABytes, AArtifact: TWasmBytes;
+  const ATier: TExecutionTier; const AIterations: Integer): Int64;
+var
+  I: Integer;
+  Started: Int64;
+begin
+  Started := GetTickCount64;
+  for I := 1 to AIterations do
+    case ATier of
+      etInterp:
+        StartupOnce(ABytes, False, nil);
+      etJit:
+        StartupOnce(ABytes, True, nil);
+      etAot:
+        StartupOnce(ABytes, False, AArtifact);
+    end;
+  Result := GetTickCount64 - Started;
+end;
+
+procedure BenchStartup(const AIterations, ASampleCount: Integer;
+  const ATiers: TExecutionTiers);
 var
   Bytes, Artifact: TWasmBytes;
   Loaded: TWasmLoadedModule;
   Engine: TWasmEngine;
   Store: TWasmStore;
-  Iters, I: Integer;
-  Started: Int64;
+  Iters, Sample: Integer;
+  Tier: TExecutionTier;
+  Samples: TInt64Samples;
 begin
   Bytes := AssembleWatText(BENCH_STARTUP_WAT);
 
-  { Compile the artifact ONCE (ahead-of-time build cost, outside every timer). }
-  Loaded := LoadModule(Bytes);
-  Engine := TWasmEngine.Create;
-  Store := TWasmStore.Create(Engine);
-  try
-    Artifact := AotCompileModule(Store, Loaded);
-  finally
-    FreeAndNil(Store);
-    Engine.Free;
-    Loaded.Free;
+  Artifact := nil;
+  if etAot in ATiers then
+  begin
+    { Compile the artifact ONCE (ahead-of-time build cost, outside every
+      timer). }
+    Loaded := LoadModule(Bytes);
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    try
+      Artifact := AotCompileModule(Store, Loaded);
+    finally
+      FreeAndNil(Store);
+      Engine.Free;
+      Loaded.Free;
+    end;
   end;
 
   { Startup is far heavier than a decode, so fewer iterations than the byte
     benches; still coarse ms over a batch. }
   Iters := AIterations div 8 + 1;
 
-  { Warm up each path once so a first-touch allocation is not in the window. }
-  StartupOnce(Bytes, False, nil);
-  StartupOnce(Bytes, True, nil);
-  StartupOnce(Bytes, False, Artifact);
-
-  Started := GetTickCount64;
-  for I := 1 to Iters do
-    StartupOnce(Bytes, False, nil);
-  ReportStartup('startup interpret', Iters, GetTickCount64 - Started);
-
-  Started := GetTickCount64;
-  for I := 1 to Iters do
-    StartupOnce(Bytes, True, nil);
-  ReportStartup('startup jit-warmup', Iters, GetTickCount64 - Started);
-
-  Started := GetTickCount64;
-  for I := 1 to Iters do
-    StartupOnce(Bytes, False, Artifact);
-  ReportStartup('startup aot-load', Iters, GetTickCount64 - Started);
+  SetLength(Samples, ASampleCount);
+  for Tier := Low(TExecutionTier) to High(TExecutionTier) do
+    if Tier in ATiers then
+    begin
+      { Warm up only the selected path, so profiling JIT or AOT never pays for
+        an interpreter run first. }
+      case Tier of
+        etInterp:
+          StartupOnce(Bytes, False, nil);
+        etJit:
+          StartupOnce(Bytes, True, nil);
+        etAot:
+          StartupOnce(Bytes, False, Artifact);
+      end;
+      for Sample := 0 to ASampleCount - 1 do
+        Samples[Sample] := MeasureStartup(Bytes, Artifact, Tier, Iters);
+      if Tier = etJit then
+        ReportStartup('startup jit-warmup', Iters, Median(Samples),
+          ASampleCount)
+      else if Tier = etAot then
+        ReportStartup('startup aot-load', Iters, Median(Samples), ASampleCount)
+      else
+        ReportStartup('startup interpret', Iters, Median(Samples),
+          ASampleCount);
+    end;
 end;
 
 { --- steady-state execution: interpreter vs JIT vs AOT -------------------
@@ -402,12 +489,49 @@ const
     '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
     '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
     '    (local.get $acc)))';
+  BENCH_FIB_WAT =
+    '(module' + sLineBreak +
+    '  (func $fib (export "run") (param $n i32) (result i32)' + sLineBreak +
+    '    (if (result i32)' + sLineBreak +
+    '      (i32.lt_u (local.get $n) (i32.const 2))' + sLineBreak +
+    '      (then (local.get $n))' + sLineBreak +
+    '      (else' + sLineBreak +
+    '        (i32.add' + sLineBreak +
+    '          (call $fib (i32.sub (local.get $n) (i32.const 1)))' + sLineBreak +
+    '          (call $fib (i32.sub (local.get $n) (i32.const 2))))))))';
+  BENCH_MEMORY_WAT =
+    '(module' + sLineBreak +
+    '  (memory 1)' + sLineBreak +
+    '  (func (export "run") (param $n i32) (result i32)' + sLineBreak +
+    '    (local $i i32) (local $acc i32)' + sLineBreak +
+    '    (loop $l' + sLineBreak +
+    '      (i32.store (i32.const 0) (local.get $i))' + sLineBreak +
+    '      (local.set $acc' + sLineBreak +
+    '        (i32.add (local.get $acc) (i32.load (i32.const 0))))' + sLineBreak +
+    '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
+    '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
+    '    (local.get $acc)))';
 
-type
-  TExecutionTier = (etInterp, etJit, etAot);
+function CompileArtifact(const ABytes: TWasmBytes): TWasmBytes;
+var
+  Loaded: TWasmLoadedModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+begin
+  Loaded := LoadModule(ABytes);
+  Engine := TWasmEngine.Create;
+  Store := TWasmStore.Create(Engine);
+  try
+    Result := AotCompileModule(Store, Loaded);
+  finally
+    FreeAndNil(Store);
+    Engine.Free;
+    Loaded.Free;
+  end;
+end;
 
 function MeasureExecution(const ABytes, AArtifact: TWasmBytes;
-  const ATier: TExecutionTier; const ALoopIterations: Integer;
+  const ATier: TExecutionTier; const AInput: Integer;
   out AResultBits: UInt64): Int64;
 var
   Loaded: TWasmLoadedModule;
@@ -455,7 +579,7 @@ begin
         end;
     end;
 
-    Params[0].Bits := UInt64(UInt32(ALoopIterations));
+    Params[0].Bits := UInt64(UInt32(AInput));
     Results[0].Bits := 0;
     Started := GetTickCount64;
     Call(RunFn, Params, Results);
@@ -471,52 +595,156 @@ begin
   end;
 end;
 
-procedure BenchExecution(const ALoopIterations: Integer);
+function Triangle32(const ACount: Integer): UInt32;
+var
+  Triangle: UInt64;
+begin
+  Triangle := (UInt64(UInt32(ACount)) * UInt64(UInt32(ACount - 1))) div 2;
+  Result := UInt32(Triangle and $FFFFFFFF);
+end;
+
+function ExpectedLoop(const AIterations: Integer): UInt32;
+begin
+  Result := UInt32((UInt64(Triangle32(AIterations)) * UInt64(1664525)) and
+    $FFFFFFFF);
+end;
+
+function ExpectedFib(const AInput: Integer): UInt32;
+var
+  I: Integer;
+  Previous, Current, Next: UInt32;
+begin
+  if AInput < 2 then
+    Exit(UInt32(AInput));
+  Previous := 0;
+  Current := 1;
+  for I := 2 to AInput do
+  begin
+    Next := Previous + Current;
+    Previous := Current;
+    Current := Next;
+  end;
+  Result := Current;
+end;
+
+function FibCallCount(const AInput: Integer): Int64;
+var
+  I: Integer;
+  Previous, Current, Next: Int64;
+begin
+  if AInput < 2 then
+    Exit(1);
+  Previous := 1;
+  Current := 1;
+  for I := 2 to AInput do
+  begin
+    Next := 1 + Previous + Current;
+    Previous := Current;
+    Current := Next;
+  end;
+  Result := Current;
+end;
+
+procedure BenchExecution(const AName, AWat: string; const AInput: Integer;
+  const AOperationCount: Int64; const AExpected: UInt32;
+  const ASampleCount: Integer; const ATiers: TExecutionTiers);
 var
   Bytes, Artifact: TWasmBytes;
-  Loaded: TWasmLoadedModule;
-  Engine: TWasmEngine;
-  Store: TWasmStore;
-  InterpMs, JitMs, AotMs: Int64;
-  InterpBits, JitBits, AotBits: UInt64;
+  Tier: TExecutionTier;
+  Sample: Integer;
+  Samples: TInt64Samples;
+  ResultBits: UInt64;
 begin
-  Bytes := AssembleWatText(BENCH_EXECUTION_WAT);
-  Loaded := LoadModule(Bytes);
-  Engine := TWasmEngine.Create;
-  Store := TWasmStore.Create(Engine);
-  try
-    Artifact := AotCompileModule(Store, Loaded);
-  finally
-    FreeAndNil(Store);
-    Engine.Free;
-    Loaded.Free;
-  end;
+  Bytes := AssembleWatText(AWat);
+  Artifact := nil;
+  if etAot in ATiers then
+    Artifact := CompileArtifact(Bytes);
+  SetLength(Samples, ASampleCount);
+  for Tier := Low(TExecutionTier) to High(TExecutionTier) do
+    if Tier in ATiers then
+    begin
+      for Sample := 0 to ASampleCount - 1 do
+      begin
+        Samples[Sample] := MeasureExecution(Bytes, Artifact, Tier, AInput,
+          ResultBits);
+        if UInt32(ResultBits) <> AExpected then
+          raise EWasmError.CreateFmt(
+            '%s benchmark %s returned %u, expected %u',
+            [AName, TierName(Tier), UInt32(ResultBits), AExpected]);
+      end;
+      ReportStartup(AName + ' ' + TierName(Tier), AOperationCount,
+        Median(Samples), ASampleCount);
+    end;
+end;
 
-  InterpMs := MeasureExecution(Bytes, Artifact, etInterp, ALoopIterations,
-    InterpBits);
-  JitMs := MeasureExecution(Bytes, Artifact, etJit, ALoopIterations, JitBits);
-  AotMs := MeasureExecution(Bytes, Artifact, etAot, ALoopIterations, AotBits);
-  if (JitBits <> InterpBits) or (AotBits <> InterpBits) then
-    raise EWasmError.Create('execution benchmark tiers returned different bits');
+function ParseWorkload(const AValue: string;
+  out AWorkloads: TBenchmarkWorkloads): Boolean;
+begin
+  Result := True;
+  if AValue = 'all' then
+    AWorkloads := [Low(TBenchmarkWorkload)..High(TBenchmarkWorkload)]
+  else if AValue = 'decode' then
+    AWorkloads := [bwDecode]
+  else if (AValue = 'leb128') or (AValue = 'leb') then
+    AWorkloads := [bwLeb128]
+  else if AValue = 'startup' then
+    AWorkloads := [bwStartup]
+  else if (AValue = 'loop') or (AValue = 'execution') then
+    AWorkloads := [bwLoop]
+  else if AValue = 'fib' then
+    AWorkloads := [bwFib]
+  else if AValue = 'memory' then
+    AWorkloads := [bwMemory]
+  else
+    Result := False;
+end;
 
-  ReportStartup('execute interpret', ALoopIterations, InterpMs);
-  ReportStartup('execute jit', ALoopIterations, JitMs);
-  ReportStartup('execute aot', ALoopIterations, AotMs);
+function ParseTiers(const AValue: string; out ATiers: TExecutionTiers): Boolean;
+begin
+  Result := True;
+  if AValue = 'all' then
+    ATiers := [Low(TExecutionTier)..High(TExecutionTier)]
+  else if (AValue = 'interp') or (AValue = 'interpret') then
+    ATiers := [etInterp]
+  else if AValue = 'jit' then
+    ATiers := [etJit]
+  else if AValue = 'aot' then
+    ATiers := [etAot]
+  else
+    Result := False;
 end;
 
 var
   Options: TOptionList;
   Positionals: TStringList;
-  IterationsOpt, ExecutionIterationsOpt: TIntegerOption;
-  Iterations, ExecutionIterations: Integer;
+  WorkloadOpt, TierOpt: TStringOption;
+  IterationsOpt, ExecutionIterationsOpt, FibInputOpt,
+    MemoryIterationsOpt, SamplesOpt: TIntegerOption;
+  Workloads: TBenchmarkWorkloads;
+  Tiers: TExecutionTiers;
+  Iterations, ExecutionIterations, FibInput, MemoryIterations,
+    SampleCount: Integer;
+  WorkloadValue, TierValue: string;
 begin
   Options := TOptionList.Create;
   try
+    WorkloadOpt := Options.AddString('workload',
+      'all|decode|leb128|startup|loop|fib|memory (default: all)');
+    TierOpt := Options.AddString('tier',
+      'all|interp|jit|aot for execution workloads (default: all)');
     IterationsOpt := Options.AddInteger('iterations',
       'Iterations per benchmark (default: ' + IntToStr(DEFAULT_ITERATIONS) + ')');
     ExecutionIterationsOpt := Options.AddInteger('execution-iterations',
       'Loop iterations per tier (default: ' +
       IntToStr(DEFAULT_EXECUTION_ITERATIONS) + ')');
+    FibInputOpt := Options.AddInteger('fib-input',
+      'Recursive Fibonacci input (default: ' + IntToStr(DEFAULT_FIB_INPUT) + ')');
+    MemoryIterationsOpt := Options.AddInteger('memory-iterations',
+      'Scalar memory loop iterations per tier (default: ' +
+      IntToStr(DEFAULT_MEMORY_ITERATIONS) + ')');
+    SamplesOpt := Options.AddInteger('samples',
+      'Samples per execution workload and tier (default: ' +
+      IntToStr(DEFAULT_SAMPLES) + ')');
 
     try
       Positionals := ParseCommandLine(Options.Options);
@@ -533,6 +761,24 @@ begin
     Iterations := IterationsOpt.ValueOr(DEFAULT_ITERATIONS);
     ExecutionIterations := ExecutionIterationsOpt.ValueOr(
       DEFAULT_EXECUTION_ITERATIONS);
+    FibInput := FibInputOpt.ValueOr(DEFAULT_FIB_INPUT);
+    MemoryIterations := MemoryIterationsOpt.ValueOr(
+      DEFAULT_MEMORY_ITERATIONS);
+    SampleCount := SamplesOpt.ValueOr(DEFAULT_SAMPLES);
+    WorkloadValue := LowerCase(WorkloadOpt.ValueOr('all'));
+    TierValue := LowerCase(TierOpt.ValueOr('all'));
+    if not ParseWorkload(WorkloadValue, Workloads) then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: unknown workload "', WorkloadValue, '"');
+      ExitCode := 1;
+      Exit;
+    end;
+    if not ParseTiers(TierValue, Tiers) then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: unknown tier "', TierValue, '"');
+      ExitCode := 1;
+      Exit;
+    end;
     if Iterations <= 0 then
     begin
       WriteLn(ErrOutput, 'wasmbench: --iterations must be positive');
@@ -545,13 +791,43 @@ begin
       ExitCode := 1;
       Exit;
     end;
+    if (FibInput < 0) or (FibInput > 40) then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --fib-input must be between 0 and 40');
+      ExitCode := 1;
+      Exit;
+    end;
+    if MemoryIterations <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --memory-iterations must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
+    if SampleCount <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --samples must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
 
     WriteLn('wasmbench ', PROGRAM_VERSION, ' — measurement only, never a CI assertion');
     WriteLn;
-    BenchDecodeModule(Iterations);
-    BenchReadU32(Iterations div 64 + 1);
-    BenchStartup(Iterations);
-    BenchExecution(ExecutionIterations);
+    if bwDecode in Workloads then
+      BenchDecodeModule(Iterations);
+    if bwLeb128 in Workloads then
+      BenchReadU32(Iterations div 64 + 1);
+    if bwStartup in Workloads then
+      BenchStartup(Iterations, SampleCount, Tiers);
+    if bwLoop in Workloads then
+      BenchExecution('execute', BENCH_EXECUTION_WAT, ExecutionIterations,
+        ExecutionIterations, ExpectedLoop(ExecutionIterations), SampleCount,
+        Tiers);
+    if bwFib in Workloads then
+      BenchExecution('fib', BENCH_FIB_WAT, FibInput, FibCallCount(FibInput),
+        ExpectedFib(FibInput), SampleCount, Tiers);
+    if bwMemory in Workloads then
+      BenchExecution('memory', BENCH_MEMORY_WAT, MemoryIterations,
+        MemoryIterations, Triangle32(MemoryIterations), SampleCount, Tiers);
   finally
     Options.Free;
   end;

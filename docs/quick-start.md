@@ -57,8 +57,9 @@ lwpt test            # co-located unit suites
 ./build/wasmlight validate module.wasm   # decode + validate, report the IR
 ./build/wasmlight run module.wasm        # run a WASI preview1 command
 ./build/wasmlight --version
-./build/wasmbench --iterations 20000     # startup + verified tier throughput
-# use --execution-iterations N to size the steady-state tier loop
+./build/wasmbench --workload loop --tier jit --samples 5
+# workloads: decode, leb128, startup, loop, fib, memory; tier defaults to all
+# size them with --execution-iterations, --fib-input, or --memory-iterations
 ```
 
 `inspect` decodes the module and reports its section table plus a
