@@ -119,7 +119,7 @@ type
     canonical, and a join needs no moves because all predecessors agree on the
     same slot-to-register map. }
   TArm64RegCache = record
-    Entries: array[0..3] of TArm64RegCacheEntry;
+    Entries: array[0..5] of TArm64RegCacheEntry;
     Next: Byte;
     StaticAllocation: Boolean;
   end;
@@ -143,6 +143,8 @@ const
   ARM64_REG_CACHE1 = 13;   { clean block-local value cache }
   ARM64_REG_CACHE2 = 14;   { dynamic cache beside a static allocation }
   ARM64_REG_CACHE3 = 15;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE4 = 16;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE5 = 17;   { dynamic cache beside a static allocation }
   ARM64_REG_LR = 30;       { x30, the link register }
   ARM64_REG_ZR = 31;       { in data-processing, 31 encodes the zero register }
   { The SAME encoding 31 means SP in load/store (unsigned offset) and in the
@@ -3167,8 +3169,9 @@ begin
     0: Result := ARM64_REG_CACHE0;
     1: Result := ARM64_REG_CACHE1;
     2: Result := ARM64_REG_CACHE2;
-  else
-    Result := ARM64_REG_CACHE3;
+    3: Result := ARM64_REG_CACHE3;
+    4: Result := ARM64_REG_CACHE4;
+  else Result := ARM64_REG_CACHE5;
   end;
 end;
 
@@ -3215,6 +3218,8 @@ begin
   begin
     ACache.Entries[2].Valid := False;
     ACache.Entries[3].Valid := False;
+    ACache.Entries[4].Valid := False;
+    ACache.Entries[5].Valid := False;
     ACache.Next := 0;
     Exit;
   end;
@@ -3240,7 +3245,7 @@ begin
   if ACache.StaticAllocation then
   begin
     Victim := 2 + ACache.Next;
-    ACache.Next := Byte(1 - ACache.Next);
+    ACache.Next := Byte((ACache.Next + 1) and 3);
   end
   else
   begin
@@ -3280,7 +3285,7 @@ begin
     if Victim < 2 then
     begin
       Victim := 2 + ACache.Next;
-      ACache.Next := Byte(1 - ACache.Next);
+      ACache.Next := Byte((ACache.Next + 1) and 3);
     end;
     Host := Arm64CacheHostReg(Victim);
     if ASrc <> Host then

@@ -56,6 +56,7 @@ type
     procedure TestCallArityFence;
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
+    procedure TestStaticCacheKeepsFourTemporaries;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -170,6 +171,30 @@ begin
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
+end;
+
+procedure TArm64Tests.TestStaticCacheKeepsFourTemporaries;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  I: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    for I := 0 to 3 do
+      Expect<Boolean>(Arm64EmitOpCached(Buf,
+        MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
+        UInt32(I), False, False, Cache)).ToBe(True);
+    for I := 0 to 3 do
+    begin
+      Expect<Boolean>(Cache.Entries[I + 2].Valid).ToBe(True);
+      Expect<UInt32>(Cache.Entries[I + 2].Slot).ToBe(UInt32(I + 2));
+    end;
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TArm64Tests.TestBranchPlaceholderBits;
@@ -572,6 +597,8 @@ begin
     TestBranchOffsetRangeGuard);
   Test('helper calls and the IR pointer are position-independent',
     TestPositionIndependentSequences);
+  Test('static allocation keeps four expression temporaries',
+    TestStaticCacheKeepsFourTemporaries);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);
