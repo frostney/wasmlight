@@ -334,6 +334,8 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64: Boolean;
   var ACache: TX64RegCache): Boolean;
+procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -696,6 +698,45 @@ begin
   else
     X64EmitAluRegReg(ABuf, AOpcode, AWide, X64_RAX, X64_RCX);
   X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
+procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
+var
+  Cond: Byte;
+  Wide: Boolean;
+begin
+  Wide := False;
+  case ACompare.Op of
+    iroI32Eq: Cond := X64_CC_E;
+    iroI32Ne: Cond := X64_CC_NE;
+    iroI32LtS: Cond := X64_CC_L;
+    iroI32LtU: Cond := X64_CC_B;
+    iroI32GtS: Cond := X64_CC_G;
+    iroI32GtU: Cond := X64_CC_A;
+    iroI32LeS: Cond := X64_CC_LE;
+    iroI32LeU: Cond := X64_CC_BE;
+    iroI32GeS: Cond := X64_CC_GE;
+    iroI32GeU: Cond := X64_CC_AE;
+    iroI64Eq: begin Cond := X64_CC_E; Wide := True; end;
+    iroI64Ne: begin Cond := X64_CC_NE; Wide := True; end;
+    iroI64LtS: begin Cond := X64_CC_L; Wide := True; end;
+    iroI64LtU: begin Cond := X64_CC_B; Wide := True; end;
+    iroI64GtS: begin Cond := X64_CC_G; Wide := True; end;
+    iroI64GtU: begin Cond := X64_CC_A; Wide := True; end;
+    iroI64LeS: begin Cond := X64_CC_LE; Wide := True; end;
+    iroI64LeU: begin Cond := X64_CC_BE; Wide := True; end;
+    iroI64GeS: begin Cond := X64_CC_GE; Wide := True; end;
+  else
+    begin Cond := X64_CC_AE; Wide := True; end;
+  end;
+  if ABranch.Op = iroBranchIfNot then
+    Cond := Cond xor 1;
+  X64CachedLoad(ABuf, ACache, X64_RAX, ACompare.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, ACompare.B);
+  X64EmitAluRegReg(ABuf, $39, Wide, X64_RAX, X64_RCX);
+  X64EmitJccTo(ABuf, Cond, ABranch.B);
+  X64InvalidateRegCache(ACache);
 end;
 
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;

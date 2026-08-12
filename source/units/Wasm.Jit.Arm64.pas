@@ -436,6 +436,8 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64: Boolean;
   var ACache: TArm64RegCache): Boolean;
+procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
 
 { The INSTRUCTION-level half of the compile predicate (§4.4). Arm64CanEmitOp
   answers "is there a template for this op"; this answers "can this particular
@@ -3176,6 +3178,48 @@ begin
   Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, AIns.B);
   ABuf.EmitU32(AWb(ARM64_REG_T0, ARM64_REG_T0, ARM64_REG_T1));
   Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
+var
+  Cond: Byte;
+  Wide: Boolean;
+begin
+  Wide := False;
+  case ACompare.Op of
+    iroI32Eq: Cond := ARM64_COND_EQ;
+    iroI32Ne: Cond := ARM64_COND_NE;
+    iroI32LtS: Cond := ARM64_COND_LT;
+    iroI32LtU: Cond := ARM64_COND_LO;
+    iroI32GtS: Cond := ARM64_COND_GT;
+    iroI32GtU: Cond := ARM64_COND_HI;
+    iroI32LeS: Cond := ARM64_COND_LE;
+    iroI32LeU: Cond := ARM64_COND_LS;
+    iroI32GeS: Cond := ARM64_COND_GE;
+    iroI32GeU: Cond := ARM64_COND_HS;
+    iroI64Eq: begin Cond := ARM64_COND_EQ; Wide := True; end;
+    iroI64Ne: begin Cond := ARM64_COND_NE; Wide := True; end;
+    iroI64LtS: begin Cond := ARM64_COND_LT; Wide := True; end;
+    iroI64LtU: begin Cond := ARM64_COND_LO; Wide := True; end;
+    iroI64GtS: begin Cond := ARM64_COND_GT; Wide := True; end;
+    iroI64GtU: begin Cond := ARM64_COND_HI; Wide := True; end;
+    iroI64LeS: begin Cond := ARM64_COND_LE; Wide := True; end;
+    iroI64LeU: begin Cond := ARM64_COND_LS; Wide := True; end;
+    iroI64GeS: begin Cond := ARM64_COND_GE; Wide := True; end;
+  else
+    begin Cond := ARM64_COND_HS; Wide := True; end;
+  end;
+  if ABranch.Op = iroBranchIfNot then
+    Cond := Cond xor 1;
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ACompare.A);
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, ACompare.B);
+  if Wide then
+    ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T1))
+  else
+    ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T1));
+  EmitBCondTo(ABuf, Cond, TWasmJitLabel(ABranch.B));
+  Arm64InvalidateRegCache(ACache);
 end;
 
 procedure Arm64CachedRel(const ABuf: TWasmCodeBuffer;

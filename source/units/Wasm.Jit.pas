@@ -352,6 +352,9 @@ var
   TargetCount: UInt32;
   AllocatedSlots: array[0..1] of UInt32;
   SlotScores: array of UInt32;
+  Fusion: array of Integer;
+  PlannedCode: TWasmIrCode;
+  SkipPlanned: array of Boolean;
   UseStaticCache: Boolean;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
@@ -364,6 +367,110 @@ var
   begin
     if ATarget < UInt32(Length(Targets)) then
       Targets[ATarget] := True;
+  end;
+
+  function IntegerCompare(const AOp: TWasmIrOp): Boolean;
+  begin
+    Result := AOp in [iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU,
+      iroI32GtS, iroI32GtU, iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU];
+  end;
+
+  function PlannedProducer(const AOp: TWasmIrOp): Boolean;
+  begin
+    Result := (AOp in [iroI32Const, iroI64Const, iroF32Const, iroF64Const,
+      iroI32Eqz, iroI64Eqz, iroI32Add, iroI32Sub, iroI32Mul, iroI32And,
+      iroI32Or, iroI32Xor, iroI64Add, iroI64Sub, iroI64Mul, iroI64And,
+      iroI64Or, iroI64Xor]) or IntegerCompare(AOp);
+  end;
+
+  function SimpleUseCount(const AReg: UInt32): UInt32;
+  var
+    K: Integer;
+  begin
+    Result := 0;
+    for K := 0 to High(AFn^.Code) do
+      case AFn^.Code[K].Op of
+        iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
+          if AFn^.Code[K].A = AReg then Inc(Result);
+        iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+        iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+        iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+        iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+        iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
+          begin
+            if AFn^.Code[K].A = AReg then Inc(Result);
+            if AFn^.Code[K].B = AReg then Inc(Result);
+          end;
+      end;
+  end;
+
+  function IsVisibleFrameReg(const AReg: UInt32): Boolean; forward;
+
+  procedure AnalyzeAdjacentMoves;
+  var
+    K: Integer;
+  begin
+    SetLength(PlannedCode, Length(AFn^.Code));
+    SetLength(SkipPlanned, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      PlannedCode[K] := AFn^.Code[K];
+    if not UseStaticCache then
+      Exit;
+    for K := 1 to High(PlannedCode) do
+      if (PlannedCode[K].Op = iroMove) and
+        PlannedProducer(PlannedCode[K - 1].Op) and
+        (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
+        (SimpleUseCount(PlannedCode[K].A) = 1) and
+        IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not Targets[K - 1] and not Targets[K] then
+      begin
+        { Fold a single-use expression result directly into the local/result
+          slot that the following lowering move would populate. The original
+          IR and its instruction labels remain intact; the skipped move binds
+          an empty label at the producer's fallthrough address. }
+        PlannedCode[K - 1].Dest := PlannedCode[K].Dest;
+        SkipPlanned[K] := True;
+      end;
+  end;
+
+  function IsVisibleFrameReg(const AReg: UInt32): Boolean;
+  var
+    K: Integer;
+  begin
+    for K := 0 to High(AFn^.LocalRegs) do
+      if AFn^.LocalRegs[K] = AReg then
+        Exit(True);
+    for K := 0 to High(AFn^.ResultRegs) do
+      if AFn^.ResultRegs[K] = AReg then
+        Exit(True);
+    Result := False;
+  end;
+
+  procedure AnalyzeFusion;
+  var
+    K: Integer;
+  begin
+    SetLength(Fusion, Length(AFn^.Code));
+    for K := 0 to High(Fusion) do
+      Fusion[K] := -1;
+    for K := 0 to High(AFn^.Code) - 1 do
+      if IntegerCompare(PlannedCode[K].Op) and
+        (PlannedCode[K + 1].Op in [iroBranchIf, iroBranchIfNot]) and
+        (PlannedCode[K + 1].A = PlannedCode[K].Dest) and
+        not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K] and not Targets[K + 1] and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) then
+      begin
+        { Validation allocates expression temporaries monotonically. An
+          immediately consumed compare result cannot be named again, so the
+          codegen plan may keep it in flags without changing the canonical IR
+          or any instruction-index label. }
+        Fusion[K] := -2;
+        Fusion[K + 1] := K;
+      end;
   end;
 
   function StaticCacheOp(const AOp: TWasmIrOp): Boolean;
@@ -496,6 +603,8 @@ begin
       end;
 
     AnalyzeStaticCache;
+    AnalyzeAdjacentMoves;
+    AnalyzeFusion;
 
     {$IFDEF WASM_JIT_ARM64}
     Arm64EmitPrologue(Buf);
@@ -526,23 +635,39 @@ begin
         {$ENDIF}
       end;
       Buf.BindLabel(TWasmJitLabel(I));
+      if SkipPlanned[I] or (Fusion[I] = -2) then
+        Continue;
       { Position-independent IR reference (aot-spec §1.3): pass the instruction
         INDEX; the runtime-op templates compute @Fn^.Code[i] from the pinned IR
         base (x23/rbp), which the entry receives freshly per invocation — no
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      Emitted := Arm64EmitOpCached(Buf, AFn^.Code[I], AFn^.AuxU32,
-        UInt32(I),
-        (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
-          (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
-          (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), ArmCache);
+      if Fusion[I] >= 0 then
+      begin
+        Arm64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
+          PlannedCode[I], ArmCache);
+        Emitted := True;
+      end
+      else
+        Emitted := Arm64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
+          UInt32(I),
+          (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
+            (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
+            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), ArmCache);
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
-      Emitted := X64EmitOpCached(Buf, AFn^.Code[I], AFn^.AuxU32,
-        UInt32(I),
-        (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
-          (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
-          (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), X64Cache);
+      if Fusion[I] >= 0 then
+      begin
+        X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
+          PlannedCode[I], X64Cache);
+        Emitted := True;
+      end
+      else
+        Emitted := X64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
+          UInt32(I),
+          (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
+            (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
+            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), X64Cache);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
