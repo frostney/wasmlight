@@ -1,7 +1,48 @@
 # Handoff
 
-Updated: 2026-08-12 (compiled direct calls and block-local register caching
-implemented, re-measured, and cross-architecture/cross-tier validated)
+Updated: 2026-08-12 (measured optimizing-codegen wave complete, integrated,
+and cross-architecture/cross-tier validated)
+
+## 2026-08-12 optimizing-codegen wave complete
+
+- **Nine accepted commits are integrated on
+  `codex/fix-tests-tier-performance`:** the isolated multi-workload benchmark
+  harness; compiled scalar-memory inlining; conservative hot-loop register
+  allocation; native scalar numeric lowering; the direct-call context trim;
+  compare/branch and redundant-move fusion; and native integer SIMD plus its
+  verified workload and x86 zero-extension correction. Each implementation was
+  measured against its immediate baseline before integration.
+- **Rejected experiments stayed out:** combining prepare/invoke/finish behind a
+  Pascal call frame regressed recursive fib by 11.8%; scratch-free direct result
+  delivery and bulk-zeroing also missed their gates. All were reverted. The
+  accepted direct-call change only removes two redundant active-context checks
+  and improved the immediate JIT/AOT medians by 3.0%/6.7%.
+- **Fresh Apple Silicon release medians, five samples:** the 300M integer loop
+  moved from JIT/AOT 740/745ms to 404/404ms (45.4%/45.8% faster); 30M scalar
+  memory iterations from 847/846ms to 276/271ms (67.4%/68.0%); the 1M numeric
+  workload from 97/97ms to 43/43ms (55.7%); and the 1M integer-SIMD workload
+  from 322/318ms to 137/136ms (57.5%/57.2%). Recursive fib(35) moved from
+  547/550ms to 495/492ms (9.5%/10.5%). Startup stayed in the same low-millisecond
+  band. These are benchmark observations, not CI thresholds.
+- **Current Wasmtime 47.0.3 comparison:** seven end-to-end samples, precompiled
+  artifacts, identical fixed modules, with compilation excluded. For a 1.2B
+  i32 mul-add loop, Wasmlight AOT is 1.651s versus Wasmtime 0.333s (5.0x gap).
+  For 50M scalar loads, 0.290s versus 0.0227s (12.7x). For recursive fib(40),
+  five Wasmlight samples and seven Wasmtime samples give 5.733s versus 0.354s
+  (16.2x). The loop gap has narrowed materially; memory address-generation and
+  recursive call mechanics are now the clearest remaining targets.
+- **Terminal correctness gate is green on both backends:** macOS/aarch64 and
+  Linux/x86-64 frozen install, formatting, release build, and all 44 unit suites
+  pass. The complete pinned corpus is byte-identical across interpreter, JIT,
+  and AOT on both architectures: pass=65204, fail=389, skip=1532, staged=0,
+  errors=0; JIT/AOT compiled=8588 on aarch64 and 8589 on x86-64. The x86 SIMD
+  mismatch found by the final gate was an unsigned i8/i16 lane-extract
+  zero-extension bug; `MOVZX` and encoder/differential coverage fixed it before
+  integration.
+- **Artifact compatibility:** scalar-memory inlining appends
+  `aohResolveMemory` and advances the compiled-helper ABI to revision 3, so
+  older `.waot` artifacts fail closed. The validated IR format remains version
+  2. The optimizer uses side tables and never rewrites or re-validates IR.
 
 ## 2026-08-12 compiled-tier optimization status
 
@@ -110,7 +151,7 @@ implemented, re-measured, and cross-architecture/cross-tier validated)
   tier-verified measurement. The wasmtime numbers have not been re-measured in
   this repair and must not be combined with the corrected local numbers.
 
-## THE ENTIRE ROADMAP (Tracks A-J) IS DELIVERED.
+## THE ENTIRE ROADMAP (Tracks A-J) IS DELIVERED
 
 Decode (A), validate + register IR (B), the .wast harness + wat assembler
 (C), runtime + precise GC (D), interpreter (E), embedding API + WASI
@@ -120,10 +161,10 @@ runtime decodes, validates, instantiates, and EXECUTES the complete core
 wasm 3.0 instruction set on two architectures via three interchangeable,
 observationally-identical tiers (interpreter / baseline JIT / AOT), runs
 real WASI programs under deny-by-default sandboxing, and is conformance-
-tested byte-for-byte against the upstream corpus (65,184 pass) in every
+tested byte-for-byte against the upstream corpus (65,204 pass) in every
 tier on both arches.
 
-## Track J (AOT) — COMPLETE (all 6 waves, both arches, CLI).
+## Track J (AOT) — COMPLETE (all 6 waves, both arches, CLI)
 
 - Wave 5 (the last): `wasmlight aot <mod.wasm> [-o <art.waot>]` compiles
   ahead of time; `wasmlight run --aot <art.waot> [--] <mod.wasm> [args]`
@@ -170,6 +211,7 @@ tier on both arches.
   not authentication) — stated honestly, not oversold.
 
 ## AOT remaining: Wave 5 (the CLI + measurement) ONLY
+
 `wasmlight aot <module.wasm> -o <artifact.waot>` (compile-ahead) and
 `wasmlight run --aot <artifact.waot> [--] <module.wasm> [args]` (load for
 instant startup, fall back to interpret/JIT if the artifact is absent/
@@ -224,7 +266,7 @@ module at load; the artifact is a perf cache, NEVER a trust bypass — its
 code is used only if module-hash + IR-version + arch + ABI-fingerprint +
 checksum all match the freshly-validated module.
 
-## Track I is DONE. The 4 non-corpus review findings (#48-51) are FIXED.
+## Track I is DONE; the 4 non-corpus review findings (#48-51) are FIXED
 
 - **Fix A (seam-transparent unwind + O(1) cross-tier tail).** New RetKind
   rtCompiledSeam: JIT-dispatch seam frames are TRANSPARENT to the
@@ -447,6 +489,7 @@ x30 preserved), i32 zero-extension identity (W-form stores), trap
 timing/unwind (a compiled body that traps is cleaned up by the
 trampoline's ResetFrames since the JIT frame IS an interp frame), W^X/
 cache-flush, predicate↔template completeness, layering. Found + FIXED:
+
 - **(Medium, Wave-3 BLOCKER) epoch snapshot** was captured per-compiled-
   entry but the interpreter captures it per-outermost-invocation → a
   compiled leaf entered after an epoch bump wouldn't interrupt where the

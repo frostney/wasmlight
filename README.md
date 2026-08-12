@@ -33,11 +33,10 @@ it. It is driven by `wasmlight inspect` / `wasmlight validate` /
 conformance corpus in any tier (`--tier=interp|jit|aot`) — assembling text
 modules, validating, instantiating, and executing the assertions, SIMD
 judged per lane and `assert_exception` judged. All three tiers produce
-**byte-identical** corpus results (**65,184 pass**) on both arches.
+**byte-identical** corpus results (**65,204 pass**) on both arches.
 [docs/roadmap.md](docs/roadmap.md) is the honest picture of exactly what
-exists and what remains (the deferred JIT optimizations, the characterized
-non-3.0-core corpus failures, and cross-platform CI validation still
-pending its first full run).
+exists and what remains (broader optimizing-compiler work, the characterized
+non-3.0-core corpus failures, and cross-platform CI validation).
 
 The project's durable direction and delivery gates live in
 [VISION.md](VISION.md), [DEFINITION_OF_READY.md](DEFINITION_OF_READY.md),
@@ -98,9 +97,9 @@ modules, validating, instantiating, and executing `assert_return` /
 ```text
 $ ./build/wasmspec tests/spec/testsuite
 ...
-ROOT      pass=64651 fail=52  skip=611  staged=0 total=65314
+ROOT      pass=64671 fail=33  skip=610  staged=0 total=65314
 PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
-TOTAL files=288 errors=0 pass=65184 fail=408 skip=1533 staged=0 total=67125
+TOTAL files=288 errors=0 pass=65204 fail=389 skip=1532 staged=0 total=67125
 ```
 
 SIMD is judged per lane (Track G) and exception handling is judged (Track
