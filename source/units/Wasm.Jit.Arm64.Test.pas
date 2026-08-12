@@ -193,7 +193,7 @@ begin
     for I := 0 to 3 do
       Expect<Boolean>(Arm64EmitOpCached(Buf,
         MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
-        UInt32(I), False, False, Cache)).ToBe(True);
+        UInt32(I), False, False, False, Cache)).ToBe(True);
     for I := 0 to 3 do
     begin
       Expect<Boolean>(Cache.Entries[I + 2].Valid).ToBe(True);
