@@ -64,7 +64,7 @@ canonical vocabulary before planning anything.
   which trap fires and when — is a bug, not a tier characteristic. All
   three tiers are shipped, and this is **enforced in CI**: `wasmspec
   --tier=interp|jit|aot` over the pinned corpus must produce a
-  byte-identical tally (65,184 pass on both aarch64 and x86-64), and the
+  byte-identical tally (65,204 pass on both aarch64 and x86-64), and the
   JIT/AOT legs assert that identity against the interpreter. The JIT and
   AOT are a 64-bit-UNIX acceleration (`WASM_JIT_EXEC`, backends
   `Wasm.Jit.Arm64` / `Wasm.Jit.X64`); on Windows and 32-bit targets the
@@ -196,7 +196,7 @@ compiler (Track J), two backends (aarch64 + x86-64) on a 64-bit UNIX host,
 each proven byte-identical to the interpreter over the corpus. **The whole
 roadmap A–J is delivered**; nothing in v1 is staged. What
 [docs/roadmap.md](docs/roadmap.md) still lists as future is *beyond* v1
-(threads, the Component Model) or is deferred JIT optimization and
+(threads, the Component Model), broader optimizing-compiler work, or
 cross-platform CI validation — never a missing behaviour. Do not document
 an unbuilt layer as if it exists, and do not re-describe a shipped one as
 staged. `$FD` vector support is shipped end to end

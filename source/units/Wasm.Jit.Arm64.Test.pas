@@ -56,6 +56,10 @@ type
     procedure TestCallArityFence;
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
+    procedure TestStaticCacheKeepsFourTemporaries;
+    procedure TestStaticCacheKeepsShiftResult;
+    procedure TestThirdStaticAllocation;
+    procedure TestExtendedFrameWords;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -76,6 +80,9 @@ begin
   Result.Imm := 0;
 end;
 
+function EmittedWord(const ABuf: TWasmCodeBuffer;
+  const AIndex: Integer): UInt32; forward;
+
 { --- portable bit assertions -------------------------------------------- }
 
 procedure TArm64Tests.TestWordBuilderBits;
@@ -90,10 +97,20 @@ begin
   Expect<UInt32>(Arm64LdrW(1, 0, 8)).ToBe($B9400801);
   Expect<UInt32>(Arm64LdrX(1, 0, 8)).ToBe($F9400401);
   Expect<UInt32>(Arm64StrX(2, 0, 16)).ToBe($F9000802);
+  { Scalar-memory zero-offset forms, independently assembled with clang. }
+  Expect<UInt32>(Arm64MemRegOffset($B9400000, 11, 14, 10, False))
+    .ToBe($B86A49CB);                    { ldr w11,[x14,w10,uxtw] }
+  Expect<UInt32>(Arm64MemRegOffset($B9000000, 11, 14, 10, False))
+    .ToBe($B82A49CB);                    { str w11,[x14,w10,uxtw] }
+  Expect<UInt32>(Arm64MemRegOffset($F9400000, 11, 14, 10, True))
+    .ToBe($F86A69CB);                    { ldr x11,[x14,x10] }
 
   { Wave-2 integer spine (ARMv8-A C6.2). }
   Expect<UInt32>(Arm64SubW(0, 1, 2)).ToBe($4B020020);
   Expect<UInt32>(Arm64MulW(0, 1, 2)).ToBe($1B027C20);
+  Expect<UInt32>(Arm64SdivW(9, 9, 10)).ToBe($1ACA0D29);
+  Expect<UInt32>(Arm64UdivX(9, 9, 10)).ToBe($9ACA0929);
+  Expect<UInt32>(Arm64MsubW(9, 11, 10, 9)).ToBe($1B0AA569);
   Expect<UInt32>(Arm64AndW(0, 1, 2)).ToBe($0A020020);
   Expect<UInt32>(Arm64OrrW(0, 1, 2)).ToBe($2A020020);
   Expect<UInt32>(Arm64EorW(0, 1, 2)).ToBe($4A020020);
@@ -108,6 +125,32 @@ begin
   Expect<UInt32>(Arm64CsetW(0, ARM64_COND_EQ)).ToBe($1A9F17E0);
   Expect<UInt32>(Arm64CsetW(0, ARM64_COND_NE)).ToBe($1A9F07E0);
   Expect<UInt32>(Arm64CselX(10, 10, 11, ARM64_COND_NE)).ToBe($9A8B114A);
+
+  { Native scalar floating point and exact conversions, assembled independently
+    with clang's aarch64 assembler. }
+  Expect<UInt32>(Arm64FmovSFromW(0, 9)).ToBe($1E270120);
+  Expect<UInt32>(Arm64FmovXFromD(9, 0)).ToBe($9E660009);
+  Expect<UInt32>(Arm64FaddS(0, 0, 1)).ToBe($1E212800);
+  Expect<UInt32>(Arm64FdivD(0, 0, 1)).ToBe($1E611800);
+  Expect<UInt32>(Arm64FcmpS(0, 1)).ToBe($1E212000);
+  Expect<UInt32>(Arm64ScvtfSX(0, 9)).ToBe($9E220120);
+  Expect<UInt32>(Arm64UcvtfDW(0, 9)).ToBe($1E630120);
+  Expect<UInt32>(Arm64FcvtSD(0, 0)).ToBe($1E624000);
+  Expect<UInt32>(Arm64SxtwX(9, 9)).ToBe($93407D29);
+
+  { Native Advanced SIMD subset, independently assembled with clang. }
+  Expect<UInt32>(Arm64LdrQ(0, 19, 16)).ToBe($3DC00660);
+  Expect<UInt32>(Arm64StrQ(1, 19, 32)).ToBe($3D800A61);
+  Expect<UInt32>(Arm64VecAnd(0, 1, 2)).ToBe($4E221C20);
+  Expect<UInt32>(Arm64VecBic(0, 1, 2)).ToBe($4E621C20);
+  Expect<UInt32>(Arm64VecOrr(0, 1, 2)).ToBe($4EA21C20);
+  Expect<UInt32>(Arm64VecEor(0, 1, 2)).ToBe($6E221C20);
+  Expect<UInt32>(Arm64VecMvn(0, 1)).ToBe($6E205820);
+  Expect<UInt32>(Arm64VecAdd(0, 1, 2, 3)).ToBe($4EE28420);
+  Expect<UInt32>(Arm64VecSub(0, 1, 2, 2)).ToBe($6EA28420);
+  Expect<UInt32>(Arm64VecDup(0, 9, 1)).ToBe($4E020D20);
+  Expect<UInt32>(Arm64VecExtract(9, 0, 0, 15, True)).ToBe($0E1F2C09);
+  Expect<UInt32>(Arm64VecExtract(9, 0, 3, 1, False)).ToBe($4E183C09);
 
   { movk, add-immediate, blr, mov reg. }
   Expect<UInt32>(Arm64MovkW(0, 1, 1)).ToBe($72A00020);
@@ -141,6 +184,106 @@ begin
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
+end;
+
+procedure TArm64Tests.TestStaticCacheKeepsFourTemporaries;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  I: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    for I := 0 to 3 do
+      Expect<Boolean>(Arm64EmitOpCached(Buf,
+        MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
+        UInt32(I), False, False, False, False, Cache)).ToBe(True);
+    for I := 0 to 3 do
+    begin
+      Expect<Boolean>(Cache.Entries[I + 3].Valid).ToBe(True);
+      Expect<UInt32>(Cache.Entries[I + 3].Slot).ToBe(UInt32(I + 2));
+    end;
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestStaticCacheKeepsShiftResult;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  I: Integer;
+  Found: Boolean;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
+      1, False, False, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Shl, 4, 2, 3, 0), Aux,
+      2, False, False, False, False, Cache)).ToBe(True);
+    Found := False;
+    for I := 0 to High(Cache.Entries) do
+      Found := Found or (Cache.Entries[I].Valid and
+        (Cache.Entries[I].Slot = 4));
+    Expect<Boolean>(Found).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestThirdStaticAllocation;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [3, 5, 7]);
+    Expect<Byte>(Cache.StaticCount).ToBe(3);
+    Expect<Boolean>(Cache.Entries[2].Valid).ToBe(True);
+    Expect<UInt32>(Cache.Entries[2].Slot).ToBe(7);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestExtendedFrameWords;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitPrologueExtended(Buf);
+    Expect<Integer>(Buf.Size).ToBe(10 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
+      Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+    Expect<UInt32>(EmittedWord(Buf, 9)).ToBe(
+      Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
+  finally
+    Buf.Free;
+  end;
+
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitEpilogueExtended(Buf);
+    Expect<Integer>(Buf.Size).ToBe(8 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
+      Arm64LdrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
+    Expect<UInt32>(EmittedWord(Buf, 6)).ToBe(
+      Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+    Expect<UInt32>(EmittedWord(Buf, 7)).ToBe(Arm64Ret);
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TArm64Tests.TestBranchPlaceholderBits;
@@ -543,6 +686,14 @@ begin
     TestBranchOffsetRangeGuard);
   Test('helper calls and the IR pointer are position-independent',
     TestPositionIndependentSequences);
+  Test('static allocation keeps four expression temporaries',
+    TestStaticCacheKeepsFourTemporaries);
+  Test('static allocation keeps a shifted expression result',
+    TestStaticCacheKeepsShiftResult);
+  Test('static allocation can retain a third long-lived slot',
+    TestThirdStaticAllocation);
+  Test('the extended frame preserves its third static register',
+    TestExtendedFrameWords);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);

@@ -16,10 +16,9 @@
   dead at every IR-op boundary — so the GC stack map is the frame itself and
   nothing extra is produced (§9.1).
 
-  WAVE 2 CALLING CONVENTION (§5.3, O-J3). Because Wave 2 needs helper calls (all
-  float ops and div/rem call Wasm.Interp.Numeric leaves; unreachable and the
-  epoch interrupt call TrapNow) and forward branches, the compiled body is no
-  longer a leaf and cannot keep the register-file base in x0 (caller-saved,
+  WAVE 2 CALLING CONVENTION (§5.3, O-J3). Because some numeric operations and
+  every trap slow path still call helpers, the compiled body is not a leaf and
+  cannot keep the register-file base in x0 (caller-saved,
   clobbered by every call). The prologue therefore pins:
 
     x19  = register-file base  (@Values[Base]; the compiled entry's 1st arg, x0)
@@ -108,6 +107,26 @@ type
     and lets every other internal error surface loudly (jit-spec §4.3). }
   EWasmJitBranchRange = class(EWasmError);
 
+  TArm64RegCacheEntry = record
+    Valid: Boolean;
+    Slot: UInt32;
+  end;
+
+  { Compile-time state for value caches. The normal mode is the original
+    clean, write-through block cache. Numeric loop functions may instead use a
+    function-wide static allocation: a slot owns x12/x13/x26 on every control-flow
+    edge, dirty values are written back only where the logical frame must be
+    canonical, and a join needs no moves because all predecessors agree on the
+    same slot-to-register map. }
+  TArm64RegCache = record
+    Entries: array[0..6] of TArm64RegCacheEntry;
+    Next: Byte;
+    StaticCount: Byte;
+    StaticAllocation: Boolean;
+  end;
+
+  TArm64WordBin = function(const ARd, ARn, ARm: Byte): UInt32;
+
 const
   { --- register roles for the Wave-2 body (jit-spec §5.3) ----------------- }
   ARM64_REG_REGFILE = 19;  { x19 = @Values[Base], the register-file base }
@@ -117,9 +136,17 @@ const
   { --- position-independent pins (aot-spec §1.2/§1.3/§4.3) --------------- }
   ARM64_REG_IRBASE = 23;   { x23 = @Fn^.Code[0], the IR-code base (entry arg x2) }
   ARM64_REG_HELPERTABLE = 24;  { x24 = the per-process helper-table base }
+  ARM64_REG_MEMORY = 25;   { x25 = one memory instance, or proven-stable Base }
   ARM64_REG_T0 = 9;        { x9/w9 scratch }
   ARM64_REG_T1 = 10;       { x10/w10 scratch }
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
+  ARM64_REG_CACHE0 = 12;   { clean block-local value cache }
+  ARM64_REG_CACHE1 = 13;   { clean block-local value cache }
+  ARM64_REG_CACHE2 = 14;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE3 = 15;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE4 = 16;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE5 = 17;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE_STATIC2 = 26; { optional third function-wide allocation }
   ARM64_REG_LR = 30;       { x30, the link register }
   ARM64_REG_ZR = 31;       { in data-processing, 31 encodes the zero register }
   { The SAME encoding 31 means SP in load/store (unsigned offset) and in the
@@ -154,6 +181,9 @@ const
   ARM64_COND_NE = 1;
   ARM64_COND_HS = 2;   { unsigned >= (carry set) }
   ARM64_COND_LO = 3;   { unsigned <  (carry clear) }
+  ARM64_COND_MI = 4;   { negative / ordered float < }
+  ARM64_COND_VS = 6;   { overflow / unordered float }
+  ARM64_COND_VC = 7;   { no overflow / ordered float }
   ARM64_COND_HI = 8;   { unsigned >  }
   ARM64_COND_LS = 9;   { unsigned <= }
   ARM64_COND_GE = 10;  { signed   >= }
@@ -169,6 +199,12 @@ function Arm64LdrW(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 function Arm64LdrX(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 function Arm64StrW(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 function Arm64StrX(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+{ Load/store register-offset form used by scalar linear-memory accesses.
+  AUnsignedBase is the existing size/sign-specific unsigned-offset opcode
+  prefix; i32 addresses use UXTW while memory64 uses an unextended X register. }
+function Arm64MemRegOffset(const AUnsignedBase: UInt32;
+  const ARt, ARn, ARm: Byte;
+  const AAddr64: Boolean): UInt32;
 
 { Data-processing (shifted register), 32-bit (W) and 64-bit (X). The W form
   zero-extends its result into the whole X register, so a following STR Xt
@@ -180,6 +216,12 @@ function Arm64SubW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64SubX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64MulW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64MulX(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64SdivW(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64SdivX(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64UdivW(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64UdivX(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64MsubW(const ARd, ARn, ARm, ARa: Byte): UInt32;
+function Arm64MsubX(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64AndW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64AndX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64OrrW(const ARd, ARn, ARm: Byte): UInt32;
@@ -220,6 +262,53 @@ function Arm64CsetW(const ARd, ACond: Byte): UInt32;
 { CSEL Xd,Xn,Xm,cond (C6.2.69): Xd := if cond then Xn else Xm — the select
   template's full 8-byte conditional copy. }
 function Arm64CselX(const ARd, ARn, ARm, ACond: Byte): UInt32;
+
+{ Scalar floating-point moves, arithmetic, comparisons and conversions. The
+  integer register arguments carry exact wasm bit patterns; scalar FP register
+  numbers use the same 0..31 encoding space. }
+function Arm64FmovSFromW(const ASd, AWn: Byte): UInt32;
+function Arm64FmovWFromS(const AWd, ASn: Byte): UInt32;
+function Arm64FmovDFromX(const ADd, AXn: Byte): UInt32;
+function Arm64FmovXFromD(const AXd, ADn: Byte): UInt32;
+function Arm64FaddS(const ASd, ASn, ARm: Byte): UInt32;
+function Arm64FsubS(const ASd, ASn, ARm: Byte): UInt32;
+function Arm64FmulS(const ASd, ASn, ARm: Byte): UInt32;
+function Arm64FdivS(const ASd, ASn, ARm: Byte): UInt32;
+function Arm64FaddD(const ADd, ADn, ADm: Byte): UInt32;
+function Arm64FsubD(const ADd, ADn, ADm: Byte): UInt32;
+function Arm64FmulD(const ADd, ADn, ADm: Byte): UInt32;
+function Arm64FdivD(const ADd, ADn, ADm: Byte): UInt32;
+function Arm64FcmpS(const ASn, ARm: Byte): UInt32;
+function Arm64FcmpD(const ADn, ADm: Byte): UInt32;
+function Arm64ScvtfSW(const ASd, AWn: Byte): UInt32;
+function Arm64ScvtfSX(const ASd, AXn: Byte): UInt32;
+function Arm64ScvtfDW(const ADd, AWn: Byte): UInt32;
+function Arm64ScvtfDX(const ADd, AXn: Byte): UInt32;
+function Arm64UcvtfSW(const ASd, AWn: Byte): UInt32;
+function Arm64UcvtfDW(const ADd, AWn: Byte): UInt32;
+function Arm64FcvtSD(const ASd, ADn: Byte): UInt32;
+function Arm64FcvtDS(const ADd, ASn: Byte): UInt32;
+function Arm64SxtbW(const AWd, AWn: Byte): UInt32;
+function Arm64SxthW(const AWd, AWn: Byte): UInt32;
+function Arm64SxtbX(const AXd, AWn: Byte): UInt32;
+function Arm64SxthX(const AXd, AWn: Byte): UInt32;
+function Arm64SxtwX(const AXd, AWn: Byte): UInt32;
+
+{ Universally available Advanced SIMD encodings used by the conservative
+  native v128 subset. Register-file vectors occupy two adjacent slots and are
+  loaded/stored as one Q register. ASize is 0/1/2/3 for 8/16/32/64-bit lanes. }
+function Arm64LdrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+function Arm64StrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+function Arm64VecAnd(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecBic(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecOrr(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecEor(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecMvn(const AVd, AVn: Byte): UInt32;
+function Arm64VecAdd(const AVd, AVn, AVm, ASize: Byte): UInt32;
+function Arm64VecSub(const AVd, AVn, AVm, ASize: Byte): UInt32;
+function Arm64VecDup(const AVd, ARn, ASize: Byte): UInt32;
+function Arm64VecExtract(const ARd, AVn, ASize, ALane: Byte;
+  const ASigned: Boolean): UInt32;
 
 { MOV Xd, Xn — register move, encoded as ORR Xd, XZR, Xn. }
 function Arm64MovReg(const ARd, ARn: Byte): UInt32;
@@ -278,6 +367,10 @@ procedure Arm64EmitStrW(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 procedure Arm64EmitStrX(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
+procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitMovzX(const ABuf: TWasmCodeBuffer; const ARd: Byte;
   const AImm16: UInt16; const AHw: Byte);
@@ -305,6 +398,7 @@ procedure Arm64EmitLoadImm64(const ABuf: TWasmCodeBuffer; const ARd: Byte;
   offset; ASnapshotOffset is Store.EpochSnapshot's. Arm64EmitEpilogue restores
   the set and returns (iroReturn emits it). }
 procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
+procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer);
 { Pin the per-process helper-table base in x24 (aot-spec §1.2/§4.3): loads it
   from the store field (x20 + AHelperTableOffset) ONCE, so every subsequent
   helper call is `ldr xT,[x24,#k*8]; blr xT`. Emitted by the driver right after
@@ -313,9 +407,12 @@ procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
   compile path. AHelperTableOffset is WasmJitOffsets.StoreJitHelperTable. }
 procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
+procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32; const ABaseOnly: Boolean);
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
+procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
 
 { Emit an indirect call to helper slot AHelper through the pinned helper table:
   `ldr x9,[x24,#Ord(AHelper)*8]; blr x9` (aot-spec §1.2). Position-independent —
@@ -364,6 +461,19 @@ function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32): Boolean;
+procedure Arm64InitRegCache(out ACache: TArm64RegCache);
+procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlots: array of UInt32);
+procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
+function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase, AExtendedFrame: Boolean;
+  var ACache: TArm64RegCache): Boolean;
+procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
 
 { The INSTRUCTION-level half of the compile predicate (§4.4). Arm64CanEmitOp
   answers "is there a template for this op"; this answers "can this particular
@@ -396,16 +506,32 @@ uses
   Wasm.Interp.Numeric,
   Wasm.Interp.Vector,
   Wasm.Runtime.Gc,
+  Wasm.Runtime.Memory,
   Wasm.Runtime.Traps;
+
+procedure Arm64CachedLoad(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ADest: Byte; const ASlot: UInt32); forward;
+procedure Arm64CachedStore(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASrc: Byte; const ASlot: UInt32); forward;
+procedure Arm64CachedAlu(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWb: TArm64WordBin;
+  var ACache: TArm64RegCache); forward;
+procedure Arm64CachedRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ACond: Byte; const AWide: Boolean;
+  var ACache: TArm64RegCache); forward;
+procedure EmitCbnzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const ATarget: UInt32); forward;
+procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const ATarget: UInt32); forward;
 
 { ===================================================================== }
 {  cdecl helper thunks — the ABI boundary the emitted code calls (§1.4) }
 { ===================================================================== }
 
-{ Every subtle op (all float arithmetic, div/rem, conversions, truncations)
-  routes through these two thunks, which switch on the IR op ordinal and call
-  the EXACT Wasm.Interp.Numeric leaf the interpreter calls — so NaN bits,
-  rounding, and the div/rem and float->int trap kind + timing are identical by
+{ Delicate numeric ops (min/max/nearest, trapping and saturating float-to-int,
+  unsigned i64-to-float, popcnt) route through these thunks, which call
+  the EXACT Wasm.Interp.Numeric leaf the interpreter calls — so the remaining
+  NaN/rounding behaviour and float-to-int trap kind + timing are identical by
   construction (§13). Results are widened to a full slot exactly as the
   interpreter's `Reg[Dest].Bits := UInt64(...)` stores them: a 32-bit result is
   returned zero-extended, a 64-bit result verbatim. cdecl = AAPCS64, so the
@@ -451,6 +577,345 @@ begin
     iroF64Ge: Result := UInt64(F64Ge(A, B));
   else
     Result := 0;
+  end;
+end;
+
+function Arm64ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32];
+end;
+
+procedure LdW(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const AReg: UInt32); forward;
+procedure LdX(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const AReg: UInt32); forward;
+procedure StX(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const AReg: UInt32); forward;
+procedure EmitBCondTo(const ABuf: TWasmCodeBuffer; const ACond: Byte;
+  const ATarget: TWasmJitLabel); forward;
+
+function Arm64MemoryAccessSize(const AOp: TWasmIrOp): UInt32;
+begin
+  case AOp of
+    iroI32Load8S, iroI32Load8U, iroI64Load8S, iroI64Load8U,
+    iroI32Store8, iroI64Store8: Result := 1;
+    iroI32Load16S, iroI32Load16U, iroI64Load16S, iroI64Load16U,
+    iroI32Store16, iroI64Store16: Result := 2;
+    iroI32Load, iroF32Load, iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroF32Store, iroI64Store32: Result := 4;
+  else
+    Result := 8;
+  end;
+end;
+
+function JitResolveMemory(const AStore: TWasmStore;
+  const AMemoryIndex: PtrUInt): PWasmMemoryInst; cdecl;
+var
+  Ctx: PWasmInterpContext;
+  Instance: TWasmModuleInstance;
+begin
+  Ctx := PWasmInterpContext(AStore.TierContext);
+  Instance := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+  Result := AStore.JitMemoryAt(Instance.MemAddrs[AMemoryIndex]);
+end;
+
+procedure Arm64EmitTrapUnless(const ABuf: TWasmCodeBuffer;
+  const AGoodCondition: Byte);
+var
+  Good: TWasmJitLabel;
+begin
+  Good := ABuf.NewLabel;
+  EmitBCondTo(ABuf, AGoodCondition, Good);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkMemoryOutOfBounds)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(Good);
+end;
+
+procedure Arm64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase: Boolean; var ACache: TArm64RegCache);
+var
+  Layout: TWasmMemoryInst;
+  AccessSize: UInt32;
+  BaseReg: Byte;
+  MemoryReg: Byte;
+  Offset: UInt64;
+  Folded: Boolean;
+  LoadOp: UInt32;
+  UseRegOffset: Boolean;
+begin
+  AccessSize := Arm64MemoryAccessSize(AIns.Op);
+  { Imm stores the memarg's u64 bit pattern in the IR's signed immediate slot.
+    Reinterpret it: a checked numeric conversion rejects offsets above
+    High(Int64), even though memory64 admits the full u64 range. }
+  Move(AIns.Imm, Offset, SizeOf(Offset));
+  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - UInt64(AccessSize);
+  UseRegOffset := Offset = 0;
+
+  { Resolve the module memory index through the current activation. The helper
+    returns the live TWasmMemoryInst; generated code then applies that memory's
+    statically selected strategy. The helper-table call keeps AOT bytes free of
+    process addresses. }
+  if AUsePinnedMemoryBase then
+  begin
+    { The driver permits a base-only pin only for zero-offset i32 guard-page
+      accesses in a function that cannot call or grow memory. No operation in
+      that frame can change Base, so x25 is the live base for its whole body. }
+    BaseReg := ARM64_REG_MEMORY;
+    MemoryReg := 0;
+  end
+  else if AUsePinnedMemory then
+    MemoryReg := ARM64_REG_MEMORY
+  else
+  begin
+    ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+    Arm64EmitLoadImm32(ABuf, 1, AIns.B);
+    Arm64EmitCallHelper(ABuf, aohResolveMemory);     { x0 := memory instance }
+    MemoryReg := 0;
+  end;
+  { The memory instance may outlive a grow/remap, but Base remains live state:
+    load it at every access even when the instance itself is pinned. The i32
+    folded guard-page case does not inspect ByteSize at all, so avoid loading a
+    field that the selected access strategy cannot consume. }
+  if not AUsePinnedMemoryBase then
+  begin
+    BaseReg := 14;
+    Arm64EmitLdrX(ABuf, BaseReg, MemoryReg,
+      UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
+    if AAddr64 or not Folded then
+      Arm64EmitLdrX(ABuf, 15, MemoryReg,
+        UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
+  end;
+  if AAddr64 then
+    Arm64CachedLoad(ABuf, ACache, 10, AIns.A)
+  else
+    Arm64CachedLoad(ABuf, ACache, 10, AIns.A);      { canonical i32 is zero-extended }
+
+  if AAddr64 and Folded then
+  begin
+    { Guard-assisted memory64: index > ByteSize can escape the reservation;
+      index <= ByteSize is safe because the static offset plus access width is
+      wholly absorbed by the reserved guard. }
+    ABuf.EmitU32(Arm64CmpX(10, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+  end
+  else if (not AAddr64) and Folded then
+    { i32 guard-page strategy on a 64-bit POSIX backend: the 4 GiB reservation
+      plus guard covers every widened index and this static offset. }
+  else
+  begin
+    { Exact MemInBounds subtraction form: index <= size; offset <= size-index;
+      access width <= size-index-offset. No addition can wrap. }
+    ABuf.EmitU32(Arm64CmpX(10, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+    ABuf.EmitU32(Arm64SubX(15, 15, 10));
+    Arm64EmitLoadImm64(ABuf, 11, Offset);
+    ABuf.EmitU32(Arm64CmpX(11, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+    ABuf.EmitU32(Arm64SubX(15, 15, 11));
+    Arm64EmitLoadImm32(ABuf, 11, AccessSize);
+    ABuf.EmitU32(Arm64CmpX(11, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+  end;
+
+  if not UseRegOffset then
+  begin
+    if BaseReg <> 14 then
+    begin
+      ABuf.EmitU32(Arm64MovReg(14, BaseReg));
+      BaseReg := 14;
+    end;
+    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 10));
+    Arm64EmitLoadImm64(ABuf, 11, Offset);
+    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 11));
+  end;
+
+  case AIns.Op of
+    iroI32Load8U, iroI64Load8U: LoadOp := $39400000;
+    iroI32Load8S: LoadOp := $39C00000;
+    iroI64Load8S: LoadOp := $39800000;
+    iroI32Load16U, iroI64Load16U: LoadOp := $79400000;
+    iroI32Load16S: LoadOp := $79C00000;
+    iroI64Load16S: LoadOp := $79800000;
+    iroI32Load, iroF32Load, iroI64Load32U: LoadOp := $B9400000;
+    iroI64Load32S: LoadOp := $B9800000;
+    iroI64Load, iroF64Load: LoadOp := $F9400000;
+    iroI32Store8, iroI64Store8:
+      begin
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($39000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($39000000 or (UInt32(BaseReg) shl 5) or 11);
+        Exit;
+      end;
+    iroI32Store16, iroI64Store16:
+      begin
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($79000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($79000000 or (UInt32(BaseReg) shl 5) or 11);
+        Exit;
+      end;
+    iroI32Store, iroF32Store, iroI64Store32:
+      begin
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($B9000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($B9000000 or (UInt32(BaseReg) shl 5) or 11);
+        Exit;
+      end;
+    iroI64Store, iroF64Store:
+      begin
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($F9000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($F9000000 or (UInt32(BaseReg) shl 5) or 11);
+        Exit;
+      end;
+  else
+    Exit;
+  end;
+  if UseRegOffset then
+    ABuf.EmitU32(Arm64MemRegOffset(LoadOp, 11, BaseReg, 10, AAddr64))
+  else
+    ABuf.EmitU32(LoadOp or (UInt32(BaseReg) shl 5) or 11);
+  Arm64CachedStore(ABuf, ACache, 11, AIns.Dest);
+end;
+
+function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase, AExtendedFrame: Boolean;
+  var ACache: TArm64RegCache): Boolean;
+begin
+  Result := True;
+  if Arm64ScalarMemoryOp(AIns.Op) then
+  begin
+    { The base-pinned static-cache shape never consumes x14/x15 itself. Every
+      other scalar-memory shape does, so discard dynamic-cache metadata before
+      those scratch registers are reused for Base/ByteSize. }
+    if not AUsePinnedMemoryBase then
+      Arm64InvalidateRegCache(ACache);
+    Arm64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory,
+      AUsePinnedMemoryBase, ACache);
+    Exit;
+  end;
+  case AIns.Op of
+    iroMove:
+      begin
+        Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+      end;
+    iroI32Const, iroF32Const:
+      begin
+        Arm64EmitLoadImm32(ABuf, ARM64_REG_T0,
+          UInt32(AIns.Imm and $FFFFFFFF));
+        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+      end;
+    iroI64Const, iroF64Const:
+      begin
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, UInt64(AIns.Imm));
+        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+      end;
+    iroBranchIf, iroBranchIfNot:
+      begin
+        Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+        if AIns.Op = iroBranchIf then
+          EmitCbnzTo(ABuf, ARM64_REG_T0, AIns.B)
+        else
+          EmitCbzTo(ABuf, ARM64_REG_T0, AIns.B);
+        Arm64InvalidateRegCache(ACache);
+      end;
+    iroJump:
+      begin
+        { Static allocation is enabled only for helper-free numeric functions.
+          Their flagged back-edge performs an epoch comparison and either
+          falls through or invokes a non-returning trap helper. No GC can run
+          on the one-thread-per-store fallthrough, and none of the allocated
+          slots is a reference. Keep numeric values in registers here; exits
+          still flush the canonical logical frame below. }
+        Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroReturn:
+      begin
+        { Results and every observable exit are read from the logical frame. }
+        Arm64FlushRegCache(ABuf, ACache);
+        if AExtendedFrame then
+          Arm64EmitEpilogueExtended(ABuf)
+        else
+          Arm64EmitEpilogue(ABuf);
+      end;
+    iroUnreachable:
+      begin
+        Arm64FlushRegCache(ABuf, ACache);
+        Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroI32Eqz, iroI64Eqz:
+      begin
+        Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+        if AIns.Op = iroI64Eqz then
+          ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_ZR))
+        else
+          ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_ZR));
+        ABuf.EmitU32(Arm64CsetW(ARM64_REG_T0, ARM64_COND_EQ));
+        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+      end;
+    iroI32Eq: Arm64CachedRel(ABuf, AIns, ARM64_COND_EQ, False, ACache);
+    iroI32Ne: Arm64CachedRel(ABuf, AIns, ARM64_COND_NE, False, ACache);
+    iroI32LtS: Arm64CachedRel(ABuf, AIns, ARM64_COND_LT, False, ACache);
+    iroI32LtU: Arm64CachedRel(ABuf, AIns, ARM64_COND_LO, False, ACache);
+    iroI32GtS: Arm64CachedRel(ABuf, AIns, ARM64_COND_GT, False, ACache);
+    iroI32GtU: Arm64CachedRel(ABuf, AIns, ARM64_COND_HI, False, ACache);
+    iroI32LeS: Arm64CachedRel(ABuf, AIns, ARM64_COND_LE, False, ACache);
+    iroI32LeU: Arm64CachedRel(ABuf, AIns, ARM64_COND_LS, False, ACache);
+    iroI32GeS: Arm64CachedRel(ABuf, AIns, ARM64_COND_GE, False, ACache);
+    iroI32GeU: Arm64CachedRel(ABuf, AIns, ARM64_COND_HS, False, ACache);
+    iroI64Eq: Arm64CachedRel(ABuf, AIns, ARM64_COND_EQ, True, ACache);
+    iroI64Ne: Arm64CachedRel(ABuf, AIns, ARM64_COND_NE, True, ACache);
+    iroI64LtS: Arm64CachedRel(ABuf, AIns, ARM64_COND_LT, True, ACache);
+    iroI64LtU: Arm64CachedRel(ABuf, AIns, ARM64_COND_LO, True, ACache);
+    iroI64GtS: Arm64CachedRel(ABuf, AIns, ARM64_COND_GT, True, ACache);
+    iroI64GtU: Arm64CachedRel(ABuf, AIns, ARM64_COND_HI, True, ACache);
+    iroI64LeS: Arm64CachedRel(ABuf, AIns, ARM64_COND_LE, True, ACache);
+    iroI64LeU: Arm64CachedRel(ABuf, AIns, ARM64_COND_LS, True, ACache);
+    iroI64GeS: Arm64CachedRel(ABuf, AIns, ARM64_COND_GE, True, ACache);
+    iroI64GeU: Arm64CachedRel(ABuf, AIns, ARM64_COND_HS, True, ACache);
+    iroI32Add: Arm64CachedAlu(ABuf, AIns, @Arm64AddW, ACache);
+    iroI32Sub: Arm64CachedAlu(ABuf, AIns, @Arm64SubW, ACache);
+    iroI32Mul: Arm64CachedAlu(ABuf, AIns, @Arm64MulW, ACache);
+    iroI32And: Arm64CachedAlu(ABuf, AIns, @Arm64AndW, ACache);
+    iroI32Or: Arm64CachedAlu(ABuf, AIns, @Arm64OrrW, ACache);
+    iroI32Xor: Arm64CachedAlu(ABuf, AIns, @Arm64EorW, ACache);
+    iroI32Shl: Arm64CachedAlu(ABuf, AIns, @Arm64LslvW, ACache);
+    iroI32ShrS: Arm64CachedAlu(ABuf, AIns, @Arm64AsrvW, ACache);
+    iroI32ShrU: Arm64CachedAlu(ABuf, AIns, @Arm64LsrvW, ACache);
+    iroI32Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvW, ACache);
+    iroI64Add: Arm64CachedAlu(ABuf, AIns, @Arm64AddX, ACache);
+    iroI64Sub: Arm64CachedAlu(ABuf, AIns, @Arm64SubX, ACache);
+    iroI64Mul: Arm64CachedAlu(ABuf, AIns, @Arm64MulX, ACache);
+    iroI64And: Arm64CachedAlu(ABuf, AIns, @Arm64AndX, ACache);
+    iroI64Or: Arm64CachedAlu(ABuf, AIns, @Arm64OrrX, ACache);
+    iroI64Xor: Arm64CachedAlu(ABuf, AIns, @Arm64EorX, ACache);
+    iroI64Shl: Arm64CachedAlu(ABuf, AIns, @Arm64LslvX, ACache);
+    iroI64ShrS: Arm64CachedAlu(ABuf, AIns, @Arm64AsrvX, ACache);
+    iroI64ShrU: Arm64CachedAlu(ABuf, AIns, @Arm64LsrvX, ACache);
+    iroI64Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvX, ACache);
+  else
+    { Helpers, safepoints, complex control and currently uncached templates all
+      observe/write the canonical memory register file. }
+    Arm64InvalidateRegCache(ACache);
+    Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
   end;
 end;
 
@@ -534,11 +999,11 @@ end;
 {  Wave 3 — the CALL family (jit-spec §4.4, §4.5, §5)                    }
 { ===================================================================== }
 
-{ THE DESIGN, in one paragraph. A compiled call does NOT re-implement calling.
-  The emitted sequence is only marshal -> call helper -> unmarshal: it copies
-  the IR's argument registers into a flat slot buffer on the native stack,
-  calls one of the cdecl helpers below, and copies the helper's flat result
-  buffer back into the IR's destination registers. The FLAT SLOT BUFFER IS THE
+{ THE DESIGN, in one paragraph. A compiled call does NOT re-implement frame
+  layout. It copies the IR arguments into a flat native-stack buffer. A direct
+  call asks the shared frame helper for a compiled entry and invokes that entry
+  immediately; host/interpreted and dynamic calls use the generic dispatcher.
+  Both paths copy the flat result buffer back into IR destinations. The buffer IS THE
   SEAM: the IR's argument/result aux blocks already list one register per
   SLOT (a v128 operand contributes its low and high halves as two separate
   entries), which is exactly the flat block the interpreter's CompiledCall /
@@ -850,20 +1315,19 @@ end;
 {  §8, §9, §12.3 Waves 4-5)                                              }
 { ===================================================================== }
 
-{ THE PATTERN, and why it is the whole of these two waves. Every memory,
-  table, reference, global and GC op is a HELPER CALL, exactly as jit-spec
+{ THE PATTERN, and why it is the whole of these two waves. Every table,
+  reference, global and GC op is a HELPER CALL, exactly as jit-spec
   §1.4 prescribes ("if the interpreter dispatches to a store/heap method for
   an op, the JIT emits a call to that same function"). The emitted template is
   UNIFORM and tiny — marshal the store, the register-file base and a pointer
   to the IR instruction into x0/x1/x2, then `blr` a single cdecl dispatcher
   (JitRtDispatch) — and every subtlety lives in Pascal:
 
-    - MEMORY goes through the ONE chokepoint Store.MemAddressAt / MemRangeAt
-      (AGENTS.md's named top failure mode). The baseline emits NO raw
-      memory-base arithmetic and does NOT rely on guard-page faults; the
-      chokepoint runs the explicit full-precision bounds check and traps
-      'out of bounds memory access' via the same TrapNow the interpreter uses
-      (jit-spec §7.1 form 1).
+    - SCALAR MEMORY uses the generated-code half of the ONE chokepoint: the
+      address type selects the strategy statically, guard-page and
+      guard-assisted folds use the reservation, and the fallback reproduces
+      MemCheck's overflow-safe subtraction sequence. memory.grow and bulk/SIMD
+      operations remain on Store.MemAddressAt / MemRangeAt helpers.
     - TABLE reference stores go through the barriered store methods
       (TableSet/Fill/Grow/Init/Copy); reads are the free functions. Traps are
       'out of bounds table access' / 'undefined element' — the store's, not
@@ -2017,6 +2481,91 @@ begin
     or ARt;
 end;
 
+function Arm64MemRegOffset(const AUnsignedBase: UInt32;
+  const ARt, ARn, ARm: Byte; const AAddr64: Boolean): UInt32;
+var
+  ExtendBits: UInt32;
+begin
+  if AAddr64 then
+    ExtendBits := $6800             { [Xn,Xm] }
+  else
+    ExtendBits := $4800;            { [Xn,Wm,UXTW] }
+  { Every scalar load/store unsigned-offset prefix is exactly $00E00000 above
+    its register-offset prefix across the byte/half/word/dword sign variants. }
+  Result := (AUnsignedBase - $00E00000) or (UInt32(ARm) shl 16) or ExtendBits or
+    (UInt32(ARn) shl 5) or ARt;
+end;
+
+function Arm64LdrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+begin
+  Result := $3DC00000 or ((AByteOffset div 16) shl 10)
+    or (UInt32(ARn) shl 5) or ARt;
+end;
+
+function Arm64StrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+begin
+  Result := $3D800000 or ((AByteOffset div 16) shl 10)
+    or (UInt32(ARn) shl 5) or ARt;
+end;
+
+function Arm64VecAnd(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $4E201C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecBic(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $4E601C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecOrr(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $4EA01C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecEor(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $6E201C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecMvn(const AVd, AVn: Byte): UInt32;
+begin
+  Result := $6E205800 or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecAdd(const AVd, AVn, AVm, ASize: Byte): UInt32;
+begin
+  Result := $4E208400 or (UInt32(ASize and 3) shl 22)
+    or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecSub(const AVd, AVn, AVm, ASize: Byte): UInt32;
+begin
+  Result := $6E208400 or (UInt32(ASize and 3) shl 22)
+    or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecDup(const AVd, ARn, ASize: Byte): UInt32;
+begin
+  Result := $4E000C00 or (UInt32(1 shl ASize) shl 16)
+    or (UInt32(ARn) shl 5) or AVd;
+end;
+
+function Arm64VecExtract(const ARd, AVn, ASize, ALane: Byte;
+  const ASigned: Boolean): UInt32;
+var
+  Imm5: UInt32;
+begin
+  Imm5 := (UInt32(ALane) shl (ASize + 1)) or UInt32(1 shl ASize);
+  if (ASize = 3) and (not ASigned) then
+    Result := $4E003C00
+  else if ASigned then
+    Result := $0E002C00
+  else
+    Result := $0E003C00;
+  Result := Result or (Imm5 shl 16) or (UInt32(AVn) shl 5) or ARd;
+end;
+
 function Arm64AddW(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $0B000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
@@ -2046,6 +2595,38 @@ end;
 function Arm64MulX(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $9B007C00 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64SdivW(const ARd, ARn, ARm: Byte): UInt32;
+begin
+  Result := $1AC00C00 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64SdivX(const ARd, ARn, ARm: Byte): UInt32;
+begin
+  Result := $9AC00C00 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64UdivW(const ARd, ARn, ARm: Byte): UInt32;
+begin
+  Result := $1AC00800 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64UdivX(const ARd, ARn, ARm: Byte): UInt32;
+begin
+  Result := $9AC00800 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64MsubW(const ARd, ARn, ARm, ARa: Byte): UInt32;
+begin
+  Result := $1B008000 or (UInt32(ARm) shl 16) or (UInt32(ARa) shl 10)
+    or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64MsubX(const ARd, ARn, ARm, ARa: Byte): UInt32;
+begin
+  Result := $9B008000 or (UInt32(ARm) shl 16) or (UInt32(ARa) shl 10)
+    or (UInt32(ARn) shl 5) or ARd;
 end;
 
 function Arm64AndW(const ARd, ARn, ARm: Byte): UInt32;
@@ -2170,6 +2751,147 @@ function Arm64CselX(const ARd, ARn, ARm, ACond: Byte): UInt32;
 begin
   Result := $9A800000 or (UInt32(ARm) shl 16) or (UInt32(ACond) shl 12)
     or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64FmovSFromW(const ASd, AWn: Byte): UInt32;
+begin
+  Result := $1E270000 or (UInt32(AWn) shl 5) or ASd;
+end;
+
+function Arm64FmovWFromS(const AWd, ASn: Byte): UInt32;
+begin
+  Result := $1E260000 or (UInt32(ASn) shl 5) or AWd;
+end;
+
+function Arm64FmovDFromX(const ADd, AXn: Byte): UInt32;
+begin
+  Result := $9E670000 or (UInt32(AXn) shl 5) or ADd;
+end;
+
+function Arm64FmovXFromD(const AXd, ADn: Byte): UInt32;
+begin
+  Result := $9E660000 or (UInt32(ADn) shl 5) or AXd;
+end;
+
+function Arm64FpBinary(const ABase: UInt32; const ADd, ADn,
+  ADm: Byte): UInt32;
+begin
+  Result := ABase or (UInt32(ADm) shl 16) or (UInt32(ADn) shl 5) or ADd;
+end;
+
+function Arm64FaddS(const ASd, ASn, ARm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E202800, ASd, ASn, ARm);
+end;
+
+function Arm64FsubS(const ASd, ASn, ARm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E203800, ASd, ASn, ARm);
+end;
+
+function Arm64FmulS(const ASd, ASn, ARm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E200800, ASd, ASn, ARm);
+end;
+
+function Arm64FdivS(const ASd, ASn, ARm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E201800, ASd, ASn, ARm);
+end;
+
+function Arm64FaddD(const ADd, ADn, ADm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E602800, ADd, ADn, ADm);
+end;
+
+function Arm64FsubD(const ADd, ADn, ADm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E603800, ADd, ADn, ADm);
+end;
+
+function Arm64FmulD(const ADd, ADn, ADm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E600800, ADd, ADn, ADm);
+end;
+
+function Arm64FdivD(const ADd, ADn, ADm: Byte): UInt32;
+begin
+  Result := Arm64FpBinary($1E601800, ADd, ADn, ADm);
+end;
+
+function Arm64FcmpS(const ASn, ARm: Byte): UInt32;
+begin
+  Result := $1E202000 or (UInt32(ARm) shl 16) or (UInt32(ASn) shl 5);
+end;
+
+function Arm64FcmpD(const ADn, ADm: Byte): UInt32;
+begin
+  Result := $1E602000 or (UInt32(ADm) shl 16) or (UInt32(ADn) shl 5);
+end;
+
+function Arm64ScvtfSW(const ASd, AWn: Byte): UInt32;
+begin
+  Result := $1E220000 or (UInt32(AWn) shl 5) or ASd;
+end;
+
+function Arm64ScvtfSX(const ASd, AXn: Byte): UInt32;
+begin
+  Result := $9E220000 or (UInt32(AXn) shl 5) or ASd;
+end;
+
+function Arm64ScvtfDW(const ADd, AWn: Byte): UInt32;
+begin
+  Result := $1E620000 or (UInt32(AWn) shl 5) or ADd;
+end;
+
+function Arm64ScvtfDX(const ADd, AXn: Byte): UInt32;
+begin
+  Result := $9E620000 or (UInt32(AXn) shl 5) or ADd;
+end;
+
+function Arm64UcvtfSW(const ASd, AWn: Byte): UInt32;
+begin
+  Result := $1E230000 or (UInt32(AWn) shl 5) or ASd;
+end;
+
+function Arm64UcvtfDW(const ADd, AWn: Byte): UInt32;
+begin
+  Result := $1E630000 or (UInt32(AWn) shl 5) or ADd;
+end;
+
+function Arm64FcvtSD(const ASd, ADn: Byte): UInt32;
+begin
+  Result := $1E624000 or (UInt32(ADn) shl 5) or ASd;
+end;
+
+function Arm64FcvtDS(const ADd, ASn: Byte): UInt32;
+begin
+  Result := $1E22C000 or (UInt32(ASn) shl 5) or ADd;
+end;
+
+function Arm64SxtbW(const AWd, AWn: Byte): UInt32;
+begin
+  Result := $13001C00 or (UInt32(AWn) shl 5) or AWd;
+end;
+
+function Arm64SxthW(const AWd, AWn: Byte): UInt32;
+begin
+  Result := $13003C00 or (UInt32(AWn) shl 5) or AWd;
+end;
+
+function Arm64SxtbX(const AXd, AWn: Byte): UInt32;
+begin
+  Result := $93401C00 or (UInt32(AWn) shl 5) or AXd;
+end;
+
+function Arm64SxthX(const AXd, AWn: Byte): UInt32;
+begin
+  Result := $93403C00 or (UInt32(AWn) shl 5) or AXd;
+end;
+
+function Arm64SxtwX(const AXd, AWn: Byte): UInt32;
+begin
+  Result := $93407C00 or (UInt32(AWn) shl 5) or AXd;
 end;
 
 function Arm64MovReg(const ARd, ARn: Byte): UInt32;
@@ -2311,6 +3033,18 @@ begin
   ABuf.EmitU32(Arm64StrX(ARt, ARn, AByteOffset));
 end;
 
+procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+begin
+  ABuf.EmitU32(Arm64LdrQ(ARt, ARn, AByteOffset));
+end;
+
+procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+begin
+  ABuf.EmitU32(Arm64StrQ(ARt, ARn, AByteOffset));
+end;
+
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
 begin
   ABuf.EmitU32(Arm64Ret);
@@ -2357,9 +3091,19 @@ begin
   ABuf.EmitU32(Arm64StpX21X22Off16);           { stp x21,x22,[sp,#16] }
   ABuf.EmitU32(Arm64StpX23X24Off32);           { stp x23,x24,[sp,#32] }
   ABuf.EmitU32(Arm64StrX(ARM64_REG_LR, ARM64_REG_ZR, 48)); { str x30,[sp,#48] }
+  ABuf.EmitU32(Arm64StrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_REGFILE, 0));  { mov x19,x0 (regbase) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_STORE, 1));    { mov x20,x1 (store) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_IRBASE, 2));   { mov x23,x2 (IR base) }
+end;
+
+procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer);
+begin
+  { Reserve one aligned callee-saved slot above the established 64-byte frame.
+    Only functions with a measured-useful third static allocation pay this. }
+  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+  Arm64EmitPrologue(ABuf);
+  ABuf.EmitU32(Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_ZR, 64));
 end;
 
 procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
@@ -2388,6 +3132,21 @@ begin
   Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_HELPERTABLE,
     UInt32(Ord(AHelper)) * 8);
   ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+end;
+
+procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32; const ABaseOnly: Boolean);
+var
+  Layout: TWasmMemoryInst;
+begin
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  Arm64EmitLoadImm32(ABuf, 1, AMemoryIndex);
+  Arm64EmitCallHelper(ABuf, aohResolveMemory);
+  if ABaseOnly then
+    Arm64EmitLdrX(ABuf, ARM64_REG_MEMORY, 0,
+      UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)))
+  else
+    ABuf.EmitU32(Arm64MovReg(ARM64_REG_MEMORY, 0));
 end;
 
 procedure Arm64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
@@ -2440,10 +3199,23 @@ end;
 
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 begin
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
   ABuf.EmitU32(Arm64LdrX(ARM64_REG_LR, ARM64_REG_ZR, 48));  { ldr x30,[sp,#48] }
   ABuf.EmitU32(Arm64LdpX23X24Off32);           { ldp x23,x24,[sp,#32] }
   ABuf.EmitU32(Arm64LdpX21X22Off16);           { ldp x21,x22,[sp,#16] }
   ABuf.EmitU32(Arm64LdpX19X20PostIndex64);     { ldp x19,x20,[sp],#64 }
+  ABuf.EmitU32(Arm64Ret);
+end;
+
+procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
+begin
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_ZR, 64));
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_LR, ARM64_REG_ZR, 48));
+  ABuf.EmitU32(Arm64LdpX23X24Off32);
+  ABuf.EmitU32(Arm64LdpX21X22Off16);
+  ABuf.EmitU32(Arm64LdpX19X20PostIndex64);
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
   ABuf.EmitU32(Arm64Ret);
 end;
 
@@ -2503,8 +3275,227 @@ begin
   Arm64EmitStrX(ABuf, ARt, ARM64_REG_REGFILE, Arm64SlotByteOffset(AReg));
 end;
 
-type
-  TArm64WordBin = function(const ARd, ARn, ARm: Byte): UInt32;
+procedure LdQ(const ABuf: TWasmCodeBuffer; const AVt: Byte; const AReg: UInt32);
+begin
+  Arm64EmitLdrQ(ABuf, AVt, ARM64_REG_REGFILE, Arm64SlotByteOffset(AReg));
+end;
+
+procedure StQ(const ABuf: TWasmCodeBuffer; const AVt: Byte; const AReg: UInt32);
+begin
+  Arm64EmitStrQ(ABuf, AVt, ARM64_REG_REGFILE, Arm64SlotByteOffset(AReg));
+end;
+
+function Arm64CacheHostReg(const AIndex: Integer): Byte;
+begin
+  case AIndex of
+    0: Result := ARM64_REG_CACHE0;
+    1: Result := ARM64_REG_CACHE1;
+    2: Result := ARM64_REG_CACHE_STATIC2;
+    3: Result := ARM64_REG_CACHE2;
+    4: Result := ARM64_REG_CACHE3;
+    5: Result := ARM64_REG_CACHE4;
+  else Result := ARM64_REG_CACHE5;
+  end;
+end;
+
+procedure Arm64InitRegCache(out ACache: TArm64RegCache);
+begin
+  FillChar(ACache, SizeOf(ACache), 0);
+end;
+
+procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlots: array of UInt32);
+var
+  I: Integer;
+begin
+  Arm64InitRegCache(ACache);
+  ACache.StaticAllocation := True;
+  for I := 0 to High(ASlots) do
+    if ASlots[I] <> High(UInt32) then
+    begin
+      ACache.Entries[ACache.StaticCount].Valid := True;
+      ACache.Entries[ACache.StaticCount].Slot := ASlots[I];
+      LdX(ABuf, Arm64CacheHostReg(ACache.StaticCount), ASlots[I]);
+      Inc(ACache.StaticCount);
+    end;
+end;
+
+procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  { Emit the fixed allocation at every canonical point. This deliberately does
+    not use compile-time dirty state: a forward branch may skip a writeback
+    that the linear emitter visited, so path-independent stores are the safe
+    reconciliation for all predecessors. }
+  for I := 0 to ACache.StaticCount - 1 do
+    if ACache.Entries[I].Valid then
+      StX(ABuf, Arm64CacheHostReg(I), ACache.Entries[I].Slot);
+end;
+
+procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
+var
+  I: Integer;
+begin
+  if ACache.StaticAllocation then
+  begin
+    for I := 3 to High(ACache.Entries) do
+      ACache.Entries[I].Valid := False;
+    ACache.Next := 0;
+    Exit;
+  end;
+  ACache.Entries[0].Valid := False;
+  ACache.Entries[1].Valid := False;
+  ACache.Next := 0;
+end;
+
+procedure Arm64CachedLoad(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ADest: Byte; const ASlot: UInt32);
+var
+  I, Victim: Integer;
+  Host: Byte;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      Host := Arm64CacheHostReg(I);
+      if ADest <> Host then
+        ABuf.EmitU32(Arm64MovReg(ADest, Host));
+      Exit;
+    end;
+  if ACache.StaticAllocation then
+  begin
+    Victim := 3 + ACache.Next;
+    ACache.Next := Byte((ACache.Next + 1) and 3);
+  end
+  else
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end;
+  Host := Arm64CacheHostReg(Victim);
+  LdX(ABuf, Host, ASlot);
+  ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Slot := ASlot;
+  if ADest <> Host then
+    ABuf.EmitU32(Arm64MovReg(ADest, Host));
+end;
+
+procedure Arm64CachedStore(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASrc: Byte; const ASlot: UInt32);
+var
+  I, Victim: Integer;
+  Host: Byte;
+begin
+  Victim := -1;
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Victim := I;
+  if ACache.StaticAllocation then
+  begin
+    if (Victim >= 0) and (Victim < ACache.StaticCount) then
+    begin
+      Host := Arm64CacheHostReg(Victim);
+      if ASrc <> Host then
+        ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+      Exit;
+    end;
+    { Unallocated expression values retain the write-through cache in
+      x14..x17, so static locals do not evict producer/consumer temporaries. }
+    StX(ABuf, ASrc, ASlot);
+    if Victim < ACache.StaticCount then
+    begin
+      Victim := 3 + ACache.Next;
+      ACache.Next := Byte((ACache.Next + 1) and 3);
+    end;
+    Host := Arm64CacheHostReg(Victim);
+    if ASrc <> Host then
+      ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Slot := ASlot;
+    Exit;
+  end;
+  StX(ABuf, ASrc, ASlot);
+  if Victim < 0 then
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - Victim);
+  end;
+  Host := Arm64CacheHostReg(Victim);
+  if ASrc <> Host then
+    ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+  ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Slot := ASlot;
+end;
+
+procedure Arm64CachedAlu(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWb: TArm64WordBin;
+  var ACache: TArm64RegCache);
+begin
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, AIns.B);
+  ABuf.EmitU32(AWb(ARM64_REG_T0, ARM64_REG_T0, ARM64_REG_T1));
+  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
+var
+  Cond: Byte;
+  Wide: Boolean;
+begin
+  Wide := False;
+  case ACompare.Op of
+    iroI32Eq: Cond := ARM64_COND_EQ;
+    iroI32Ne: Cond := ARM64_COND_NE;
+    iroI32LtS: Cond := ARM64_COND_LT;
+    iroI32LtU: Cond := ARM64_COND_LO;
+    iroI32GtS: Cond := ARM64_COND_GT;
+    iroI32GtU: Cond := ARM64_COND_HI;
+    iroI32LeS: Cond := ARM64_COND_LE;
+    iroI32LeU: Cond := ARM64_COND_LS;
+    iroI32GeS: Cond := ARM64_COND_GE;
+    iroI32GeU: Cond := ARM64_COND_HS;
+    iroI64Eq: begin Cond := ARM64_COND_EQ; Wide := True; end;
+    iroI64Ne: begin Cond := ARM64_COND_NE; Wide := True; end;
+    iroI64LtS: begin Cond := ARM64_COND_LT; Wide := True; end;
+    iroI64LtU: begin Cond := ARM64_COND_LO; Wide := True; end;
+    iroI64GtS: begin Cond := ARM64_COND_GT; Wide := True; end;
+    iroI64GtU: begin Cond := ARM64_COND_HI; Wide := True; end;
+    iroI64LeS: begin Cond := ARM64_COND_LE; Wide := True; end;
+    iroI64LeU: begin Cond := ARM64_COND_LS; Wide := True; end;
+    iroI64GeS: begin Cond := ARM64_COND_GE; Wide := True; end;
+  else
+    begin Cond := ARM64_COND_HS; Wide := True; end;
+  end;
+  if ABranch.Op = iroBranchIfNot then
+    Cond := Cond xor 1;
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ACompare.A);
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, ACompare.B);
+  if Wide then
+    ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T1))
+  else
+    ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T1));
+  EmitBCondTo(ABuf, Cond, TWasmJitLabel(ABranch.B));
+  Arm64InvalidateRegCache(ACache);
+end;
+
+procedure Arm64CachedRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ACond: Byte; const AWide: Boolean;
+  var ACache: TArm64RegCache);
+begin
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, AIns.B);
+  if AWide then
+    ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T1))
+  else
+    ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T1));
+  ABuf.EmitU32(Arm64CsetW(ARM64_REG_T0, ACond));
+  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+end;
 
 { 32-bit two-operand ALU: w9 := op(w[A], w[B]); store the widened slot. }
 procedure EmitAluW(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
@@ -2627,6 +3618,224 @@ begin
   ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(AIns.Op)), 0));
   Arm64EmitCallHelper(ABuf, aohOpUnary);
   StX(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitTrap(const ABuf: TWasmCodeBuffer; const AKind: TWasmTrapKind);
+begin
+  ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(AKind)), 0));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
+procedure EmitDivRem(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
+  const AWide, ASigned, ARem: Boolean);
+var
+  NonZero, Safe: TWasmJitLabel;
+begin
+  if AWide then
+  begin
+    LdX(ABuf, ARM64_REG_T0, AIns.A);
+    LdX(ABuf, ARM64_REG_T1, AIns.B);
+    ABuf.EmitU32(Arm64CmpX(ARM64_REG_T1, ARM64_REG_ZR));
+  end
+  else
+  begin
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+    LdW(ABuf, ARM64_REG_T1, AIns.B);
+    ABuf.EmitU32(Arm64CmpW(ARM64_REG_T1, ARM64_REG_ZR));
+  end;
+  NonZero := ABuf.NewLabel;
+  EmitBCondTo(ABuf, ARM64_COND_NE, NonZero);
+  EmitTrap(ABuf, wtkDivideByZero);
+  ABuf.BindLabel(NonZero);
+
+  { Signed division alone traps MIN_INT / -1. Signed remainder returns zero;
+    A64 SDIV itself is non-trapping and produces MIN_INT, from which MSUB
+    computes the required zero remainder. }
+  if ASigned and not ARem then
+  begin
+    Safe := ABuf.NewLabel;
+    if AWide then
+    begin
+      Arm64EmitLoadImm64(ABuf, ARM64_REG_T2, High(UInt64));
+      ABuf.EmitU32(Arm64CmpX(ARM64_REG_T1, ARM64_REG_T2));
+      EmitBCondTo(ABuf, ARM64_COND_NE, Safe);
+      Arm64EmitLoadImm64(ABuf, ARM64_REG_T2, UInt64(1) shl 63);
+      ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T2));
+    end
+    else
+    begin
+      Arm64EmitLoadImm32(ABuf, ARM64_REG_T2, High(UInt32));
+      ABuf.EmitU32(Arm64CmpW(ARM64_REG_T1, ARM64_REG_T2));
+      EmitBCondTo(ABuf, ARM64_COND_NE, Safe);
+      Arm64EmitLoadImm32(ABuf, ARM64_REG_T2, UInt32(1) shl 31);
+      ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T2));
+    end;
+    EmitBCondTo(ABuf, ARM64_COND_NE, Safe);
+    EmitTrap(ABuf, wtkIntegerOverflow);
+    ABuf.BindLabel(Safe);
+  end;
+
+  if AWide then
+  begin
+    if ASigned then
+      ABuf.EmitU32(Arm64SdivX(ARM64_REG_T2, ARM64_REG_T0, ARM64_REG_T1))
+    else
+      ABuf.EmitU32(Arm64UdivX(ARM64_REG_T2, ARM64_REG_T0, ARM64_REG_T1));
+    if ARem then
+      ABuf.EmitU32(Arm64MsubX(ARM64_REG_T0, ARM64_REG_T2,
+        ARM64_REG_T1, ARM64_REG_T0))
+    else
+      ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, ARM64_REG_T2));
+  end
+  else
+  begin
+    if ASigned then
+      ABuf.EmitU32(Arm64SdivW(ARM64_REG_T2, ARM64_REG_T0, ARM64_REG_T1))
+    else
+      ABuf.EmitU32(Arm64UdivW(ARM64_REG_T2, ARM64_REG_T0, ARM64_REG_T1));
+    if ARem then
+      ABuf.EmitU32(Arm64MsubW(ARM64_REG_T0, ARM64_REG_T2,
+        ARM64_REG_T1, ARM64_REG_T0))
+    else
+      ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, ARM64_REG_T2));
+  end;
+  StX(ABuf, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure EmitCanonicalFloatResult(const ABuf: TWasmCodeBuffer;
+  const AWide: Boolean; const ADest: UInt32);
+var
+  NanValue, Done: TWasmJitLabel;
+begin
+  { Arithmetic and narrowing/widening conversions must return the project's
+    canonical NaN, matching Wasm.Interp.Numeric exactly. FCMP value,value sets
+    V for every NaN without disturbing the result register. }
+  if AWide then
+    ABuf.EmitU32(Arm64FcmpD(0, 0))
+  else
+    ABuf.EmitU32(Arm64FcmpS(0, 0));
+  NanValue := ABuf.NewLabel;
+  Done := ABuf.NewLabel;
+  EmitBCondTo(ABuf, ARM64_COND_VS, NanValue);
+  if AWide then
+    ABuf.EmitU32(Arm64FmovXFromD(ARM64_REG_T0, 0))
+  else
+    ABuf.EmitU32(Arm64FmovWFromS(ARM64_REG_T0, 0));
+  EmitBranchTo(ABuf, UInt32(Done));
+  ABuf.BindLabel(NanValue);
+  if AWide then
+    Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, WASM_F64_CANONICAL_NAN)
+  else
+    Arm64EmitLoadImm32(ABuf, ARM64_REG_T0, WASM_F32_CANONICAL_NAN);
+  ABuf.BindLabel(Done);
+  StX(ABuf, ARM64_REG_T0, ADest);
+end;
+
+procedure EmitFloatBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWide: Boolean;
+  const AWord: TArm64WordBin);
+begin
+  if AWide then
+  begin
+    LdX(ABuf, ARM64_REG_T0, AIns.A);
+    LdX(ABuf, ARM64_REG_T1, AIns.B);
+    ABuf.EmitU32(Arm64FmovDFromX(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FmovDFromX(1, ARM64_REG_T1));
+  end
+  else
+  begin
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+    LdW(ABuf, ARM64_REG_T1, AIns.B);
+    ABuf.EmitU32(Arm64FmovSFromW(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FmovSFromW(1, ARM64_REG_T1));
+  end;
+  ABuf.EmitU32(AWord(0, 0, 1));
+  EmitCanonicalFloatResult(ABuf, AWide, AIns.Dest);
+end;
+
+procedure EmitFloatRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWide: Boolean; const ACond: Byte);
+begin
+  if AWide then
+  begin
+    LdX(ABuf, ARM64_REG_T0, AIns.A);
+    LdX(ABuf, ARM64_REG_T1, AIns.B);
+    ABuf.EmitU32(Arm64FmovDFromX(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FmovDFromX(1, ARM64_REG_T1));
+    ABuf.EmitU32(Arm64FcmpD(0, 1));
+  end
+  else
+  begin
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+    LdW(ABuf, ARM64_REG_T1, AIns.B);
+    ABuf.EmitU32(Arm64FmovSFromW(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FmovSFromW(1, ARM64_REG_T1));
+    ABuf.EmitU32(Arm64FcmpS(0, 1));
+  end;
+  ABuf.EmitU32(Arm64CsetW(ARM64_REG_T0, ACond));
+  StX(ABuf, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure EmitIntegerConversion(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWord: UInt32; const ALoadWide: Boolean);
+begin
+  if ALoadWide then
+    LdX(ABuf, ARM64_REG_T0, AIns.A)
+  else
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+  if AWord <> 0 then
+    ABuf.EmitU32(AWord);
+  StX(ABuf, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure EmitIntToFloat(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASourceWide, AResultWide,
+  AUnsigned: Boolean);
+begin
+  if ASourceWide then
+    LdX(ABuf, ARM64_REG_T0, AIns.A)
+  else
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+  if AResultWide then
+  begin
+    if AUnsigned then
+      ABuf.EmitU32(Arm64UcvtfDW(0, ARM64_REG_T0))
+    else if ASourceWide then
+      ABuf.EmitU32(Arm64ScvtfDX(0, ARM64_REG_T0))
+    else
+      ABuf.EmitU32(Arm64ScvtfDW(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FmovXFromD(ARM64_REG_T0, 0));
+  end
+  else
+  begin
+    if AUnsigned then
+      ABuf.EmitU32(Arm64UcvtfSW(0, ARM64_REG_T0))
+    else if ASourceWide then
+      ABuf.EmitU32(Arm64ScvtfSX(0, ARM64_REG_T0))
+    else
+      ABuf.EmitU32(Arm64ScvtfSW(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FmovWFromS(ARM64_REG_T0, 0));
+  end;
+  StX(ABuf, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure EmitFloatWidthConversion(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ADemote: Boolean);
+begin
+  if ADemote then
+  begin
+    LdX(ABuf, ARM64_REG_T0, AIns.A);
+    ABuf.EmitU32(Arm64FmovDFromX(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FcvtSD(0, 0));
+    EmitCanonicalFloatResult(ABuf, False, AIns.Dest);
+  end
+  else
+  begin
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+    ABuf.EmitU32(Arm64FmovSFromW(0, ARM64_REG_T0));
+    ABuf.EmitU32(Arm64FcvtDS(0, 0));
+    EmitCanonicalFloatResult(ABuf, True, AIns.Dest);
+  end;
 end;
 
 procedure EmitBrTable(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
@@ -2753,12 +3962,18 @@ end;
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32);
 var
-  ArgN, ResN, ArgBytes, FrameBytes: UInt32;
+  ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
+  FallbackLabel, DoneLabel: TWasmJitLabel;
 begin
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
   ArgBytes := ArgN * ARM64_SLOT_SIZE;
-  FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
+  ResBytes := ResN * ARM64_SLOT_SIZE;
+  StateOffset := ArgBytes + ResBytes;
+  if AIns.Op = iroCall then
+    FrameBytes := Arm64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
+  else
+    FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
 
   ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
@@ -2767,10 +3982,33 @@ begin
   case AIns.Op of
     iroCall:
       begin
+        { Static compiled callee: enter its shared logical/GC frame once, call
+          its native entry directly, then use the shared result/pop path. The
+          nil return falls back to the existing host/interpreter dispatcher. }
+        FallbackLabel := ABuf.NewLabel;
+        DoneLabel := ABuf.NewLabel;
+        Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
+        ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+        ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
+        Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
+        ABuf.EmitU32(Arm64CmpX(0, 31));
+        EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
+        ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
+        Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, StateOffset);
+        ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
+        Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset + ARM64_SLOT_SIZE);
+        ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+        ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+        Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+        EmitBranchTo(ABuf, UInt32(DoneLabel));
+        ABuf.BindLabel(FallbackLabel);
+        ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
         Arm64EmitCallHelper(ABuf, aohCall);
+        ABuf.BindLabel(DoneLabel);
       end;
     iroCallIndirect:
       begin
@@ -2870,6 +4108,98 @@ begin
   ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));    { x1 := regbase }
   Arm64EmitIrInsPtr(ABuf, 2, AInsIndex);              { x2 := @Fn^.Code[i] }
   Arm64EmitCallHelper(ABuf, aohVecDispatch);
+end;
+
+function Arm64NativeVecOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    iroV128Not, iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+    iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+    iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub,
+    iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+    iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+    iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+    iroI32x4ExtractLane, iroI64x2ExtractLane:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+procedure EmitNativeVecBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ABase: UInt32);
+begin
+  LdQ(ABuf, 0, AIns.A);
+  LdQ(ABuf, 1, AIns.B);
+  ABuf.EmitU32(ABase or (UInt32(1) shl 16));
+  StQ(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecLaneBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte; const ASub: Boolean);
+begin
+  LdQ(ABuf, 0, AIns.A);
+  LdQ(ABuf, 1, AIns.B);
+  if ASub then
+    ABuf.EmitU32(Arm64VecSub(0, 0, 1, ASize))
+  else
+    ABuf.EmitU32(Arm64VecAdd(0, 0, 1, ASize));
+  StQ(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecSplat(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte);
+begin
+  if ASize = 3 then
+    LdX(ABuf, ARM64_REG_T0, AIns.A)
+  else
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+  ABuf.EmitU32(Arm64VecDup(0, ARM64_REG_T0, ASize));
+  StQ(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecExtract(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte; const ASigned: Boolean);
+begin
+  LdQ(ABuf, 0, AIns.A);
+  ABuf.EmitU32(Arm64VecExtract(ARM64_REG_T0, 0, ASize,
+    Byte(UInt32(AIns.Imm)), ASigned));
+  StX(ABuf, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure EmitNativeVec(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr);
+begin
+  case AIns.Op of
+    iroV128Not:
+      begin
+        LdQ(ABuf, 0, AIns.A);
+        ABuf.EmitU32(Arm64VecMvn(0, 0));
+        StQ(ABuf, 0, AIns.Dest);
+      end;
+    iroV128And: EmitNativeVecBinary(ABuf, AIns, $4E201C00);
+    iroV128Andnot: EmitNativeVecBinary(ABuf, AIns, $4E601C00);
+    iroV128Or: EmitNativeVecBinary(ABuf, AIns, $4EA01C00);
+    iroV128Xor: EmitNativeVecBinary(ABuf, AIns, $6E201C00);
+    iroI8x16Add: EmitNativeVecLaneBinary(ABuf, AIns, 0, False);
+    iroI8x16Sub: EmitNativeVecLaneBinary(ABuf, AIns, 0, True);
+    iroI16x8Add: EmitNativeVecLaneBinary(ABuf, AIns, 1, False);
+    iroI16x8Sub: EmitNativeVecLaneBinary(ABuf, AIns, 1, True);
+    iroI32x4Add: EmitNativeVecLaneBinary(ABuf, AIns, 2, False);
+    iroI32x4Sub: EmitNativeVecLaneBinary(ABuf, AIns, 2, True);
+    iroI64x2Add: EmitNativeVecLaneBinary(ABuf, AIns, 3, False);
+    iroI64x2Sub: EmitNativeVecLaneBinary(ABuf, AIns, 3, True);
+    iroI8x16Splat: EmitNativeVecSplat(ABuf, AIns, 0);
+    iroI16x8Splat: EmitNativeVecSplat(ABuf, AIns, 1);
+    iroI32x4Splat: EmitNativeVecSplat(ABuf, AIns, 2);
+    iroI64x2Splat: EmitNativeVecSplat(ABuf, AIns, 3);
+    iroI8x16ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 0, True);
+    iroI8x16ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 0, False);
+    iroI16x8ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 1, True);
+    iroI16x8ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 1, False);
+    iroI32x4ExtractLane: EmitNativeVecExtract(ABuf, AIns, 2, False);
+    iroI64x2ExtractLane: EmitNativeVecExtract(ABuf, AIns, 3, False);
+  end;
 end;
 
 { br_on_null / br_on_non_null / br_on_cast / br_on_cast_fail. Call the
@@ -2977,14 +4307,8 @@ end;
 function Arm64LeafBinaryOp(const AOp: TWasmIrOp): Boolean;
 begin
   case AOp of
-    iroI32DivS, iroI32DivU, iroI32RemS, iroI32RemU,
-    iroI64DivS, iroI64DivU, iroI64RemS, iroI64RemU,
-    iroF32Add, iroF32Sub, iroF32Mul, iroF32Div, iroF32Min, iroF32Max,
-    iroF32Copysign,
-    iroF32Eq, iroF32Ne, iroF32Lt, iroF32Gt, iroF32Le, iroF32Ge,
-    iroF64Add, iroF64Sub, iroF64Mul, iroF64Div, iroF64Min, iroF64Max,
-    iroF64Copysign,
-    iroF64Eq, iroF64Ne, iroF64Lt, iroF64Gt, iroF64Le, iroF64Ge:
+    iroF32Min, iroF32Max, iroF32Copysign,
+    iroF64Min, iroF64Max, iroF64Copysign:
       Result := True;
   else
     Result := False;
@@ -2995,20 +4319,13 @@ function Arm64LeafUnaryOp(const AOp: TWasmIrOp): Boolean;
 begin
   case AOp of
     iroI32Popcnt, iroI64Popcnt,
-    iroI32WrapI64, iroI64ExtendI32S, iroI64ExtendI32U,
-    iroI32Extend8S, iroI32Extend16S,
-    iroI64Extend8S, iroI64Extend16S, iroI64Extend32S,
     iroF32Abs, iroF32Neg, iroF32Ceil, iroF32Floor, iroF32Trunc,
     iroF32Nearest, iroF32Sqrt,
     iroF64Abs, iroF64Neg, iroF64Ceil, iroF64Floor, iroF64Trunc,
     iroF64Nearest, iroF64Sqrt,
-    iroF32DemoteF64, iroF64PromoteF32,
     iroI32TruncF32S, iroI32TruncF32U, iroI32TruncF64S, iroI32TruncF64U,
     iroI64TruncF32S, iroI64TruncF32U, iroI64TruncF64S, iroI64TruncF64U,
-    iroF32ConvertI32S, iroF32ConvertI32U, iroF32ConvertI64S, iroF32ConvertI64U,
-    iroF64ConvertI32S, iroF64ConvertI32U, iroF64ConvertI64S, iroF64ConvertI64U,
-    iroI32ReinterpretF32, iroF32ReinterpretI32,
-    iroI64ReinterpretF64, iroF64ReinterpretI64,
+    iroF32ConvertI64U, iroF64ConvertI64U,
     iroI32TruncSatF32S, iroI32TruncSatF32U, iroI32TruncSatF64S,
     iroI32TruncSatF64U,
     iroI64TruncSatF32S, iroI64TruncSatF32U, iroI64TruncSatF64S,
@@ -3030,10 +4347,24 @@ begin
     iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
     iroI64Eqz, iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
     iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+    iroI32DivS, iroI32DivU, iroI32RemS, iroI32RemU,
+    iroI64DivS, iroI64DivU, iroI64RemS, iroI64RemU,
     iroI32Clz, iroI32Ctz, iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or,
     iroI32Xor, iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
     iroI64Clz, iroI64Ctz, iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or,
-    iroI64Xor, iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr:
+    iroI64Xor, iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+    iroF32Add, iroF32Sub, iroF32Mul, iroF32Div,
+    iroF32Eq, iroF32Ne, iroF32Lt, iroF32Gt, iroF32Le, iroF32Ge,
+    iroF64Add, iroF64Sub, iroF64Mul, iroF64Div,
+    iroF64Eq, iroF64Ne, iroF64Lt, iroF64Gt, iroF64Le, iroF64Ge,
+    iroI32WrapI64, iroI64ExtendI32S, iroI64ExtendI32U,
+    iroI32Extend8S, iroI32Extend16S,
+    iroI64Extend8S, iroI64Extend16S, iroI64Extend32S,
+    iroF32DemoteF64, iroF64PromoteF32,
+    iroF32ConvertI32S, iroF32ConvertI32U, iroF32ConvertI64S,
+    iroF64ConvertI32S, iroF64ConvertI32U, iroF64ConvertI64S,
+    iroI32ReinterpretF32, iroF32ReinterpretI32,
+    iroI64ReinterpretF64, iroF64ReinterpretI64:
       Result := True;
   else
     Result := False;
@@ -3216,8 +4547,78 @@ begin
         StX(ABuf, ARM64_REG_T0, AIns.Dest);
       end;
 
+    { --- native integer division/remainder --------------------------- }
+    iroI32DivS: EmitDivRem(ABuf, AIns, False, True, False);
+    iroI32DivU: EmitDivRem(ABuf, AIns, False, False, False);
+    iroI32RemS: EmitDivRem(ABuf, AIns, False, True, True);
+    iroI32RemU: EmitDivRem(ABuf, AIns, False, False, True);
+    iroI64DivS: EmitDivRem(ABuf, AIns, True, True, False);
+    iroI64DivU: EmitDivRem(ABuf, AIns, True, False, False);
+    iroI64RemS: EmitDivRem(ABuf, AIns, True, True, True);
+    iroI64RemU: EmitDivRem(ABuf, AIns, True, False, True);
+
+    { --- native scalar floating point -------------------------------- }
+    iroF32Add: EmitFloatBinary(ABuf, AIns, False, @Arm64FaddS);
+    iroF32Sub: EmitFloatBinary(ABuf, AIns, False, @Arm64FsubS);
+    iroF32Mul: EmitFloatBinary(ABuf, AIns, False, @Arm64FmulS);
+    iroF32Div: EmitFloatBinary(ABuf, AIns, False, @Arm64FdivS);
+    iroF64Add: EmitFloatBinary(ABuf, AIns, True, @Arm64FaddD);
+    iroF64Sub: EmitFloatBinary(ABuf, AIns, True, @Arm64FsubD);
+    iroF64Mul: EmitFloatBinary(ABuf, AIns, True, @Arm64FmulD);
+    iroF64Div: EmitFloatBinary(ABuf, AIns, True, @Arm64FdivD);
+    iroF32Eq: EmitFloatRel(ABuf, AIns, False, ARM64_COND_EQ);
+    iroF32Ne: EmitFloatRel(ABuf, AIns, False, ARM64_COND_NE);
+    iroF32Lt: EmitFloatRel(ABuf, AIns, False, ARM64_COND_MI);
+    iroF32Gt: EmitFloatRel(ABuf, AIns, False, ARM64_COND_GT);
+    iroF32Le: EmitFloatRel(ABuf, AIns, False, ARM64_COND_LS);
+    iroF32Ge: EmitFloatRel(ABuf, AIns, False, ARM64_COND_GE);
+    iroF64Eq: EmitFloatRel(ABuf, AIns, True, ARM64_COND_EQ);
+    iroF64Ne: EmitFloatRel(ABuf, AIns, True, ARM64_COND_NE);
+    iroF64Lt: EmitFloatRel(ABuf, AIns, True, ARM64_COND_MI);
+    iroF64Gt: EmitFloatRel(ABuf, AIns, True, ARM64_COND_GT);
+    iroF64Le: EmitFloatRel(ABuf, AIns, True, ARM64_COND_LS);
+    iroF64Ge: EmitFloatRel(ABuf, AIns, True, ARM64_COND_GE);
+
+    { --- exact integer and scalar float conversions ------------------ }
+    iroI32WrapI64:
+      EmitIntegerConversion(ABuf, AIns, 0, False);
+    iroI64ExtendI32U:
+      EmitIntegerConversion(ABuf, AIns, 0, False);
+    iroI64ExtendI32S:
+      EmitIntegerConversion(ABuf, AIns,
+        Arm64SxtwX(ARM64_REG_T0, ARM64_REG_T0), False);
+    iroI32Extend8S:
+      EmitIntegerConversion(ABuf, AIns,
+        Arm64SxtbW(ARM64_REG_T0, ARM64_REG_T0), False);
+    iroI32Extend16S:
+      EmitIntegerConversion(ABuf, AIns,
+        Arm64SxthW(ARM64_REG_T0, ARM64_REG_T0), False);
+    iroI64Extend8S:
+      EmitIntegerConversion(ABuf, AIns,
+        Arm64SxtbX(ARM64_REG_T0, ARM64_REG_T0), True);
+    iroI64Extend16S:
+      EmitIntegerConversion(ABuf, AIns,
+        Arm64SxthX(ARM64_REG_T0, ARM64_REG_T0), True);
+    iroI64Extend32S:
+      EmitIntegerConversion(ABuf, AIns,
+        Arm64SxtwX(ARM64_REG_T0, ARM64_REG_T0), True);
+    iroF32ConvertI32S: EmitIntToFloat(ABuf, AIns, False, False, False);
+    iroF32ConvertI32U: EmitIntToFloat(ABuf, AIns, False, False, True);
+    iroF32ConvertI64S: EmitIntToFloat(ABuf, AIns, True, False, False);
+    iroF64ConvertI32S: EmitIntToFloat(ABuf, AIns, False, True, False);
+    iroF64ConvertI32U: EmitIntToFloat(ABuf, AIns, False, True, True);
+    iroF64ConvertI64S: EmitIntToFloat(ABuf, AIns, True, True, False);
+    iroF32DemoteF64: EmitFloatWidthConversion(ABuf, AIns, True);
+    iroF64PromoteF32: EmitFloatWidthConversion(ABuf, AIns, False);
+    iroI32ReinterpretF32, iroF32ReinterpretI32:
+      EmitIntegerConversion(ABuf, AIns, 0, False);
+    iroI64ReinterpretF64, iroF64ReinterpretI64:
+      EmitIntegerConversion(ABuf, AIns, 0, True);
+
   else
-    if Arm64LeafBinaryOp(AIns.Op) then
+    if Arm64NativeVecOp(AIns.Op) then
+      EmitNativeVec(ABuf, AIns)
+    else if Arm64LeafBinaryOp(AIns.Op) then
       EmitLeafBinary(ABuf, AIns)
     else if Arm64LeafUnaryOp(AIns.Op) then
       EmitLeafUnary(ABuf, AIns)
@@ -3264,6 +4665,9 @@ begin
     GArm64HelperTable[aohReturnCall] := @JitReturnCallHelper;
     GArm64HelperTable[aohReturnCallIndirect] := @JitReturnCallIndirectHelper;
     GArm64HelperTable[aohReturnCallRef] := @JitReturnCallRefHelper;
+    GArm64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
+    GArm64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
+    GArm64HelperTable[aohResolveMemory] := @JitResolveMemory;
     GArm64HelperTableFilled := True;
   end;
   Result := @GArm64HelperTable[aohTrapKind];

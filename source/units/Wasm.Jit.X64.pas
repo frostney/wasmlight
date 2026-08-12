@@ -101,6 +101,17 @@ type
     backend. }
   EWasmJitBranchRange = class(EWasmError);
 
+  TX64RegCacheEntry = record
+    Valid: Boolean;
+    Slot: UInt32;
+  end;
+
+  TX64RegCache = record
+    Entries: array[0..3] of TX64RegCacheEntry;
+    Next: Byte;
+    StaticAllocation: Boolean;
+  end;
+
 const
   { --- x86-64 register numbers (SDM Vol. 2 Table 2-2) --------------------- }
   X64_RAX = 0;
@@ -113,6 +124,8 @@ const
   X64_RDI = 7;
   X64_R8 = 8;
   X64_R9 = 9;
+  X64_R10 = 10;
+  X64_R11 = 11;
   X64_R12 = 12;
   X64_R13 = 13;
   X64_R14 = 14;
@@ -162,6 +175,7 @@ const
   X64_CC_AE = $3;   { CF=0        (unsigned >=) }
   X64_CC_BE = $6;   { unsigned <= }
   X64_CC_A = $7;    { unsigned >  }
+  X64_CC_P = $A;    { parity / unordered scalar float }
   X64_CC_L = $C;    { SF<>OF      (signed <) }
   X64_CC_GE = $D;   { signed >= }
   X64_CC_LE = $E;   { signed <= }
@@ -211,6 +225,21 @@ procedure X64EmitLoadSlot32(const ABuf: TWasmCodeBuffer; const AReg: Byte;
 procedure X64EmitStoreSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 
+{ Universally available SSE2 encodings used by the conservative native v128
+  subset. MOVDQU keeps the register-file representation independent of host
+  alignment; packed integer add/sub and bitwise operations are exact modulo
+  their lane width. }
+procedure X64EmitLoadVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+procedure X64EmitStoreVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+procedure X64EmitVecBinary(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
+  const ADestXmm, ASrcXmm: Byte);
+procedure X64EmitVecDup(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const AReg, ASize: Byte);
+procedure X64EmitVecExtract(const ABuf: TWasmCodeBuffer; const AReg,
+  AXmm, ASize, ALane: Byte; const ASigned: Boolean);
+
 { ALU register-register: <op> ADst, ASrc. AOpcode is the r/m,r opcode byte
   (ADD=01, OR=09, AND=21, SUB=29, XOR=31, CMP=39, TEST=85). AWide selects the
   REX.W 64-bit form. }
@@ -231,6 +260,30 @@ procedure X64EmitMovzxEaxAl(const ABuf: TWasmCodeBuffer);
 { cmovcc ADst, ASrc (0F 40+cc /r). }
 procedure X64EmitCmovcc(const ABuf: TWasmCodeBuffer; const ACc: Byte;
   const AWide: Boolean; const ADst, ASrc: Byte);
+
+{ Native scalar numeric encodings. Integer operands use general registers;
+  scalar FP operands use XMM register numbers in the same 0..15 range. }
+procedure X64EmitSignDividend(const ABuf: TWasmCodeBuffer;
+  const AWide: Boolean);
+procedure X64EmitDivReg(const ABuf: TWasmCodeBuffer;
+  const ASigned, AWide: Boolean; const AReg: Byte);
+procedure X64EmitMovToXmm(const ABuf: TWasmCodeBuffer; const AXmm,
+  AReg: Byte; const AWide: Boolean);
+procedure X64EmitMovFromXmm(const ABuf: TWasmCodeBuffer; const AReg,
+  AXmm: Byte; const AWide: Boolean);
+procedure X64EmitScalarFloatBinary(const ABuf: TWasmCodeBuffer;
+  const AOpcode: Byte; const AWide: Boolean; const ADestXmm, ASrcXmm: Byte);
+procedure X64EmitScalarFloatCompare(const ABuf: TWasmCodeBuffer;
+  const APredicate: Byte; const AWide: Boolean;
+  const ADestXmm, ASrcXmm: Byte);
+procedure X64EmitScalarFloatUcomi(const ABuf: TWasmCodeBuffer;
+  const AWide: Boolean; const ALeftXmm, ARightXmm: Byte);
+procedure X64EmitIntToFloat(const ABuf: TWasmCodeBuffer;
+  const ASourceWide, AResultWide: Boolean; const ADestXmm, ASrcReg: Byte);
+procedure X64EmitFloatWidthConvert(const ABuf: TWasmCodeBuffer;
+  const ADemote: Boolean; const ADestXmm, ASrcXmm: Byte);
+procedure X64EmitSignExtendRax(const ABuf: TWasmCodeBuffer;
+  const ASourceBits: Byte; const ATargetWide: Boolean);
 
 procedure X64EmitPushReg(const ABuf: TWasmCodeBuffer; const AReg: Byte);
 procedure X64EmitPopReg(const ABuf: TWasmCodeBuffer; const AReg: Byte);
@@ -254,6 +307,11 @@ procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer);
   right after the prologue; the exec-only encoder tests skip it. }
 procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
+{ Resolve a single function memory once and keep its stable instance pointer in
+  the prologue's otherwise-unused alignment slot at [rsp]. Scalar accesses
+  still reload live Base/ByteSize fields, so memory.grow semantics are unchanged. }
+procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32);
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer);
@@ -286,6 +344,18 @@ function X64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32): Boolean;
+procedure X64InitRegCache(out ACache: TX64RegCache);
+procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlots: array of UInt32);
+procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
+procedure X64InvalidateRegCache(var ACache: TX64RegCache);
+function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
+  var ACache: TX64RegCache): Boolean;
+procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -308,16 +378,35 @@ uses
   Wasm.Interp.Numeric,
   Wasm.Interp.Vector,
   Wasm.Runtime.Gc,
+  Wasm.Runtime.Memory,
   Wasm.Runtime.Traps;
+
+procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64,
+  AUsePinnedMemory: Boolean); forward;
+
+procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ADest: Byte; const ASlot: UInt32); forward;
+procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ASrc: Byte; const ASlot: UInt32); forward;
+procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
+  var ACache: TX64RegCache); forward;
+procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache); forward;
+procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache); forward;
 
 { ===================================================================== }
 {  cdecl helper thunks — the ABI boundary the emitted code calls (§1.4)  }
 { ===================================================================== }
 
-{ Every subtle op (all float arithmetic, div/rem, conversions, truncations,
-  clz/ctz/popcnt) routes through these thunks, which switch on the IR op ordinal
-  and call the EXACT Wasm.Interp.Numeric leaf the interpreter calls — so NaN
-  bits, rounding, and the div/rem and float->int trap kind + timing are
+{ Delicate numeric ops (min/max/nearest, trapping and saturating float-to-int,
+  unsigned i64-to-float, clz/ctz/popcnt) route through these thunks,
+  and call the EXACT Wasm.Interp.Numeric leaf the interpreter calls — so the
+  remaining NaN/rounding behaviour and float-to-int trap kind + timing are
   identical by construction (§13). A 32-bit result is returned zero-extended, a
   64-bit result verbatim, exactly as the interpreter stores it. }
 function X64OpBinary(const AOp: PtrUInt; const A, B: UInt64): UInt64; cdecl;
@@ -362,6 +451,346 @@ begin
   else
     Result := 0;
   end;
+end;
+
+function X64ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32];
+end;
+
+function X64MemoryAccessSize(const AOp: TWasmIrOp): UInt32;
+begin
+  case AOp of
+    iroI32Load8S, iroI32Load8U, iroI64Load8S, iroI64Load8U,
+    iroI32Store8, iroI64Store8: Result := 1;
+    iroI32Load16S, iroI32Load16U, iroI64Load16S, iroI64Load16U,
+    iroI32Store16, iroI64Store16: Result := 2;
+    iroI32Load, iroF32Load, iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroF32Store, iroI64Store32: Result := 4;
+  else
+    Result := 8;
+  end;
+end;
+
+function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
+  var ACache: TX64RegCache): Boolean;
+begin
+  Result := True;
+  if X64ScalarMemoryOp(AIns.Op) then
+  begin
+    X64InvalidateRegCache(ACache);
+    X64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
+    Exit;
+  end;
+  case AIns.Op of
+    iroMove:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroI32Const, iroF32Const:
+      begin
+        X64EmitMovRegImm32(ABuf, X64_RAX, UInt32(AIns.Imm and $FFFFFFFF));
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroI64Const, iroF64Const:
+      begin
+        X64EmitMovRegImm64(ABuf, X64_RAX, UInt64(AIns.Imm));
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroBranchIf, iroBranchIfNot:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+        X64EmitAluRegReg(ABuf, $85, False, X64_RAX, X64_RAX);
+        if AIns.Op = iroBranchIf then
+          X64EmitJccTo(ABuf, X64_CC_NE, AIns.B)
+        else
+          X64EmitJccTo(ABuf, X64_CC_E, AIns.B);
+        X64InvalidateRegCache(ACache);
+      end;
+    iroJump:
+      begin
+        { Static allocation is restricted to helper-free numeric functions.
+          The epoch-only back-edge cannot collect on its fallthrough and the
+          mismatch path traps without returning, so numeric slots need no
+          canonical writeback here. Observable exits still flush below. }
+        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroReturn, iroUnreachable:
+      begin
+        X64FlushRegCache(ABuf, ACache);
+        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroI32Eqz, iroI64Eqz:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+        X64EmitAluRegReg(ABuf, $85, AIns.Op = iroI64Eqz, X64_RAX, X64_RAX);
+        X64EmitSetccAl(ABuf, X64_CC_E);
+        X64EmitMovzxEaxAl(ABuf);
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroI32Eq: X64CachedRel(ABuf, AIns, X64_CC_E, False, ACache);
+    iroI32Ne: X64CachedRel(ABuf, AIns, X64_CC_NE, False, ACache);
+    iroI32LtS: X64CachedRel(ABuf, AIns, X64_CC_L, False, ACache);
+    iroI32LtU: X64CachedRel(ABuf, AIns, X64_CC_B, False, ACache);
+    iroI32GtS: X64CachedRel(ABuf, AIns, X64_CC_G, False, ACache);
+    iroI32GtU: X64CachedRel(ABuf, AIns, X64_CC_A, False, ACache);
+    iroI32LeS: X64CachedRel(ABuf, AIns, X64_CC_LE, False, ACache);
+    iroI32LeU: X64CachedRel(ABuf, AIns, X64_CC_BE, False, ACache);
+    iroI32GeS: X64CachedRel(ABuf, AIns, X64_CC_GE, False, ACache);
+    iroI32GeU: X64CachedRel(ABuf, AIns, X64_CC_AE, False, ACache);
+    iroI64Eq: X64CachedRel(ABuf, AIns, X64_CC_E, True, ACache);
+    iroI64Ne: X64CachedRel(ABuf, AIns, X64_CC_NE, True, ACache);
+    iroI64LtS: X64CachedRel(ABuf, AIns, X64_CC_L, True, ACache);
+    iroI64LtU: X64CachedRel(ABuf, AIns, X64_CC_B, True, ACache);
+    iroI64GtS: X64CachedRel(ABuf, AIns, X64_CC_G, True, ACache);
+    iroI64GtU: X64CachedRel(ABuf, AIns, X64_CC_A, True, ACache);
+    iroI64LeS: X64CachedRel(ABuf, AIns, X64_CC_LE, True, ACache);
+    iroI64LeU: X64CachedRel(ABuf, AIns, X64_CC_BE, True, ACache);
+    iroI64GeS: X64CachedRel(ABuf, AIns, X64_CC_GE, True, ACache);
+    iroI64GeU: X64CachedRel(ABuf, AIns, X64_CC_AE, True, ACache);
+    iroI32Add: X64CachedAlu(ABuf, AIns, $01, False, False, ACache);
+    iroI32Sub: X64CachedAlu(ABuf, AIns, $29, False, False, ACache);
+    iroI32Mul: X64CachedAlu(ABuf, AIns, 0, False, True, ACache);
+    iroI32And: X64CachedAlu(ABuf, AIns, $21, False, False, ACache);
+    iroI32Or: X64CachedAlu(ABuf, AIns, $09, False, False, ACache);
+    iroI32Xor: X64CachedAlu(ABuf, AIns, $31, False, False, ACache);
+    iroI32Shl: X64CachedShift(ABuf, AIns, 4, False, ACache);
+    iroI32ShrS: X64CachedShift(ABuf, AIns, 7, False, ACache);
+    iroI32ShrU: X64CachedShift(ABuf, AIns, 5, False, ACache);
+    iroI32Rotr: X64CachedShift(ABuf, AIns, 1, False, ACache);
+    iroI64Add: X64CachedAlu(ABuf, AIns, $01, True, False, ACache);
+    iroI64Sub: X64CachedAlu(ABuf, AIns, $29, True, False, ACache);
+    iroI64Mul: X64CachedAlu(ABuf, AIns, 0, True, True, ACache);
+    iroI64And: X64CachedAlu(ABuf, AIns, $21, True, False, ACache);
+    iroI64Or: X64CachedAlu(ABuf, AIns, $09, True, False, ACache);
+    iroI64Xor: X64CachedAlu(ABuf, AIns, $31, True, False, ACache);
+    iroI64Shl: X64CachedShift(ABuf, AIns, 4, True, ACache);
+    iroI64ShrS: X64CachedShift(ABuf, AIns, 7, True, ACache);
+    iroI64ShrU: X64CachedShift(ABuf, AIns, 5, True, ACache);
+    iroI64Rotr: X64CachedShift(ABuf, AIns, 1, True, ACache);
+  else
+    X64InvalidateRegCache(ACache);
+    Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+  end;
+end;
+
+function X64CacheHostReg(const AIndex: Integer): Byte;
+begin
+  case AIndex of
+    0: Result := X64_R8;
+    1: Result := X64_R9;
+    2: Result := X64_R10;
+  else
+    Result := X64_R11;
+  end;
+end;
+
+procedure X64InitRegCache(out ACache: TX64RegCache);
+begin
+  FillChar(ACache, SizeOf(ACache), 0);
+end;
+
+procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlots: array of UInt32);
+var
+  I: Integer;
+begin
+  X64InitRegCache(ACache);
+  ACache.StaticAllocation := True;
+  for I := 0 to 1 do
+    if I <= High(ASlots) then
+    begin
+      ACache.Entries[I].Valid := True;
+      ACache.Entries[I].Slot := ASlots[I];
+      X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ASlots[I]);
+    end;
+end;
+
+procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid then
+      X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+end;
+
+procedure X64InvalidateRegCache(var ACache: TX64RegCache);
+begin
+  if ACache.StaticAllocation then
+  begin
+    ACache.Entries[2].Valid := False;
+    ACache.Entries[3].Valid := False;
+    ACache.Next := 0;
+    Exit;
+  end;
+  ACache.Entries[0].Valid := False;
+  ACache.Entries[1].Valid := False;
+  ACache.Next := 0;
+end;
+
+procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ADest: Byte; const ASlot: UInt32);
+var
+  I, Victim: Integer;
+  Host: Byte;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      Host := X64CacheHostReg(I);
+      if ADest <> Host then
+        X64EmitMovRegReg(ABuf, ADest, Host);
+      Exit;
+    end;
+  if ACache.StaticAllocation then
+  begin
+    Victim := 2 + ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end
+  else
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end;
+  Host := X64CacheHostReg(Victim);
+  X64EmitLoadSlot64(ABuf, Host, ASlot);
+  ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Slot := ASlot;
+  if ADest <> Host then
+    X64EmitMovRegReg(ABuf, ADest, Host);
+end;
+
+procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ASrc: Byte; const ASlot: UInt32);
+var
+  I, Victim: Integer;
+  Host: Byte;
+begin
+  Victim := -1;
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Victim := I;
+  if ACache.StaticAllocation then
+  begin
+    if (Victim >= 0) and (Victim <= 1) then
+    begin
+      Host := X64CacheHostReg(Victim);
+      if ASrc <> Host then
+        X64EmitMovRegReg(ABuf, Host, ASrc);
+      Exit;
+    end;
+    X64EmitStoreSlot64(ABuf, ASrc, ASlot);
+    if Victim < 2 then
+    begin
+      Victim := 2 + ACache.Next;
+      ACache.Next := Byte(1 - ACache.Next);
+    end;
+    Host := X64CacheHostReg(Victim);
+    if ASrc <> Host then
+      X64EmitMovRegReg(ABuf, Host, ASrc);
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Slot := ASlot;
+    Exit;
+  end;
+  X64EmitStoreSlot64(ABuf, ASrc, ASlot);
+  if Victim < 0 then
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - Victim);
+  end;
+  Host := X64CacheHostReg(Victim);
+  if ASrc <> Host then
+    X64EmitMovRegReg(ABuf, Host, ASrc);
+  ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Slot := ASlot;
+end;
+
+procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
+  var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  if AMul then
+    X64EmitImul(ABuf, AWide, X64_RAX, X64_RCX)
+  else
+    X64EmitAluRegReg(ABuf, AOpcode, AWide, X64_RAX, X64_RCX);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
+procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  X64EmitShiftCl(ABuf, ASubop, AWide, X64_RAX);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
+procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
+var
+  Cond: Byte;
+  Wide: Boolean;
+begin
+  Wide := False;
+  case ACompare.Op of
+    iroI32Eq: Cond := X64_CC_E;
+    iroI32Ne: Cond := X64_CC_NE;
+    iroI32LtS: Cond := X64_CC_L;
+    iroI32LtU: Cond := X64_CC_B;
+    iroI32GtS: Cond := X64_CC_G;
+    iroI32GtU: Cond := X64_CC_A;
+    iroI32LeS: Cond := X64_CC_LE;
+    iroI32LeU: Cond := X64_CC_BE;
+    iroI32GeS: Cond := X64_CC_GE;
+    iroI32GeU: Cond := X64_CC_AE;
+    iroI64Eq: begin Cond := X64_CC_E; Wide := True; end;
+    iroI64Ne: begin Cond := X64_CC_NE; Wide := True; end;
+    iroI64LtS: begin Cond := X64_CC_L; Wide := True; end;
+    iroI64LtU: begin Cond := X64_CC_B; Wide := True; end;
+    iroI64GtS: begin Cond := X64_CC_G; Wide := True; end;
+    iroI64GtU: begin Cond := X64_CC_A; Wide := True; end;
+    iroI64LeS: begin Cond := X64_CC_LE; Wide := True; end;
+    iroI64LeU: begin Cond := X64_CC_BE; Wide := True; end;
+    iroI64GeS: begin Cond := X64_CC_GE; Wide := True; end;
+  else
+    begin Cond := X64_CC_AE; Wide := True; end;
+  end;
+  if ABranch.Op = iroBranchIfNot then
+    Cond := Cond xor 1;
+  X64CachedLoad(ABuf, ACache, X64_RAX, ACompare.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, ACompare.B);
+  X64EmitAluRegReg(ABuf, $39, Wide, X64_RAX, X64_RCX);
+  X64EmitJccTo(ABuf, Cond, ABranch.B);
+  X64InvalidateRegCache(ACache);
+end;
+
+procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  X64EmitAluRegReg(ABuf, $39, AWide, X64_RAX, X64_RCX);
+  X64EmitSetccAl(ABuf, ACc);
+  X64EmitMovzxEaxAl(ABuf);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
 end;
 
 function X64OpUnary(const AOp: PtrUInt; const A: UInt64): UInt64; cdecl;
@@ -470,6 +899,15 @@ var
 begin
   Ctx := InterpContextFor(AStore);
   Result := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+end;
+
+function X64ResolveMemory(const AStore: TWasmStore;
+  const AMemoryIndex: PtrUInt): PWasmMemoryInst; cdecl;
+var
+  Instance: TWasmModuleInstance;
+begin
+  Instance := X64CallerInstance(AStore);
+  Result := AStore.JitMemoryAt(Instance.MemAddrs[AMemoryIndex]);
 end;
 
 { Run an INTERPRETED callee as one nested invocation over the shared context.
@@ -696,7 +1134,7 @@ end;
 
 { ===================================================================== }
 {  Waves 4 & 5 — memory / table / reference / global / GC (jit-spec §7,  }
-{  §8, §9). Every op is the SAME uniform three-argument helper call (store,   }
+{  §8, §9). Non-scalar-memory ops use the uniform helper call (store,          }
 {  register-file base, IR-instruction pointer); the Pascal below reproduces    }
 {  the interpreter's Exec* bodies verbatim, so trap kind/message/order and the }
 {  final memory/table/global/GC-heap state are the interpreter's by            }
@@ -704,6 +1142,8 @@ end;
 {  Store.MemAddressAt / MemRangeAt. The GC frame is walkable at every          }
 {  allocation because JitEnterFrame pushed Slots = @Values[Base] with          }
 {  publish-first preserved (§9.3). }
+{ Scalar loads/stores now use the generated-code half of the memory
+  chokepoint; grow, bulk and SIMD memory remain in this dispatcher. }
 { ===================================================================== }
 
 function X64TopActivation(const AStore: TWasmStore): PWasmActivation;
@@ -1818,6 +2258,155 @@ begin
   EmitMemOperand(ABuf, AReg, ABase, ADisp);
 end;
 
+procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean);
+begin
+  case ASize of
+    1, 2:
+      begin
+        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3, 0,
+          ABase shr 3);
+        ABuf.EmitByte($0F);
+        if ASigned then
+          ABuf.EmitByte($BE + Ord(ASize = 2))
+        else
+          ABuf.EmitByte($B6 + Ord(ASize = 2));
+        EmitMemOperand(ABuf, ADest, ABase, 0);
+      end;
+    4:
+      if ASigned and AResult64 then
+      begin
+        X64EmitRex(ABuf, 1, ADest shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($63);                    { movsxd r64, r/m32 }
+        EmitMemOperand(ABuf, ADest, ABase, 0);
+      end
+      else
+        X64EmitLoadMem32(ABuf, ADest, ABase, 0);
+  else
+    X64EmitLoadMem64(ABuf, ADest, ABase, 0);
+  end;
+end;
+
+procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase: Byte; const ASize: UInt32);
+begin
+  case ASize of
+    1:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($88);
+        EmitMemOperand(ABuf, ASource, ABase, 0);
+      end;
+    2:
+      begin
+        ABuf.EmitByte($66);
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+        EmitMemOperand(ABuf, ASource, ABase, 0);
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+        EmitMemOperand(ABuf, ASource, ABase, 0);
+      end;
+  else
+    X64EmitStoreMem64(ABuf, ASource, ABase, 0);
+  end;
+end;
+
+procedure X64EmitTrapUnless(const ABuf: TWasmCodeBuffer;
+  const AGoodCondition: Byte);
+var
+  Good: TWasmJitLabel;
+begin
+  Good := ABuf.NewLabel;
+  X64EmitJccTo(ABuf, AGoodCondition, Good);
+  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkMemoryOutOfBounds)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(Good);
+end;
+
+procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64, AUsePinnedMemory: Boolean);
+var
+  Layout: TWasmMemoryInst;
+  AccessSize: UInt32;
+  Offset: UInt64;
+  Folded: Boolean;
+  SignedLoad: Boolean;
+begin
+  AccessSize := X64MemoryAccessSize(AIns.Op);
+  { Imm stores the memarg's u64 bit pattern in the IR's signed immediate slot.
+    Reinterpret it: a checked numeric conversion rejects offsets above
+    High(Int64), even though memory64 admits the full u64 range. }
+  Move(AIns.Imm, Offset, SizeOf(Offset));
+  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - UInt64(AccessSize);
+
+  if AUsePinnedMemory then
+    X64EmitLoadMem64(ABuf, X64_RAX, X64_RSP, 0)
+  else
+  begin
+    X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+    X64EmitMovRegImm32(ABuf, X64_ARG1, AIns.B);
+    X64EmitCallHelper(ABuf, aohResolveMemory);         { rax := memory instance }
+  end;
+  X64EmitLoadMem64(ABuf, X64_R8, X64_RAX,
+    Int32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX,
+    Int32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
+  if AAddr64 then
+    X64EmitLoadSlot64(ABuf, X64_RCX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.A);
+
+  if AAddr64 and Folded then
+  begin
+    X64EmitAluRegReg(ABuf, $39, True, X64_RCX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+  end
+  else if (not AAddr64) and Folded then
+    { i32 guard pages need no explicit check for a folded static offset. }
+  else
+  begin
+    X64EmitAluRegReg(ABuf, $39, True, X64_RCX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+    X64EmitAluRegReg(ABuf, $29, True, X64_RDX, X64_RCX);
+    X64EmitMovRegImm64(ABuf, X64_RAX, Offset);
+    X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+    X64EmitAluRegReg(ABuf, $29, True, X64_RDX, X64_RAX);
+    X64EmitMovRegImm32(ABuf, X64_RAX, AccessSize);
+    X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+  end;
+
+  X64EmitAluRegReg(ABuf, $01, True, X64_R8, X64_RCX);
+  if Offset <= UInt64(High(Int32)) then
+    X64EmitLea(ABuf, X64_R8, X64_R8, Int32(Offset))
+  else
+  begin
+    X64EmitMovRegImm64(ABuf, X64_RAX, Offset);
+    X64EmitAluRegReg(ABuf, $01, True, X64_R8, X64_RAX);
+  end;
+
+  if AIns.Op in [iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32] then
+  begin
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.Dest);
+    X64EmitStoreScalar(ABuf, X64_RAX, X64_R8, AccessSize);
+    Exit;
+  end;
+
+  SignedLoad := AIns.Op in [iroI32Load8S, iroI32Load16S,
+    iroI64Load8S, iroI64Load16S, iroI64Load32S];
+  X64EmitLoadScalar(ABuf, X64_RAX, X64_R8, AccessSize, SignedLoad,
+    AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S]);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
 procedure X64EmitLoadSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 begin
@@ -1837,6 +2426,105 @@ begin
     Int32(X64SlotByteOffset(ASlot)));
 end;
 
+procedure X64EmitLoadVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+begin
+  ABuf.EmitByte($F3);
+  X64EmitRex(ABuf, 0, AXmm shr 3, 0, X64_REG_REGFILE shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($6F);   { MOVDQU xmm, m128 }
+  EmitMemOperand(ABuf, AXmm, X64_REG_REGFILE,
+    Int32(X64SlotByteOffset(ASlot)));
+end;
+
+procedure X64EmitStoreVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+begin
+  ABuf.EmitByte($F3);
+  X64EmitRex(ABuf, 0, AXmm shr 3, 0, X64_REG_REGFILE shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($7F);   { MOVDQU m128, xmm }
+  EmitMemOperand(ABuf, AXmm, X64_REG_REGFILE,
+    Int32(X64SlotByteOffset(ASlot)));
+end;
+
+procedure X64EmitVecBinary(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
+  const ADestXmm, ASrcXmm: Byte);
+begin
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, 0, ADestXmm shr 3, 0, ASrcXmm shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte(AOpcode);
+  EmitModRMReg(ABuf, ADestXmm, ASrcXmm);
+end;
+
+procedure X64EmitVecDup(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const AReg, ASize: Byte);
+begin
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, Ord(ASize = 3), AXmm shr 3, 0, AReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($6E);             { MOVD/MOVQ xmm, r32/r64 }
+  EmitModRMReg(ABuf, AXmm, AReg);
+  case ASize of
+    0:
+      begin
+        X64EmitVecBinary(ABuf, $60, AXmm, AXmm); { PUNPCKLBW }
+        X64EmitVecBinary(ABuf, $61, AXmm, AXmm); { PUNPCKLWD }
+        X64EmitVecBinary(ABuf, $70, AXmm, AXmm); { PSHUFD xmm,xmm,0 }
+        ABuf.EmitByte(0);
+      end;
+    1:
+      begin
+        X64EmitVecBinary(ABuf, $61, AXmm, AXmm); { PUNPCKLWD }
+        X64EmitVecBinary(ABuf, $70, AXmm, AXmm);
+        ABuf.EmitByte(0);
+      end;
+    2:
+      begin
+        X64EmitVecBinary(ABuf, $70, AXmm, AXmm);
+        ABuf.EmitByte(0);
+      end;
+  else
+    X64EmitVecBinary(ABuf, $6C, AXmm, AXmm);     { PUNPCKLQDQ }
+  end;
+end;
+
+procedure X64EmitVecExtract(const ABuf: TWasmCodeBuffer; const AReg,
+  AXmm, ASize, ALane: Byte; const ASigned: Boolean);
+var
+  Shift: Byte;
+begin
+  Shift := ALane shl ASize;
+  if Shift <> 0 then
+  begin
+    ABuf.EmitByte($66);
+    ABuf.EmitByte($0F);
+    ABuf.EmitByte($73);
+    EmitModRMReg(ABuf, 3, AXmm);   { PSRLDQ xmm, imm8 }
+    ABuf.EmitByte(Shift);
+  end;
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, Ord(ASize = 3), AXmm shr 3, 0, AReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($7E);              { MOVD/MOVQ r32/r64, xmm }
+  EmitModRMReg(ABuf, AXmm, AReg);
+  if ASize < 2 then
+  begin
+    if ASigned then
+      X64EmitSignExtendRax(ABuf, 8 shl ASize, False)
+    else
+    begin
+      ABuf.EmitByte($0F);
+      if ASize = 0 then
+        ABuf.EmitByte($B6)         { MOVZX eax,al }
+      else
+        ABuf.EmitByte($B7);        { MOVZX eax,ax }
+      ABuf.EmitByte($C0);
+    end;
+  end;
+end;
+
 procedure X64EmitAluRegReg(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
   const AWide: Boolean; const ADst, ASrc: Byte);
 begin
@@ -1854,6 +2542,131 @@ begin
   ABuf.EmitByte($0F);
   ABuf.EmitByte($AF);
   EmitModRMReg(ABuf, ADst, ASrc);
+end;
+
+procedure X64EmitSignDividend(const ABuf: TWasmCodeBuffer;
+  const AWide: Boolean);
+begin
+  if AWide then
+    ABuf.EmitByte($48);   { CQO = REX.W 99 }
+  ABuf.EmitByte($99);     { CDQ / CQO: sign-extend eax/rax into edx/rdx }
+end;
+
+procedure X64EmitDivReg(const ABuf: TWasmCodeBuffer;
+  const ASigned, AWide: Boolean; const AReg: Byte);
+var
+  Subop: Byte;
+begin
+  if ASigned then
+    Subop := 7
+  else
+    Subop := 6;
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  ABuf.EmitByte($F7);
+  EmitModRMReg(ABuf, Subop, AReg);   { DIV/IDIV r/m32|64 = F7 /6|/7 }
+end;
+
+procedure X64EmitMovToXmm(const ABuf: TWasmCodeBuffer; const AXmm,
+  AReg: Byte; const AWide: Boolean);
+begin
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, Ord(AWide), AXmm shr 3, 0, AReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($6E);   { MOVD/MOVQ xmm, r32|64 }
+  EmitModRMReg(ABuf, AXmm, AReg);
+end;
+
+procedure X64EmitMovFromXmm(const ABuf: TWasmCodeBuffer; const AReg,
+  AXmm: Byte; const AWide: Boolean);
+begin
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, Ord(AWide), AXmm shr 3, 0, AReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($7E);   { MOVD/MOVQ r32|64, xmm }
+  EmitModRMReg(ABuf, AXmm, AReg);
+end;
+
+procedure X64EmitScalarFloatBinary(const ABuf: TWasmCodeBuffer;
+  const AOpcode: Byte; const AWide: Boolean; const ADestXmm, ASrcXmm: Byte);
+begin
+  if AWide then
+    ABuf.EmitByte($F2)
+  else
+    ABuf.EmitByte($F3);
+  X64EmitRex(ABuf, 0, ADestXmm shr 3, 0, ASrcXmm shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte(AOpcode);
+  EmitModRMReg(ABuf, ADestXmm, ASrcXmm);
+end;
+
+procedure X64EmitScalarFloatCompare(const ABuf: TWasmCodeBuffer;
+  const APredicate: Byte; const AWide: Boolean;
+  const ADestXmm, ASrcXmm: Byte);
+begin
+  X64EmitScalarFloatBinary(ABuf, $C2, AWide, ADestXmm, ASrcXmm);
+  ABuf.EmitByte(APredicate);
+end;
+
+procedure X64EmitScalarFloatUcomi(const ABuf: TWasmCodeBuffer;
+  const AWide: Boolean; const ALeftXmm, ARightXmm: Byte);
+begin
+  if AWide then
+    ABuf.EmitByte($66);
+  X64EmitRex(ABuf, 0, ALeftXmm shr 3, 0, ARightXmm shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($2E);   { UCOMISS/UCOMISD xmm, xmm }
+  EmitModRMReg(ABuf, ALeftXmm, ARightXmm);
+end;
+
+procedure X64EmitIntToFloat(const ABuf: TWasmCodeBuffer;
+  const ASourceWide, AResultWide: Boolean; const ADestXmm, ASrcReg: Byte);
+begin
+  if AResultWide then
+    ABuf.EmitByte($F2)
+  else
+    ABuf.EmitByte($F3);
+  X64EmitRex(ABuf, Ord(ASourceWide), ADestXmm shr 3, 0, ASrcReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($2A);   { CVTSI2SS/CVTSI2SD xmm, r32|64 }
+  EmitModRMReg(ABuf, ADestXmm, ASrcReg);
+end;
+
+procedure X64EmitFloatWidthConvert(const ABuf: TWasmCodeBuffer;
+  const ADemote: Boolean; const ADestXmm, ASrcXmm: Byte);
+begin
+  if ADemote then
+    ABuf.EmitByte($F2)   { CVTSD2SS }
+  else
+    ABuf.EmitByte($F3);  { CVTSS2SD }
+  X64EmitRex(ABuf, 0, ADestXmm shr 3, 0, ASrcXmm shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($5A);
+  EmitModRMReg(ABuf, ADestXmm, ASrcXmm);
+end;
+
+procedure X64EmitSignExtendRax(const ABuf: TWasmCodeBuffer;
+  const ASourceBits: Byte; const ATargetWide: Boolean);
+begin
+  if ATargetWide then
+    ABuf.EmitByte($48);
+  if ASourceBits = 32 then
+  begin
+    { MOVSXD rax,eax = 48 63 C0. A 32-bit target needs no operation. }
+    if ATargetWide then
+    begin
+      ABuf.EmitByte($63);
+      ABuf.EmitByte($C0);
+    end;
+  end
+  else
+  begin
+    ABuf.EmitByte($0F);
+    if ASourceBits = 8 then
+      ABuf.EmitByte($BE)
+    else
+      ABuf.EmitByte($BF);
+    ABuf.EmitByte($C0);   { MOVSX eax|rax, al|ax }
+  end;
 end;
 
 procedure X64EmitShiftCl(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
@@ -2020,6 +2833,15 @@ begin
     and held callee-saved so every helper call is `call [r15 + k*8]`. }
   X64EmitLoadMem64(ABuf, X64_REG_HELPERTABLE, X64_REG_STORE,
     Int32(AHelperTableOffset));
+end;
+
+procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32);
+begin
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitMovRegImm32(ABuf, X64_ARG1, AMemoryIndex);
+  X64EmitCallHelper(ABuf, aohResolveMemory);
+  X64EmitStoreMem64(ABuf, X64_RAX, X64_RSP, 0);
 end;
 
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
@@ -2257,6 +3079,187 @@ begin
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
 end;
 
+procedure EmitDivRem(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
+  const AWide, ASigned, ARem: Boolean);
+var
+  NonZero, Safe, Done: TWasmJitLabel;
+begin
+  if AWide then
+  begin
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A);
+    X64EmitLoadSlot64(ABuf, X64_RCX, AIns.B);
+  end
+  else
+  begin
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.B);
+  end;
+  X64EmitAluRegReg(ABuf, $85, AWide, X64_RCX, X64_RCX);
+  NonZero := ABuf.NewLabel;
+  X64EmitJccTo(ABuf, X64_CC_NE, UInt32(NonZero));
+  EmitTrapCall(ABuf, wtkDivideByZero);
+  ABuf.BindLabel(NonZero);
+
+  if ASigned then
+  begin
+    Safe := ABuf.NewLabel;
+    if AWide then
+    begin
+      X64EmitMovRegImm64(ABuf, X64_RDX, High(UInt64));
+      X64EmitAluRegReg(ABuf, $39, True, X64_RCX, X64_RDX);
+      X64EmitJccTo(ABuf, X64_CC_NE, UInt32(Safe));
+      X64EmitMovRegImm64(ABuf, X64_RDX, UInt64(1) shl 63);
+      X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_RDX);
+    end
+    else
+    begin
+      X64EmitMovRegImm32(ABuf, X64_RDX, High(UInt32));
+      X64EmitAluRegReg(ABuf, $39, False, X64_RCX, X64_RDX);
+      X64EmitJccTo(ABuf, X64_CC_NE, UInt32(Safe));
+      X64EmitMovRegImm32(ABuf, X64_RDX, UInt32(1) shl 31);
+      X64EmitAluRegReg(ABuf, $39, False, X64_RAX, X64_RDX);
+    end;
+    X64EmitJccTo(ABuf, X64_CC_NE, UInt32(Safe));
+    if not ARem then
+      EmitTrapCall(ABuf, wtkIntegerOverflow)
+    else
+    begin
+      { Unlike A64 SDIV, x86 IDIV faults on MIN_INT/-1. Remainder is defined as
+        zero, so bypass IDIV for precisely this pair. }
+      X64EmitMovRegImm32(ABuf, X64_RAX, 0);
+      Done := ABuf.NewLabel;
+      X64EmitJmpTo(ABuf, UInt32(Done));
+    end;
+    ABuf.BindLabel(Safe);
+  end;
+
+  if ASigned then
+    X64EmitSignDividend(ABuf, AWide)
+  else
+    X64EmitAluRegReg(ABuf, $31, False, X64_RDX, X64_RDX);
+  X64EmitDivReg(ABuf, ASigned, AWide, X64_RCX);
+  if ARem then
+    X64EmitMovRegReg(ABuf, X64_RAX, X64_RDX);
+  if ASigned and ARem then
+    ABuf.BindLabel(Done);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+procedure EmitCanonicalFloatResult(const ABuf: TWasmCodeBuffer;
+  const AWide: Boolean; const ADest: UInt32);
+var
+  NanValue, Done: TWasmJitLabel;
+begin
+  X64EmitScalarFloatUcomi(ABuf, AWide, 0, 0);
+  NanValue := ABuf.NewLabel;
+  Done := ABuf.NewLabel;
+  X64EmitJccTo(ABuf, X64_CC_P, UInt32(NanValue));
+  X64EmitMovFromXmm(ABuf, X64_RAX, 0, AWide);
+  X64EmitJmpTo(ABuf, UInt32(Done));
+  ABuf.BindLabel(NanValue);
+  if AWide then
+    X64EmitMovRegImm64(ABuf, X64_RAX, WASM_F64_CANONICAL_NAN)
+  else
+    X64EmitMovRegImm32(ABuf, X64_RAX, WASM_F32_CANONICAL_NAN);
+  ABuf.BindLabel(Done);
+  X64EmitStoreSlot64(ABuf, X64_RAX, ADest);
+end;
+
+procedure EmitFloatBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWide: Boolean; const AOpcode: Byte);
+begin
+  if AWide then
+  begin
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A);
+    X64EmitLoadSlot64(ABuf, X64_RCX, AIns.B);
+  end
+  else
+  begin
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.B);
+  end;
+  X64EmitMovToXmm(ABuf, 0, X64_RAX, AWide);
+  X64EmitMovToXmm(ABuf, 1, X64_RCX, AWide);
+  X64EmitScalarFloatBinary(ABuf, AOpcode, AWide, 0, 1);
+  EmitCanonicalFloatResult(ABuf, AWide, AIns.Dest);
+end;
+
+procedure EmitFloatRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AWide: Boolean;
+  const APredicate: Byte; const ASwap: Boolean);
+var
+  ResultXmm: Byte;
+begin
+  if AWide then
+  begin
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A);
+    X64EmitLoadSlot64(ABuf, X64_RCX, AIns.B);
+  end
+  else
+  begin
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.B);
+  end;
+  X64EmitMovToXmm(ABuf, 0, X64_RAX, AWide);
+  X64EmitMovToXmm(ABuf, 1, X64_RCX, AWide);
+  if ASwap then
+  begin
+    X64EmitScalarFloatCompare(ABuf, APredicate, AWide, 1, 0);
+    ResultXmm := 1;
+  end
+  else
+  begin
+    X64EmitScalarFloatCompare(ABuf, APredicate, AWide, 0, 1);
+    ResultXmm := 0;
+  end;
+  X64EmitMovFromXmm(ABuf, X64_RAX, ResultXmm, AWide);
+  { CMPSS/CMPSD produces all-ones or zero; narrow to wasm's i32 1/0. }
+  ABuf.EmitByte($83);
+  ABuf.EmitByte($E0);   { and eax, 1 }
+  ABuf.EmitByte($01);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+procedure EmitIntegerConversion(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ALoadWide: Boolean;
+  const ASourceBits: Byte; const ATargetWide: Boolean);
+begin
+  if ALoadWide then
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+  if ASourceBits <> 0 then
+    X64EmitSignExtendRax(ABuf, ASourceBits, ATargetWide);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+procedure EmitIntToFloatConversion(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASourceWide, AResultWide,
+  AUnsigned: Boolean);
+begin
+  if ASourceWide then
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+  { x86 has no u32 scalar conversion before AVX-512. A zero-extended u32 is a
+    positive i64, so the r64 signed conversion is exactly equivalent. }
+  X64EmitIntToFloat(ABuf, ASourceWide or AUnsigned, AResultWide, 0, X64_RAX);
+  X64EmitMovFromXmm(ABuf, X64_RAX, 0, AResultWide);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+procedure EmitFloatWidthConversion(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ADemote: Boolean);
+begin
+  if ADemote then
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+  X64EmitMovToXmm(ABuf, 0, X64_RAX, ADemote);
+  X64EmitFloatWidthConvert(ABuf, ADemote, 0, 0);
+  EmitCanonicalFloatResult(ABuf, not ADemote, AIns.Dest);
+end;
+
 { The uniform three-argument runtime/vector helper call: store (r12), regbase
   (rbx), and a pointer to the live IR instruction. Fix C: the baked pointer is
   AInsPtr = @Fn^.Code[i], the driver's guaranteed-stable location in the
@@ -2279,6 +3282,93 @@ begin
   X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_REGFILE);
   X64EmitIrInsPtr(ABuf, X64_ARG2, AInsIndex);          { rdx := @Fn^.Code[i] }
   X64EmitCallHelper(ABuf, aohVecDispatch);
+end;
+
+function X64NativeVecOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    iroV128Not, iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+    iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+    iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub,
+    iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+    iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+    iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+    iroI32x4ExtractLane, iroI64x2ExtractLane:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+procedure EmitNativeVecBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AOpcode: Byte);
+begin
+  X64EmitLoadVec(ABuf, 0, AIns.A);
+  X64EmitLoadVec(ABuf, 1, AIns.B);
+  X64EmitVecBinary(ABuf, AOpcode, 0, 1);
+  X64EmitStoreVec(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecSplat(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte);
+begin
+  if ASize = 3 then
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+  X64EmitVecDup(ABuf, 0, X64_RAX, ASize);
+  X64EmitStoreVec(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecExtract(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte; const ASigned: Boolean);
+begin
+  X64EmitLoadVec(ABuf, 0, AIns.A);
+  X64EmitVecExtract(ABuf, X64_RAX, 0, ASize, Byte(UInt32(AIns.Imm)), ASigned);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+procedure EmitNativeVec(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr);
+begin
+  case AIns.Op of
+    iroV128Not:
+      begin
+        X64EmitLoadVec(ABuf, 0, AIns.A);
+        X64EmitVecBinary(ABuf, $76, 1, 1); { PCMPEQD xmm1,xmm1 => all ones }
+        X64EmitVecBinary(ABuf, $EF, 0, 1);
+        X64EmitStoreVec(ABuf, 0, AIns.Dest);
+      end;
+    iroV128And: EmitNativeVecBinary(ABuf, AIns, $DB);
+    iroV128Andnot:
+      begin
+        { PANDN computes ~dest & src; reverse wasm's a & ~b operands. }
+        X64EmitLoadVec(ABuf, 0, AIns.B);
+        X64EmitLoadVec(ABuf, 1, AIns.A);
+        X64EmitVecBinary(ABuf, $DF, 0, 1);
+        X64EmitStoreVec(ABuf, 0, AIns.Dest);
+      end;
+    iroV128Or: EmitNativeVecBinary(ABuf, AIns, $EB);
+    iroV128Xor: EmitNativeVecBinary(ABuf, AIns, $EF);
+    iroI8x16Add: EmitNativeVecBinary(ABuf, AIns, $FC);
+    iroI8x16Sub: EmitNativeVecBinary(ABuf, AIns, $F8);
+    iroI16x8Add: EmitNativeVecBinary(ABuf, AIns, $FD);
+    iroI16x8Sub: EmitNativeVecBinary(ABuf, AIns, $F9);
+    iroI32x4Add: EmitNativeVecBinary(ABuf, AIns, $FE);
+    iroI32x4Sub: EmitNativeVecBinary(ABuf, AIns, $FA);
+    iroI64x2Add: EmitNativeVecBinary(ABuf, AIns, $D4);
+    iroI64x2Sub: EmitNativeVecBinary(ABuf, AIns, $FB);
+    iroI8x16Splat: EmitNativeVecSplat(ABuf, AIns, 0);
+    iroI16x8Splat: EmitNativeVecSplat(ABuf, AIns, 1);
+    iroI32x4Splat: EmitNativeVecSplat(ABuf, AIns, 2);
+    iroI64x2Splat: EmitNativeVecSplat(ABuf, AIns, 3);
+    iroI8x16ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 0, True);
+    iroI8x16ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 0, False);
+    iroI16x8ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 1, True);
+    iroI16x8ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 1, False);
+    iroI32x4ExtractLane: EmitNativeVecExtract(ABuf, AIns, 2, False);
+    iroI64x2ExtractLane: EmitNativeVecExtract(ABuf, AIns, 3, False);
+  end;
 end;
 
 procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
@@ -2349,12 +3439,18 @@ end;
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32);
 var
-  ArgN, ResN, ArgBytes, FrameBytes: UInt32;
+  ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
+  FallbackLabel, DoneLabel: TWasmJitLabel;
 begin
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
   ArgBytes := ArgN * X64_SLOT_SIZE;
-  FrameBytes := X64CallFrameBytes(ArgN, ResN);
+  ResBytes := ResN * X64_SLOT_SIZE;
+  StateOffset := ArgBytes + ResBytes;
+  if AIns.Op = iroCall then
+    FrameBytes := X64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
+  else
+    FrameBytes := X64CallFrameBytes(ArgN, ResN);
 
   X64EmitSubRsp(ABuf, Int32(FrameBytes));
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
@@ -2363,10 +3459,31 @@ begin
   case AIns.Op of
     iroCall:
       begin
+        FallbackLabel := ABuf.NewLabel;
+        DoneLabel := ABuf.NewLabel;
         X64EmitMovRegImm32(ABuf, X64_ARG1, UInt32(AIns.Imm));    { funcidx }
         X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);                  { args }
         X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));    { results }
+        X64EmitLea(ABuf, X64_ARG4, X64_RSP, Int32(StateOffset)); { state }
+        X64EmitCallHelper(ABuf, aohDirectCallPrepare);
+        X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);     { test rax,rax }
+        X64EmitJccTo(ABuf, X64_CC_E, UInt32(FallbackLabel));
+        X64EmitMovRegReg(ABuf, X64_R11, X64_RAX);                { entry }
+        X64EmitLoadMem64(ABuf, X64_ARG0, X64_RSP, Int32(StateOffset));
+        X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_STORE);
+        X64EmitLoadMem64(ABuf, X64_ARG2, X64_RSP,
+          Int32(StateOffset + X64_SLOT_SIZE));
+        X64EmitCallReg(ABuf, X64_R11);
+        X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+        X64EmitCallHelper(ABuf, aohDirectCallFinish);
+        X64EmitJmpTo(ABuf, UInt32(DoneLabel));
+        ABuf.BindLabel(FallbackLabel);
+        X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+        X64EmitMovRegImm32(ABuf, X64_ARG1, UInt32(AIns.Imm));
+        X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);
+        X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));
         X64EmitCallHelper(ABuf, aohCall);
+        ABuf.BindLabel(DoneLabel);
       end;
     iroCallIndirect:
       begin
@@ -2491,14 +3608,8 @@ end;
 function X64LeafBinaryOp(const AOp: TWasmIrOp): Boolean;
 begin
   case AOp of
-    iroI32DivS, iroI32DivU, iroI32RemS, iroI32RemU,
-    iroI64DivS, iroI64DivU, iroI64RemS, iroI64RemU,
-    iroF32Add, iroF32Sub, iroF32Mul, iroF32Div, iroF32Min, iroF32Max,
-    iroF32Copysign,
-    iroF32Eq, iroF32Ne, iroF32Lt, iroF32Gt, iroF32Le, iroF32Ge,
-    iroF64Add, iroF64Sub, iroF64Mul, iroF64Div, iroF64Min, iroF64Max,
-    iroF64Copysign,
-    iroF64Eq, iroF64Ne, iroF64Lt, iroF64Gt, iroF64Le, iroF64Ge:
+    iroF32Min, iroF32Max, iroF32Copysign,
+    iroF64Min, iroF64Max, iroF64Copysign:
       Result := True;
   else
     Result := False;
@@ -2512,20 +3623,13 @@ begin
   case AOp of
     iroI32Clz, iroI32Ctz, iroI64Clz, iroI64Ctz,
     iroI32Popcnt, iroI64Popcnt,
-    iroI32WrapI64, iroI64ExtendI32S, iroI64ExtendI32U,
-    iroI32Extend8S, iroI32Extend16S,
-    iroI64Extend8S, iroI64Extend16S, iroI64Extend32S,
     iroF32Abs, iroF32Neg, iroF32Ceil, iroF32Floor, iroF32Trunc,
     iroF32Nearest, iroF32Sqrt,
     iroF64Abs, iroF64Neg, iroF64Ceil, iroF64Floor, iroF64Trunc,
     iroF64Nearest, iroF64Sqrt,
-    iroF32DemoteF64, iroF64PromoteF32,
     iroI32TruncF32S, iroI32TruncF32U, iroI32TruncF64S, iroI32TruncF64U,
     iroI64TruncF32S, iroI64TruncF32U, iroI64TruncF64S, iroI64TruncF64U,
-    iroF32ConvertI32S, iroF32ConvertI32U, iroF32ConvertI64S, iroF32ConvertI64U,
-    iroF64ConvertI32S, iroF64ConvertI32U, iroF64ConvertI64S, iroF64ConvertI64U,
-    iroI32ReinterpretF32, iroF32ReinterpretI32,
-    iroI64ReinterpretF64, iroF64ReinterpretI64,
+    iroF32ConvertI64U, iroF64ConvertI64U,
     iroI32TruncSatF32S, iroI32TruncSatF32U, iroI32TruncSatF64S,
     iroI32TruncSatF64U,
     iroI64TruncSatF32S, iroI64TruncSatF32U, iroI64TruncSatF64S,
@@ -2548,10 +3652,24 @@ begin
     iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
     iroI64Eqz, iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
     iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+    iroI32DivS, iroI32DivU, iroI32RemS, iroI32RemU,
+    iroI64DivS, iroI64DivU, iroI64RemS, iroI64RemU,
     iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or,
     iroI32Xor, iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
     iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or,
-    iroI64Xor, iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr:
+    iroI64Xor, iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+    iroF32Add, iroF32Sub, iroF32Mul, iroF32Div,
+    iroF32Eq, iroF32Ne, iroF32Lt, iroF32Gt, iroF32Le, iroF32Ge,
+    iroF64Add, iroF64Sub, iroF64Mul, iroF64Div,
+    iroF64Eq, iroF64Ne, iroF64Lt, iroF64Gt, iroF64Le, iroF64Ge,
+    iroI32WrapI64, iroI64ExtendI32S, iroI64ExtendI32U,
+    iroI32Extend8S, iroI32Extend16S,
+    iroI64Extend8S, iroI64Extend16S, iroI64Extend32S,
+    iroF32DemoteF64, iroF64PromoteF32,
+    iroF32ConvertI32S, iroF32ConvertI32U, iroF32ConvertI64S,
+    iroF64ConvertI32S, iroF64ConvertI32U, iroF64ConvertI64S,
+    iroI32ReinterpretF32, iroF32ReinterpretI32,
+    iroI64ReinterpretF64, iroF64ReinterpretI64:
       Result := True;
   else
     Result := False;
@@ -2670,8 +3788,76 @@ begin
     iroI64Rotl: EmitShiftX(ABuf, AIns, 0);
     iroI64Rotr: EmitShiftX(ABuf, AIns, 1);
 
+    iroI32DivS: EmitDivRem(ABuf, AIns, False, True, False);
+    iroI32DivU: EmitDivRem(ABuf, AIns, False, False, False);
+    iroI32RemS: EmitDivRem(ABuf, AIns, False, True, True);
+    iroI32RemU: EmitDivRem(ABuf, AIns, False, False, True);
+    iroI64DivS: EmitDivRem(ABuf, AIns, True, True, False);
+    iroI64DivU: EmitDivRem(ABuf, AIns, True, False, False);
+    iroI64RemS: EmitDivRem(ABuf, AIns, True, True, True);
+    iroI64RemU: EmitDivRem(ABuf, AIns, True, False, True);
+
+    iroF32Add: EmitFloatBinary(ABuf, AIns, False, $58);
+    iroF32Sub: EmitFloatBinary(ABuf, AIns, False, $5C);
+    iroF32Mul: EmitFloatBinary(ABuf, AIns, False, $59);
+    iroF32Div: EmitFloatBinary(ABuf, AIns, False, $5E);
+    iroF64Add: EmitFloatBinary(ABuf, AIns, True, $58);
+    iroF64Sub: EmitFloatBinary(ABuf, AIns, True, $5C);
+    iroF64Mul: EmitFloatBinary(ABuf, AIns, True, $59);
+    iroF64Div: EmitFloatBinary(ABuf, AIns, True, $5E);
+    { CMPSS/CMPDS predicates: 0=eq, 1=lt, 2=le, 4=ne. gt/ge swap inputs. }
+    iroF32Eq: EmitFloatRel(ABuf, AIns, False, 0, False);
+    iroF32Ne: EmitFloatRel(ABuf, AIns, False, 4, False);
+    iroF32Lt: EmitFloatRel(ABuf, AIns, False, 1, False);
+    iroF32Gt: EmitFloatRel(ABuf, AIns, False, 1, True);
+    iroF32Le: EmitFloatRel(ABuf, AIns, False, 2, False);
+    iroF32Ge: EmitFloatRel(ABuf, AIns, False, 2, True);
+    iroF64Eq: EmitFloatRel(ABuf, AIns, True, 0, False);
+    iroF64Ne: EmitFloatRel(ABuf, AIns, True, 4, False);
+    iroF64Lt: EmitFloatRel(ABuf, AIns, True, 1, False);
+    iroF64Gt: EmitFloatRel(ABuf, AIns, True, 1, True);
+    iroF64Le: EmitFloatRel(ABuf, AIns, True, 2, False);
+    iroF64Ge: EmitFloatRel(ABuf, AIns, True, 2, True);
+
+    iroI32WrapI64:
+      EmitIntegerConversion(ABuf, AIns, False, 0, False);
+    iroI64ExtendI32U:
+      EmitIntegerConversion(ABuf, AIns, False, 0, True);
+    iroI64ExtendI32S:
+      EmitIntegerConversion(ABuf, AIns, False, 32, True);
+    iroI32Extend8S:
+      EmitIntegerConversion(ABuf, AIns, False, 8, False);
+    iroI32Extend16S:
+      EmitIntegerConversion(ABuf, AIns, False, 16, False);
+    iroI64Extend8S:
+      EmitIntegerConversion(ABuf, AIns, True, 8, True);
+    iroI64Extend16S:
+      EmitIntegerConversion(ABuf, AIns, True, 16, True);
+    iroI64Extend32S:
+      EmitIntegerConversion(ABuf, AIns, True, 32, True);
+    iroF32ConvertI32S:
+      EmitIntToFloatConversion(ABuf, AIns, False, False, False);
+    iroF32ConvertI32U:
+      EmitIntToFloatConversion(ABuf, AIns, False, False, True);
+    iroF32ConvertI64S:
+      EmitIntToFloatConversion(ABuf, AIns, True, False, False);
+    iroF64ConvertI32S:
+      EmitIntToFloatConversion(ABuf, AIns, False, True, False);
+    iroF64ConvertI32U:
+      EmitIntToFloatConversion(ABuf, AIns, False, True, True);
+    iroF64ConvertI64S:
+      EmitIntToFloatConversion(ABuf, AIns, True, True, False);
+    iroF32DemoteF64: EmitFloatWidthConversion(ABuf, AIns, True);
+    iroF64PromoteF32: EmitFloatWidthConversion(ABuf, AIns, False);
+    iroI32ReinterpretF32, iroF32ReinterpretI32:
+      EmitIntegerConversion(ABuf, AIns, False, 0, False);
+    iroI64ReinterpretF64, iroF64ReinterpretI64:
+      EmitIntegerConversion(ABuf, AIns, True, 0, True);
+
   else
-    if X64LeafBinaryOp(AIns.Op) then
+    if X64NativeVecOp(AIns.Op) then
+      EmitNativeVec(ABuf, AIns)
+    else if X64LeafBinaryOp(AIns.Op) then
       EmitLeafBinary(ABuf, AIns)
     else if X64LeafUnaryOp(AIns.Op) then
       EmitLeafUnary(ABuf, AIns)
@@ -2710,6 +3896,9 @@ begin
     GX64HelperTable[aohReturnCall] := @X64ReturnCallHelper;
     GX64HelperTable[aohReturnCallIndirect] := @X64ReturnCallIndirectHelper;
     GX64HelperTable[aohReturnCallRef] := @X64ReturnCallRefHelper;
+    GX64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
+    GX64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
+    GX64HelperTable[aohResolveMemory] := @X64ResolveMemory;
     GX64HelperTableFilled := True;
   end;
   Result := @GX64HelperTable[aohTrapKind];

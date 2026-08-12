@@ -66,8 +66,12 @@ uses
   Wasm.Module,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
+  Wasm.Runtime.Traps,
   Wasm.Runtime.Values,
   Wasm.Validator;
+
+const
+  JIT_BACKEND_AVAILABLE = {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF};
 
 { --- byte-assembly helpers (mirrors Wasm.Interp.Test) -------------------- }
 
@@ -584,7 +588,7 @@ begin
       BLit([$60, $00, $01, $7F]),                    { 2: ()->i32 }
       BLit([$60, $03, $7F, $7F, $7F, $01, $7F])])),  { 3: (i32,i32,i32)->i32 }
     Sect(3, VecOf([BLit([$00]), BLit([$01]), BLit([$01]), BLit([$02]),
-      BLit([$01]), BLit([$03]), BLit([$03])])),
+      BLit([$01]), BLit([$03]), BLit([$03]), BLit([$01])])),
     Sect(5, VecOf([BLit([$00, $01])])),              { memory min 1 }
     Sect(7, VecOf([
       ExportEntry('sload', $00, 0),
@@ -593,7 +597,8 @@ begin
       ExportEntry('size', $00, 3),
       ExportEntry('grow', $00, 4),
       ExportEntry('fill', $00, 5),
-      ExportEntry('copy', $00, 6)])),
+      ExportEntry('copy', $00, 6),
+      ExportEntry('offsetload', $00, 7)])),
     Sect(10, VecOf([
       CodeEntry([$00, $20, $00, $20, $01, $36, $02, $00,
         $20, $00, $28, $02, $00, $0B]),              { store arg1@arg0; load arg0 }
@@ -604,9 +609,51 @@ begin
       CodeEntry([$00, $20, $00, $20, $01, $20, $02, $FC, $0B, $00,
         $20, $00, $2D, $00, $00, $0B]),               { fill; load8_u arg0 }
       CodeEntry([$00, $20, $00, $20, $01, $20, $02, $FC, $0A, $00, $00,
-        $20, $00, $2D, $00, $00, $0B])])),            { copy; load8_u arg0 }
+        $20, $00, $2D, $00, $00, $0B]),               { copy; load8_u arg0 }
+      CodeEntry([$00, $20, $00, $28, $02, $04, $0B])])), { i32.load offset=4 }
     Sect(11, VecOf([Cat([BLit([$00, $41, $00, $0B]),
       ULeb(8), BLit([$FF, $11, $22, $33, $44, $55, $66, $77])])]))
+  ]);
+end;
+
+{ The largest valid memory64 memarg offset. The IR stores immediates in an
+  Int64 slot, so this value exercises the unsigned bit-pattern boundary in
+  every tier. It is valid to compile and traps only when the load executes. }
+function Mem64MaxOffsetModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$04, $01])])),              { memory i64 min 1 }
+    Sect(7, VecOf([ExportEntry('load', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([$00,
+      $42, $00,                                      { i64.const 0 }
+      $28, $02,                                      { i32.load align=2 }
+      $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $01,
+      $0B])]))                                       { offset=High(UInt64) }
+  ]);
+end;
+
+{ A helper-free, zero-offset i32 memory loop: on aarch64 this is the exact
+  shape allowed to pin the live base and retain numeric slots across scalar
+  accesses. It stores and reloads i=0..n-1 and returns their sum. }
+function MemLoopModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, $01])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $01, $02, $7F,                  { locals: i, acc }
+      $03, $40,                       { loop }
+      $41, $00, $20, $01, $36, $02, $00, { memory[0] := i }
+      $20, $02, $41, $00, $28, $02, $00, $6A, $21, $02, { acc += memory[0] }
+      $20, $01, $41, $01, $6A, $22, $01, { ++i }
+      $20, $00, $49, $0D, $00,        { while i < n }
+      $0B, $20, $02, $0B])]))
   ]);
 end;
 
@@ -1165,7 +1212,9 @@ type
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
+    procedure TestMemoryLoopCache;
     procedure TestMemoryOobTraps;
+    procedure TestMemory64MaxOffset;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
     procedure TestMemoryInitDrop;
@@ -1375,6 +1424,14 @@ begin
     FDiffCompiledAll := Result;
     JitOut := Invoke;
 
+    { A normal compiled return, including the direct compiled-to-compiled
+      epilogue, must retire both runtime views of the activation. This catches
+      a fast return that copies the value correctly but leaves either the GC
+      chain or the shared logical-frame cursors stale for the next call. }
+    Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(Store)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(Store)^.ValueTop).ToBe(0);
+
     { Observational identity: same trap-or-value, bitwise. }
     Expect<Boolean>(JitOut.Trapped).ToBe(InterpOut.Trapped);
     if InterpOut.Trapped then
@@ -1536,10 +1593,13 @@ begin
   {$IFDEF WASM_JIT_BACKEND}
   Expect<Boolean>(Compiled).ToBe(True);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(True);
+  Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry =
+    FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
   Expect<Boolean>(FJit.ForceCompile(AddAddr)).ToBe(True);
   {$ELSE}
   Expect<Boolean>(Compiled).ToBe(False);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(False);
+  Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry = nil).ToBe(True);
   {$ENDIF}
 end;
 
@@ -2056,7 +2116,7 @@ procedure TJitTests.TestEpochInterruptDifferential;
           snapshot targets. (Since Wave 3 the caller WOULD compile, calls and
           all; leaving it interpreted here is deliberate, and RunAddr is
           referenced below so the tier choice stays explicit.) }
-        Expect<Boolean>(Jit.ForceCompile(LeafAddr)).ToBe(True);
+        Expect<Boolean>(Jit.ForceCompile(LeafAddr)).ToBe(JIT_BACKEND_AVAILABLE);
         Expect<Boolean>(Store.Funcs[RunAddr].CompiledEntry = nil).ToBe(True);
       end;
 
@@ -2071,6 +2131,19 @@ procedure TJitTests.TestEpochInterruptDifferential;
           Result.Trapped := True;
           Result.Msg := E.Message;
         end;
+      end;
+      { The leaf is a helper-free integer loop, so its instruction set and
+        back-edge make it eligible for the function-wide static register
+        cache. An epoch mismatch must still unwind past that cached frame and
+        leave no stale trampoline or GC frame. A fresh outermost invocation on
+        the same store re-captures the now-current epoch and must complete. }
+      Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+      Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
+      if Result.Trapped then
+      begin
+        InterpInvoke(Store, LeafAddr, nil, nil);
+        Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+        Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
       end;
     finally
       FreeAndNil(Jit);
@@ -2170,7 +2243,7 @@ procedure TJitTests.TestEpochInterruptAcrossSeamToInterpCallee;
         Jit := RegisterJit(Store);
         { Only the CALLER is compiled; the leaf stays interpreted and is reached
           across the tier seam — the nested re-entry that must NOT re-seed. }
-        Expect<Boolean>(Jit.ForceCompile(RunAddr)).ToBe(True);
+        Expect<Boolean>(Jit.ForceCompile(RunAddr)).ToBe(JIT_BACKEND_AVAILABLE);
         Expect<Boolean>(Store.Funcs[LeafAddr].CompiledEntry = nil).ToBe(True);
       end;
 
@@ -2291,7 +2364,7 @@ begin
     feeds a callee reached through the store's compiled hook. }
   CompileExports(['helper', 'run']);
   Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
-    [MakeValueI32(10)])).ToBe(True);
+    [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallCompiledToInterpreted;
@@ -2300,7 +2373,7 @@ begin
     interpreter — the compiled -> interpreted direction of the seam. }
   CompileExports(['run']);
   Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
-    [MakeValueI32(10)])).ToBe(True);
+    [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallInterpretedToCompiled;
@@ -2308,14 +2381,14 @@ begin
   { Only the callee is compiled: the interpreter's own CompiledCall seam. }
   CompileExports(['helper']);
   Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
-    [MakeValueI32(10)])).ToBe(True);
+    [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallIndirectHit;
 begin
   CompileExports(['double', 'run']);
   Expect<Boolean>(DiffModule(CallIndirectModuleBytes, 'run',
-    [MakeValueI32(21), MakeValueI32(0)])).ToBe(True);
+    [MakeValueI32(21), MakeValueI32(0)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallIndirectTraps;
@@ -2354,11 +2427,12 @@ begin
     iroCallRef template. }
   CompileExports(['double', 'run']);
   Expect<Boolean>(DiffModule(CallRefModuleBytes, 'mk',
-    [MakeValueI32(21)])).ToBe(True);
+    [MakeValueI32(21)])).ToBe(JIT_BACKEND_AVAILABLE);
 
   { A null funcref traps identically under both tiers. }
   CompileExports(['run']);
-  Expect<Boolean>(DiffModule(CallRefModuleBytes, 'mknull', [])).ToBe(True);
+  Expect<Boolean>(DiffModule(CallRefModuleBytes, 'mknull', []))
+    .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<string>(TrapMessageOf(CallRefModuleBytes, 'mknull', []))
     .ToBe('null function reference');
 end;
@@ -2367,7 +2441,8 @@ procedure TJitTests.TestMultiValueCall;
 begin
   { Two results across the call: the unmarshal loop must place BOTH slots. }
   CompileExports(['pair', 'run']);
-  Expect<Boolean>(DiffModule(MultiValueModuleBytes, 'run', [])).ToBe(True);
+  Expect<Boolean>(DiffModule(MultiValueModuleBytes, 'run', []))
+    .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestVecThroughCall;
@@ -2394,7 +2469,7 @@ begin
   FDiffHost := @JitIncCallback;
   CompileExports(['callhost']);
   Expect<Boolean>(DiffModule(HostCallModuleBytes, 'callhost',
-    [MakeValueI32(5)])).ToBe(True);
+    [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestTailCallSelfIsBounded;
@@ -2406,7 +2481,7 @@ begin
     thousands of iterations and this would crash rather than fail. }
   CompileExports(['count']);
   Expect<Boolean>(DiffModule(TailSelfModuleBytes, 'count',
-    [MakeValueI64(1000000)])).ToBe(True);
+    [MakeValueI64(1000000)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestTailCallMutual;
@@ -2415,7 +2490,7 @@ begin
     the chain across FUNCTIONS, not just around one. }
   CompileExports(['a', 'b']);
   Expect<Boolean>(DiffModule(TailMutualModuleBytes, 'a',
-    [MakeValueI64(100000)])).ToBe(True);
+    [MakeValueI64(100000)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestTailCallCrossTierBounded;
@@ -2442,7 +2517,7 @@ begin
   FDiffHost := @JitIncCallback;
   CompileExports(['tailhost']);
   Expect<Boolean>(DiffModule(HostCallModuleBytes, 'tailhost',
-    [MakeValueI32(5)])).ToBe(True);
+    [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestDeepRecursionExhausts;
@@ -2462,7 +2537,7 @@ begin
     begin
       CompileExports(['rec']);
       Expect<Boolean>(DiffModule(RecurseModuleBytes, 'rec',
-        [MakeValueI32(N)])).ToBe(True);
+        [MakeValueI32(N)])).ToBe(JIT_BACKEND_AVAILABLE);
     end;
 
     { And the message itself, at a depth well past the cap — still under the
@@ -2505,6 +2580,12 @@ begin
     [MakeValueI32(0)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+procedure TJitTests.TestMemoryLoopCache;
+begin
+  Expect<Boolean>(DiffFresh(MemLoopModuleBytes, 'run', [MakeValueI32(100)]))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
 procedure TJitTests.TestMemoryOobTraps;
 begin
   { an out-of-bounds load and store both trap 'out of bounds memory access'
@@ -2516,6 +2597,23 @@ begin
     [MakeValueI32(Integer($1FFFF)), MakeValueI32(1)]);
   Expect<string>(TrapMessageOf(MemBasicModuleBytes, 'sload',
     [MakeValueI32(Integer($1FFFF)), MakeValueI32(1)]))
+    .ToBe('out of bounds memory access');
+  { A folded non-zero static offset uses the i32 guard reservation too: the
+    final four bytes are valid, while advancing that effective address by four
+    enters the guard and must produce the same trap as the interpreter. }
+  Expect<Boolean>(DiffFresh(MemBasicModuleBytes, 'offsetload',
+    [MakeValueI32(Integer($FFF8))])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  DiffFresh(MemBasicModuleBytes, 'offsetload',
+    [MakeValueI32(Integer($FFFC))]);
+  Expect<string>(TrapMessageOf(MemBasicModuleBytes, 'offsetload',
+    [MakeValueI32(Integer($FFFC))])).ToBe('out of bounds memory access');
+end;
+
+procedure TJitTests.TestMemory64MaxOffset;
+begin
+  Expect<Boolean>(DiffFresh(Mem64MaxOffsetModuleBytes, 'load', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<string>(TrapMessageOf(Mem64MaxOffsetModuleBytes, 'load', []))
     .ToBe('out of bounds memory access');
 end;
 
@@ -2819,7 +2917,11 @@ begin
     TestThrowAcrossCompiledFrameCaught);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
+  Test('a scalar memory loop retains cached values identically',
+    TestMemoryLoopCache);
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);
+  Test('memory64 maximum offset compiles and traps identically',
+    TestMemory64MaxOffset);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);
   Test('memory.fill/copy match the interpreter', TestMemoryFillCopy);
   Test('memory.init/data.drop match the interpreter', TestMemoryInitDrop);

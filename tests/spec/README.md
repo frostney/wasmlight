@@ -157,9 +157,9 @@ reads 0. The status stays in the harness for the next deferred feature.
 `WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`, 288 scripts:
 
 ```text
-ROOT      pass=64651 fail=52  skip=611  staged=0 total=65314
+ROOT      pass=64671 fail=33  skip=610  staged=0 total=65314
 PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
-TOTAL files=288 errors=0 pass=65184 fail=408 skip=1533 staged=0 total=67125
+TOTAL files=288 errors=0 pass=65204 fail=389 skip=1532 staged=0 total=67125
 ```
 
 `ROOT` is everything outside `proposals/` (the 3.0 target plus the out-of-scope
@@ -169,16 +169,16 @@ runtime units — the interpreter's traps reach the runtime `MSG_*` strings the
 binary-only runs never did, and a raise site appends its context after the
 prefix rather than in front of it.
 
-Judged commands are `pass + fail` = **~65,592**. The `staged` column is **0**:
+Judged commands are `pass + fail` = **~65,593**. The `staged` column is **0**:
 Track H shipped exception-handling throwing, so `try_table`, `throw`, and
 `throw_ref` execute and `assert_exception` is judged — the whole core 3.0
-instruction set now runs. The `skip` column (~1,533) is the residue: assertions
+instruction set now runs. The `skip` column (~1,532) is the residue: assertions
 downstream of an unprovided import, host imports the harness does not provide,
 and `assert_unlinkable`.
 
-### What the 408 failures are
+### What the 389 failures are
 
-The split is the headline: **356 are `PROPOSALS`** and only **52 are `ROOT`**, so
+The split is the headline: **356 are `PROPOSALS`** and only **33 are `ROOT`**, so
 the failures cluster in post-3.0 features, not in the 3.0 target — and none is a
 SIMD or exception-handling execution failure. None is a wrong-CLASS rejection
 between `malformed` and `invalid`.
@@ -194,30 +194,16 @@ these must be accepted) and as **wording mismatches** on modules upstream also
 rejects. The justification holds — 3.0 does not have these features — but the
 honest label on the `expected=""` cases is *false rejection*, not diagnostics.
 
-**`ROOT` (52)** are five kinds:
+**`ROOT` (33)** are three kinds:
 
 - **Legacy exception handling** (`testsuite/legacy/try_catch.wast`,
   `rethrow.wast`, `throw.wast`, `try_delegate.wast`, 16 cases) — the pre-3.0
   `try`/`catch`/`delegate`/`rethrow` encoding, out of 3.0 scope and staying
   failing (Track H covers the 3.0 `try_table` form only, which passes).
-- **The `binary-leb128` and `binary` wording divergences** carried since the
-  binary subset — deliberately overlong or over-wide LEB128 whose bytes run past
-  the section that declares them, where upstream reads the whole encoding
-  (`integer too large` / `integer representation too long`) and our bounded
-  `SubReader` reports the section bound first. Our decoder gives every section
-  body and code entry a reader bounded by its declared size, which is what makes
-  `length out of bounds` and `section size mismatch` right everywhere else.
-- **The M7 `extern.convert_any` / `any.convert_extern` imprecision** — a handful
-  of `ref_test.wast` / `ref_cast.wast` `assert_return` cases where our result
-  does not match the expected extern/any round-trip.
-- **Two 3.0 `throw` message-wording edges** (`throw.wast`) — `assert_invalid`
-  cases where the module is correctly rejected but our type-mismatch wording
-  differs from upstream's (a validator-message divergence, not a throwing bug;
-  `try_table.wast` and `throw_ref.wast` pass clean).
-- **A few assembler/decoder edges** — `expected=""` text cases the assembler does
-  not yet build (`instance.wast`, `id.wast`, `table*.wast`, `memory*.wast`,
-  `call_indirect64.wast`) and a few decoder wordings (`binary.wast`,
-  `obsolete-keywords.wast`, `ref_func.wast`).
+- **Module-definition and instance harness forms** — commands the harness does
+  not yet model, rather than instruction or tier failures.
+- **A few assembler/decoder framing edges** — remaining text forms and message
+  boundaries that do not affect execution of accepted core 3.0 modules.
 
 Extract the live signatures rather than trusting this list to stay exact — the
 grep in the "Reading the output" section keys on the `got=`/`expected=` pair and

@@ -126,17 +126,13 @@ const
     where index and offset could otherwise reach past the reservation
     together.
 
-    NOTE as of Track C Wave 6b the helper MemCheck no longer folds at all:
-    it does a full-precision explicit check on every strategy (see MemCheck
-    for why the guard-page fold was deferred to a future JIT tier). This
-    constant, the per-instance GuardBytes field, and the guard reservation
-    survive as the sizing and latent capability that a JIT-emitted inline
-    no-check access will use; it remains the human-readable boundary and
-    the value tests use to construct an offset well past a one-page
-    memory. The former H1 bug — a wide access at the maximum i32 index and
-    an offset equal to the guard reaching past the reservation — cannot
-    recur through this helper, because the explicit check now precedes
-    every dereference. }
+    MemCheck deliberately remains the fully checked interpreter/host helper.
+    The compiled tiers use this constant as the JIT/AOT chokepoint's static
+    fold boundary: a safe i32 offset takes the guard-page access, and a safe
+    memory64 offset takes the guard-assisted index check. The former H1 bug —
+    a wide access at the maximum i32 index and an offset equal to the guard
+    reaching past the reservation — is excluded because the fold subtracts
+    the access width below. }
   WASM_STATIC_OFFSET_FOLD = WASM_GUARD_BYTES;
 
 type
@@ -531,7 +527,6 @@ begin
       the host legitimately owns. }
     ReservationRegister(AMem.ReserveBase, NativeUInt(AMem.ReserveBytes));
     InstallFaultHandler;
-    EnsureAltSignalStack;
   end;
 end;
 

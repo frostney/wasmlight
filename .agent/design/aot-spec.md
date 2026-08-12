@@ -160,12 +160,13 @@ into "fill one table + pass two registers".
 style).** The emitter no longer bakes a helper's absolute address. Instead it
 calls **indirectly through a fixed-index slot** of a helper table:
 
-```
+```text
 ; aarch64  (xHT = pinned helper-table base, §4.3)
 ldr   xT, [xHT, #k*8]     ; k = the helper's fixed index (0..11)
 blr   xT
 ```
-```
+
+```text
 ; x86-64  (rHT = pinned helper-table base)
 call  qword [rHT + k*8]
 ```
@@ -183,10 +184,11 @@ function's **IR code base** (`@Fn^.Code[0]`) in a new argument register, pinned
 callee-saved for the body; a template that needs `@Fn^.Code[i]` computes it
 PC-independently:
 
-```
+```text
 ; aarch64  (xIR = pinned IR-code base, §4.3)
 add   x2, xIR, #(i * SizeOf(TWasmIrInstr))     ; i is a compile-time constant
 ```
+
 (with a `movz`+`add` fallback when `i*stride` exceeds the `add` immediate range).
 The load path passes the *freshly-decoded* IR's `Code[0]` address — so the code
 is never trusting a baked IR pointer, and this also **subsumes Fix C's** latent
@@ -282,7 +284,7 @@ the natural choice and needs no per-load byte-swap.
 
 ### 2.2 Layout
 
-```
+```text
 Header (fixed size)
   magic          : 4 bytes  = 'W','A','O','T'  (0x57 0x41 0x4F 0x54)
   aotFormatVer   : u16      container format version (starts at 1; this doc)

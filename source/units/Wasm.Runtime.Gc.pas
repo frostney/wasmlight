@@ -312,10 +312,12 @@ type
 
       1. EVERY REGISTER IN [0, RegisterCount) WHOSE TYPE IS A REFERENCE
          MUST HOLD A VALID TWasmRef (possibly null) AT EVERY SAFEPOINT. A
-         register that has not been written yet must read as null, so the
-         frame is ZEROED AT ENTRY (ValueZeroSlots). This is the single
-         most important line in the contract: an unzeroed slot is
-         indistinguishable from a live reference.
+         register that has not been written yet must read as null, so every
+         reference slot is ZEROED BEFORE FRAME PUBLICATION. This is the single
+         most important line in the contract: an unzeroed reference slot is
+         indistinguishable from a live reference. Numeric slots outside the
+         declared locals are definition-dominated by validated IR and are not
+         roots, so they need no entry value.
       2. The frame record is pushed before the first safepoint in the
          function and popped after the last. A frame that is live but not
          on the chain is a lost root.
@@ -663,8 +665,8 @@ type
 
     { The frame chain (contract GC-1). PushFrame sets Prev itself, so a
       caller only fills Slots, RefRegBits and RegisterCount. }
-    procedure PushFrame(const AFrame: PWasmGcFrame);
-    procedure PopFrame;
+    procedure PushFrame(const AFrame: PWasmGcFrame); inline;
+    procedure PopFrame; inline;
     { Drop the whole chain. The trampoline's obligation after a trap: a
       siglongjmp skips every PopFrame between the fault and the landing
       pad, so the chain must be re-established rather than trusted.

@@ -204,7 +204,19 @@ jobs:
           echo "testsuite @ $(git -C tests/spec/testsuite rev-parse HEAD)"
           WS=./build/wasmspec${{ matrix.exe }}
           FLOOR=64000
-          run_tier() { "$WS" --tier="$1" tests/spec/testsuite | grep '^TOTAL'; }
+          run_tier() {
+            local output total
+            set +e
+            output=$("$WS" --failures-only --tier="$1" tests/spec/testsuite)
+            set -e
+            total=$(printf '%s\n' "$output" | grep '^TOTAL' || true)
+            if [ -z "$total" ]; then
+              printf '%s\n' "$output" >&2
+              echo "::error::$1 did not produce a TOTAL tally" >&2
+              return 1
+            fi
+            printf '%s\n' "$total"
+          }
           sig() { echo "$1" | grep -oE '(errors|pass|fail|skip)=[0-9]+' | sort | tr '\n' ' '; }
           field() { echo "$1" | grep -oE "$2=[0-9]+" | head -1 | cut -d= -f2; }
           IL=$(run_tier interp); echo "interp: $IL"

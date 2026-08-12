@@ -259,7 +259,7 @@ transfer; store the top before unwinding, exactly as `iroCall` does), and
 `exn` is a live `wokExn` ref (freshly allocated by `throw`, or the operand of
 `throw_ref`).
 
-```
+```text
 procedure UnwindException(Ctx: PWasmInterpContext; Exn: TWasmRef);
 var Top: PWasmActivation; ip, h, c: UInt32; TagAddr, ClauseTag: UInt32;
     matched: Boolean;
@@ -336,7 +336,7 @@ Notes tying this to shipped code:
 
 #### 2.3.1 `ResumeAtClause`
 
-```
+```text
 procedure ResumeAtClause(Ctx; Top: PWasmActivation;
   const Clause: TWasmIrCatchClause; Exn: TWasmRef);
 var Dest: ^UInt32; argc, i: UInt32; Reg: PWasmValue;
@@ -374,7 +374,7 @@ loop and the `PayloadAux` block agree.
 
 When the unwind pops the entry frame (`RetKind = rtEntry`) with no match, the
 exception is uncaught in this invocation. It must leave the interpreter — but
-**not** as an `EWasmTrap** and **not** by `siglongjmp`. It becomes a real Pascal
+**not** as an `EWasmTrap` and **not** by `siglongjmp`. It becomes a real Pascal
 exception raised from `Run` (ordinary Pascal ground; `Run`'s locals are all
 unmanaged pointers/scalars, so a normal `raise` unwinds cleanly and runs
 `WasmInvoke`'s `finally`).
@@ -538,7 +538,7 @@ and add the `UnwindException` / `ResumeAtClause` helpers (§2.3). Delete
 
 ### 6.1 `iroThrow`
 
-```
+```text
 iroThrow:
 begin
   Act^.IP := IP;                                      { publish the throw site }
@@ -562,7 +562,7 @@ frame, `LoadTop` is correct and cheap.)
 
 ### 6.2 `iroThrowRef`
 
-```
+```text
 iroThrowRef:
 begin
   Act^.IP := IP;
@@ -611,7 +611,7 @@ exception** (the corpus has 41 such commands; `throw.wast`, `throw_ref.wast`,
   be listed first or the generic clause would swallow it as `wakError`). Keep
   `on E: EWasmTrap` first as today — a trap must never satisfy
   `assert_exception`, and an exception must never satisfy `assert_trap`.
-- In `ExecuteCommand`, replace `wcAssertException: Skipped(…, 
+- In `ExecuteCommand`, replace `wcAssertException: Skipped(…,
   WAST_REASON_EXCEPTIONS)` with a real judge: run the action; **pass** iff
   `Act.Kind = wakException`; otherwise **fail** (a returned value, a trap, or a
   staged/error result all fail the assertion). Mirror `RunAssertTrap`'s shape.

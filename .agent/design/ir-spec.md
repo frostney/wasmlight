@@ -516,7 +516,7 @@ a non-empty `Mnemonic`.
 
 Several ops carry two `u32` index immediates. They pack into `Imm` as:
 
-```
+```text
 Imm = Int64(Low32) or (Int64(High32) shl 32)
 ```
 
@@ -774,7 +774,7 @@ Line format: `Format('%.4d  %-22s %s', [Index, Mnemonic, Operands])`,
 with trailing whitespace trimmed. Registers render `r<N>`; instruction
 indices render `@<4-digit>`; `IR_NO_REG` renders `-`. Operand forms:
 
-```
+```text
 0000  i32.const              r2 <- 7
 0001  f64.const              r3 <- 0x3FF0000000000000
 0002  i32.add                r4 <- r2, r2
@@ -800,11 +800,13 @@ indices render `@<4-digit>`; `IR_NO_REG` renders `-`. Operand forms:
 ```
 
 Rules the forms follow, so a new op needs no new decision: a destination
-is `<dest> <- `; source registers are comma-separated; index immediates
+is `<dest> <-` followed by a space; source registers are comma-separated;
+index immediates
 render as `<letter><n>` for the compact spaces (`g`=global, `t`=table,
 `f`=function) and `<name>=<n>` otherwise; aux register lists render
 parenthesised; branch targets render `-> @nnnn`; the safepoint flag
-renders as a trailing ` safepoint`. `ref.null` and `ref.cast` print the
+renders as a trailing space followed by `safepoint`. `ref.null` and `ref.cast`
+print the
 reference type from `RegTypes[Dest].Describe` (`Wasm.Core` already has
 it).
 
@@ -832,7 +834,7 @@ Temporaries, by contrast, are single-assignment — see §3.2.
 
 Per function, in this order:
 
-```
+```text
 [0 .. P-1]                 parameters, in declaration order
 [P .. P+L-1]               declared locals, run-length expanded, in order
 [P+L .. P+L+R-1]           the return register block (R = result arity)
@@ -987,7 +989,7 @@ push the same registers back, per the spec algorithm.
 
 Emit it as a **correct parallel move**, not a naive left-to-right loop:
 
-```
+```text
 procedure EmitParallelMove(Dests, Sources: array of UInt32)
   1. Drop every pair where Dests[i] = Sources[i].          { self-moves }
   2. While a pair (d, s) exists whose d is not the Source of any
@@ -1048,7 +1050,7 @@ Registers: `r0` = return block (i32); temporaries from `r1`.
 | `0B` end (block) | reachable → merge move `r1 <- r2`; push `r1` |
 | `0B` end (func) | merge move `r0 <- r1`; emit `iroReturn` |
 
-```
+```text
 0000  i32.const              r2 <- 7
 0001  move                   r1 <- r2
 0002  move                   r0 <- r1
@@ -1090,7 +1092,7 @@ Registers: `r0` param, `r1` local, `r2` return block, temporaries from
 empty and no merge moves appear — which is exactly why this example
 isolates the safepoint.
 
-```
+```text
 0000  move                   r3 <- r0
 0001  i32.eqz                r4 <- r3
 0002  branch_if              r4 -> @0008
@@ -1121,7 +1123,7 @@ Bytes: `20 00 04 7F 41 01 05 41 02 0B 0B`
 
 Registers: `r0` param, `r1` return block, temporaries from `r2`.
 
-```
+```text
 0000  move                   r2 <- r0
 0001  branch_if_not          r2 -> @0005
 0002  i32.const              r4 <- 1
@@ -1173,7 +1175,7 @@ Body bytes (with `$tt` at type index 1, so the block type is the s33
 Registers: `r0` (i32) and `r1` (i64) are the return block; temporaries
 from `r2`.
 
-```
+```text
 0000  i32.const              r4 <- 1
 0001  i64.const              r5 <- 2
 0002  move                   r2 <- r4
@@ -1233,7 +1235,7 @@ immediately after the instruction is safe because `br_table` is
 unconditional: the frame is unreachable afterwards, so nothing else is
 emitted there anyway.
 
-```
+```text
 0000  i32.const              r4 <- 7
 0001  move                   r5 <- r0
 0002  br_table               r5 -> [@0003, @0005, @0007]
@@ -1264,14 +1266,14 @@ the default's are popped. Mismatched arity is `invalid result arity`
 A conditional branch is emitted **directly** when it needs no merge moves
 *and* its target is not a `loop` label:
 
-```
+```text
 branch_if  cond -> target
 ```
 
 Otherwise it is emitted in the inverted form, with the taken edge laid
 out inline:
 
-```
+```text
 0000  branch_if_not          cond -> @0004     ; skip the taken edge
 0001  move                   m0 <- s0
 0002  move                   m1 <- s1
@@ -1321,9 +1323,10 @@ then mark the frame unreachable.
 ```wat
 (func (result i32 i32) i32.const 1 i32.const 2 return)
 ```
+
 `41 01 41 02 0F 0B`
 
-```
+```text
 0000  i32.const              r2 <- 1
 0001  i32.const              r3 <- 2
 0002  move                   r0 <- r2
@@ -1404,7 +1407,7 @@ Body bytes: `02 7F 1F 7F 01 00 00 00 41 01 0B 0B 0B`
 Registers: `r0` return block; `$h` merge `r1`; try_table merge `r2`;
 temporaries from `r3`.
 
-```
+```text
 0000  i32.const              r3 <- 1
 0001  move                   r2 <- r3
 0002  move                   r1 <- r2
@@ -1438,9 +1441,10 @@ results directly.
 ```wat
 (func (param i32) (result i32) local.get 0 (return_call 1))
 ```
+
 `20 00 12 01 0B`
 
-```
+```text
 0000  move                   r2 <- r0
 0001  return_call            f1 (r2)
 0002  return
@@ -1482,7 +1486,7 @@ Boolean`.
 Implement `appendix/algorithm-stacks` verbatim, extended with register
 assignment. The two that carry the extension:
 
-```
+```text
 PopVal() : TWasmValEntry
   if (Length(Vals) = Ctrls[top].ValHeight) and Ctrls[top].Unreachable then
     Result := (IsBot: True; Reg: IR_NO_REG)
@@ -1808,7 +1812,7 @@ also syntactically equal, hence allowing a simple equality check on
 
 Algorithm, one pass over the type section:
 
-```
+```text
 CanonNextId := 0
 for each rec group g, with first type index f and member count n:
     key := SerialiseGroup(g, f, n)

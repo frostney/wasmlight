@@ -34,8 +34,8 @@
   a 64-bit-UNIX acceleration (two backends, aarch64 and x86-64); on Windows
   and 32-bit targets the runtime is interpreter-only and still fully
   conformant. [roadmap.md](roadmap.md) is the honest picture of what
-  remains — deferred JIT optimizations and cross-platform CI validation,
-  not any missing behaviour.
+  remains — broader optimizing-compiler work and cross-platform CI
+  validation, not any missing behaviour.
 
 ## Layering
 
@@ -405,11 +405,24 @@ different.
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the
 interpreter, the tier of record, runs alone; that leg is unaccelerated but
-fully conformant. Three JIT optimizations are deliberately **deferred and
-measured**, never required for correctness: guard-page inline memory access
-(the baseline uses explicit bounds checks through the chokepoint),
-native-SIMD codegen (it calls the `Wasm.Interp.Vector` leaves), and
-machine-register allocation (it keeps the register file in memory).
+fully conformant. The compiling tiers include measured native fast paths
+without changing that seam: conservative machine-register allocation for
+helper-free numeric loops, scalar memory access inlined according to the
+memory chokepoint's selected strategy, native scalar-numeric and integer-SIMD
+subsets, compare/branch fusion, and redundant-move folding. Helper-free numeric
+loops keep two allocated values and four expression temporaries in machine
+registers across epoch-only back-edges; the epoch check still runs, and exits
+restore the canonical frame. On aarch64, a function that addresses one static
+memory pins that memory instance once at entry while every access still loads
+its live base and required size. A narrower helper-free shape with only
+zero-offset i32 guard-page accesses and no call or `memory.grow` pins the stable
+base itself and retains cached operands across accesses. Compiled frame entry
+clears the validation-computed set of semantic local and reference slots, not
+definition-dominated numeric temporaries. Direct compiled calls reuse resolved
+function metadata and specialize their normal result gather and frame pop; no
+Pascal helper frame spans the native callee. Delicate or unsupported operations
+continue through the exact shared helpers. The code-generation plan is a side
+table over the validated IR, so no optimization rewrites or re-validates it.
 
 `wasmspec` is the third shipped program: it runs the `.wast` corpus through
 `Wasm.Wast.Runner`, which assembles text modules, decodes, validates,

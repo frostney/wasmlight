@@ -527,7 +527,7 @@ against the value captured at frame entry (`EpochCache`), and on inequality
 call the trap stub `TrapNow(wtkEpochInterrupt)` (→ `MSG_TRAP_EPOCH_INTERRUPT
 = 'interrupt'`). Concretely at a back-edge, before taking the branch:
 
-```
+```text
 ; aarch64 sketch (UNCONFIRMED encodings)
 ldr   x9, [x21, #EPOCH_OFF]     ; x21 = Store; load Store.Epoch
 cmp   x9, xEPOCHCACHE           ; compare against frame-entry snapshot
@@ -619,8 +619,8 @@ on:
   attribution; the trampoline (`CurrentTrampoline`) is thread-local and
   already installed around every guest entry, so a fault in compiled code
   `LongJmp`s to it exactly as ADR-0009 set up;
-- the alternate signal stack (`EnsureAltSignalStack`) and cache/altstack
-  interactions hold for the compiled-code fault case.
+- the signal-handler and cache interactions hold for the compiled-code fault
+  case.
 
 The guard-page reservation and the fault handler **stay mapped and installed
 as latent capability** (the memory unit keeps them); Track I's baseline simply
@@ -714,7 +714,7 @@ and finds every live reference, **because §1's design keeps the register file
 in memory as the interpreter's frame**. The compiled prologue publishes the
 same record the interpreter publishes:
 
-```
+```text
 GcFrame.Slots        := @Values[Base];        { the register file, in memory }
 GcFrame.RefRegBits   := @Fn^.RefRegBits[0];   { the IR's precomputed projection }
 GcFrame.RegisterCount:= Fn^.RegisterCount;

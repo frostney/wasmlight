@@ -241,6 +241,7 @@ type
     procedure TestCallCountIncrementsPerInterpretedCall;
     procedure TestJitHookDispatchedAtEntry;
     procedure TestJitHookDispatchedForInternalCall;
+    procedure TestJitEntryClearsSemanticSlots;
     procedure TestJitFrameOffsetsMatchLayout;
     procedure TestAotAbiFingerprintDeterministic;
   end;
@@ -2375,6 +2376,77 @@ begin
   Expect<Boolean>(Off.ActBase < Off.ActStride).ToBe(True);
 end;
 
+procedure TInterpTests.TestJitEntryClearsSemanticSlots;
+const
+  STALE_BITS = UInt64($A5A5A5A5DEADBEEF);
+var
+  Base: PWasmValue;
+  Ctx: PWasmInterpContext;
+  Fn: PWasmIrFunction;
+  I, Reg, TempReg: UInt32;
+begin
+  { The shared compiled-entry frame starts over reused reservation storage.
+    Give it a numeric local, an aligned v128 local, a reference local, a
+    reference temporary, and a numeric temporary. Every reference slot must be
+    null before the frame's entry safepoint; declared numeric/vector locals must
+    have wasm's default zero; definition-dominated numeric temporaries may keep
+    stale bits and are deliberately not on the GC map. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $00]),
+      BLit([$60, $00, $00])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(7, VecOf([BLit([$03, $72, $75, $6E, $00, $00])])),
+    Sect(10, VecOf([CodeEntry([
+      $03, $01, $7F, $01, $7B, $01, $63, $00,
+      $D0, $00, $1A,
+      $41, $01, $1A,
+      $0B])]))
+  ]));
+  DoInstantiate;
+  Fn := @FIr.Functions[0];
+  Ctx := InterpContextFor(FStore);
+  I := 0;
+  while I < Fn^.RegisterCount do
+  begin
+    Ctx^.Values[I].Bits := STALE_BITS;
+    Inc(I);
+  end;
+
+  Base := JitEnterFrame(Ctx, FStore, FuncAddr('run'), nil, nil, rtEntry);
+  Reg := Fn^.LocalRegs[0];
+  Expect<UInt64>(Base[Reg].Bits).ToBe(0);
+  Reg := Fn^.LocalRegs[1];
+  Expect<UInt64>(Base[Reg].Bits).ToBe(0);
+  Expect<UInt64>(Base[Reg + 1].Bits).ToBe(0);
+
+  I := 0;
+  while I < Fn^.RegisterCount do
+  begin
+    if IrRegIsRef(Fn^, I) then
+      Expect<UInt64>(Base[I].Bits).ToBe(0);
+    Inc(I);
+  end;
+
+  TempReg := IR_NO_REG;
+  I := 0;
+  while I < UInt32(Length(Fn^.Code)) do
+  begin
+    if Fn^.Code[I].Op = iroI32Const then
+      TempReg := Fn^.Code[I].Dest;
+    Inc(I);
+  end;
+  Expect<Boolean>(TempReg <> IR_NO_REG).ToBe(True);
+  if TempReg <> IR_NO_REG then
+    Expect<UInt64>(Base[TempReg].Bits).ToBe(STALE_BITS);
+
+  { Collection here models the first entry safepoint. Stale numeric bits are
+    ignored; stale reference bits would be observable to the precise walker. }
+  FStore.Heap.Collect;
+  JitLeaveFrame(Ctx);
+end;
+
 procedure TInterpTests.TestAotAbiFingerprintDeterministic;
 var
   A, B: UInt64;
@@ -2501,6 +2573,8 @@ begin
     TestJitHookDispatchedAtEntry);
   Test('a compiled internal callee dispatches through the JIT hook',
     TestJitHookDispatchedForInternalCall);
+  Test('compiled entry clears default locals and all GC-visible ref slots',
+    TestJitEntryClearsSemanticSlots);
   Test('the JIT register-file and frame offsets match the layout',
     TestJitFrameOffsetsMatchLayout);
   Test('the AOT ABI fingerprint is deterministic and non-zero',

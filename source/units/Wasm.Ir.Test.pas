@@ -396,11 +396,12 @@ begin
   Expect<Int64>(Bits).ToBe($3F800000);
   Expect<Boolean>(IrBitsAsF32(Bits) = 1.0).ToBe(True);
 
-  { A signalling-NaN payload survives, which is the whole reason floats
-    are stored as bits: assert_return distinguishes canonical from
-    arithmetic NaNs. }
-  Bits := IrF64Bits(IrBitsAsF64(Int64($7FF0000000000001)));
-  Expect<Int64>(Bits).ToBe(Int64($7FF0000000000001));
+  { A quiet-NaN payload survives, which is the whole reason floats are stored
+    as bits: assert_return distinguishes canonical from arithmetic NaNs. A
+    signalling NaN cannot be loaded through an x87 register on 32-bit Windows
+    without raising an invalid-operation exception before this helper runs. }
+  Bits := IrF64Bits(IrBitsAsF64(Int64($7FF8000000000001)));
+  Expect<Int64>(Bits).ToBe(Int64($7FF8000000000001));
 end;
 
 procedure TIrTests.TestAuxBlocksRoundTrip;

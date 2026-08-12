@@ -47,6 +47,7 @@ type
     procedure TestAluAddSubImul;
     procedure TestCmpTestShift;
     procedure TestSetccMovzxCmov;
+    procedure TestNativeNumericEncodings;
     procedure TestPushPopRsp;
     procedure TestCallRet;
     procedure TestLea;
@@ -62,6 +63,7 @@ type
     procedure TestPredicateCoversWaves;
     procedure TestPredicateDeclinesEh;
     procedure TestCallArityFence;
+    procedure TestStaticCacheKeepsShiftResult;
 
     procedure TestExecPlaceholder;
   end;
@@ -75,6 +77,47 @@ begin
   for I := 0 to High(AExpected) do
     if I < ABuf.Size then
       Expect<Byte>(ABuf.ByteAt(I)).ToBe(AExpected[I]);
+end;
+
+procedure TX64Tests.TestNativeNumericEncodings;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitSignDividend(Buf, True);
+    X64EmitDivReg(Buf, True, True, X64_RCX);
+    X64EmitMovToXmm(Buf, 0, X64_RAX, False);
+    X64EmitScalarFloatBinary(Buf, $58, False, 0, 1);
+    X64EmitScalarFloatCompare(Buf, 1, True, 0, 1);
+    X64EmitIntToFloat(Buf, True, True, 0, X64_RAX);
+    X64EmitFloatWidthConvert(Buf, True, 0, 0);
+    X64EmitSignExtendRax(Buf, 8, True);
+    X64EmitLoadVec(Buf, 0, 2);
+    X64EmitVecBinary(Buf, $DB, 0, 1);
+    X64EmitVecDup(Buf, 0, X64_RAX, 1);
+    X64EmitVecExtract(Buf, X64_RAX, 0, 0, 15, True);
+    X64EmitVecExtract(Buf, X64_RAX, 0, 1, 7, False);
+    X64EmitStoreVec(Buf, 0, 4);
+    CheckSeq(Buf, [$48, $99, $48, $F7, $F9,
+      $66, $0F, $6E, $C0,
+      $F3, $0F, $58, $C1,
+      $F2, $0F, $C2, $C1, $01,
+      $F2, $48, $0F, $2A, $C0,
+      $F2, $0F, $5A, $C0,
+      $48, $0F, $BE, $C0,
+      $F3, $0F, $6F, $43, $10,
+      $66, $0F, $DB, $C1,
+      $66, $0F, $6E, $C0, $66, $0F, $61, $C0,
+      $66, $0F, $70, $C0, $00,
+      $66, $0F, $73, $D8, $0F, $66, $0F, $7E, $C0,
+      $0F, $BE, $C0,
+      $66, $0F, $73, $D8, $0E, $66, $0F, $7E, $C0,
+      $0F, $B7, $C0,
+      $F3, $0F, $7F, $43, $20]);
+  finally
+    Buf.Free;
+  end;
 end;
 
 { --- register-register / immediate moves (SDM: MOV 89 /r, B8+rd) --------- }
@@ -469,6 +512,18 @@ begin
     Buf.Free;
   end;
 
+  { PinMemory: resolve memory 7 through the helper table, then retain the
+    stable instance pointer in the existing [rsp] alignment slot. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPinMemory(Buf, 7);
+    CheckSeq(Buf, [$4C, $89, $E7, $BE, $07, $00, $00, $00,
+      $41, $FF, $57, Byte(Ord(aohResolveMemory) * 8),
+      $48, $89, $04, $24]);
+  finally
+    Buf.Free;
+  end;
+
   { CallHelper: call qword [r15 + k*8] — the code holds only the slot index k.
     k = Ord(aohRtDispatch) = 3, disp = 24: 41 FF 57 18. }
   Buf := TWasmCodeBuffer.Create;
@@ -485,6 +540,36 @@ begin
   try
     X64EmitIrInsPtr(Buf, X64_ARG2, 1);
     CheckSeq(Buf, [$48, $8D, $55, Byte(SizeOf(TWasmIrInstr))]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestStaticCacheKeepsShiftResult;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  I: Integer;
+  Found: Boolean;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux,
+      0, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
+      1, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Shl, 4, 2, 3, 0), Aux,
+      2, False, False, Cache)).ToBe(True);
+    Found := False;
+    for I := 0 to High(Cache.Entries) do
+      Found := Found or (Cache.Entries[I].Valid and
+        (Cache.Entries[I].Slot = 4));
+    Expect<Boolean>(Found).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -558,6 +643,8 @@ begin
   Test('add/sub/imul emit the asserted bytes', TestAluAddSubImul);
   Test('cmp/test/shift-by-cl emit the asserted bytes', TestCmpTestShift);
   Test('setcc/movzx/cmov emit the asserted bytes', TestSetccMovzxCmov);
+  Test('native numeric instructions emit the asserted bytes',
+    TestNativeNumericEncodings);
   Test('push/pop/rsp-adjust emit the asserted bytes', TestPushPopRsp);
   Test('call reg / ret emit the asserted bytes', TestCallRet);
   Test('lea with SIB base emits the asserted bytes', TestLea);
@@ -579,6 +666,8 @@ begin
     TestPredicateCoversWaves);
   Test('predicate declines exception-handling ops', TestPredicateDeclinesEh);
   Test('the call-site arity fence admits a zero-slot call', TestCallArityFence);
+  Test('static allocation keeps a shifted expression result',
+    TestStaticCacheKeepsShiftResult);
   Test('executable proof is gated to a real x86-64 host', TestExecPlaceholder);
 end;
 

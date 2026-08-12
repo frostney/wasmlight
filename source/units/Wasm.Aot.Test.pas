@@ -56,6 +56,7 @@ uses
   Wasm.Interp,
   Wasm.Ir,
   Wasm.Jit,
+  Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values;
@@ -447,9 +448,10 @@ begin
 end;
 {$ELSE}
 begin
-  { No backend on this target: the milestone cannot map+execute. Assert the host
-    reports no AOT arch, so the test still records an assertion. }
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  { No backend on this target: the milestone cannot map+execute. CPU identity
+    and executable-code capability are separate (Windows x86-64 has the former
+    but not the latter), so assert the capability directly. }
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -499,7 +501,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -610,7 +612,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -718,7 +720,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -797,7 +799,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -833,7 +835,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -865,7 +867,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 
@@ -919,7 +921,7 @@ begin
 end;
 {$ELSE}
 begin
-  Expect<Integer>(Integer(AotHostArch)).ToBe(Integer(WAOT_ARCH_UNKNOWN));
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
 end;
 {$ENDIF}
 

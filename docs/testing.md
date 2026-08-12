@@ -185,12 +185,12 @@ The current run over the whole checkout
 (`WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`):
 
 ```text
-ROOT      pass=64651 fail=52  skip=611  staged=0 total=65314
+ROOT      pass=64671 fail=33  skip=610  staged=0 total=65314
 PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
-TOTAL files=288 errors=0 pass=65184 fail=408 skip=1533 staged=0 total=67125
+TOTAL files=288 errors=0 pass=65204 fail=389 skip=1532 staged=0 total=67125
 ```
 
-Judged commands — `pass + fail` — are **~65,592** of the corpus's
+Judged commands — `pass + fail` — are **~65,593** of the corpus's
 ~67,000. The `staged` column is now **0**: Track H shipped the exception
 throwing that used to sit there, so `try_table`, `throw`, and `throw_ref`
 execute and `assert_exception` is judged.
@@ -200,13 +200,11 @@ This is honest conformance, and it now reaches execution across the
 assembler builds what upstream builds, the validator rejects what upstream
 rejects with the right class and a prefix-matching message, and the
 interpreter produces the results — lane by lane for `v128` — the traps, and
-the exceptions the corpus asserts. The 408 failures are **not** 3.0-core
+the exceptions the corpus asserts. The 389 failures are **not** 3.0-core
 gaps — 356 of them are `PROPOSALS` (post-3.0 features outside the pinned
-target), and the 52 `ROOT` failures are the legacy `try`/`catch`/`delegate`/
-`rethrow` encoding (out of 3.0 scope), the pre-existing `binary-leb128`
-wording divergences, the M7 `extern`/`any` convert imprecision, two
-validator-message-wording edges on the 3.0 `throw`, and a few
-assembler/decoder edges (see
+target), and the 33 `ROOT` failures are the legacy `try`/`catch`/`delegate`/
+`rethrow` encoding (out of 3.0 scope), module-definition/instance harness
+forms, and a few deferred decode/framing edges (see
 [`tests/spec/README.md`](../tests/spec/README.md)). None is a SIMD or
 exception-handling execution failure.
 
@@ -258,9 +256,9 @@ All three execution tiers exist, so the harness runs per tier —
 `wasmspec --tier=interp|jit|aot` — and the suite doubles as the
 differential test between them: every tier must produce identical outcomes
 ([ADR-0001](adr/0001-tiered-execution-seam.md)). It does. Over the pinned
-`testsuite@de54fd27`, all three tiers report `pass=65184 fail=408
+`testsuite@de54fd27`, all three tiers report `pass=65204 fail=389
 staged=0` byte-for-byte, with the two compiling tiers reporting
-`compiled=8562` functions on aarch64 (`compiled=8563` on x86-64 — one more
+`compiled=8588` functions on aarch64 (`compiled=8589` on x86-64 — one more
 function clears the scope fence there). The JIT and AOT tiers run only on a
 64-bit UNIX host (`WASM_JIT_EXEC`); on Windows and 32-bit targets the
 interpreter runs alone.
@@ -300,3 +298,7 @@ on the hermetic suites, not on an external corpus.
 - Benchmarks are not tests. `wasmbench` numbers never become CI
   assertions — see the "Honest measurement" principle in
   [VISION.md](../VISION.md).
+- `wasmbench --workload loop|fib|memory|numeric|simd|startup --tier interp|jit|aot`
+  isolates one execution workload and tier for profiling. `--samples N`
+  reports the median; selecting a compiled tier does not run the interpreter
+  first.

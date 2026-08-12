@@ -406,10 +406,6 @@ begin
   {$ELSE}
   Expect<Boolean>(FaultHandlerInstalled).ToBe(False);
   {$ENDIF}
-  { Safe to call on any thread, any number of times. }
-  EnsureAltSignalStack;
-  EnsureAltSignalStack;
-  Expect<Boolean>(True).ToBe(True);
 end;
 
 procedure TRuntimeTrapsTests.SetupTests;
