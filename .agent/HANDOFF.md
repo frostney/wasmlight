@@ -3,6 +3,47 @@
 Updated: 2026-08-12 (measured optimizing-codegen wave complete, integrated,
 and cross-architecture/cross-tier validated)
 
+## 2026-08-12 second measured optimization wave complete
+
+- **Three more measured commits are integrated on
+  `codex/fix-tests-tier-performance`:** `749e123` pins the one static memory
+  used by an aarch64 function while loading its live base and size at every
+  access; `0484de4` keeps allocated numeric values in machine registers across
+  epoch-only back-edges while preserving the epoch check and flushing exits;
+  `65d061e` clears only validation-computed semantic local/reference slots at
+  compiled-frame entry. The attempted runtime scan for sparse clearing
+  regressed fib and was removed before the precomputed design was accepted.
+- **Profiles selected the work:** a 1B-iteration memory sample attributed
+  562/2,483 samples to per-access `JitMemoryAt` resolution and 302/2,483 to
+  `InterpContextFor`; fib(40) attributed 562/2,385 samples to `ValueZeroSlots`;
+  generated numeric loops showed canonical register-file writeback at every
+  epoch-only back-edge.
+- **Fresh integrated Apple Silicon release medians, seven samples:** versus the
+  exact pre-wave build, the 300M loop moved from JIT/AOT 417/417ms to 336/335ms
+  (19.4%/19.7% faster), fib(35) from 488/498ms to 422/407ms
+  (13.5%/18.3%), and 30M scalar-memory iterations from 270/270ms to 84/85ms
+  (68.9%/68.5%). Numeric, SIMD, and startup stayed flat at 43ms, 134ms, and
+  7/9ms JIT/AOT startup batches.
+- **Linux/x86-64 guard measurement:** in the Rosetta-backed OrbStack VM, JIT
+  medians moved from loop 2,214ms to 2,026ms and fib(35) 5,493ms to 4,413ms;
+  memory 2,697ms to 2,691ms, numeric 361ms to 365ms, SIMD 1,174ms to 1,156ms,
+  and startup 29ms to 29ms are flat within VM noise. The aarch64 memory pin is
+  intentionally absent on x86-64.
+- **Current Wasmtime 47.0.3 comparison:** end-to-end precompiled commands over
+  identical fixed modules, compilation excluded and one warmup discarded. On
+  macOS, Wasmlight/Wasmtime medians are 335.686/82.917ms for the 300M loop
+  (4.05x), 185.856/18.532ms for 50M scalar loads (10.03x), and
+  405.980/34.810ms for fib(35) (11.66x). In the Rosetta x86-64 Linux VM they
+  are 2.039/0.644s (3.17x), 2.603/0.180s (14.48x), and 4.421/0.425s
+  (10.41x), respectively; those Linux absolute times describe the VM, not
+  native x86-64 hardware.
+- **Combined correctness is green:** frozen install, formatting, release build,
+  and all 44 unit suites pass on macOS/aarch64 and Linux/x86-64. The complete
+  pinned corpus is tier-identical on both: pass=65204, fail=389, skip=1532,
+  staged=0, errors=0; JIT/AOT compiled=8588 on aarch64 and 8589 on x86-64.
+  The memory-entry ABI change advances `.waot` ABI revision 3 to 4 so old
+  artifacts fail closed; the validated IR format remains version 2.
+
 ## 2026-08-12 optimizing-codegen wave complete
 
 - **Nine accepted commits are integrated on

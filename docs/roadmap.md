@@ -77,7 +77,10 @@
   inlining, loop-invariant code motion, and global value numbering. The
   current compiling tiers already inline scalar memory, lower exact scalar
   numeric and integer-SIMD subsets, allocate hot loop values, and fuse safe
-  compare/branch and move sequences. Second, the 389
+  compare/branch and move sequences. They also retain helper-free numeric loop
+  values across epoch-only back-edges, sparsely initialize compiled frames from
+  validation metadata, and pin single-memory instances in the aarch64 backend.
+  Second, the 389
   characterized corpus failures, none a 3.0-core gap (see Track C). Third,
   cross-platform CI validation on the legs never yet run on real hardware:
   the three-tier identity is proven locally on **aarch64-darwin** (native)
@@ -526,9 +529,11 @@ interpreter-only, which is fully conformant (the interpreter is the tier
 of record). Post-track optimization work now ships conservative hot-loop
 machine-register allocation, scalar memory access inlined according to the
 runtime-selected strategy, native scalar-numeric and integer-SIMD subsets,
-compare/branch fusion, and redundant-move folding. These remain performance
-choices, never correctness requirements; unsupported and delicate operations
-continue through the shared exact helpers.
+compare/branch fusion, redundant-move folding, sparse compiled-frame
+initialization, epoch-only back-edge register retention for helper-free numeric
+loops, and aarch64 single-memory instance pinning with live base/size loads.
+These remain performance choices, never correctness requirements; unsupported
+and delicate operations continue through the shared exact helpers.
 
 ### Track J — Ahead-of-time compiler and artifact cache (needs I) — **delivered**
 

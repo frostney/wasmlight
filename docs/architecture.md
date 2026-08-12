@@ -409,10 +409,16 @@ fully conformant. The compiling tiers include measured native fast paths
 without changing that seam: conservative machine-register allocation for
 helper-free numeric loops, scalar memory access inlined according to the
 memory chokepoint's selected strategy, native scalar-numeric and integer-SIMD
-subsets, compare/branch fusion, and redundant-move folding. Register-backed
-values are flushed at safepoints and exits; delicate or unsupported operations
-continue through the exact shared helpers. The code-generation plan is a side
-table over the validated IR, so no optimization rewrites or re-validates it.
+subsets, compare/branch fusion, and redundant-move folding. Helper-free numeric
+loops keep allocated values in machine registers across epoch-only back-edges;
+the epoch check still runs, and exits restore the canonical frame. On aarch64,
+a function that addresses one static memory pins that memory instance once at
+entry while every access still loads its live base and size. Compiled frame
+entry clears the validation-computed set of semantic local and reference slots,
+not definition-dominated numeric temporaries. Delicate or unsupported
+operations continue through the exact shared helpers. The code-generation plan
+is a side table over the validated IR, so no optimization rewrites or
+re-validates it.
 
 `wasmspec` is the third shipped program: it runs the `.wast` corpus through
 `Wasm.Wast.Runner`, which assembles text modules, decodes, validates,
