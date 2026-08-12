@@ -107,8 +107,9 @@ type
   end;
 
   TX64RegCache = record
-    Entries: array[0..1] of TX64RegCacheEntry;
+    Entries: array[0..3] of TX64RegCacheEntry;
     Next: Byte;
+    StaticAllocation: Boolean;
   end;
 
 const
@@ -299,6 +300,10 @@ function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32): Boolean;
 procedure X64InitRegCache(out ACache: TX64RegCache);
+procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlots: array of UInt32);
+procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
@@ -461,6 +466,19 @@ begin
           X64EmitJccTo(ABuf, X64_CC_E, AIns.B);
         X64InvalidateRegCache(ACache);
       end;
+    iroJump:
+      begin
+        { Safepoint back-edges expose the logical frame to the runtime. Flush
+          dirty allocated values but retain their fixed register mapping. }
+        if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
+          X64FlushRegCache(ABuf, ACache);
+        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroReturn, iroUnreachable:
+      begin
+        X64FlushRegCache(ABuf, ACache);
+        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
     iroI32Eqz, iroI64Eqz:
       begin
         X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
@@ -509,10 +527,13 @@ end;
 
 function X64CacheHostReg(const AIndex: Integer): Byte;
 begin
-  if AIndex = 0 then
-    Result := X64_R8
+  case AIndex of
+    0: Result := X64_R8;
+    1: Result := X64_R9;
+    2: Result := X64_R10;
   else
-    Result := X64_R9;
+    Result := X64_R11;
+  end;
 end;
 
 procedure X64InitRegCache(out ACache: TX64RegCache);
@@ -520,8 +541,43 @@ begin
   FillChar(ACache, SizeOf(ACache), 0);
 end;
 
+procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlots: array of UInt32);
+var
+  I: Integer;
+begin
+  X64InitRegCache(ACache);
+  ACache.StaticAllocation := True;
+  for I := 0 to 1 do
+    if I <= High(ASlots) then
+    begin
+      ACache.Entries[I].Valid := True;
+      ACache.Entries[I].Slot := ASlots[I];
+      X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ASlots[I]);
+    end;
+end;
+
+procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid then
+      X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+end;
+
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
 begin
+  if ACache.StaticAllocation then
+  begin
+    ACache.Entries[2].Valid := False;
+    ACache.Entries[3].Valid := False;
+    ACache.Next := 0;
+    Exit;
+  end;
   ACache.Entries[0].Valid := False;
   ACache.Entries[1].Valid := False;
   ACache.Next := 0;
@@ -533,7 +589,7 @@ var
   I, Victim: Integer;
   Host: Byte;
 begin
-  for I := 0 to 1 do
+  for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
     begin
       Host := X64CacheHostReg(I);
@@ -541,8 +597,16 @@ begin
         X64EmitMovRegReg(ABuf, ADest, Host);
       Exit;
     end;
-  Victim := ACache.Next;
-  ACache.Next := Byte(1 - Victim);
+  if ACache.StaticAllocation then
+  begin
+    Victim := 2 + ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end
+  else
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end;
   Host := X64CacheHostReg(Victim);
   X64EmitLoadSlot64(ABuf, Host, ASlot);
   ACache.Entries[Victim].Valid := True;
@@ -557,11 +621,33 @@ var
   I, Victim: Integer;
   Host: Byte;
 begin
-  X64EmitStoreSlot64(ABuf, ASrc, ASlot);
   Victim := -1;
-  for I := 0 to 1 do
+  for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
       Victim := I;
+  if ACache.StaticAllocation then
+  begin
+    if (Victim >= 0) and (Victim <= 1) then
+    begin
+      Host := X64CacheHostReg(Victim);
+      if ASrc <> Host then
+        X64EmitMovRegReg(ABuf, Host, ASrc);
+      Exit;
+    end;
+    X64EmitStoreSlot64(ABuf, ASrc, ASlot);
+    if Victim < 2 then
+    begin
+      Victim := 2 + ACache.Next;
+      ACache.Next := Byte(1 - ACache.Next);
+    end;
+    Host := X64CacheHostReg(Victim);
+    if ASrc <> Host then
+      X64EmitMovRegReg(ABuf, Host, ASrc);
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Slot := ASlot;
+    Exit;
+  end;
+  X64EmitStoreSlot64(ABuf, ASrc, ASlot);
   if Victim < 0 then
   begin
     Victim := ACache.Next;

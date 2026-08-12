@@ -350,6 +350,9 @@ var
   Emitted: Boolean;
   Targets: array of Boolean;
   TargetCount: UInt32;
+  AllocatedSlots: array[0..1] of UInt32;
+  SlotScores: array of UInt32;
+  UseStaticCache: Boolean;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -361,6 +364,107 @@ var
   begin
     if ATarget < UInt32(Length(Targets)) then
       Targets[ATarget] := True;
+  end;
+
+  function StaticCacheOp(const AOp: TWasmIrOp): Boolean;
+  begin
+    case AOp of
+      iroMove, iroJump, iroBranchIf, iroBranchIfNot, iroUnreachable,
+      iroReturn, iroI32Const, iroI64Const, iroF32Const, iroF64Const,
+      iroI32Eqz, iroI64Eqz,
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
+        Result := True;
+    else
+      Result := False;
+    end;
+  end;
+
+  procedure ScoreSlot(const ASlot: UInt32; const AWeight: UInt32 = 1);
+  begin
+    if ASlot < UInt32(Length(SlotScores)) then
+      Inc(SlotScores[ASlot], AWeight);
+  end;
+
+  procedure ScoreInstruction(const AIns: TWasmIrInstr);
+  begin
+    case AIns.Op of
+      iroMove:
+        begin
+          { Local traffic is represented by moves between stable local slots
+            and short-lived expression registers. Give both ends enough weight
+            for frequently reused locals to beat one-use temporaries. }
+          ScoreSlot(AIns.A, 2);
+          ScoreSlot(AIns.Dest, 2);
+        end;
+      iroI32Const, iroI64Const, iroF32Const, iroF64Const:
+        ScoreSlot(AIns.Dest);
+      iroBranchIf, iroBranchIfNot:
+        ScoreSlot(AIns.A);
+      iroI32Eqz, iroI64Eqz:
+        begin
+          ScoreSlot(AIns.A);
+          ScoreSlot(AIns.Dest);
+        end;
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
+        begin
+          ScoreSlot(AIns.A);
+          ScoreSlot(AIns.B);
+          ScoreSlot(AIns.Dest);
+        end;
+    end;
+  end;
+
+  procedure AnalyzeStaticCache;
+  var
+    K, Best, Second: Integer;
+    HasBackEdge, Eligible: Boolean;
+  begin
+    UseStaticCache := False;
+    if AFn^.RegisterCount = 0 then
+      Exit;
+    SetLength(SlotScores, AFn^.RegisterCount);
+    HasBackEdge := False;
+    Eligible := True;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
+      if (AFn^.Code[K].Op = iroJump) and
+        (AFn^.Code[K].A <= UInt32(K)) then
+        HasBackEdge := True;
+      ScoreInstruction(AFn^.Code[K]);
+    end;
+    if not Eligible or not HasBackEdge then
+      Exit;
+
+    Best := -1;
+    Second := -1;
+    for K := 0 to High(SlotScores) do
+      if (Best < 0) or (SlotScores[K] > SlotScores[Best]) then
+      begin
+        Second := Best;
+        Best := K;
+      end
+      else if (Second < 0) or (SlotScores[K] > SlotScores[Second]) then
+        Second := K;
+    { Loading and preserving a one-use expression register costs more than the
+      old write-through cache. Require both physical registers to serve slots
+      that occur repeatedly in the loop-shaped function. }
+    if (Best < 0) or (Second < 0) or
+      (SlotScores[Best] < 3) or (SlotScores[Second] < 3) then
+      Exit;
+    AllocatedSlots[0] := UInt32(Best);
+    AllocatedSlots[1] := UInt32(Second);
+    UseStaticCache := True;
   end;
 begin
   Result := TWasmCodeBuffer.Create;
@@ -391,17 +495,23 @@ begin
           end;
       end;
 
+    AnalyzeStaticCache;
+
     {$IFDEF WASM_JIT_ARM64}
     Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     Arm64InitRegCache(ArmCache);
+    if UseStaticCache then
+      Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     X64EmitPrologue(Buf);
     X64EmitPinHelperTable(Buf, AHelperTableOffset);
     X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     X64InitRegCache(X64Cache);
+    if UseStaticCache then
+      X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
     {$ENDIF}
 
     for I := 0 to High(AFn^.Code) do

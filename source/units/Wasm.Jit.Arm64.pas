@@ -113,12 +113,16 @@ type
     Slot: UInt32;
   end;
 
-  { Compile-time state for two clean, write-through value caches. The physical
-    registers are caller-saved x12/x13, so helper calls simply invalidate this
-    metadata; memory remains authoritative at every instruction boundary. }
+  { Compile-time state for two value caches. The normal mode is the original
+    clean, write-through block cache. Numeric loop functions may instead use a
+    function-wide static allocation: a slot owns x12/x13 on every control-flow
+    edge, dirty values are written back only where the logical frame must be
+    canonical, and a join needs no moves because all predecessors agree on the
+    same slot-to-register map. }
   TArm64RegCache = record
-    Entries: array[0..1] of TArm64RegCacheEntry;
+    Entries: array[0..3] of TArm64RegCacheEntry;
     Next: Byte;
+    StaticAllocation: Boolean;
   end;
 
   TArm64WordBin = function(const ARd, ARn, ARm: Byte): UInt32;
@@ -137,6 +141,8 @@ const
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
   ARM64_REG_CACHE0 = 12;   { clean block-local value cache }
   ARM64_REG_CACHE1 = 13;   { clean block-local value cache }
+  ARM64_REG_CACHE2 = 14;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE3 = 15;   { dynamic cache beside a static allocation }
   ARM64_REG_LR = 30;       { x30, the link register }
   ARM64_REG_ZR = 31;       { in data-processing, 31 encodes the zero register }
   { The SAME encoding 31 means SP in load/store (unsigned offset) and in the
@@ -382,6 +388,10 @@ function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32): Boolean;
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
+procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlots: array of UInt32);
+procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
@@ -691,6 +701,21 @@ begin
         else
           EmitCbzTo(ABuf, ARM64_REG_T0, AIns.B);
         Arm64InvalidateRegCache(ACache);
+      end;
+    iroJump:
+      begin
+        { A flagged back-edge is both an epoch check and a GC safepoint. Keep
+          the logical frame canonical there, but retain the function-wide
+          mapping so the target can reuse the values without reloading. }
+        if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
+          Arm64FlushRegCache(ABuf, ACache);
+        Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroReturn, iroUnreachable:
+      begin
+        { Results and every observable exit are read from the logical frame. }
+        Arm64FlushRegCache(ABuf, ACache);
+        Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
     iroI32Eqz, iroI64Eqz:
       begin
@@ -2792,10 +2817,13 @@ end;
 
 function Arm64CacheHostReg(const AIndex: Integer): Byte;
 begin
-  if AIndex = 0 then
-    Result := ARM64_REG_CACHE0
+  case AIndex of
+    0: Result := ARM64_REG_CACHE0;
+    1: Result := ARM64_REG_CACHE1;
+    2: Result := ARM64_REG_CACHE2;
   else
-    Result := ARM64_REG_CACHE1;
+    Result := ARM64_REG_CACHE3;
+  end;
 end;
 
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
@@ -2803,8 +2831,47 @@ begin
   FillChar(ACache, SizeOf(ACache), 0);
 end;
 
+procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlots: array of UInt32);
+var
+  I: Integer;
+begin
+  Arm64InitRegCache(ACache);
+  ACache.StaticAllocation := True;
+  for I := 0 to 1 do
+    if I <= High(ASlots) then
+    begin
+      ACache.Entries[I].Valid := True;
+      ACache.Entries[I].Slot := ASlots[I];
+      LdX(ABuf, Arm64CacheHostReg(I), ASlots[I]);
+    end;
+end;
+
+procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  { Emit the fixed allocation at every canonical point. This deliberately does
+    not use compile-time dirty state: a forward branch may skip a writeback
+    that the linear emitter visited, so path-independent stores are the safe
+    reconciliation for all predecessors. }
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid then
+      StX(ABuf, Arm64CacheHostReg(I), ACache.Entries[I].Slot);
+end;
+
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 begin
+  if ACache.StaticAllocation then
+  begin
+    ACache.Entries[2].Valid := False;
+    ACache.Entries[3].Valid := False;
+    ACache.Next := 0;
+    Exit;
+  end;
   ACache.Entries[0].Valid := False;
   ACache.Entries[1].Valid := False;
   ACache.Next := 0;
@@ -2816,7 +2883,7 @@ var
   I, Victim: Integer;
   Host: Byte;
 begin
-  for I := 0 to 1 do
+  for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
     begin
       Host := Arm64CacheHostReg(I);
@@ -2824,8 +2891,16 @@ begin
         ABuf.EmitU32(Arm64MovReg(ADest, Host));
       Exit;
     end;
-  Victim := ACache.Next;
-  ACache.Next := Byte(1 - Victim);
+  if ACache.StaticAllocation then
+  begin
+    Victim := 2 + ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end
+  else
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - ACache.Next);
+  end;
   Host := Arm64CacheHostReg(Victim);
   LdX(ABuf, Host, ASlot);
   ACache.Entries[Victim].Valid := True;
@@ -2840,11 +2915,35 @@ var
   I, Victim: Integer;
   Host: Byte;
 begin
-  StX(ABuf, ASrc, ASlot);
   Victim := -1;
-  for I := 0 to 1 do
+  for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
       Victim := I;
+  if ACache.StaticAllocation then
+  begin
+    if (Victim >= 0) and (Victim <= 1) then
+    begin
+      Host := Arm64CacheHostReg(Victim);
+      if ASrc <> Host then
+        ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+      Exit;
+    end;
+    { Unallocated expression values retain the old write-through cache in
+      x14/x15, so the static locals do not evict producer/consumer temporaries. }
+    StX(ABuf, ASrc, ASlot);
+    if Victim < 2 then
+    begin
+      Victim := 2 + ACache.Next;
+      ACache.Next := Byte(1 - ACache.Next);
+    end;
+    Host := Arm64CacheHostReg(Victim);
+    if ASrc <> Host then
+      ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Slot := ASlot;
+    Exit;
+  end;
+  StX(ABuf, ASrc, ASlot);
   if Victim < 0 then
   begin
     Victim := ACache.Next;
