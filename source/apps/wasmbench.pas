@@ -46,7 +46,7 @@ type
   TExecutionTier = (etInterp, etJit, etAot);
   TExecutionTiers = set of TExecutionTier;
   TBenchmarkWorkload = (bwDecode, bwLeb128, bwStartup, bwLoop, bwFib,
-    bwMemory, bwNumeric, bwSimd);
+    bwMemory, bwMemoryVarying, bwNumeric, bwSimd);
   TBenchmarkWorkloads = set of TBenchmarkWorkload;
   TInt64Samples = array of Int64;
 
@@ -513,6 +513,22 @@ const
     '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
     '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
     '    (local.get $acc)))';
+  BENCH_MEMORY_VARYING_WAT =
+    '(module' + sLineBreak +
+    '  (memory 1)' + sLineBreak +
+    '  (func (export "run") (param $n i32) (result i32)' + sLineBreak +
+    '    (local $i i32) (local $acc i32) (local $addr i32)' + sLineBreak +
+    '    (loop $l' + sLineBreak +
+    '      (local.set $addr' + sLineBreak +
+    '        (i32.shl (i32.and (local.get $i) (i32.const 16383))' +
+    '          (i32.const 2)))' + sLineBreak +
+    '      (i32.store (local.get $addr) (local.get $i))' + sLineBreak +
+    '      (local.set $acc' + sLineBreak +
+    '        (i32.add (local.get $acc) (i32.load (local.get $addr))))' +
+    sLineBreak +
+    '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
+    '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
+    '    (local.get $acc)))';
   BENCH_NUMERIC_WAT =
     '(module' + sLineBreak +
     '  (func (export "run") (param $n i32) (result i64)' + sLineBreak +
@@ -848,6 +864,8 @@ begin
     AWorkloads := [bwFib]
   else if AValue = 'memory' then
     AWorkloads := [bwMemory]
+  else if (AValue = 'memory-varying') or (AValue = 'address') then
+    AWorkloads := [bwMemoryVarying]
   else if AValue = 'numeric' then
     AWorkloads := [bwNumeric]
   else if AValue = 'simd' then
@@ -888,7 +906,8 @@ begin
   Options := TOptionList.Create;
   try
     WorkloadOpt := Options.AddString('workload',
-      'all|decode|leb128|startup|loop|fib|memory|numeric|simd (default: all)');
+      'all|decode|leb128|startup|loop|fib|memory|memory-varying|numeric|simd ' +
+      '(default: all)');
     TierOpt := Options.AddString('tier',
       'all|interp|jit|aot for execution workloads (default: all)');
     IterationsOpt := Options.AddInteger('iterations',
@@ -1008,6 +1027,10 @@ begin
     if bwMemory in Workloads then
       BenchExecution('memory', BENCH_MEMORY_WAT, MemoryIterations,
         MemoryIterations, Triangle32(MemoryIterations), SampleCount, Tiers);
+    if bwMemoryVarying in Workloads then
+      BenchExecution('memory-varying', BENCH_MEMORY_VARYING_WAT,
+        MemoryIterations, MemoryIterations, Triangle32(MemoryIterations),
+        SampleCount, Tiers);
     if bwNumeric in Workloads then
       BenchExecution('numeric', BENCH_NUMERIC_WAT, NumericIterations,
         NumericIterations, UInt64(NumericIterations) * UInt64(1975333344) +
