@@ -38,13 +38,14 @@ const
   DEFAULT_EXECUTION_ITERATIONS = 300000000;
   DEFAULT_FIB_INPUT = 35;
   DEFAULT_MEMORY_ITERATIONS = 10000000;
+  DEFAULT_NUMERIC_ITERATIONS = 1000000;
   DEFAULT_SAMPLES = 1;
 
 type
   TExecutionTier = (etInterp, etJit, etAot);
   TExecutionTiers = set of TExecutionTier;
   TBenchmarkWorkload = (bwDecode, bwLeb128, bwStartup, bwLoop, bwFib,
-    bwMemory);
+    bwMemory, bwNumeric);
   TBenchmarkWorkloads = set of TBenchmarkWorkload;
   TInt64Samples = array of Int64;
 
@@ -511,6 +512,107 @@ const
     '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
     '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
     '    (local.get $acc)))';
+  BENCH_NUMERIC_WAT =
+    '(module' + sLineBreak +
+    '  (func (export "run") (param $n i32) (result i64)' + sLineBreak +
+    '    (local $i i32) (local $acc i64) (local $x f32) (local $y f64)' +
+    sLineBreak +
+    '    (loop $l' + sLineBreak +
+    '      (local.set $x' + sLineBreak +
+    '        (f32.div' + sLineBreak +
+    '          (f32.mul' + sLineBreak +
+    '            (f32.sub' + sLineBreak +
+    '              (f32.add (f32.convert_i32_s (local.get $i))' +
+    '                (f32.const 1.25))' + sLineBreak +
+    '              (f32.const 0.25))' + sLineBreak +
+    '            (f32.const 0.5))' + sLineBreak +
+    '          (f32.const 0.5)))' + sLineBreak +
+    '      (local.set $y' + sLineBreak +
+    '        (f64.div' + sLineBreak +
+    '          (f64.mul' + sLineBreak +
+    '            (f64.sub' + sLineBreak +
+    '              (f64.add' + sLineBreak +
+    '                (f64.convert_i64_s' + sLineBreak +
+    '                  (i64.extend_i32_u (local.get $i)))' + sLineBreak +
+    '                (f64.const 1.25))' + sLineBreak +
+    '              (f64.const 0.25))' + sLineBreak +
+    '            (f64.const 0.5))' + sLineBreak +
+    '          (f64.const 0.5)))' + sLineBreak +
+    '      (local.set $acc' + sLineBreak +
+    '        (i64.add (local.get $acc)' + sLineBreak +
+    '          (i64.add' + sLineBreak +
+    '            (i64.extend_i32_u' + sLineBreak +
+    '              (i32.add' + sLineBreak +
+    '                (i32.add' + sLineBreak +
+    '                  (i32.mul' + sLineBreak +
+    '                    (i32.div_u' + sLineBreak +
+    '                      (i32.add (local.get $i) (i32.const 12345))' +
+    '                      (i32.const 7))' + sLineBreak +
+    '                    (i32.const 7))' + sLineBreak +
+    '                  (i32.rem_u' + sLineBreak +
+    '                    (i32.add (local.get $i) (i32.const 12345))' +
+    '                    (i32.const 7)))' + sLineBreak +
+    '                (i32.add' + sLineBreak +
+    '                  (i32.mul' + sLineBreak +
+    '                    (i32.div_s' + sLineBreak +
+    '                      (i32.add (local.get $i) (i32.const 12345))' +
+    '                      (i32.const 7))' + sLineBreak +
+    '                    (i32.const 7))' + sLineBreak +
+    '                  (i32.rem_s' + sLineBreak +
+    '                    (i32.add (local.get $i) (i32.const 12345))' +
+    '                    (i32.const 7)))))' + sLineBreak +
+    '            (i64.add' + sLineBreak +
+    '              (i64.add' + sLineBreak +
+    '                (i64.mul' + sLineBreak +
+    '                  (i64.div_u' + sLineBreak +
+    '                    (i64.add (i64.extend_i32_u (local.get $i))' +
+    '                      (i64.const 987654321))' + sLineBreak +
+    '                    (i64.const 11))' + sLineBreak +
+    '                  (i64.const 11))' + sLineBreak +
+    '                (i64.rem_u' + sLineBreak +
+    '                  (i64.add (i64.extend_i32_u (local.get $i))' +
+    '                    (i64.const 987654321))' + sLineBreak +
+    '                  (i64.const 11)))' + sLineBreak +
+    '              (i64.add' + sLineBreak +
+    '                (i64.mul' + sLineBreak +
+    '                  (i64.div_s' + sLineBreak +
+    '                    (i64.add (i64.extend_i32_u (local.get $i))' +
+    '                      (i64.const 987654321))' + sLineBreak +
+    '                    (i64.const 11))' + sLineBreak +
+    '                  (i64.const 11))' + sLineBreak +
+    '                (i64.rem_s' + sLineBreak +
+    '                  (i64.add (i64.extend_i32_u (local.get $i))' +
+    '                    (i64.const 987654321))' + sLineBreak +
+    '                  (i64.const 11)))))))' + sLineBreak +
+    '      (local.set $acc' + sLineBreak +
+    '        (i64.add (local.get $acc)' + sLineBreak +
+    '          (i64.extend_i32_u' + sLineBreak +
+    '            (i32.add' + sLineBreak +
+    '              (i32.add' + sLineBreak +
+    '                (i32.add (f32.eq (local.get $x) (local.get $x))' +
+    '                  (f32.ne (local.get $x) (f32.const -1)))' + sLineBreak +
+    '                (i32.add (f32.lt (local.get $x)' +
+    '                    (f32.add (local.get $x) (f32.const 1)))' +
+    '                  (f32.gt (local.get $x) (f32.const -1))))' + sLineBreak +
+    '              (i32.add (f32.le (local.get $x) (local.get $x))' +
+    '                (f32.ge (local.get $x) (local.get $x)))))))' +
+    sLineBreak +
+    '      (local.set $acc' + sLineBreak +
+    '        (i64.add (local.get $acc)' + sLineBreak +
+    '          (i64.extend_i32_u' + sLineBreak +
+    '            (i32.add' + sLineBreak +
+    '              (i32.add' + sLineBreak +
+    '                (i32.add (f64.eq (local.get $y) (local.get $y))' +
+    '                  (f64.ne (local.get $y) (f64.const -1)))' + sLineBreak +
+    '                (i32.add (f64.lt (local.get $y)' +
+    '                    (f64.add (local.get $y) (f64.const 1)))' +
+    '                  (f64.gt (local.get $y) (f64.const -1))))' + sLineBreak +
+    '              (i32.add (f64.le (local.get $y) (local.get $y))' +
+    '                (f64.ge (local.get $y) (local.get $y)))))))' +
+    sLineBreak +
+    '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
+    '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
+    '    (local.get $acc)))';
 
 function CompileArtifact(const ABytes: TWasmBytes): TWasmBytes;
 var
@@ -595,12 +697,14 @@ begin
   end;
 end;
 
-function Triangle32(const ACount: Integer): UInt32;
-var
-  Triangle: UInt64;
+function Triangle64(const ACount: Integer): UInt64;
 begin
-  Triangle := (UInt64(UInt32(ACount)) * UInt64(UInt32(ACount - 1))) div 2;
-  Result := UInt32(Triangle and $FFFFFFFF);
+  Result := (UInt64(UInt32(ACount)) * UInt64(UInt32(ACount - 1))) div 2;
+end;
+
+function Triangle32(const ACount: Integer): UInt32;
+begin
+  Result := UInt32(Triangle64(ACount) and $FFFFFFFF);
 end;
 
 function ExpectedLoop(const AIterations: Integer): UInt32;
@@ -646,7 +750,7 @@ begin
 end;
 
 procedure BenchExecution(const AName, AWat: string; const AInput: Integer;
-  const AOperationCount: Int64; const AExpected: UInt32;
+  const AOperationCount: Int64; const AExpected: UInt64;
   const ASampleCount: Integer; const ATiers: TExecutionTiers);
 var
   Bytes, Artifact: TWasmBytes;
@@ -667,10 +771,10 @@ begin
       begin
         Samples[Sample] := MeasureExecution(Bytes, Artifact, Tier, AInput,
           ResultBits);
-        if UInt32(ResultBits) <> AExpected then
+        if ResultBits <> AExpected then
           raise EWasmError.CreateFmt(
             '%s benchmark %s returned %u, expected %u',
-            [AName, TierName(Tier), UInt32(ResultBits), AExpected]);
+            [AName, TierName(Tier), ResultBits, AExpected]);
       end;
       ReportStartup(AName + ' ' + TierName(Tier), AOperationCount,
         Median(Samples), ASampleCount);
@@ -695,6 +799,8 @@ begin
     AWorkloads := [bwFib]
   else if AValue = 'memory' then
     AWorkloads := [bwMemory]
+  else if AValue = 'numeric' then
+    AWorkloads := [bwNumeric]
   else
     Result := False;
 end;
@@ -719,17 +825,18 @@ var
   Positionals: TStringList;
   WorkloadOpt, TierOpt: TStringOption;
   IterationsOpt, ExecutionIterationsOpt, FibInputOpt,
-    MemoryIterationsOpt, SamplesOpt: TIntegerOption;
+    MemoryIterationsOpt, NumericIterationsOpt, SamplesOpt: TIntegerOption;
   Workloads: TBenchmarkWorkloads;
   Tiers: TExecutionTiers;
   Iterations, ExecutionIterations, FibInput, MemoryIterations,
+    NumericIterations,
     SampleCount: Integer;
   WorkloadValue, TierValue: string;
 begin
   Options := TOptionList.Create;
   try
     WorkloadOpt := Options.AddString('workload',
-      'all|decode|leb128|startup|loop|fib|memory (default: all)');
+      'all|decode|leb128|startup|loop|fib|memory|numeric (default: all)');
     TierOpt := Options.AddString('tier',
       'all|interp|jit|aot for execution workloads (default: all)');
     IterationsOpt := Options.AddInteger('iterations',
@@ -742,6 +849,9 @@ begin
     MemoryIterationsOpt := Options.AddInteger('memory-iterations',
       'Scalar memory loop iterations per tier (default: ' +
       IntToStr(DEFAULT_MEMORY_ITERATIONS) + ')');
+    NumericIterationsOpt := Options.AddInteger('numeric-iterations',
+      'Scalar numeric loop iterations per tier (default: ' +
+      IntToStr(DEFAULT_NUMERIC_ITERATIONS) + ')');
     SamplesOpt := Options.AddInteger('samples',
       'Samples per execution workload and tier (default: ' +
       IntToStr(DEFAULT_SAMPLES) + ')');
@@ -764,6 +874,8 @@ begin
     FibInput := FibInputOpt.ValueOr(DEFAULT_FIB_INPUT);
     MemoryIterations := MemoryIterationsOpt.ValueOr(
       DEFAULT_MEMORY_ITERATIONS);
+    NumericIterations := NumericIterationsOpt.ValueOr(
+      DEFAULT_NUMERIC_ITERATIONS);
     SampleCount := SamplesOpt.ValueOr(DEFAULT_SAMPLES);
     WorkloadValue := LowerCase(WorkloadOpt.ValueOr('all'));
     TierValue := LowerCase(TierOpt.ValueOr('all'));
@@ -803,6 +915,12 @@ begin
       ExitCode := 1;
       Exit;
     end;
+    if NumericIterations <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --numeric-iterations must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
     if SampleCount <= 0 then
     begin
       WriteLn(ErrOutput, 'wasmbench: --samples must be positive');
@@ -828,6 +946,10 @@ begin
     if bwMemory in Workloads then
       BenchExecution('memory', BENCH_MEMORY_WAT, MemoryIterations,
         MemoryIterations, Triangle32(MemoryIterations), SampleCount, Tiers);
+    if bwNumeric in Workloads then
+      BenchExecution('numeric', BENCH_NUMERIC_WAT, NumericIterations,
+        NumericIterations, UInt64(NumericIterations) * UInt64(1975333344) +
+        UInt64(4) * Triangle64(NumericIterations), SampleCount, Tiers);
   finally
     Options.Free;
   end;

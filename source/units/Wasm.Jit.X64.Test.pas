@@ -47,6 +47,7 @@ type
     procedure TestAluAddSubImul;
     procedure TestCmpTestShift;
     procedure TestSetccMovzxCmov;
+    procedure TestNativeNumericEncodings;
     procedure TestPushPopRsp;
     procedure TestCallRet;
     procedure TestLea;
@@ -75,6 +76,32 @@ begin
   for I := 0 to High(AExpected) do
     if I < ABuf.Size then
       Expect<Byte>(ABuf.ByteAt(I)).ToBe(AExpected[I]);
+end;
+
+procedure TX64Tests.TestNativeNumericEncodings;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitSignDividend(Buf, True);
+    X64EmitDivReg(Buf, True, True, X64_RCX);
+    X64EmitMovToXmm(Buf, 0, X64_RAX, False);
+    X64EmitScalarFloatBinary(Buf, $58, False, 0, 1);
+    X64EmitScalarFloatCompare(Buf, 1, True, 0, 1);
+    X64EmitIntToFloat(Buf, True, True, 0, X64_RAX);
+    X64EmitFloatWidthConvert(Buf, True, 0, 0);
+    X64EmitSignExtendRax(Buf, 8, True);
+    CheckSeq(Buf, [$48, $99, $48, $F7, $F9,
+      $66, $0F, $6E, $C0,
+      $F3, $0F, $58, $C1,
+      $F2, $0F, $C2, $C1, $01,
+      $F2, $48, $0F, $2A, $C0,
+      $F2, $0F, $5A, $C0,
+      $48, $0F, $BE, $C0]);
+  finally
+    Buf.Free;
+  end;
 end;
 
 { --- register-register / immediate moves (SDM: MOV 89 /r, B8+rd) --------- }
@@ -558,6 +585,8 @@ begin
   Test('add/sub/imul emit the asserted bytes', TestAluAddSubImul);
   Test('cmp/test/shift-by-cl emit the asserted bytes', TestCmpTestShift);
   Test('setcc/movzx/cmov emit the asserted bytes', TestSetccMovzxCmov);
+  Test('native numeric instructions emit the asserted bytes',
+    TestNativeNumericEncodings);
   Test('push/pop/rsp-adjust emit the asserted bytes', TestPushPopRsp);
   Test('call reg / ret emit the asserted bytes', TestCallRet);
   Test('lea with SIB base emits the asserted bytes', TestLea);

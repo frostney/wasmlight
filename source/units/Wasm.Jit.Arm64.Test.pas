@@ -94,6 +94,9 @@ begin
   { Wave-2 integer spine (ARMv8-A C6.2). }
   Expect<UInt32>(Arm64SubW(0, 1, 2)).ToBe($4B020020);
   Expect<UInt32>(Arm64MulW(0, 1, 2)).ToBe($1B027C20);
+  Expect<UInt32>(Arm64SdivW(9, 9, 10)).ToBe($1ACA0D29);
+  Expect<UInt32>(Arm64UdivX(9, 9, 10)).ToBe($9ACA0929);
+  Expect<UInt32>(Arm64MsubW(9, 11, 10, 9)).ToBe($1B0AA569);
   Expect<UInt32>(Arm64AndW(0, 1, 2)).ToBe($0A020020);
   Expect<UInt32>(Arm64OrrW(0, 1, 2)).ToBe($2A020020);
   Expect<UInt32>(Arm64EorW(0, 1, 2)).ToBe($4A020020);
@@ -108,6 +111,18 @@ begin
   Expect<UInt32>(Arm64CsetW(0, ARM64_COND_EQ)).ToBe($1A9F17E0);
   Expect<UInt32>(Arm64CsetW(0, ARM64_COND_NE)).ToBe($1A9F07E0);
   Expect<UInt32>(Arm64CselX(10, 10, 11, ARM64_COND_NE)).ToBe($9A8B114A);
+
+  { Native scalar floating point and exact conversions, assembled independently
+    with clang's aarch64 assembler. }
+  Expect<UInt32>(Arm64FmovSFromW(0, 9)).ToBe($1E270120);
+  Expect<UInt32>(Arm64FmovXFromD(9, 0)).ToBe($9E660009);
+  Expect<UInt32>(Arm64FaddS(0, 0, 1)).ToBe($1E212800);
+  Expect<UInt32>(Arm64FdivD(0, 0, 1)).ToBe($1E611800);
+  Expect<UInt32>(Arm64FcmpS(0, 1)).ToBe($1E212000);
+  Expect<UInt32>(Arm64ScvtfSX(0, 9)).ToBe($9E220120);
+  Expect<UInt32>(Arm64UcvtfDW(0, 9)).ToBe($1E630120);
+  Expect<UInt32>(Arm64FcvtSD(0, 0)).ToBe($1E624000);
+  Expect<UInt32>(Arm64SxtwX(9, 9)).ToBe($93407D29);
 
   { movk, add-immediate, blr, mov reg. }
   Expect<UInt32>(Arm64MovkW(0, 1, 1)).ToBe($72A00020);
