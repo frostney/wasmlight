@@ -1,7 +1,48 @@
 # Handoff
 
-Updated: 2026-08-12 (third measured optimization wave integrated and
+Updated: 2026-08-12 (fourth measured optimization wave integrated and
 cross-architecture/cross-tier validated)
+
+## 2026-08-12 fourth measured optimization wave complete
+
+- **Three measured commits are integrated on
+  `codex/fix-tests-tier-performance`:** `e14d067` adds a permanent,
+  tier-verified `memory-varying` workload; `a119423` retains shifted address
+  expressions in the aarch64 cache and folds their one-use result moves;
+  `e02a9c2` resolves an x86-64 function's single memory once at entry and
+  retains native shift results in its register cache.
+- **Apple Silicon serialized A/B, seven release samples:** for 300M iterations
+  of the new varying-address store/load loop, JIT moved from 1,384ms to 594ms
+  (57.1% faster) and AOT from 1,372ms to 594ms (56.7% faster). The first
+  shift-cache step measured about 640ms; adjacent move folding lowered it to
+  about 593ms, so both retained steps independently cleared the gate.
+  Constant-address memory, the numeric loop, fib(35), numeric, SIMD, and
+  startup remained in their prior bands.
+- **Linux/x86-64 serialized A/B in the Rosetta OrbStack VM:** for 10M
+  iterations of the same workload, JIT moved from 963ms to 147ms (84.7%
+  faster) and AOT from 946ms to 148ms (84.4% faster). Resolving the memory once
+  first measured 169-170ms; native cached shifts then measured 142-148ms, so
+  both steps were positive. Final guards versus the exact baseline are flat:
+  30M loop 208/205ms, fib(35) 3,655/3,651ms, numeric 37/37ms, SIMD 123/121ms,
+  and startup 30/30ms; constant-address memory also improved 900ms to 113ms.
+- **Safety boundaries:** aarch64 broadens only the existing helper-free,
+  single-memory static-cache shape. x86-64 stores the stable memory-instance
+  pointer in the prologue's otherwise-unused aligned stack slot, but reloads
+  live `Base` and `ByteSize` at every access; multi-memory functions retain the
+  per-access resolver. The generated frame size, helper table, artifact ABI,
+  epoch checks, and validation IR are unchanged, so old `.waot` artifacts
+  remain valid (and retain their older, slower generated sequence).
+- **Correctness is exact on both architectures:** frozen install, formatting,
+  release build, and all 44 unit suites pass. The complete interpreter/JIT/AOT
+  corpus is tier-identical on macOS and Linux: pass=65204, fail=389,
+  skip=1532, staged=0, errors=0; JIT/AOT compiled=8588 on aarch64 and 8589 on
+  x86-64.
+- **Refreshed Wasmtime 47.0.3 comparison for the identical new workload:**
+  compilation excluded, precompiled modules, one warmup discarded, seven
+  samples. On macOS at 300M iterations, Wasmlight AOT is 594ms versus Wasmtime
+  94.675ms (6.27x gap). In the Rosetta Linux VM at 50M iterations, Wasmlight
+  AOT is 748ms versus Wasmtime 202.832ms (3.69x gap). Linux absolute timings
+  describe the VM, not native x86-64 hardware.
 
 ## 2026-08-12 third measured optimization wave complete
 
