@@ -3111,31 +3111,32 @@ end;
 
 { --- the shared tier-seam frame helpers (O-J2) --------------------------- }
 
-function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
-  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue;
-  const ARetKind: TWasmRetKind): PWasmValue;
+{ Frame entry after the caller has already resolved its function instance and
+  validated IR function. Direct compiled calls use this to avoid resolving the
+  same metadata twice. ACountResults is False only for rtCaller direct frames:
+  their normal return writes EntryResults, while exception unwind consults
+  RetKind but never RetCount. No helper frame spans the native callee call. }
+function JitEnterResolvedFrame(const ACtx: PWasmInterpContext;
+  const AInst: TWasmModuleInstance; const AFn: PWasmIrFunction;
+  const AParams, AResults: PWasmValue;
+  const ARetKind: TWasmRetKind; const ACountResults: Boolean): PWasmValue;
 var
-  Inst: TWasmModuleInstance;
-  Fn: PWasmIrFunction;
   Entry: PWasmActivation;
   Slots: PWasmValue;
   I: Integer;
 begin
-  Inst := AStore.Funcs[AFuncAddr].Instance;
-  Fn := @Inst.Ir.Functions[AStore.Funcs[AFuncAddr].FuncIrIndex];
-
   { Exhaustion guard BEFORE any mutation (interp-spec §5.2 / jit-spec §5.1),
     against BOTH caps and the same threshold every frame push uses. }
   if (ACtx^.Depth >= ACtx^.DepthCap) or
-    (ACtx^.ValueTop + Fn^.RegisterCount > ACtx^.ValueCap) then
+    (ACtx^.ValueTop + AFn^.RegisterCount > ACtx^.ValueCap) then
     TrapNow(wtkStackExhausted);
 
   Entry := @ACtx^.Acts[ACtx^.Depth];
-  Entry^.Fn := Fn;
-  Entry^.Instance := Inst;
+  Entry^.Fn := AFn;
+  Entry^.Instance := AInst;
   Entry^.Base := ACtx^.ValueTop;
   Entry^.IP := 0;
-  ACtx^.ValueTop := Entry^.Base + Fn^.RegisterCount;
+  ACtx^.ValueTop := Entry^.Base + AFn^.RegisterCount;
 
   { GC-1: default locals and every reference slot are zero before publication.
     Validated numeric temporaries are definition-dominated and need no entry
@@ -3143,9 +3144,9 @@ begin
     without declared locals (recursive fib) takes only the empty-loop check. }
   Slots := Frame(ACtx^.Values, Entry^.Base);
   I := 0;
-  while I < Length(Fn^.EntryZeroRegs) do
+  while I < Length(AFn^.EntryZeroRegs) do
   begin
-    Slots[Fn^.EntryZeroRegs[I]].Bits := 0;
+    Slots[AFn^.EntryZeroRegs[I]].Bits := 0;
     Inc(I);
   end;
 
@@ -3156,7 +3157,7 @@ begin
     the same translation the wasm->wasm and tail-call paths use. A scalar-only
     function walks 1:1. AParams may be nil for a no-parameter entry
     (ParamCount = 0 skips the loop). }
-  ScatterParamsFlat(Fn, Slots, AParams);
+  ScatterParamsFlat(AFn, Slots, AParams);
 
   { Fix A: rtEntry for a genuine outermost entry, rtCompiledSeam for a nested
     tier-seam entry (a compiled body, or a cross-seam interpreted callee) — this
@@ -3164,15 +3165,31 @@ begin
   Entry^.RetKind := ARetKind;
   { RetCount is a SLOT count so a v128 result flows into two flat AResults
     slots (simd-spec §1.6); DoReturn's per-slot copy then needs no change. }
-  Entry^.RetCount := ResultSlotCount(Fn);
+  if ACountResults then
+    Entry^.RetCount := ResultSlotCount(AFn)
+  else
+    Entry^.RetCount := 0;
   Entry^.RetDest := nil;
   Entry^.RetBase := 0;
   Entry^.EntryResults := AResults;
 
   { GC-1: push before the IP-0 safepoint (the body's first op may allocate). }
-  PushGcFrame(ACtx, Entry, Fn, Entry^.Base);
+  PushGcFrame(ACtx, Entry, AFn, Entry^.Base);
   Inc(ACtx^.Depth);
   Result := Slots;
+end;
+
+function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
+  const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue;
+  const ARetKind: TWasmRetKind): PWasmValue;
+var
+  Inst: TWasmModuleInstance;
+  Fn: PWasmIrFunction;
+begin
+  Inst := AStore.Funcs[AFuncAddr].Instance;
+  Fn := @Inst.Ir.Functions[AStore.Funcs[AFuncAddr].FuncIrIndex];
+  Result := JitEnterResolvedFrame(ACtx, Inst, Fn, AParams, AResults,
+    ARetKind, True);
 end;
 
 procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
@@ -3190,6 +3207,7 @@ var
   Ctx: PWasmInterpContext;
   Inst: TWasmModuleInstance;
   Addr: TWasmFuncAddr;
+  FuncInst: ^TWasmFuncInst;
   Fn: PWasmIrFunction;
 begin
   Result := nil;
@@ -3198,31 +3216,56 @@ begin
   Ctx := PWasmInterpContext(AStore.TierContext);
   Inst := Ctx^.Acts[Ctx^.Depth - 1].Instance;
   Addr := Inst.FuncAddrs[UInt32(AFuncIdx)];
-  if (AStore.Funcs[Addr].Kind <> wfkWasm) or
-    (AStore.Funcs[Addr].CompiledDirectEntry = nil) then
+  FuncInst := @AStore.Funcs[Addr];
+  if (FuncInst^.Kind <> wfkWasm) or
+    (FuncInst^.CompiledDirectEntry = nil) then
     Exit;
 
-  AState^.RegBase := JitEnterFrame(Ctx, AStore, Addr, AArgs, AResults,
-    rtCaller);
-  Fn := @AStore.Funcs[Addr].Instance.Ir.Functions[
-    AStore.Funcs[Addr].FuncIrIndex];
+  Fn := @FuncInst^.Instance.Ir.Functions[FuncInst^.FuncIrIndex];
+  AState^.RegBase := JitEnterResolvedFrame(Ctx, FuncInst^.Instance, Fn,
+    AArgs, AResults, rtCaller, False);
   if Length(Fn^.Code) > 0 then
     AState^.IrBase := @Fn^.Code[0]
   else
     AState^.IrBase := nil;
-  Result := AStore.Funcs[Addr].CompiledDirectEntry;
+  Result := FuncInst^.CompiledDirectEntry;
 end;
 
 procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
 var
   Ctx: PWasmInterpContext;
+  Entry: PWasmActivation;
+  Fn: PWasmIrFunction;
+  FrameBase: PWasmValue;
+  K, FlatCur, LowReg: UInt32;
 begin
   Ctx := PWasmInterpContext(AStore.TierContext);
-  { During execution rtCaller made the frame transparent to the outer native
-    unwind barrier. No exception is live now, so select the existing flat
-    result-marshalling branch immediately before the shared pop. }
-  Ctx^.Acts[Ctx^.Depth - 1].RetKind := rtCompiledSeam;
-  JitLeaveFrame(Ctx);
+  Entry := @Ctx^.Acts[Ctx^.Depth - 1];
+  { This is the rtCaller direct-call normal-return branch specialized for the
+    flat EntryResults buffer the generated call site supplied. The exceptional
+    path never reaches here: the existing seam unwind consumes rtCaller and
+    hops outward exactly as before. Keeping finish as a separate helper also
+    ensures no Pascal activation remains live across recursive machine code. }
+  Fn := Entry^.Fn;
+  FrameBase := Frame(Ctx^.Values, Entry^.Base);
+  FlatCur := 0;
+  K := 0;
+  while K < Fn^.ResultCount do
+  begin
+    LowReg := Fn^.ResultRegs[K];
+    Entry^.EntryResults[FlatCur] := FrameBase[LowReg];
+    if Fn^.RegTypes[LowReg].Kind = wvkVec then
+    begin
+      Entry^.EntryResults[FlatCur + 1] := FrameBase[LowReg + 1];
+      Inc(FlatCur, 2);
+    end
+    else
+      Inc(FlatCur);
+    Inc(K);
+  end;
+  Ctx^.Store.Heap.PopFrame;
+  Ctx^.ValueTop := Entry^.Base;
+  Dec(Ctx^.Depth);
 end;
 
 function WasmJitFrameOffsets: TWasmJitFrameOffsets;

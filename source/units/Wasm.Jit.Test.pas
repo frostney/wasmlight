@@ -1379,6 +1379,14 @@ begin
     FDiffCompiledAll := Result;
     JitOut := Invoke;
 
+    { A normal compiled return, including the direct compiled-to-compiled
+      epilogue, must retire both runtime views of the activation. This catches
+      a fast return that copies the value correctly but leaves either the GC
+      chain or the shared logical-frame cursors stale for the next call. }
+    Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(Store)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(Store)^.ValueTop).ToBe(0);
+
     { Observational identity: same trap-or-value, bitwise. }
     Expect<Boolean>(JitOut.Trapped).ToBe(InterpOut.Trapped);
     if InterpOut.Trapped then
