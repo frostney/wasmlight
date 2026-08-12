@@ -35,6 +35,7 @@ uses
 
 const
   DEFAULT_ITERATIONS = 20000;
+  DEFAULT_EXECUTION_ITERATIONS = 300000000;
 
 { A module with enough sections to exercise the walk without being
   dominated by any single one: a run of known sections in id order plus
@@ -379,16 +380,143 @@ begin
   ReportStartup('startup aot-load', Iters, GetTickCount64 - Started);
 end;
 
+{ --- steady-state execution: interpreter vs JIT vs AOT -------------------
+
+  Keep load, validation, instantiation, JIT compilation and AOT loading outside
+  the timer. This answers a different question from BenchStartup: how quickly
+  each tier executes the same already-ready integer loop. ForceCompile and the
+  AOT load result are checked so an accidental fallback cannot masquerade as a
+  compiled-tier measurement. JIT and AOT intentionally execute byte-identical
+  code; their expected steady-state times are therefore equal, while AOT's win
+  belongs to the startup benchmark above. }
+
+const
+  BENCH_EXECUTION_WAT =
+    '(module' + sLineBreak +
+    '  (func (export "run") (param $n i32) (result i32)' + sLineBreak +
+    '    (local $i i32) (local $acc i32)' + sLineBreak +
+    '    (loop $l' + sLineBreak +
+    '      (local.set $acc' + sLineBreak +
+    '        (i32.add (local.get $acc)' + sLineBreak +
+    '          (i32.mul (local.get $i) (i32.const 1664525))))' + sLineBreak +
+    '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
+    '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
+    '    (local.get $acc)))';
+
+type
+  TExecutionTier = (etInterp, etJit, etAot);
+
+function MeasureExecution(const ABytes, AArtifact: TWasmBytes;
+  const ATier: TExecutionTier; const ALoopIterations: Integer;
+  out AResultBits: UInt64): Int64;
+var
+  Loaded: TWasmLoadedModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Linker: TWasmLinker;
+  Instance: TWasmInstance;
+  Jit: TWasmJitContext;
+  LoadRes: TWasmAotLoadResult;
+  RunFn: TWasmFunc;
+  Params, Results: array[0..0] of TWasmValue;
+  Started: Int64;
+begin
+  Loaded := nil;
+  Engine := nil;
+  Store := nil;
+  Linker := nil;
+  Instance := nil;
+  Jit := nil;
+  try
+    Loaded := LoadModule(ABytes);
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    EnsureInterpreter(Store);
+    Linker := TWasmLinker.Create(Store);
+    Instance := Instantiate(Store, Linker, Loaded);
+    if not Instance.FindExportFunc('run', RunFn) then
+      raise EWasmError.Create('execution benchmark has no run export');
+
+    case ATier of
+      etJit:
+        begin
+          Jit := RegisterJit(Store);
+          if not Jit.ForceCompile(RunFn.Addr) then
+            raise EWasmError.Create('execution benchmark JIT declined run');
+        end;
+      etAot:
+        begin
+          Jit := AotLoadAndWire(Store, Loaded, Instance.Raw, AArtifact, LoadRes);
+          if (LoadRes <> alrLoaded) or (Jit = nil) or
+            (Store.Funcs[RunFn.Addr].CompiledEntry = nil) then
+            raise EWasmError.CreateFmt(
+              'execution benchmark AOT did not wire run (load result %d)',
+              [Ord(LoadRes)]);
+        end;
+    end;
+
+    Params[0].Bits := UInt64(UInt32(ALoopIterations));
+    Results[0].Bits := 0;
+    Started := GetTickCount64;
+    Call(RunFn, Params, Results);
+    Result := GetTickCount64 - Started;
+    AResultBits := Results[0].Bits;
+  finally
+    Instance.Free;
+    Jit.Free;
+    Linker.Free;
+    FreeAndNil(Store);
+    Engine.Free;
+    Loaded.Free;
+  end;
+end;
+
+procedure BenchExecution(const ALoopIterations: Integer);
+var
+  Bytes, Artifact: TWasmBytes;
+  Loaded: TWasmLoadedModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  InterpMs, JitMs, AotMs: Int64;
+  InterpBits, JitBits, AotBits: UInt64;
+begin
+  Bytes := AssembleWatText(BENCH_EXECUTION_WAT);
+  Loaded := LoadModule(Bytes);
+  Engine := TWasmEngine.Create;
+  Store := TWasmStore.Create(Engine);
+  try
+    Artifact := AotCompileModule(Store, Loaded);
+  finally
+    FreeAndNil(Store);
+    Engine.Free;
+    Loaded.Free;
+  end;
+
+  InterpMs := MeasureExecution(Bytes, Artifact, etInterp, ALoopIterations,
+    InterpBits);
+  JitMs := MeasureExecution(Bytes, Artifact, etJit, ALoopIterations, JitBits);
+  AotMs := MeasureExecution(Bytes, Artifact, etAot, ALoopIterations, AotBits);
+  if (JitBits <> InterpBits) or (AotBits <> InterpBits) then
+    raise EWasmError.Create('execution benchmark tiers returned different bits');
+
+  ReportStartup('execute interpret', ALoopIterations, InterpMs);
+  ReportStartup('execute jit', ALoopIterations, JitMs);
+  ReportStartup('execute aot', ALoopIterations, AotMs);
+end;
+
 var
   Options: TOptionList;
   Positionals: TStringList;
-  IterationsOpt: TIntegerOption;
-  Iterations: Integer;
+  IterationsOpt, ExecutionIterationsOpt: TIntegerOption;
+  Iterations, ExecutionIterations: Integer;
 begin
   Options := TOptionList.Create;
   try
     IterationsOpt := Options.AddInteger('iterations',
       'Iterations per benchmark (default: ' + IntToStr(DEFAULT_ITERATIONS) + ')');
+    ExecutionIterationsOpt := Options.AddInteger('execution-iterations',
+      'Loop iterations per tier (default: ' +
+      IntToStr(DEFAULT_EXECUTION_ITERATIONS) + ')');
 
     try
       Positionals := ParseCommandLine(Options.Options);
@@ -403,9 +531,17 @@ begin
     Positionals.Free;
 
     Iterations := IterationsOpt.ValueOr(DEFAULT_ITERATIONS);
+    ExecutionIterations := ExecutionIterationsOpt.ValueOr(
+      DEFAULT_EXECUTION_ITERATIONS);
     if Iterations <= 0 then
     begin
       WriteLn(ErrOutput, 'wasmbench: --iterations must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
+    if ExecutionIterations <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --execution-iterations must be positive');
       ExitCode := 1;
       Exit;
     end;
@@ -415,6 +551,7 @@ begin
     BenchDecodeModule(Iterations);
     BenchReadU32(Iterations div 64 + 1);
     BenchStartup(Iterations);
+    BenchExecution(ExecutionIterations);
   finally
     Options.Free;
   end;

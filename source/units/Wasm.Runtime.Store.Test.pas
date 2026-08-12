@@ -1267,9 +1267,16 @@ begin
   Off := WasmJitOffsets(FStore);
 
   { A memory instance keeps Base first and ByteSize immediately after it — the
-    hot pair the inline bounds check loads (jit-spec §7.1). }
+    hot pair the inline bounds check loads (jit-spec §7.1). The JIT-supported
+    64-bit layouts keep them adjacent; FPC may align UInt64 to eight bytes on a
+    32-bit target, where the JIT is unavailable. }
   ExpectCount('MemBase', Integer(Off.MemBase), 0);
+  {$IFDEF CPU64}
   ExpectCount('MemByteSize', Integer(Off.MemByteSize), SizeOf(Pointer));
+  {$ELSE}
+  Expect<Boolean>(Off.MemByteSize >= SizeOf(Pointer)).ToBe(True);
+  Expect<Boolean>(Off.MemByteSize < SizeOf(Pointer) + SizeOf(UInt64)).ToBe(True);
+  {$ENDIF}
 
   { A func inst keeps Kind first (the wasm/host discriminator), and the two
     tier fields are adjacent (CompiledEntry then the u32 CallCount), all within

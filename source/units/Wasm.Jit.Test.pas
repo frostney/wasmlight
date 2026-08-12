@@ -69,6 +69,9 @@ uses
   Wasm.Runtime.Values,
   Wasm.Validator;
 
+const
+  JIT_BACKEND_AVAILABLE = {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF};
+
 { --- byte-assembly helpers (mirrors Wasm.Interp.Test) -------------------- }
 
 function ULeb(const AValue: UInt32): TWasmBytes;
@@ -2056,7 +2059,7 @@ procedure TJitTests.TestEpochInterruptDifferential;
           snapshot targets. (Since Wave 3 the caller WOULD compile, calls and
           all; leaving it interpreted here is deliberate, and RunAddr is
           referenced below so the tier choice stays explicit.) }
-        Expect<Boolean>(Jit.ForceCompile(LeafAddr)).ToBe(True);
+        Expect<Boolean>(Jit.ForceCompile(LeafAddr)).ToBe(JIT_BACKEND_AVAILABLE);
         Expect<Boolean>(Store.Funcs[RunAddr].CompiledEntry = nil).ToBe(True);
       end;
 
@@ -2170,7 +2173,7 @@ procedure TJitTests.TestEpochInterruptAcrossSeamToInterpCallee;
         Jit := RegisterJit(Store);
         { Only the CALLER is compiled; the leaf stays interpreted and is reached
           across the tier seam — the nested re-entry that must NOT re-seed. }
-        Expect<Boolean>(Jit.ForceCompile(RunAddr)).ToBe(True);
+        Expect<Boolean>(Jit.ForceCompile(RunAddr)).ToBe(JIT_BACKEND_AVAILABLE);
         Expect<Boolean>(Store.Funcs[LeafAddr].CompiledEntry = nil).ToBe(True);
       end;
 
@@ -2291,7 +2294,7 @@ begin
     feeds a callee reached through the store's compiled hook. }
   CompileExports(['helper', 'run']);
   Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
-    [MakeValueI32(10)])).ToBe(True);
+    [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallCompiledToInterpreted;
@@ -2300,7 +2303,7 @@ begin
     interpreter — the compiled -> interpreted direction of the seam. }
   CompileExports(['run']);
   Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
-    [MakeValueI32(10)])).ToBe(True);
+    [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallInterpretedToCompiled;
@@ -2308,14 +2311,14 @@ begin
   { Only the callee is compiled: the interpreter's own CompiledCall seam. }
   CompileExports(['helper']);
   Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
-    [MakeValueI32(10)])).ToBe(True);
+    [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallIndirectHit;
 begin
   CompileExports(['double', 'run']);
   Expect<Boolean>(DiffModule(CallIndirectModuleBytes, 'run',
-    [MakeValueI32(21), MakeValueI32(0)])).ToBe(True);
+    [MakeValueI32(21), MakeValueI32(0)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestCallIndirectTraps;
@@ -2354,11 +2357,12 @@ begin
     iroCallRef template. }
   CompileExports(['double', 'run']);
   Expect<Boolean>(DiffModule(CallRefModuleBytes, 'mk',
-    [MakeValueI32(21)])).ToBe(True);
+    [MakeValueI32(21)])).ToBe(JIT_BACKEND_AVAILABLE);
 
   { A null funcref traps identically under both tiers. }
   CompileExports(['run']);
-  Expect<Boolean>(DiffModule(CallRefModuleBytes, 'mknull', [])).ToBe(True);
+  Expect<Boolean>(DiffModule(CallRefModuleBytes, 'mknull', []))
+    .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<string>(TrapMessageOf(CallRefModuleBytes, 'mknull', []))
     .ToBe('null function reference');
 end;
@@ -2367,7 +2371,8 @@ procedure TJitTests.TestMultiValueCall;
 begin
   { Two results across the call: the unmarshal loop must place BOTH slots. }
   CompileExports(['pair', 'run']);
-  Expect<Boolean>(DiffModule(MultiValueModuleBytes, 'run', [])).ToBe(True);
+  Expect<Boolean>(DiffModule(MultiValueModuleBytes, 'run', []))
+    .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestVecThroughCall;
@@ -2394,7 +2399,7 @@ begin
   FDiffHost := @JitIncCallback;
   CompileExports(['callhost']);
   Expect<Boolean>(DiffModule(HostCallModuleBytes, 'callhost',
-    [MakeValueI32(5)])).ToBe(True);
+    [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestTailCallSelfIsBounded;
@@ -2406,7 +2411,7 @@ begin
     thousands of iterations and this would crash rather than fail. }
   CompileExports(['count']);
   Expect<Boolean>(DiffModule(TailSelfModuleBytes, 'count',
-    [MakeValueI64(1000000)])).ToBe(True);
+    [MakeValueI64(1000000)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestTailCallMutual;
@@ -2415,7 +2420,7 @@ begin
     the chain across FUNCTIONS, not just around one. }
   CompileExports(['a', 'b']);
   Expect<Boolean>(DiffModule(TailMutualModuleBytes, 'a',
-    [MakeValueI64(100000)])).ToBe(True);
+    [MakeValueI64(100000)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestTailCallCrossTierBounded;
@@ -2442,7 +2447,7 @@ begin
   FDiffHost := @JitIncCallback;
   CompileExports(['tailhost']);
   Expect<Boolean>(DiffModule(HostCallModuleBytes, 'tailhost',
-    [MakeValueI32(5)])).ToBe(True);
+    [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestDeepRecursionExhausts;
@@ -2462,7 +2467,7 @@ begin
     begin
       CompileExports(['rec']);
       Expect<Boolean>(DiffModule(RecurseModuleBytes, 'rec',
-        [MakeValueI32(N)])).ToBe(True);
+        [MakeValueI32(N)])).ToBe(JIT_BACKEND_AVAILABLE);
     end;
 
     { And the message itself, at a depth well past the cap — still under the

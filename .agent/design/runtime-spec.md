@@ -915,28 +915,24 @@ exception-object layout now.
 
 ### 5.2 Handler installation
 
-Per **process**, once, guarded by a module-level flag; the alternate
-stack is per **thread**, once. Installed lazily at the first
-guard-strategy memory creation — a store with no guard-page memory (32-bit,
-Windows this wave) installs nothing.
+Per **process**, once, guarded by a module-level flag. Installed lazily at the
+first guard-strategy memory creation — a store with no guard-page memory
+(32-bit, Windows this wave) installs nothing.
 
 ```
 { per process, once }
-sigaltstack-independent: install with sigaction, SA_SIGINFO | SA_ONSTACK | SA_NODEFER
+install with sigaction, SA_SIGINFO | SA_NODEFER
   for SIGSEGV and SIGBUS.
   - SIGBUS matters on macOS (and for truncated file-backed mappings);
     Linux delivers SIGSEGV for our case, macOS can deliver either.
-  - SA_ONSTACK is what makes the handler survive a fault caused by
-    stack overflow; without it the handler cannot run.
+  - The handler claims only registered linear-memory reservations, not host
+    stack faults, so it deliberately does not request SA_ONSTACK. FPC 3.2.2's
+    Linux fpSigAction also fails to install its required sa_restorer when that
+    flag is supplied.
   - Chain to the previously installed handler when the fault is NOT
     ours (§5.3). Save the old sigaction and re-raise through it —
     never swallow a fault we did not cause.
 
-{ per thread, once, on first entry to WasmInvoke on that thread }
-sigaltstack(ss_size = max(SIGSTKSZ, 64 KiB))
-  - allocated with mmap, never freed while the thread lives.
-  - ADR-0008 confines a STORE to a thread; the signal handler is
-    process-global, so its state must be either per-thread or read-only.
 ```
 
 **Handler body — the complete list of what it may do.** Async-signal

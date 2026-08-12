@@ -311,13 +311,6 @@ procedure WasmInvoke(const AGuest: TWasmGuestProc; const AData: Pointer);
 procedure InstallFaultHandler;
 function FaultHandlerInstalled: Boolean;
 
-{ Install this thread's alternate signal stack, once. SA_ONSTACK is what
-  lets the handler run at all when the fault was a stack overflow; the
-  stack is mapped and never released while the thread lives.
-
-  A no-op where guard strategies do not exist. }
-procedure EnsureAltSignalStack;
-
 implementation
 
 { --- messages -------------------------------------------------------- }
@@ -510,28 +503,12 @@ type
     si_addr: Pointer;
   end;
 
-  TWasmAltStack = record
-    ss_sp: Pointer;
-    {$IF DEFINED(DARWIN) OR DEFINED(FREEBSD) OR DEFINED(NETBSD) OR DEFINED(OPENBSD)}
-    ss_size: NativeUInt;
-    ss_flags: cint;
-    {$ELSE}
-    ss_flags: cint;
-    ss_size: NativeUInt;
-    {$ENDIF}
-  end;
-
   { The two shapes a previously-installed disposition can take, for
     chaining a fault that is not ours (H3/A2). Which one applies is read
     from the saved action's SA_SIGINFO flag. }
   TWasmSigInfoHandler = procedure(ASig: cint; AInfo: PWasmSigInfo;
     ACtx: Pointer); cdecl;
   TWasmSimpleHandler = procedure(ASig: cint); cdecl;
-
-  { sigaltstack is POSIX but FPC does not surface it through BaseUnix on
-    every target, so it is bound directly. }
-function Sigaltstack(const ANew: Pointer; const AOld: Pointer): cint; cdecl;
-  external 'c' name 'sigaltstack';
 
 { abort(3) is async-signal-safe and terminates with SIGABRT — used only on
   the "ours but no trampoline" bug path, after a raw diagnostic write. }
@@ -541,12 +518,6 @@ var
   GHandlerInstalled: Boolean = False;
   GOldSegv: SigActionRec;
   GOldBus: SigActionRec;
-
-threadvar
-  GAltStackReady: Boolean;
-
-const
-  WASM_ALT_STACK_BYTES = 128 * 1024;
 
 { Ours, but no invocation to unwind to. Chokepoint use outside WasmInvoke
   is forbidden by design (§5): a guard memory may only be touched inside an
@@ -641,10 +612,13 @@ begin
     the empty set on every POSIX target, so no fpsigemptyset is needed
     and the field's per-target spelling never comes up. }
   FillChar(Action, SizeOf(Action), 0);
-  { SA_SIGINFO for si_addr, SA_ONSTACK so a stack-overflow fault can still
-    run the handler, SA_NODEFER so jumping out does not leave the signal
-    blocked. }
-  Action.sa_flags := SA_SIGINFO or SA_ONSTACK or SA_NODEFER;
+  { SA_SIGINFO supplies si_addr; SA_NODEFER keeps the signal unblocked across
+    LongJmp. This handler claims only faults in registered linear-memory
+    reservations, never host stack faults, so it does not need SA_ONSTACK.
+    More importantly, FPC 3.2.2's Linux fpSigAction fails to install its
+    required sa_restorer when SA_ONSTACK is supplied, which can prevent handler
+    delivery. }
+  Action.sa_flags := SA_SIGINFO or SA_NODEFER;
   { The handler occupies offset 0 of struct sigaction on every POSIX ABI
     this project targets, but FPC spells the field differently per target
     — a plain procedure pointer on Darwin and the BSDs, a variant record
@@ -675,37 +649,6 @@ begin
   Result := GHandlerInstalled;
 end;
 
-procedure EnsureAltSignalStack;
-var
-  Stack: TWasmAltStack;
-  Memory: Pointer;
-  Size: NativeUInt;
-begin
-  if GAltStackReady then
-    Exit;
-
-  { A fixed size rather than SIGSTKSZ: glibc 2.34 made SIGSTKSZ a runtime
-    query rather than a constant, and FPC does not surface it on every
-    target. 128 KiB is comfortably above every platform's minimum and the
-    mapping is lazily backed, so the slack costs nothing. }
-  Size := WASM_ALT_STACK_BYTES;
-
-  Memory := Fpmmap(nil, Size, PROT_READ or PROT_WRITE,
-    MAP_PRIVATE or MAP_ANONYMOUS, -1, 0);
-  if Memory = Pointer(-1) then
-    Exit;
-
-  Stack.ss_sp := Memory;
-  Stack.ss_size := Size;
-  Stack.ss_flags := 0;
-  if Sigaltstack(@Stack, nil) = 0 then
-    { Never unmapped: the stack must outlive every handler that could run
-      on it, which is the whole life of the thread. }
-    GAltStackReady := True
-  else
-    Fpmunmap(Memory, Size);
-end;
-
 {$ELSE}
 
 { No guard strategies here: Windows this wave (ADR-0005 names explicit
@@ -723,10 +666,6 @@ end;
 function FaultHandlerInstalled: Boolean;
 begin
   Result := False;
-end;
-
-procedure EnsureAltSignalStack;
-begin
 end;
 
 {$ENDIF}

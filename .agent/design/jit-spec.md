@@ -619,8 +619,8 @@ on:
   attribution; the trampoline (`CurrentTrampoline`) is thread-local and
   already installed around every guest entry, so a fault in compiled code
   `LongJmp`s to it exactly as ADR-0009 set up;
-- the alternate signal stack (`EnsureAltSignalStack`) and cache/altstack
-  interactions hold for the compiled-code fault case.
+- the signal-handler and cache interactions hold for the compiled-code fault
+  case.
 
 The guard-page reservation and the fault handler **stay mapped and installed
 as latent capability** (the memory unit keeps them); Track I's baseline simply

@@ -531,7 +531,6 @@ begin
       the host legitimately owns. }
     ReservationRegister(AMem.ReserveBase, NativeUInt(AMem.ReserveBytes));
     InstallFaultHandler;
-    EnsureAltSignalStack;
   end;
 end;
 

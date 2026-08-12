@@ -1,7 +1,38 @@
 # Handoff
 
-Updated: 2026-08-10 (Track I COMPLETE — both backends, cross-arch proven,
-all 4 review findings fixed; Track J AOT is next)
+Updated: 2026-08-12 (main CI repaired locally; tier benchmark corrected and
+validated; branch `codex/fix-tests-tier-performance`, changes uncommitted)
+
+## 2026-08-12 repair status
+
+- **Main's six red CI jobs were classified from run 31565283477 and fixed.**
+  Linux/aarch64 now links `__clear_cache` from `libgcc_s`; Linux guard-fault
+  delivery no longer requests `SA_ONSTACK`, which FPC 3.2.2's Linux
+  `fpSigAction` combines with a missing `sa_restorer`; Windows-only tests now
+  distinguish CPU architecture from executable-JIT capability, accept the
+  32-bit record alignment FPC actually selects, and avoid loading a signalling
+  NaN through x87. Unsupported-tier JIT tests assert a clean decline instead of
+  demanding native compilation.
+- **The conformance workflow no longer treats wasmspec's expected exit 1 as a
+  missing tally.** Both CI workflows capture the output, require a `TOTAL` line,
+  then enforce `errors=0`, the pass floor, compiled counts and byte-identical
+  tier signatures. Locally: all tiers report pass=65204, fail=389, skip=1532;
+  JIT/AOT compiled=8588.
+- **The apparent tier performance failure was benchmark contamination.**
+  `wasmlight run` auto-detects a sibling `.waot`; the old 300M-loop “interp”
+  result (~1.2s) was already AOT because it did not pass `--no-aot`. The new
+  `wasmbench` steady-state case creates isolated stores and refuses to report a
+  JIT/AOT number unless `ForceCompile`/`AotLoadAndWire` really wired native
+  code. On aarch64-darwin release: interp 4317ms, JIT 1131ms, AOT 1109ms for
+  300M iterations (3.8x compiled speedup). JIT and AOT matching is correct: the
+  artifact deliberately serializes the JIT's byte-identical machine code; AOT's
+  separate advantage is startup.
+- **Current verification:** macOS and Linux/x86-64 `lwpt test` both 44/44;
+  focused Linux/x86-64 real guard-fault suite 26/26; Linux/aarch64 `wasmlight`
+  direct build links; exact local three-tier corpus identity passes; frozen
+  install, formatting, YAML parsing and diff whitespace checks pass. The broad
+  markdown lint still reports the repository's existing 100 issues in nine
+  `.agent` design/handoff files. Push/open CI only if requested.
 
 ## Post-roadmap follow-ups (this session)
 
@@ -21,20 +52,18 @@ all 4 review findings fixed; Track J AOT is next)
   (+8). Remaining 389 = 356 post-3.0 proposals + 16 legacy EH (both out
   of scope) + ~9 (module definition/instance) harness forms + a few
   deferred decode/framing edges.
-- **Perf vs wasmtime (done, HONEST):** aarch64-darwin, min of 4 runs.
+- **Superseded perf note (measurement was contaminated):** aarch64-darwin,
+  min of 4 runs.
   fib(35): interp 4682ms / aot 4567ms / wasmtime 38ms. loop(300M mul-add):
   interp 1205 / aot 1194 / wasmtime 94. noop startup: interp 3 / aot 3 /
   wasmtime 5. TAKEAWAYS, stated plainly: (1) wasmtime's optimizing
   Cranelift JIT is 13-120x faster than wasmlight's baseline on throughput
   — expected, and the VISION "rivals C/Rust" goal is NOT met by the
-  current tiers. (2) The baseline JIT/AOT is only ~1-3% faster than the
-  interpreter here: the memory-register-file design keeps all the
-  load/store traffic and calls go through the same helpers, so the JIT
-  removes only dispatch overhead. The real speedup lives in the DEFERRED
-  optimizations (machine-register allocation, guard-page inline memory,
-  native SIMD) — genuinely future work, not shipped. (3) wasmlight's AOT
-  startup marginally beats wasmtime for trivial modules (no run-time
-  compile), but the margin is small.
+  current tiers. The wasmlight comparison itself is invalid: after producing a
+  sibling artifact, the supposed interpreter command omitted `--no-aot`, so it
+  auto-loaded AOT too. See the 2026-08-12 status above for the corrected,
+  tier-verified measurement. The wasmtime numbers have not been re-measured in
+  this repair and must not be combined with the corrected local numbers.
 
 ## THE ENTIRE ROADMAP (Tracks A-J) IS DELIVERED.
 

@@ -247,14 +247,15 @@ procedure JitFlushICache(const AStart: Pointer; const ALen: NativeUInt); cdecl;
   external 'c' name 'sys_icache_invalidate';
 {$ELSE}
 {$IFDEF CPUAARCH64}
-{ libgcc/compiler-rt: void __clear_cache(void *begin, void *end). Linux-aarch64
-  I-cache flush; what the C compilers emit for JIT trampolines.
-  UNCONFIRMED (O-J4): whether __clear_cache resolves as an `external 'c'`
-  symbol on the FPC linux-aarch64 link line, or whether the cacheflush syscall
-  is needed instead. Cannot be verified on the aarch64-DARWIN dev host; the
-  linux-aarch64 CI leg is the check. }
+{ void __clear_cache(void *begin, void *end). On Linux/aarch64 the symbol is
+  supplied by libgcc_s rather than libc; other aarch64 UNIX targets retain the
+  libc binding they already used. }
 procedure JitClearCache(const ABegin, AEnd: Pointer); cdecl;
+  {$IFDEF LINUX}
+  external 'gcc_s' name '__clear_cache';
+  {$ELSE}
   external 'c' name '__clear_cache';
+  {$ENDIF}
 {$ENDIF}
 {$ENDIF}
 
