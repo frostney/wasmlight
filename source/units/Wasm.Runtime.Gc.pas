@@ -665,8 +665,8 @@ type
 
     { The frame chain (contract GC-1). PushFrame sets Prev itself, so a
       caller only fills Slots, RefRegBits and RegisterCount. }
-    procedure PushFrame(const AFrame: PWasmGcFrame);
-    procedure PopFrame;
+    procedure PushFrame(const AFrame: PWasmGcFrame); inline;
+    procedure PopFrame; inline;
     { Drop the whole chain. The trampoline's obligation after a trap: a
       siglongjmp skips every PopFrame between the fault and the landing
       pad, so the chain must be re-established rather than trusted.
