@@ -91,6 +91,13 @@ begin
   Expect<UInt32>(Arm64LdrW(1, 0, 8)).ToBe($B9400801);
   Expect<UInt32>(Arm64LdrX(1, 0, 8)).ToBe($F9400401);
   Expect<UInt32>(Arm64StrX(2, 0, 16)).ToBe($F9000802);
+  { Scalar-memory zero-offset forms, independently assembled with clang. }
+  Expect<UInt32>(Arm64MemRegOffset($B9400000, 11, 14, 10, False))
+    .ToBe($B86A49CB);                    { ldr w11,[x14,w10,uxtw] }
+  Expect<UInt32>(Arm64MemRegOffset($B9000000, 11, 14, 10, False))
+    .ToBe($B82A49CB);                    { str w11,[x14,w10,uxtw] }
+  Expect<UInt32>(Arm64MemRegOffset($F9400000, 11, 14, 10, True))
+    .ToBe($F86A69CB);                    { ldr x11,[x14,x10] }
 
   { Wave-2 integer spine (ARMv8-A C6.2). }
   Expect<UInt32>(Arm64SubW(0, 1, 2)).ToBe($4B020020);

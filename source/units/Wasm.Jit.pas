@@ -357,6 +357,7 @@ var
   SkipPlanned: array of Boolean;
   UseStaticCache: Boolean;
   UsePinnedMemory: Boolean;
+  UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
@@ -488,6 +489,18 @@ var
       iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
       iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
         Result := True;
+      {$IFDEF WASM_JIT_ARM64}
+      iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+      iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+      iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+      iroI64Load32S, iroI64Load32U,
+      iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+      iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+      iroI64Store32:
+        { Only base-pinned memory functions are helper-free and keep x14/x15
+          available for the static cache's expression-value side. }
+        Result := UsePinnedMemoryBase;
+      {$ENDIF}
     else
       Result := False;
     end;
@@ -583,6 +596,7 @@ var
     Found, Multiple: Boolean;
   begin
     UsePinnedMemory := False;
+    UsePinnedMemoryBase := False;
     PinnedMemoryIndex := 0;
     Found := False;
     Multiple := False;
@@ -606,6 +620,33 @@ var
           Multiple := True;
       end;
     UsePinnedMemory := Found and not Multiple;
+    UsePinnedMemoryBase := UsePinnedMemory;
+    if UsePinnedMemoryBase then
+      for K := 0 to High(AFn^.Code) do
+      begin
+        { A host/direct/tail call can re-enter the embedder, and memory.grow can
+          change the live base in this frame. Keep pinning the instance for
+          those functions. Base-only pinning is restricted further to the
+          zero-offset i32 guard-page form, which consumes neither ByteSize nor
+          an explicit address-add sequence. }
+        if AFn^.Code[K].Op in [iroCall, iroCallIndirect, iroCallRef,
+          iroReturnCall, iroReturnCallIndirect, iroReturnCallRef,
+          iroMemoryGrow] then
+          UsePinnedMemoryBase := False
+        else if AFn^.Code[K].Op in [
+          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+          iroI64Load32S, iroI64Load32U,
+          iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+          iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+          iroI64Store32] then
+          if (AFn^.Code[K].Imm <> 0) or
+            (AFn^.Code[K].A >= UInt32(Length(AFn^.RegTypes))) or
+            (AFn^.RegTypes[AFn^.Code[K].A].Kind <> wvkNum) or
+            (AFn^.RegTypes[AFn^.Code[K].A].Num <> wntI32) then
+            UsePinnedMemoryBase := False;
+      end;
   end;
 begin
   Result := TWasmCodeBuffer.Create;
@@ -636,8 +677,8 @@ begin
           end;
       end;
 
-    AnalyzeStaticCache;
     AnalyzePinnedMemory;
+    AnalyzeStaticCache;
     AnalyzeAdjacentMoves;
     AnalyzeFusion;
 
@@ -646,7 +687,7 @@ begin
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     if UsePinnedMemory then
-      Arm64EmitPinMemory(Buf, PinnedMemoryIndex);
+      Arm64EmitPinMemory(Buf, PinnedMemoryIndex, UsePinnedMemoryBase);
     Arm64InitRegCache(ArmCache);
     if UseStaticCache then
       Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
@@ -691,7 +732,7 @@ begin
           (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
-          UsePinnedMemory, ArmCache);
+          UsePinnedMemory, UsePinnedMemoryBase, ArmCache);
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
       if Fusion[I] >= 0 then

@@ -588,7 +588,7 @@ begin
       BLit([$60, $00, $01, $7F]),                    { 2: ()->i32 }
       BLit([$60, $03, $7F, $7F, $7F, $01, $7F])])),  { 3: (i32,i32,i32)->i32 }
     Sect(3, VecOf([BLit([$00]), BLit([$01]), BLit([$01]), BLit([$02]),
-      BLit([$01]), BLit([$03]), BLit([$03])])),
+      BLit([$01]), BLit([$03]), BLit([$03]), BLit([$01])])),
     Sect(5, VecOf([BLit([$00, $01])])),              { memory min 1 }
     Sect(7, VecOf([
       ExportEntry('sload', $00, 0),
@@ -597,7 +597,8 @@ begin
       ExportEntry('size', $00, 3),
       ExportEntry('grow', $00, 4),
       ExportEntry('fill', $00, 5),
-      ExportEntry('copy', $00, 6)])),
+      ExportEntry('copy', $00, 6),
+      ExportEntry('offsetload', $00, 7)])),
     Sect(10, VecOf([
       CodeEntry([$00, $20, $00, $20, $01, $36, $02, $00,
         $20, $00, $28, $02, $00, $0B]),              { store arg1@arg0; load arg0 }
@@ -608,9 +609,32 @@ begin
       CodeEntry([$00, $20, $00, $20, $01, $20, $02, $FC, $0B, $00,
         $20, $00, $2D, $00, $00, $0B]),               { fill; load8_u arg0 }
       CodeEntry([$00, $20, $00, $20, $01, $20, $02, $FC, $0A, $00, $00,
-        $20, $00, $2D, $00, $00, $0B])])),            { copy; load8_u arg0 }
+        $20, $00, $2D, $00, $00, $0B]),               { copy; load8_u arg0 }
+      CodeEntry([$00, $20, $00, $28, $02, $04, $0B])])), { i32.load offset=4 }
     Sect(11, VecOf([Cat([BLit([$00, $41, $00, $0B]),
       ULeb(8), BLit([$FF, $11, $22, $33, $44, $55, $66, $77])])]))
+  ]);
+end;
+
+{ A helper-free, zero-offset i32 memory loop: on aarch64 this is the exact
+  shape allowed to pin the live base and retain numeric slots across scalar
+  accesses. It stores and reloads i=0..n-1 and returns their sum. }
+function MemLoopModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, $01])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $01, $02, $7F,                  { locals: i, acc }
+      $03, $40,                       { loop }
+      $41, $00, $20, $01, $36, $02, $00, { memory[0] := i }
+      $20, $02, $41, $00, $28, $02, $00, $6A, $21, $02, { acc += memory[0] }
+      $20, $01, $41, $01, $6A, $22, $01, { ++i }
+      $20, $00, $49, $0D, $00,        { while i < n }
+      $0B, $20, $02, $0B])]))
   ]);
 end;
 
@@ -1169,6 +1193,7 @@ type
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
+    procedure TestMemoryLoopCache;
     procedure TestMemoryOobTraps;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
@@ -2535,6 +2560,12 @@ begin
     [MakeValueI32(0)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+procedure TJitTests.TestMemoryLoopCache;
+begin
+  Expect<Boolean>(DiffFresh(MemLoopModuleBytes, 'run', [MakeValueI32(100)]))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
 procedure TJitTests.TestMemoryOobTraps;
 begin
   { an out-of-bounds load and store both trap 'out of bounds memory access'
@@ -2547,6 +2578,15 @@ begin
   Expect<string>(TrapMessageOf(MemBasicModuleBytes, 'sload',
     [MakeValueI32(Integer($1FFFF)), MakeValueI32(1)]))
     .ToBe('out of bounds memory access');
+  { A folded non-zero static offset uses the i32 guard reservation too: the
+    final four bytes are valid, while advancing that effective address by four
+    enters the guard and must produce the same trap as the interpreter. }
+  Expect<Boolean>(DiffFresh(MemBasicModuleBytes, 'offsetload',
+    [MakeValueI32(Integer($FFF8))])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  DiffFresh(MemBasicModuleBytes, 'offsetload',
+    [MakeValueI32(Integer($FFFC))]);
+  Expect<string>(TrapMessageOf(MemBasicModuleBytes, 'offsetload',
+    [MakeValueI32(Integer($FFFC))])).ToBe('out of bounds memory access');
 end;
 
 procedure TJitTests.TestMemorySizeGrow;
@@ -2849,6 +2889,8 @@ begin
     TestThrowAcrossCompiledFrameCaught);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
+  Test('a scalar memory loop retains cached values identically',
+    TestMemoryLoopCache);
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);
   Test('memory.fill/copy match the interpreter', TestMemoryFillCopy);

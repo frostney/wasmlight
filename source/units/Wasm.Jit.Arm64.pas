@@ -135,7 +135,7 @@ const
   { --- position-independent pins (aot-spec §1.2/§1.3/§4.3) --------------- }
   ARM64_REG_IRBASE = 23;   { x23 = @Fn^.Code[0], the IR-code base (entry arg x2) }
   ARM64_REG_HELPERTABLE = 24;  { x24 = the per-process helper-table base }
-  ARM64_REG_MEMORY = 25;   { x25 = single static memory instance, when used }
+  ARM64_REG_MEMORY = 25;   { x25 = one memory instance, or proven-stable Base }
   ARM64_REG_T0 = 9;        { x9/w9 scratch }
   ARM64_REG_T1 = 10;       { x10/w10 scratch }
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
@@ -197,6 +197,12 @@ function Arm64LdrW(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 function Arm64LdrX(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 function Arm64StrW(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 function Arm64StrX(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+{ Load/store register-offset form used by scalar linear-memory accesses.
+  AUnsignedBase is the existing size/sign-specific unsigned-offset opcode
+  prefix; i32 addresses use UXTW while memory64 uses an unextended X register. }
+function Arm64MemRegOffset(const AUnsignedBase: UInt32;
+  const ARt, ARn, ARm: Byte;
+  const AAddr64: Boolean): UInt32;
 
 { Data-processing (shifted register), 32-bit (W) and 64-bit (X). The W form
   zero-extends its result into the whole X register, so a following STR Xt
@@ -399,7 +405,7 @@ procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
 procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
-  const AMemoryIndex: UInt32);
+  const AMemoryIndex: UInt32; const ABaseOnly: Boolean);
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
@@ -459,7 +465,8 @@ procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase: Boolean;
   var ACache: TArm64RegCache): Boolean;
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
@@ -628,37 +635,61 @@ begin
 end;
 
 procedure Arm64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAddr64, AUsePinnedMemory: Boolean);
+  const AIns: TWasmIrInstr; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase: Boolean; var ACache: TArm64RegCache);
 var
   Layout: TWasmMemoryInst;
   AccessSize: UInt32;
+  BaseReg: Byte;
+  MemoryReg: Byte;
   Offset: UInt64;
   Folded: Boolean;
   LoadOp: UInt32;
+  UseRegOffset: Boolean;
 begin
   AccessSize := Arm64MemoryAccessSize(AIns.Op);
   Offset := UInt64(AIns.Imm);
   Folded := Offset <= WASM_STATIC_OFFSET_FOLD - AccessSize;
+  UseRegOffset := Offset = 0;
 
   { Resolve the module memory index through the current activation. The helper
     returns the live TWasmMemoryInst; generated code then applies that memory's
     statically selected strategy. The helper-table call keeps AOT bytes free of
     process addresses. }
-  if AUsePinnedMemory then
-    ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_MEMORY))
+  if AUsePinnedMemoryBase then
+  begin
+    { The driver permits a base-only pin only for zero-offset i32 guard-page
+      accesses in a function that cannot call or grow memory. No operation in
+      that frame can change Base, so x25 is the live base for its whole body. }
+    BaseReg := ARM64_REG_MEMORY;
+    MemoryReg := 0;
+  end
+  else if AUsePinnedMemory then
+    MemoryReg := ARM64_REG_MEMORY
   else
   begin
     ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
     Arm64EmitLoadImm32(ABuf, 1, AIns.B);
     Arm64EmitCallHelper(ABuf, aohResolveMemory);     { x0 := memory instance }
+    MemoryReg := 0;
   end;
-  Arm64EmitLdrX(ABuf, 14, 0, UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
-  Arm64EmitLdrX(ABuf, 15, 0,
-    UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
+  { The memory instance may outlive a grow/remap, but Base remains live state:
+    load it at every access even when the instance itself is pinned. The i32
+    folded guard-page case does not inspect ByteSize at all, so avoid loading a
+    field that the selected access strategy cannot consume. }
+  if not AUsePinnedMemoryBase then
+  begin
+    BaseReg := 14;
+    Arm64EmitLdrX(ABuf, BaseReg, MemoryReg,
+      UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
+    if AAddr64 or not Folded then
+      Arm64EmitLdrX(ABuf, 15, MemoryReg,
+        UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
+  end;
   if AAddr64 then
-    LdX(ABuf, 10, AIns.A)
+    Arm64CachedLoad(ABuf, ACache, 10, AIns.A)
   else
-    LdW(ABuf, 10, AIns.A);                          { zero-extended i32 index }
+    Arm64CachedLoad(ABuf, ACache, 10, AIns.A);      { canonical i32 is zero-extended }
 
   if AAddr64 and Folded then
   begin
@@ -687,11 +718,16 @@ begin
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
   end;
 
-  ABuf.EmitU32(Arm64AddX(14, 14, 10));
-  if Offset <> 0 then
+  if not UseRegOffset then
   begin
+    if BaseReg <> 14 then
+    begin
+      ABuf.EmitU32(Arm64MovReg(14, BaseReg));
+      BaseReg := 14;
+    end;
+    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 10));
     Arm64EmitLoadImm64(ABuf, 11, Offset);
-    ABuf.EmitU32(Arm64AddX(14, 14, 11));
+    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 11));
   end;
 
   case AIns.Op of
@@ -706,45 +742,66 @@ begin
     iroI64Load, iroF64Load: LoadOp := $F9400000;
     iroI32Store8, iroI64Store8:
       begin
-        LdX(ABuf, 11, AIns.Dest);
-        ABuf.EmitU32($39000000 or (UInt32(14) shl 5) or 11);
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($39000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($39000000 or (UInt32(BaseReg) shl 5) or 11);
         Exit;
       end;
     iroI32Store16, iroI64Store16:
       begin
-        LdX(ABuf, 11, AIns.Dest);
-        ABuf.EmitU32($79000000 or (UInt32(14) shl 5) or 11);
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($79000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($79000000 or (UInt32(BaseReg) shl 5) or 11);
         Exit;
       end;
     iroI32Store, iroF32Store, iroI64Store32:
       begin
-        LdX(ABuf, 11, AIns.Dest);
-        ABuf.EmitU32($B9000000 or (UInt32(14) shl 5) or 11);
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($B9000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($B9000000 or (UInt32(BaseReg) shl 5) or 11);
         Exit;
       end;
     iroI64Store, iroF64Store:
       begin
-        LdX(ABuf, 11, AIns.Dest);
-        ABuf.EmitU32($F9000000 or (UInt32(14) shl 5) or 11);
+        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        if UseRegOffset then
+          ABuf.EmitU32(Arm64MemRegOffset($F9000000, 11, BaseReg, 10, AAddr64))
+        else
+          ABuf.EmitU32($F9000000 or (UInt32(BaseReg) shl 5) or 11);
         Exit;
       end;
   else
     Exit;
   end;
-  ABuf.EmitU32(LoadOp or (UInt32(14) shl 5) or 11);
-  StX(ABuf, 11, AIns.Dest);
+  if UseRegOffset then
+    ABuf.EmitU32(Arm64MemRegOffset(LoadOp, 11, BaseReg, 10, AAddr64))
+  else
+    ABuf.EmitU32(LoadOp or (UInt32(BaseReg) shl 5) or 11);
+  Arm64CachedStore(ABuf, ACache, 11, AIns.Dest);
 end;
 
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase: Boolean;
   var ACache: TArm64RegCache): Boolean;
 begin
   Result := True;
   if Arm64ScalarMemoryOp(AIns.Op) then
   begin
-    Arm64InvalidateRegCache(ACache);
-    Arm64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
+    { The base-pinned static-cache shape never consumes x14/x15 itself. Every
+      other scalar-memory shape does, so discard dynamic-cache metadata before
+      those scratch registers are reused for Base/ByteSize. }
+    if not AUsePinnedMemoryBase then
+      Arm64InvalidateRegCache(ACache);
+    Arm64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory,
+      AUsePinnedMemoryBase, ACache);
     Exit;
   end;
   case AIns.Op of
@@ -2401,6 +2458,21 @@ begin
     or ARt;
 end;
 
+function Arm64MemRegOffset(const AUnsignedBase: UInt32;
+  const ARt, ARn, ARm: Byte; const AAddr64: Boolean): UInt32;
+var
+  ExtendBits: UInt32;
+begin
+  if AAddr64 then
+    ExtendBits := $6800             { [Xn,Xm] }
+  else
+    ExtendBits := $4800;            { [Xn,Wm,UXTW] }
+  { Every scalar load/store unsigned-offset prefix is exactly $00E00000 above
+    its register-offset prefix across the byte/half/word/dword sign variants. }
+  Result := (AUnsignedBase - $00E00000) or (UInt32(ARm) shl 16) or ExtendBits or
+    (UInt32(ARn) shl 5) or ARt;
+end;
+
 function Arm64LdrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
 begin
   Result := $3DC00000 or ((AByteOffset div 16) shl 10)
@@ -3031,12 +3103,18 @@ begin
 end;
 
 procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
-  const AMemoryIndex: UInt32);
+  const AMemoryIndex: UInt32; const ABaseOnly: Boolean);
+var
+  Layout: TWasmMemoryInst;
 begin
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
   Arm64EmitLoadImm32(ABuf, 1, AMemoryIndex);
   Arm64EmitCallHelper(ABuf, aohResolveMemory);
-  ABuf.EmitU32(Arm64MovReg(ARM64_REG_MEMORY, 0));
+  if ABaseOnly then
+    Arm64EmitLdrX(ABuf, ARM64_REG_MEMORY, 0,
+      UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)))
+  else
+    ABuf.EmitU32(Arm64MovReg(ARM64_REG_MEMORY, 0));
 end;
 
 procedure Arm64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
