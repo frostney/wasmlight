@@ -616,6 +616,25 @@ begin
   ]);
 end;
 
+{ The largest valid memory64 memarg offset. The IR stores immediates in an
+  Int64 slot, so this value exercises the unsigned bit-pattern boundary in
+  every tier. It is valid to compile and traps only when the load executes. }
+function Mem64MaxOffsetModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$04, $01])])),              { memory i64 min 1 }
+    Sect(7, VecOf([ExportEntry('load', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([$00,
+      $42, $00,                                      { i64.const 0 }
+      $28, $02,                                      { i32.load align=2 }
+      $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $01,
+      $0B])]))                                       { offset=High(UInt64) }
+  ]);
+end;
+
 { A helper-free, zero-offset i32 memory loop: on aarch64 this is the exact
   shape allowed to pin the live base and retain numeric slots across scalar
   accesses. It stores and reloads i=0..n-1 and returns their sum. }
@@ -1195,6 +1214,7 @@ type
     procedure TestMemoryLoadStore;
     procedure TestMemoryLoopCache;
     procedure TestMemoryOobTraps;
+    procedure TestMemory64MaxOffset;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
     procedure TestMemoryInitDrop;
@@ -2589,6 +2609,14 @@ begin
     [MakeValueI32(Integer($FFFC))])).ToBe('out of bounds memory access');
 end;
 
+procedure TJitTests.TestMemory64MaxOffset;
+begin
+  Expect<Boolean>(DiffFresh(Mem64MaxOffsetModuleBytes, 'load', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<string>(TrapMessageOf(Mem64MaxOffsetModuleBytes, 'load', []))
+    .ToBe('out of bounds memory access');
+end;
+
 procedure TJitTests.TestMemorySizeGrow;
 begin
   { size returns the initial page count; grow returns the OLD size (1) then
@@ -2892,6 +2920,8 @@ begin
   Test('a scalar memory loop retains cached values identically',
     TestMemoryLoopCache);
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);
+  Test('memory64 maximum offset compiles and traps identically',
+    TestMemory64MaxOffset);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);
   Test('memory.fill/copy match the interpreter', TestMemoryFillCopy);
   Test('memory.init/data.drop match the interpreter', TestMemoryInitDrop);

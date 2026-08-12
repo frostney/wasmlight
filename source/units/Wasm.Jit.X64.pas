@@ -2338,8 +2338,11 @@ var
   SignedLoad: Boolean;
 begin
   AccessSize := X64MemoryAccessSize(AIns.Op);
-  Offset := UInt64(AIns.Imm);
-  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - AccessSize;
+  { Imm stores the memarg's u64 bit pattern in the IR's signed immediate slot.
+    Reinterpret it: a checked numeric conversion rejects offsets above
+    High(Int64), even though memory64 admits the full u64 range. }
+  Move(AIns.Imm, Offset, SizeOf(Offset));
+  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - UInt64(AccessSize);
 
   if AUsePinnedMemory then
     X64EmitLoadMem64(ABuf, X64_RAX, X64_RSP, 0)

@@ -15,8 +15,21 @@ cross-architecture/cross-tier validated; PR #1 open)
   `.agent/design`. The blocking rule was kept intact; the internal design notes
   were mechanically repaired with fence-language tags, real appendix headings,
   spacing fixes, and no technical content changes. Repository-wide Markdown
-  lint now passes all 41 files. Keep the PR draft until the new exact-head CI
-  run is green, then mark it ready for review.
+  lint now passes all 41 files.
+- Exact-head CI then exposed two checked-build portability defects. The macOS
+  corpus compiled a legal `memory64` offset above `High(Int64)` through a
+  checked numeric conversion, and the Windows AOT test referenced the
+  executable-memory capability probe without directly importing its unit.
+  The native emitters and interpreter now reinterpret the IR immediate's raw
+  bits, the fold comparison is explicitly unsigned on both backends, and the
+  AOT suite imports `Wasm.Jit.CodeBuffer` directly. A new differential invokes
+  the maximum u64 offset and requires the same out-of-bounds trap in interpreter
+  and compiled execution.
+- The post-fix macOS gate is green: frozen install, format, dev and release
+  builds, 44/44 unit suites, repository-wide Markdown lint, and full corpus
+  tier identity at pass=65204, fail=389, skip=1532, staged=0, errors=0, with
+  8588 compiled JIT/AOT functions. Push this exact head and keep the PR draft
+  until its replacement CI run is green, then mark it ready for review.
 
 ## 2026-08-12 fifth measured optimization wave complete
 

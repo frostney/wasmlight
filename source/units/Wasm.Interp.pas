@@ -1216,7 +1216,8 @@ begin
     slot, so an i32 index reads back exactly); Imm = raw u64 static offset. }
   MemAddr := AAct^.Instance.MemAddrs[AIns^.B];
   Index := Reg[AIns^.A].U64;
-  Offset := UInt64(AIns^.Imm);
+  { The IR keeps the memarg's raw u64 bits in its signed immediate slot. }
+  Move(AIns^.Imm, Offset, SizeOf(Offset));
   case AIns^.Op of
     iroI32Load:
       Reg[AIns^.Dest].Bits := UInt64(UInt32(MemLoad(Store, MemAddr, Index, Offset, 4)));
@@ -1278,7 +1279,8 @@ begin
     index. Store8/16/32 write only the low bytes. }
   MemAddr := AAct^.Instance.MemAddrs[AIns^.B];
   Index := Reg[AIns^.A].U64;
-  Offset := UInt64(AIns^.Imm);
+  { The IR keeps the memarg's raw u64 bits in its signed immediate slot. }
+  Move(AIns^.Imm, Offset, SizeOf(Offset));
   Value := Reg[AIns^.Dest].U64;
   case AIns^.Op of
     iroI32Store, iroF32Store: MemStore(Store, MemAddr, Index, Offset, 4, Value);

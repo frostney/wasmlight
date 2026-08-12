@@ -56,6 +56,7 @@ uses
   Wasm.Interp,
   Wasm.Ir,
   Wasm.Jit,
+  Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values;

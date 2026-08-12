@@ -652,8 +652,11 @@ var
   UseRegOffset: Boolean;
 begin
   AccessSize := Arm64MemoryAccessSize(AIns.Op);
-  Offset := UInt64(AIns.Imm);
-  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - AccessSize;
+  { Imm stores the memarg's u64 bit pattern in the IR's signed immediate slot.
+    Reinterpret it: a checked numeric conversion rejects offsets above
+    High(Int64), even though memory64 admits the full u64 range. }
+  Move(AIns.Imm, Offset, SizeOf(Offset));
+  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - UInt64(AccessSize);
   UseRegOffset := Offset = 0;
 
   { Resolve the module memory index through the current activation. The helper
