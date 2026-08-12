@@ -1,7 +1,53 @@
 # Handoff
 
-Updated: 2026-08-12 (measured optimizing-codegen wave complete, integrated,
-and cross-architecture/cross-tier validated)
+Updated: 2026-08-12 (third measured optimization wave integrated and
+cross-architecture/cross-tier validated)
+
+## 2026-08-12 third measured optimization wave complete
+
+- **Three accepted implementations are integrated:** `468bd5e` expands the
+  aarch64 helper-free numeric loop cache from two to four expression
+  temporaries beside its two allocated locals; `f10181a` reuses resolved
+  direct-call metadata and specializes normal result gather/frame retirement;
+  `b4c7395` pins a stable memory base and retains operands only for helper-free,
+  zero-offset i32 guard-page loops with no calls or `memory.grow`. `fdfeea9`
+  updates the cache-rotation test for the combined emitter seam.
+- **Every lane passed an immediate serialized A/B gate before integration.**
+  Four retained temporaries improved loop JIT/AOT by 3.1-3.9%/4.2-4.5%.
+  Streamlined call frames improved fib(35) by 3.9-18.4%/9.9-12.6% across
+  forward and reverse runs. The accepted memory-loop shape improved 30M scalar
+  memory by 35.7%/36.9%; direct pinned-instance addressing, register-offset
+  addressing, and base pinning alone were each below the materiality threshold.
+- **Rejected implementations stayed out:** allocating four long-lived loop
+  slots regressed 336ms to 634ms (~89%); destination-aware ALU emission lost
+  most of the temporary-cache gain; and the earlier Pascal helper spanning a
+  recursive native call was not retried. No Pascal helper frame spans the
+  accepted direct-call path's native callee.
+- **Fresh integrated Apple Silicon release medians, seven samples:** against
+  the exact pre-wave 345/342ms loop, 429/488ms fib, and 86/87ms memory medians,
+  JIT/AOT now measure 320/319ms (7.2%/6.7%), 373/372ms (13.1%/23.8%), and
+  46/46ms (46.5%/47.1%). Numeric 43ms, SIMD 135ms, and startup 7/9ms remain in
+  their prior bands. Isolated serialized A/B figures above are the acceptance
+  evidence; the combined percentages include ordinary host-load variation.
+- **Safety boundaries:** the four-temporary cache retains the existing
+  helper/call/reference/memory-free eligibility and flushes canonical exits;
+  epoch mismatch remains non-returning. The memory-specific path is aarch64
+  only and requires one memory, zero offsets, i32 guard-page addresses, a
+  back-edge, and no call, tail call, or grow; every other shape retains live
+  per-access state and cache invalidation. Direct calls retain stack exhaustion,
+  precise GC publication, exceptional unwind, and the tail-call trampoline.
+- **Combined correctness:** macOS frozen install, formatting, release build,
+  all 44 unit suites, and the full three-tier corpus are green: pass=65204,
+  fail=389, skip=1532, staged=0, errors=0, compiled=8588 for JIT/AOT.
+  Linux/x86-64 also passes frozen install, formatting, release build, all 44
+  suites, and the identical corpus tally with compiled=8589.
+- **Refreshed Wasmtime 47.0.3 comparison:** end-to-end precompiled commands,
+  identical fixed modules, compilation excluded, one warmup discarded. On
+  macOS, Wasmlight/Wasmtime medians are 323.169/83.658ms for the 300M loop
+  (3.86x), 173.011/18.536ms for 50M varying-address scalar loads (9.33x), and
+  386.399/34.755ms for fib(35) (11.12x). In the Rosetta x86-64 Linux VM they
+  are 2.058/0.647s (3.18x), 2.615/0.181s (14.46x), and 3.677/0.423s (8.70x).
+  The Linux absolute times describe the VM, not native x86-64 hardware.
 
 ## 2026-08-12 second measured optimization wave complete
 
