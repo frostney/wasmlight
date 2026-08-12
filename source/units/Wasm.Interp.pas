@@ -3185,7 +3185,9 @@ var
   Fn: PWasmIrFunction;
 begin
   Result := nil;
-  Ctx := InterpContextFor(AStore);
+  { A compiled call can only execute inside an already-registered invocation;
+    avoid the lazy-context branch on every recursive native call. }
+  Ctx := PWasmInterpContext(AStore.TierContext);
   Inst := Ctx^.Acts[Ctx^.Depth - 1].Instance;
   Addr := Inst.FuncAddrs[UInt32(AFuncIdx)];
   if (AStore.Funcs[Addr].Kind <> wfkWasm) or
@@ -3207,7 +3209,7 @@ procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
 var
   Ctx: PWasmInterpContext;
 begin
-  Ctx := InterpContextFor(AStore);
+  Ctx := PWasmInterpContext(AStore.TierContext);
   { During execution rtCaller made the frame transparent to the outer native
     unwind barrier. No exception is live now, so select the existing flat
     result-marshalling branch immediately before the shared pop. }
