@@ -1539,10 +1539,13 @@ begin
   {$IFDEF WASM_JIT_BACKEND}
   Expect<Boolean>(Compiled).ToBe(True);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(True);
+  Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry =
+    FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
   Expect<Boolean>(FJit.ForceCompile(AddAddr)).ToBe(True);
   {$ELSE}
   Expect<Boolean>(Compiled).ToBe(False);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(False);
+  Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry = nil).ToBe(True);
   {$ENDIF}
 end;
 

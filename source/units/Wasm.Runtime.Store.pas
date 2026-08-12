@@ -279,6 +279,11 @@ type
       interpreter only maintains the counter — the compile decision and the
       threshold belong to Wasm.Jit. }
     CompiledEntry: Pointer;
+    { Same machine-code address only when the body cannot publish a pending
+      return_call*. Direct native callers use this stricter pointer so a
+      tail-calling body always stays on the invocation trampoline that consumes
+      and re-dispatches its pending target. }
+    CompiledDirectEntry: Pointer;
     CallCount: UInt32;
     { wfkHost }
     Callback: TWasmHostFunc;
@@ -886,7 +891,8 @@ type
     to the helper's live address, filled once at RegisterJit. Both backends
     share this ordering, and the ABI fingerprint (Wasm.Interp) folds the count
     in, so a reorder is caught. NEVER reorder without bumping AOT_ABI_REVISION.
-    The twelve entries mirror jit-spec's baked-helper table exactly. }
+    Existing ordinals never move: AOT artifacts bake them into machine code.
+    New helpers are appended and the ABI revision is bumped with the emitter. }
   TWasmAotHelper = (
     aohTrapKind,               { 0  TrapNow(kind) — every trap stub }
     aohOpBinary,               { 1  binary numeric leaf }
@@ -899,7 +905,9 @@ type
     aohCallRef,                { 8  call_ref }
     aohReturnCall,             { 9  return_call }
     aohReturnCallIndirect,     { 10 return_call_indirect }
-    aohReturnCallRef           { 11 return_call_ref }
+    aohReturnCallRef,          { 11 return_call_ref }
+    aohDirectCallPrepare,      { 12 compiled direct-call frame entry }
+    aohDirectCallFinish        { 13 compiled direct-call frame exit }
   );
 
 const
@@ -915,6 +923,7 @@ type
     FuncInstStride: NativeUInt;      { SizeOf(TWasmFuncInst) }
     FuncKind: NativeUInt;            { TWasmFuncInst.Kind }
     FuncCompiledEntry: NativeUInt;   { TWasmFuncInst.CompiledEntry }
+    FuncCompiledDirectEntry: NativeUInt; { TWasmFuncInst.CompiledDirectEntry }
     FuncCallCount: NativeUInt;       { TWasmFuncInst.CallCount }
     MemInstStride: NativeUInt;       { SizeOf(TWasmMemoryInst) }
     MemBase: NativeUInt;             { TWasmMemoryInst.Base }
@@ -2243,6 +2252,8 @@ begin
   Result.FuncInstStride := SizeOf(TWasmFuncInst);
   Result.FuncKind := PtrUInt(@F.Kind) - PtrUInt(@F);
   Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);
+  Result.FuncCompiledDirectEntry :=
+    PtrUInt(@F.CompiledDirectEntry) - PtrUInt(@F);
   Result.FuncCallCount := PtrUInt(@F.CallCount) - PtrUInt(@F);
   Result.MemInstStride := SizeOf(TWasmMemoryInst);
   Result.MemBase := PtrUInt(@M.Base) - PtrUInt(@M);

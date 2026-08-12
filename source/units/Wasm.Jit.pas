@@ -18,14 +18,15 @@
       (JitCanCompile — the scope fence, §10.3), so the JIT is always correct and
       only ever faster where it applies.
 
-  THE HAND-OFF (§5.1, the frame IS the interpreter's frame). The compiled code
-  never carves its own frame. JitDispatch builds the frame through the SHARED
-  helper Wasm.Interp.JitEnterFrame — exhaustion check, register-file carve,
+  THE HAND-OFF (§5.1, the frame IS the interpreter's frame). Generated code
+  never edits the interpreter context layout itself. JitDispatch builds an
+  entry frame, and a direct compiled call reaches the same logic through
+  JitPrepareDirectCall — exhaustion check, register-file carve,
   zero, param marshal, GC-frame push — which returns @Values[Base], the
   register-file base. It passes that base to the compiled entry in the first
   argument register (x0 on AAPCS64); the compiled body reads and writes ONLY the
   in-memory register file (Reg[k] = base + k*8) and returns; then
-  Wasm.Interp.JitLeaveFrame marshals the result slots out and pops the frame.
+  JitLeaveFrame/JitFinishDirectCall marshal the result slots out and pop it.
   Because the carve/zero/push/pop and the param/result marshaling are the
   interpreter's exact code, the exhaustion threshold, the GC contract, and the
   flat-slot calling convention are identical by construction — the observational
@@ -226,6 +227,20 @@ begin
   X64InvokeCompiled(AStore, AFuncAddr, AParams, AResults);
   {$ENDIF}
 end;
+
+function JitCanDirectCall(const AFn: PWasmIrFunctionRec): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if AFn = nil then
+    Exit;
+  for I := 0 to High(AFn^.Code) do
+    if AFn^.Code[I].Op in
+      [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef] then
+      Exit;
+  Result := True;
+end;
 {$ELSE}
 var
   Ctx: PWasmInterpContext;
@@ -330,9 +345,23 @@ function JitCompileToBuffer(const AFn: PWasmIrFunctionRec;
   const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
   const AFinalize: Boolean = True): TWasmCodeBuffer;
 var
-  I: Integer;
+  I, J: Integer;
   Buf: TWasmCodeBuffer;
   Emitted: Boolean;
+  Targets: array of Boolean;
+  TargetCount: UInt32;
+  {$IFDEF WASM_JIT_ARM64}
+  ArmCache: TArm64RegCache;
+  {$ENDIF}
+  {$IFDEF WASM_JIT_X64}
+  X64Cache: TX64RegCache;
+  {$ENDIF}
+
+  procedure MarkTarget(const ATarget: UInt32);
+  begin
+    if ATarget < UInt32(Length(Targets)) then
+      Targets[ATarget] := True;
+  end;
 begin
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
@@ -342,29 +371,62 @@ begin
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
 
+    { A cache is valid only along one straight-line predecessor. Mark every IR
+      branch destination up front so a join invalidates compile-time cache
+      metadata before its label is bound. Values are write-through, therefore
+      no generated flush is needed. }
+    SetLength(Targets, Length(AFn^.Code));
+    for I := 0 to High(AFn^.Code) do
+      case AFn^.Code[I].Op of
+        iroJump: MarkTarget(AFn^.Code[I].A);
+        iroBranchIf, iroBranchIfNot,
+        iroBrOnNull, iroBrOnNonNull, iroBrOnCast, iroBrOnCastFail:
+          MarkTarget(AFn^.Code[I].B);
+        iroBrTable:
+          begin
+            TargetCount := IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[I].B);
+            for J := 0 to Integer(TargetCount) - 1 do
+              MarkTarget(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[I].B,
+                UInt32(J)));
+          end;
+      end;
+
     {$IFDEF WASM_JIT_ARM64}
     Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    Arm64InitRegCache(ArmCache);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     X64EmitPrologue(Buf);
     X64EmitPinHelperTable(Buf, AHelperTableOffset);
     X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    X64InitRegCache(X64Cache);
     {$ENDIF}
 
     for I := 0 to High(AFn^.Code) do
     begin
+      if Targets[I] then
+      begin
+        {$IFDEF WASM_JIT_ARM64}
+        Arm64InvalidateRegCache(ArmCache);
+        {$ENDIF}
+        {$IFDEF WASM_JIT_X64}
+        X64InvalidateRegCache(X64Cache);
+        {$ENDIF}
+      end;
       Buf.BindLabel(TWasmJitLabel(I));
       { Position-independent IR reference (aot-spec §1.3): pass the instruction
         INDEX; the runtime-op templates compute @Fn^.Code[i] from the pinned IR
         base (x23/rbp), which the entry receives freshly per invocation — no
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      Emitted := Arm64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32, UInt32(I));
+      Emitted := Arm64EmitOpCached(Buf, AFn^.Code[I], AFn^.AuxU32,
+        UInt32(I), ArmCache);
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
-      Emitted := X64EmitOp(Buf, AFn^.Code[I], AFn^.AuxU32, UInt32(I));
+      Emitted := X64EmitOpCached(Buf, AFn^.Code[I], AFn^.AuxU32,
+        UInt32(I), X64Cache);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
@@ -416,7 +478,10 @@ begin
   begin
     for I := 0 to High(FCompiledAddrs) do
       if FCompiledAddrs[I] <= High(FStore.Funcs) then
+      begin
         FStore.Funcs[FCompiledAddrs[I]].CompiledEntry := nil;
+        FStore.Funcs[FCompiledAddrs[I]].CompiledDirectEntry := nil;
+      end;
     { We installed the hook (RegisterJit); clear it so a later call finds no
       dispatcher and runs interpreted. Normal use is one JIT context per store,
       so an unconditional clear is correct. }
@@ -502,6 +567,8 @@ begin
   end;
 
   FStore.Funcs[AAddr].CompiledEntry := FBuffers[N].EntryPoint;
+  if JitCanDirectCall(Fn) then
+    FStore.Funcs[AAddr].CompiledDirectEntry := FBuffers[N].EntryPoint;
 
   N := Length(FCompiledAddrs);
   SetLength(FCompiledAddrs, N + 1);
@@ -557,6 +624,9 @@ begin
     is honoured for a future layout that prefixes the code. }
   FStore.Funcs[AAddr].CompiledEntry :=
     Pointer(PtrUInt(Buf.EntryPoint) + AEntryOffset);
+  if JitCanDirectCall(IrFunctionFor(AAddr)) then
+    FStore.Funcs[AAddr].CompiledDirectEntry :=
+      FStore.Funcs[AAddr].CompiledEntry;
 
   N := Length(FCompiledAddrs);
   SetLength(FCompiledAddrs, N + 1);

@@ -154,6 +154,15 @@ type
     GcFrameRegisterCount: NativeUInt;{ TWasmGcFrame.RegisterCount }
   end;
 
+  { The two live values a generated direct-call site needs after the shared
+    frame helper has resolved and entered a compiled callee. Kept pointer-only
+    so both native backends use the same 16-byte stack layout. }
+  PWasmJitDirectCallState = ^TWasmJitDirectCallState;
+  TWasmJitDirectCallState = record
+    RegBase: PWasmValue;
+    IrBase: PWasmIrInstr;
+  end;
+
 var
   { The two reservations' sizes (interp-spec §1.1). Read once, when a store's
     interpreter context is first created. Mutable globals rather than
@@ -276,6 +285,18 @@ function JitEnterFrame(const ACtx: PWasmInterpContext; const AStore: TWasmStore;
   iroReturn on an rtEntry frame. Pops the top activation of ACtx. }
 procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
 
+{ Fast path for a statically indexed compiled-to-compiled call. Prepare
+  resolves the caller's module function index, returns nil without changing
+  state for host/interpreted callees, or pushes a transparent rtCaller frame
+  and returns the native entry. Finish switches that already-completed frame
+  to flat-result delivery and pops it. Keeping rtCaller while native code runs
+  lets the outer invocation's one LongJmp barrier unwind through any number of
+  direct native calls without installing a Pascal seam per call. }
+function JitPrepareDirectCall(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
+  const AState: PWasmJitDirectCallState): Pointer; cdecl;
+procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
+
 { O-J5: the register-file / frame offsets the JIT hard-codes (see the record
   above). Layout-only; the co-located test asserts them. }
 function WasmJitFrameOffsets: TWasmJitFrameOffsets;
@@ -286,7 +307,7 @@ const
     template's byte layout, a pinned-register reassignment, the entry-ABI shape.
     Bump it whenever position-independent codegen changes in a way that would
     make an existing artifact's bytes wrong. }
-  AOT_ABI_REVISION = 1;
+  AOT_ABI_REVISION = 2;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -3154,6 +3175,46 @@ begin
   DoReturn(ACtx, @ACtx^.Acts[ACtx^.Depth - 1]);
 end;
 
+function JitPrepareDirectCall(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
+  const AState: PWasmJitDirectCallState): Pointer; cdecl;
+var
+  Ctx: PWasmInterpContext;
+  Inst: TWasmModuleInstance;
+  Addr: TWasmFuncAddr;
+  Fn: PWasmIrFunction;
+begin
+  Result := nil;
+  Ctx := InterpContextFor(AStore);
+  Inst := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+  Addr := Inst.FuncAddrs[UInt32(AFuncIdx)];
+  if (AStore.Funcs[Addr].Kind <> wfkWasm) or
+    (AStore.Funcs[Addr].CompiledDirectEntry = nil) then
+    Exit;
+
+  AState^.RegBase := JitEnterFrame(Ctx, AStore, Addr, AArgs, AResults,
+    rtCaller);
+  Fn := @AStore.Funcs[Addr].Instance.Ir.Functions[
+    AStore.Funcs[Addr].FuncIrIndex];
+  if Length(Fn^.Code) > 0 then
+    AState^.IrBase := @Fn^.Code[0]
+  else
+    AState^.IrBase := nil;
+  Result := AStore.Funcs[Addr].CompiledDirectEntry;
+end;
+
+procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
+var
+  Ctx: PWasmInterpContext;
+begin
+  Ctx := InterpContextFor(AStore);
+  { During execution rtCaller made the frame transparent to the outer native
+    unwind barrier. No exception is live now, so select the existing flat
+    result-marshalling branch immediately before the shared pop. }
+  Ctx^.Acts[Ctx^.Depth - 1].RetKind := rtCompiledSeam;
+  JitLeaveFrame(Ctx);
+end;
+
 function WasmJitFrameOffsets: TWasmJitFrameOffsets;
 var
   C: TWasmInterpContext;
@@ -3210,6 +3271,7 @@ begin
   Fold(JO.FuncInstStride);
   Fold(JO.FuncKind);
   Fold(JO.FuncCompiledEntry);
+  Fold(JO.FuncCompiledDirectEntry);
   Fold(JO.FuncCallCount);
   Fold(JO.MemInstStride);
   Fold(JO.MemBase);

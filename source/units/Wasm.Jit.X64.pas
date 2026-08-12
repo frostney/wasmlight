@@ -101,6 +101,16 @@ type
     backend. }
   EWasmJitBranchRange = class(EWasmError);
 
+  TX64RegCacheEntry = record
+    Valid: Boolean;
+    Slot: UInt32;
+  end;
+
+  TX64RegCache = record
+    Entries: array[0..1] of TX64RegCacheEntry;
+    Next: Byte;
+  end;
+
 const
   { --- x86-64 register numbers (SDM Vol. 2 Table 2-2) --------------------- }
   X64_RAX = 0;
@@ -113,6 +123,8 @@ const
   X64_RDI = 7;
   X64_R8 = 8;
   X64_R9 = 9;
+  X64_R10 = 10;
+  X64_R11 = 11;
   X64_R12 = 12;
   X64_R13 = 13;
   X64_R14 = 14;
@@ -286,6 +298,11 @@ function X64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32): Boolean;
+procedure X64InitRegCache(out ACache: TX64RegCache);
+procedure X64InvalidateRegCache(var ACache: TX64RegCache);
+function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; var ACache: TX64RegCache): Boolean;
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -309,6 +326,17 @@ uses
   Wasm.Interp.Vector,
   Wasm.Runtime.Gc,
   Wasm.Runtime.Traps;
+
+procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ADest: Byte; const ASlot: UInt32); forward;
+procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ASrc: Byte; const ASlot: UInt32); forward;
+procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
+  var ACache: TX64RegCache); forward;
+procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache); forward;
 
 { ===================================================================== }
 {  cdecl helper thunks — the ABI boundary the emitted code calls (§1.4)  }
@@ -362,6 +390,175 @@ begin
   else
     Result := 0;
   end;
+end;
+
+function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; var ACache: TX64RegCache): Boolean;
+begin
+  Result := True;
+  case AIns.Op of
+    iroMove:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroI32Const, iroF32Const:
+      begin
+        X64EmitMovRegImm32(ABuf, X64_RAX, UInt32(AIns.Imm and $FFFFFFFF));
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroI64Const, iroF64Const:
+      begin
+        X64EmitMovRegImm64(ABuf, X64_RAX, UInt64(AIns.Imm));
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroBranchIf, iroBranchIfNot:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+        X64EmitAluRegReg(ABuf, $85, False, X64_RAX, X64_RAX);
+        if AIns.Op = iroBranchIf then
+          X64EmitJccTo(ABuf, X64_CC_NE, AIns.B)
+        else
+          X64EmitJccTo(ABuf, X64_CC_E, AIns.B);
+        X64InvalidateRegCache(ACache);
+      end;
+    iroI32Eqz, iroI64Eqz:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+        X64EmitAluRegReg(ABuf, $85, AIns.Op = iroI64Eqz, X64_RAX, X64_RAX);
+        X64EmitSetccAl(ABuf, X64_CC_E);
+        X64EmitMovzxEaxAl(ABuf);
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroI32Eq: X64CachedRel(ABuf, AIns, X64_CC_E, False, ACache);
+    iroI32Ne: X64CachedRel(ABuf, AIns, X64_CC_NE, False, ACache);
+    iroI32LtS: X64CachedRel(ABuf, AIns, X64_CC_L, False, ACache);
+    iroI32LtU: X64CachedRel(ABuf, AIns, X64_CC_B, False, ACache);
+    iroI32GtS: X64CachedRel(ABuf, AIns, X64_CC_G, False, ACache);
+    iroI32GtU: X64CachedRel(ABuf, AIns, X64_CC_A, False, ACache);
+    iroI32LeS: X64CachedRel(ABuf, AIns, X64_CC_LE, False, ACache);
+    iroI32LeU: X64CachedRel(ABuf, AIns, X64_CC_BE, False, ACache);
+    iroI32GeS: X64CachedRel(ABuf, AIns, X64_CC_GE, False, ACache);
+    iroI32GeU: X64CachedRel(ABuf, AIns, X64_CC_AE, False, ACache);
+    iroI64Eq: X64CachedRel(ABuf, AIns, X64_CC_E, True, ACache);
+    iroI64Ne: X64CachedRel(ABuf, AIns, X64_CC_NE, True, ACache);
+    iroI64LtS: X64CachedRel(ABuf, AIns, X64_CC_L, True, ACache);
+    iroI64LtU: X64CachedRel(ABuf, AIns, X64_CC_B, True, ACache);
+    iroI64GtS: X64CachedRel(ABuf, AIns, X64_CC_G, True, ACache);
+    iroI64GtU: X64CachedRel(ABuf, AIns, X64_CC_A, True, ACache);
+    iroI64LeS: X64CachedRel(ABuf, AIns, X64_CC_LE, True, ACache);
+    iroI64LeU: X64CachedRel(ABuf, AIns, X64_CC_BE, True, ACache);
+    iroI64GeS: X64CachedRel(ABuf, AIns, X64_CC_GE, True, ACache);
+    iroI64GeU: X64CachedRel(ABuf, AIns, X64_CC_AE, True, ACache);
+    iroI32Add: X64CachedAlu(ABuf, AIns, $01, False, False, ACache);
+    iroI32Sub: X64CachedAlu(ABuf, AIns, $29, False, False, ACache);
+    iroI32Mul: X64CachedAlu(ABuf, AIns, 0, False, True, ACache);
+    iroI32And: X64CachedAlu(ABuf, AIns, $21, False, False, ACache);
+    iroI32Or: X64CachedAlu(ABuf, AIns, $09, False, False, ACache);
+    iroI32Xor: X64CachedAlu(ABuf, AIns, $31, False, False, ACache);
+    iroI64Add: X64CachedAlu(ABuf, AIns, $01, True, False, ACache);
+    iroI64Sub: X64CachedAlu(ABuf, AIns, $29, True, False, ACache);
+    iroI64Mul: X64CachedAlu(ABuf, AIns, 0, True, True, ACache);
+    iroI64And: X64CachedAlu(ABuf, AIns, $21, True, False, ACache);
+    iroI64Or: X64CachedAlu(ABuf, AIns, $09, True, False, ACache);
+    iroI64Xor: X64CachedAlu(ABuf, AIns, $31, True, False, ACache);
+  else
+    X64InvalidateRegCache(ACache);
+    Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+  end;
+end;
+
+function X64CacheHostReg(const AIndex: Integer): Byte;
+begin
+  if AIndex = 0 then
+    Result := X64_R8
+  else
+    Result := X64_R9;
+end;
+
+procedure X64InitRegCache(out ACache: TX64RegCache);
+begin
+  FillChar(ACache, SizeOf(ACache), 0);
+end;
+
+procedure X64InvalidateRegCache(var ACache: TX64RegCache);
+begin
+  ACache.Entries[0].Valid := False;
+  ACache.Entries[1].Valid := False;
+  ACache.Next := 0;
+end;
+
+procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ADest: Byte; const ASlot: UInt32);
+var
+  I, Victim: Integer;
+  Host: Byte;
+begin
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      Host := X64CacheHostReg(I);
+      if ADest <> Host then
+        X64EmitMovRegReg(ABuf, ADest, Host);
+      Exit;
+    end;
+  Victim := ACache.Next;
+  ACache.Next := Byte(1 - Victim);
+  Host := X64CacheHostReg(Victim);
+  X64EmitLoadSlot64(ABuf, Host, ASlot);
+  ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Slot := ASlot;
+  if ADest <> Host then
+    X64EmitMovRegReg(ABuf, ADest, Host);
+end;
+
+procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ASrc: Byte; const ASlot: UInt32);
+var
+  I, Victim: Integer;
+  Host: Byte;
+begin
+  X64EmitStoreSlot64(ABuf, ASrc, ASlot);
+  Victim := -1;
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Victim := I;
+  if Victim < 0 then
+  begin
+    Victim := ACache.Next;
+    ACache.Next := Byte(1 - Victim);
+  end;
+  Host := X64CacheHostReg(Victim);
+  if ASrc <> Host then
+    X64EmitMovRegReg(ABuf, Host, ASrc);
+  ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Slot := ASlot;
+end;
+
+procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
+  var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  if AMul then
+    X64EmitImul(ABuf, AWide, X64_RAX, X64_RCX)
+  else
+    X64EmitAluRegReg(ABuf, AOpcode, AWide, X64_RAX, X64_RCX);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
+procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  X64EmitAluRegReg(ABuf, $39, AWide, X64_RAX, X64_RCX);
+  X64EmitSetccAl(ABuf, ACc);
+  X64EmitMovzxEaxAl(ABuf);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
 end;
 
 function X64OpUnary(const AOp: PtrUInt; const A: UInt64): UInt64; cdecl;
@@ -2349,12 +2546,18 @@ end;
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32);
 var
-  ArgN, ResN, ArgBytes, FrameBytes: UInt32;
+  ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
+  FallbackLabel, DoneLabel: TWasmJitLabel;
 begin
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
   ArgBytes := ArgN * X64_SLOT_SIZE;
-  FrameBytes := X64CallFrameBytes(ArgN, ResN);
+  ResBytes := ResN * X64_SLOT_SIZE;
+  StateOffset := ArgBytes + ResBytes;
+  if AIns.Op = iroCall then
+    FrameBytes := X64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
+  else
+    FrameBytes := X64CallFrameBytes(ArgN, ResN);
 
   X64EmitSubRsp(ABuf, Int32(FrameBytes));
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
@@ -2363,10 +2566,31 @@ begin
   case AIns.Op of
     iroCall:
       begin
+        FallbackLabel := ABuf.NewLabel;
+        DoneLabel := ABuf.NewLabel;
         X64EmitMovRegImm32(ABuf, X64_ARG1, UInt32(AIns.Imm));    { funcidx }
         X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);                  { args }
         X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));    { results }
+        X64EmitLea(ABuf, X64_ARG4, X64_RSP, Int32(StateOffset)); { state }
+        X64EmitCallHelper(ABuf, aohDirectCallPrepare);
+        X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);     { test rax,rax }
+        X64EmitJccTo(ABuf, X64_CC_E, UInt32(FallbackLabel));
+        X64EmitMovRegReg(ABuf, X64_R11, X64_RAX);                { entry }
+        X64EmitLoadMem64(ABuf, X64_ARG0, X64_RSP, Int32(StateOffset));
+        X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_STORE);
+        X64EmitLoadMem64(ABuf, X64_ARG2, X64_RSP,
+          Int32(StateOffset + X64_SLOT_SIZE));
+        X64EmitCallReg(ABuf, X64_R11);
+        X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+        X64EmitCallHelper(ABuf, aohDirectCallFinish);
+        X64EmitJmpTo(ABuf, UInt32(DoneLabel));
+        ABuf.BindLabel(FallbackLabel);
+        X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+        X64EmitMovRegImm32(ABuf, X64_ARG1, UInt32(AIns.Imm));
+        X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);
+        X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));
         X64EmitCallHelper(ABuf, aohCall);
+        ABuf.BindLabel(DoneLabel);
       end;
     iroCallIndirect:
       begin
@@ -2710,6 +2934,8 @@ begin
     GX64HelperTable[aohReturnCall] := @X64ReturnCallHelper;
     GX64HelperTable[aohReturnCallIndirect] := @X64ReturnCallIndirectHelper;
     GX64HelperTable[aohReturnCallRef] := @X64ReturnCallRefHelper;
+    GX64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
+    GX64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
     GX64HelperTableFilled := True;
   end;
   Result := @GX64HelperTable[aohTrapKind];

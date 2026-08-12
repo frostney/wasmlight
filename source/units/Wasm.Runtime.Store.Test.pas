@@ -1251,8 +1251,10 @@ begin
   H := FStore.AddHostFunc(0, nil, nil);
 
   Expect<Boolean>(FStore.Funcs[W].CompiledEntry = nil).ToBe(True);
+  Expect<Boolean>(FStore.Funcs[W].CompiledDirectEntry = nil).ToBe(True);
   ExpectCount('wasm CallCount', Integer(FStore.Funcs[W].CallCount), 0);
   Expect<Boolean>(FStore.Funcs[H].CompiledEntry = nil).ToBe(True);
+  Expect<Boolean>(FStore.Funcs[H].CompiledDirectEntry = nil).ToBe(True);
   ExpectCount('host CallCount', Integer(FStore.Funcs[H].CallCount), 0);
   Expect<Boolean>(Assigned(FStore.JitInvokeCompiled)).ToBe(False);
 end;
@@ -1278,13 +1280,15 @@ begin
   Expect<Boolean>(Off.MemByteSize < SizeOf(Pointer) + SizeOf(UInt64)).ToBe(True);
   {$ENDIF}
 
-  { A func inst keeps Kind first (the wasm/host discriminator), and the two
-    tier fields are adjacent (CompiledEntry then the u32 CallCount), all within
-    the record. }
+  { A func inst keeps Kind first (the wasm/host discriminator), and its tier
+    fields are adjacent (generic entry, direct-safe entry, then CallCount). }
   ExpectCount('FuncKind', Integer(Off.FuncKind), 0);
-  ExpectCount('FuncCallCount - FuncCompiledEntry',
-    Integer(Off.FuncCallCount - Off.FuncCompiledEntry), SizeOf(Pointer));
-  Expect<Boolean>(Off.FuncCompiledEntry + SizeOf(Pointer) +
+  ExpectCount('FuncCompiledDirectEntry - FuncCompiledEntry',
+    Integer(Off.FuncCompiledDirectEntry - Off.FuncCompiledEntry),
+    SizeOf(Pointer));
+  ExpectCount('FuncCallCount - FuncCompiledDirectEntry',
+    Integer(Off.FuncCallCount - Off.FuncCompiledDirectEntry), SizeOf(Pointer));
+  Expect<Boolean>(Off.FuncCompiledDirectEntry + SizeOf(Pointer) +
     SizeOf(UInt32) <= Off.FuncInstStride).ToBe(True);
   Expect<Boolean>((Off.FuncCompiledEntry and (SizeOf(Pointer) - 1)) = 0)
     .ToBe(True);

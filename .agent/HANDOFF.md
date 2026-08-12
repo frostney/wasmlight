@@ -1,7 +1,39 @@
 # Handoff
 
-Updated: 2026-08-12 (main CI repair committed and pushed as `c0b604a` on
-`codex/fix-tests-tier-performance`; Wasmtime comparison refreshed afterward)
+Updated: 2026-08-12 (compiled direct calls and block-local register caching
+implemented, re-measured, and cross-architecture/cross-tier validated)
+
+## 2026-08-12 compiled-tier optimization status
+
+- **Both measured bottlenecks are fixed.** Static compiled-to-compiled calls
+  now resolve/enter the shared logical + GC frame once and invoke the callee's
+  machine-code entry directly; host/interpreted and dynamic calls retain the
+  existing dispatcher. This removes the nested generic tier dispatcher and
+  per-call seam catch without changing stack-exhaustion, GC, tail-call, trap,
+  or exception-unwind behavior. A body containing `return_call*` deliberately
+  stays on the trampoline so that invocation consumes its pending tail target.
+  Both native backends also keep two clean,
+  write-through values in caller-saved registers inside straight-line blocks.
+  Branch joins, calls, helpers, complex control, and safepoints invalidate the
+  cache; the in-memory register file remains canonical at every instruction
+  boundary. The AOT ABI revision is 2 and old artifacts fail closed.
+- **Correctness proof:** macOS/aarch64 release build, formatting, and 44/44
+  unit suites pass. The OrbStack Linux/x86-64 release build and 44/44 suites
+  pass. On both architectures the complete pinned corpus is byte-identical
+  across tiers: pass=65204, fail=389, skip=1532, errors=0; compiled=8588 on
+  aarch64 and 8589 on x86-64 for both JIT and AOT.
+- **Fresh Apple Silicon/macOS medians:** release builds, Wasmtime 47.0.3
+  default opt-level 2, fresh `.waot`/`.cwasm` artifacts. The tier-verified 300M
+  i32 mul-add loop (five warmed samples) is wasmlight interp 4345ms, JIT 731ms,
+  AOT 728ms; Wasmtime JIT 89.35ms and precompiled 88.02ms. Against the prior
+  1132/1119ms compiled medians, register caching cuts wasmlight JIT 35.4% and
+  AOT 34.9%; the Wasmtime gap narrows from 13.1x to 8.2-8.3x.
+- **Recursive fib(35):** wasmlight interp 1117.84ms, AOT 551.03ms; Wasmtime JIT
+  39.50ms and precompiled 39.27ms. Direct calls cut wasmlight AOT by 47.2%
+  versus the prior 1044ms and narrow the compiled gap from 28.3x to 14.0x.
+  No-op command startup (50 samples) remains wasmlight's advantage under the
+  same current load: interp 6.15ms/AOT 6.09ms versus Wasmtime 8.18ms/7.91ms.
+  These remain workload measurements, never CI assertions.
 
 ## 2026-08-12 repair status
 
