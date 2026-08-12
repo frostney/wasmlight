@@ -11,25 +11,33 @@ See [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-Pre-0.1, early. What is shipped today is the whole path from bytes — or
-from text — to a running module: the bounds-checked binary reader with
-full LEB128 handling, the decoded module model, the structural decoder, the
-validator that emits the register IR, the runtime layer below the tier seam
-(store, instances, the memory-access chokepoint, traps, instantiation, and
-the precise collector), and the interpreter tier that executes the IR — the
-**complete core wasm 3.0 instruction set**, `v128` SIMD and exception
-handling (`throw` / `throw_ref` / `try_table`) included — plus a wat
-text-format assembler. On top of that core sits the host surface: the
-`Wasm.Engine` embedding API and a deny-by-default WASI preview1 host, so
-the runtime now **runs real WASI programs** — `wasmlight run
-hello.wasm` prints `hello` and exits 0, and a program granted a preopen
-reads the filesystem through it. It is driven by `wasmlight inspect` /
-`wasmlight validate` / `wasmlight run`, and `wasmspec` runs the upstream
-conformance corpus — assembling text modules, validating, instantiating,
-and executing the assertions, SIMD judged per lane and `assert_exception`
-judged. Only the baseline JIT and AOT tiers (performance, not behaviour)
-are staged in [docs/roadmap.md](docs/roadmap.md) — that file, not this one,
-is the honest picture of what exists.
+Pre-0.1, early — but the roadmap is complete. What is shipped today is the
+whole path from bytes — or from text — to a running module: the
+bounds-checked binary reader with full LEB128 handling, the decoded module
+model, the structural decoder, the validator that emits the register IR,
+the runtime layer below the tier seam (store, instances, the memory-access
+chokepoint, traps, instantiation, and the precise collector), and **three
+interchangeable execution tiers** over that IR — the interpreter (the tier
+of record, on every platform), a **baseline JIT**, and an **ahead-of-time
+compiler** — each executing the **complete core wasm 3.0 instruction
+set**, `v128` SIMD and exception handling (`throw` / `throw_ref` /
+`try_table`) included, plus a wat text-format assembler. The JIT and AOT
+run in two backends, aarch64 and x86-64, on a 64-bit UNIX host; on Windows
+and 32-bit targets the runtime is interpreter-only, and still fully
+conformant. On top of that core sits the host surface: the `Wasm.Engine`
+embedding API and a deny-by-default WASI preview1 host, so the runtime
+**runs real WASI programs** — `wasmlight run hello.wasm` prints `hello`
+and exits 0, and a program granted a preopen reads the filesystem through
+it. It is driven by `wasmlight inspect` / `wasmlight validate` /
+`wasmlight run` / `wasmlight aot`, and `wasmspec` runs the upstream
+conformance corpus in any tier (`--tier=interp|jit|aot`) — assembling text
+modules, validating, instantiating, and executing the assertions, SIMD
+judged per lane and `assert_exception` judged. All three tiers produce
+**byte-identical** corpus results (**65,184 pass**) on both arches.
+[docs/roadmap.md](docs/roadmap.md) is the honest picture of exactly what
+exists and what remains (the deferred JIT optimizations, the characterized
+non-3.0-core corpus failures, and cross-platform CI validation still
+pending its first full run).
 
 The project's durable direction and delivery gates live in
 [VISION.md](VISION.md), [DEFINITION_OF_READY.md](DEFINITION_OF_READY.md),
@@ -70,6 +78,17 @@ $ ./build/wasmlight run tests/fixtures/wasi/hello.wasm
 hello
 $ echo $?
 0
+```
+
+On a 64-bit UNIX host, `wasmlight aot` compiles a module ahead of time to a
+`.waot` artifact, and `run --aot` loads it for instant startup — always
+re-validating the module first and falling back to the interpreter if the
+artifact is stale, wrong-arch, or absent (`--no-aot` forces interpret):
+
+```text
+$ ./build/wasmlight aot tests/fixtures/wasi/hello.wasm -o hello.waot
+$ ./build/wasmlight run --aot hello.waot tests/fixtures/wasi/hello.wasm
+hello
 ```
 
 `wasmspec` runs the upstream `.wast` conformance corpus — assembling text

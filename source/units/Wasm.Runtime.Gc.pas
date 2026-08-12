@@ -67,19 +67,34 @@ type
 
   PWasmRef = ^TWasmRef;
 
-  { The five heap object kinds. wokExn's layout is fixed HERE, in Track D,
+  { The heap object kinds. wokExn's layout is fixed HERE, in Track D,
     with throw/catch left to Track H: "an exception instance … holds the
     address of the respective tag and the argument values"
     (`syntax-exninst`) is a fixed shape, and discovering in Track H that
     exnref needs a sixth kind would mean changing the header enum, the
     trace loop and the abstract-kind map at a point where the collector is
-    already under test. }
+    already under test.
+
+    wokExternalized / wokInternalized are the M7 conversion wrappers
+    (`extern.convert_any` / `any.convert_extern`, 0xFB 0x1B / 0xFB 0x1A,
+    both 3.0). The two hierarchies `any` and `extern` "are interconvertible
+    … an isomorphic set of values, but may have different, incompatible
+    representations in practice" (`syntax-heaptype`). Because an
+    externalized unboxed i31 or null carries no header, a header flag cannot
+    express the hierarchy switch — so a value crossing the boundary is
+    WRAPPED in one of these one-field boxes, which presents the requested
+    hierarchy to ref.test/ref.cast (via GcAbsKindOf) while holding the
+    original value for the inverse conversion to recover. Both hold exactly
+    one inner reference that the collector must trace. All seven ordinals
+    still fit the header's 3-bit kind field (mask 7). }
   TWasmObjKind = (
     wokStruct,
     wokArray,
     wokFuncRef,
     wokHostBox,
-    wokExn
+    wokExn,
+    wokExternalized,
+    wokInternalized
   );
 
   { The embedder's hook for a swept host box. NOT a finalization API — see
@@ -138,6 +153,8 @@ const
       wokFuncRef  [header:8][funcaddr:4][pad:4]
       wokHostBox  [header:8][payload:NativeUInt][release:Pointer]
       wokExn      [header:8][tagaddr:4][argc:4][arg 0 : TWasmValue]...
+      wokExternalized / wokInternalized
+                  [header:8][inner:TWasmRef]
 
     An array's length is a SEPARATE WORD rather than header bits: a length
     is u32 and the header has 27 spare bits, which is not enough. }
@@ -152,6 +169,9 @@ const
   WASM_EXN_TAG_OFFSET = 8;
   WASM_EXN_ARGC_OFFSET = 12;
   WASM_EXN_ARGS_OFFSET = 16;
+  { The single inner reference a conversion wrapper holds. }
+  WASM_CONVERT_INNER_OFFSET = 8;
+  WASM_CONVERT_SIZE = 8 + SizeOf(TWasmRef);
 
 type
   { One field's storage, resolved to bytes.
@@ -413,6 +433,8 @@ type
     function TakeCell(const ASize: UInt32): PByte;
     function Allocate(const ASize: UInt32; const AKind: TWasmObjKind;
       const ATypeId: TWasmGcTypeId): PByte;
+    function AllocConvert(const AKind: TWasmObjKind;
+      const AInner: TWasmRef): TWasmRef;
 
     procedure Push(const ARef: TWasmRef);
     procedure MarkRoots;
@@ -456,6 +478,24 @@ type
       const ARelease: TWasmHostRelease): TWasmRef;
     function AllocExn(const ATagAddr: UInt32;
       const ATypeId: TWasmGcTypeId; const AArgCount: UInt32): TWasmRef;
+
+    { The M7 hierarchy conversions, shared by every tier (the interpreter's
+      iroExternConvertAny / iroAnyConvertExtern arms, the JIT/AOT dispatcher,
+      and the const-expr evaluator all route here so the answer cannot drift
+      between tiers — ADR-0001 observational identity).
+
+      ExternalizeAny implements `extern.convert_any` (any -> extern):
+      null stays null; a value previously produced by InternalizeExtern is
+      UNWRAPPED back to the external reference it carried; any other `any`
+      value (struct/array/i31) is wrapped in a wokExternalized box that
+      presents as `extern`. InternalizeExtern is the exact dual for
+      `any.convert_extern` (extern -> any): null stays null; a wokExternalized
+      is unwrapped; any other `extern` value (a host box) is wrapped in a
+      wokInternalized box that presents as `any` (but not `eq`). The pair are
+      mutual inverses, so a round trip recovers the original reference with no
+      accumulated wrappers. Both wrap sites are allocation safepoints. }
+    function ExternalizeAny(const ARef: TWasmRef): TWasmRef;
+    function InternalizeExtern(const ARef: TWasmRef): TWasmRef;
 
     { aux-default over every field / element. A zeroed object already
       holds those values; these check that each one HAS a default and
@@ -675,38 +715,35 @@ function GcRefIsMarked(const ARef: TWasmRef): Boolean;
 { The funcaddr a wokFuncRef handle names. }
 function GcFuncRefAddr(const ARef: TWasmRef): UInt32;
 function GcHostBoxPayload(const ARef: TWasmRef): NativeUInt;
+{ The inner reference a conversion wrapper (wokExternalized / wokInternalized)
+  carries. Raises EWasmError for any other reference — a caller bug. }
+function GcConvertInner(const ARef: TWasmRef): TWasmRef;
 
 { The abstract heap type an object sits under. THREE DISJOINT HIERARCHIES
   fall out of this map — func, aggregate, extern, plus exn — which is the
   property that makes a wokFuncRef answer false for `anyref`.
 
-  KNOWN LIMITATION (M7), tracked for Track E. This map derives the abstract
-  hierarchy from the object KIND alone, so a value's hierarchy is fixed at
-  allocation. That is wrong for `extern.convert_any` / `any.convert_extern`
-  (opcodes 0xFB 0x1B / 0xFB 0x1A, both 3.0). The spec places struct/array/
-  i31 in the aggregate (`any`) hierarchy and host values in the `extern`
-  hierarchy, but says the two "are interconvertible … both type hierarchies
-  are inhabited by an isomorphic set of values, but may have different,
-  incompatible representations in practice" (`syntax-heaptype`, a.k.a.
-  `type-abstract`; also: `any` "denotes the common supertype of all
+  M7 — the hierarchy conversions, now implemented. The spec places struct/
+  array/i31 in the aggregate (`any`) hierarchy and host values in the
+  `extern` hierarchy, but says the two "are interconvertible … both type
+  hierarchies are inhabited by an isomorphic set of values, but may have
+  different, incompatible representations in practice" (`syntax-heaptype`,
+  a.k.a. `type-abstract`; also: `any` "denotes the common supertype of all
   aggregate types, as well as possibly abstract values produced by
   internalizing an external reference of type extern"). Both convert ops
-  report `can_trap:false` and are identity on the operand.
+  report `can_trap:false`.
 
-  So after `struct.new → extern.convert_any`, `ref.test (ref extern)` MUST
-  answer true and `ref.test (ref any)` false — the opposite of what this
-  map gives for a `wokStruct`. Expressing that needs the value to record
-  which hierarchy it currently inhabits, which the spec's "incompatible
-  representations" clause licenses an engine to do with either a wrapper
-  object created at the convert site or a toggled header flag. Neither can
-  be driven from this unit alone: the convert ops and the ref.test/ref.cast
-  surface both live in Wasm.Runtime.Store / the interpreter (Track E), and
-  a pure header flag cannot cover an externalized unboxed i31 or null,
-  which carry no header. This unit therefore ships the KIND-only map and a
-  MARKED, staged test that pins the gap rather than a silently-wrong
-  answer; the convert ops are unimplemented, so nothing observes the wrong
-  answer yet. Design §1.3's "no-op on representation" note is the claim
-  that must be revisited when Track E lands these ops. }
+  This map still derives an object's hierarchy from its KIND alone, which is
+  exactly why `extern.convert_any` / `any.convert_extern` (0xFB 0x1B /
+  0xFB 0x1A, both 3.0) are realised as WRAPPER KINDS rather than a header
+  flag: an externalized value gets a wokExternalized box whose kind maps to
+  `wahExtern`, and an internalized value a wokInternalized box whose kind
+  maps to `wahAny` (the internalized external is `any` but deliberately NOT
+  `eq` — corpus ref_test.wast row 6). A header flag could not have covered an
+  externalized unboxed i31 or null, which carry no header; a wrapper can. The
+  wrap/unwrap logic and the tracing of the inner reference are ExternalizeAny
+  / InternalizeExtern above, shared by every tier; ref.test/ref.cast read
+  this map through Wasm.Runtime.Store.IsRefOfRefType unchanged. }
 function GcAbsKindOf(const AKind: TWasmObjKind): TWasmAbsHeapType;
 
 implementation
@@ -817,6 +854,18 @@ begin
   Result := PNativeUInt(PByte(Header) + WASM_HOSTBOX_PAYLOAD_OFFSET)^;
 end;
 
+function GcConvertInner(const ARef: TWasmRef): TWasmRef;
+var
+  Header: PWasmU64;
+  Kind: TWasmObjKind;
+begin
+  Header := HeaderOf(ARef);
+  Kind := KindOfHeader(Header^);
+  if (Kind <> wokExternalized) and (Kind <> wokInternalized) then
+    raise EWasmError.Create('internal: not a converted reference');
+  Result := PWasmRef(PByte(Header) + WASM_CONVERT_INNER_OFFSET)^;
+end;
+
 function GcAbsKindOf(const AKind: TWasmObjKind): TWasmAbsHeapType;
 begin
   case AKind of
@@ -824,6 +873,11 @@ begin
     wokArray: Result := wahArray;
     wokFuncRef: Result := wahFunc;
     wokHostBox: Result := wahExtern;
+    { extern.convert_any's wrapper presents its inner `any` value AS extern. }
+    wokExternalized: Result := wahExtern;
+    { any.convert_extern's wrapper presents its inner `extern` value AS `any`
+      — the top of the aggregate hierarchy, not `eq`. }
+    wokInternalized: Result := wahAny;
   else
     Result := wahExn;
   end;
@@ -1373,6 +1427,54 @@ begin
   PWasmU32(Cell + WASM_EXN_TAG_OFFSET)^ := ATagAddr;
   PWasmU32(Cell + WASM_EXN_ARGC_OFFSET)^ := AArgCount;
   Result := MakeObjectRef(Cell);
+end;
+
+function TWasmGcHeap.AllocConvert(const AKind: TWasmObjKind;
+  const AInner: TWasmRef): TWasmRef;
+var
+  Cell: PByte;
+  Handle: TWasmRootHandle;
+begin
+  { The inner reference is held only in this Pascal local, and the very next
+    Allocate is a safepoint that may collect. Register it as a root across
+    the allocation so a young inner value is not reclaimed mid-wrap; the
+    collector is non-moving, so the pointer is unchanged and can be stored
+    directly afterwards. Registering a null or unboxed i31 is harmless — the
+    root walk skips both by encoding. }
+  Handle := RootRegister(AInner);
+  try
+    Cell := Allocate(WASM_CONVERT_SIZE, AKind, WASM_GC_NO_TYPE_ID);
+  finally
+    RootRelease(Handle);
+  end;
+  PWasmRef(Cell + WASM_CONVERT_INNER_OFFSET)^ := AInner;
+  Result := MakeObjectRef(Cell);
+end;
+
+function TWasmGcHeap.ExternalizeAny(const ARef: TWasmRef): TWasmRef;
+begin
+  { extern.convert_any: any -> extern. Null stays null. A value produced by
+    the inverse (InternalizeExtern) is unwrapped to the external reference it
+    carried, so the round trip recovers the original with no nesting. Any
+    other `any` value is wrapped so it presents as `extern`. }
+  if RefIsNull(ARef) then
+    Exit(ARef);
+  if RefIsObject(ARef) and (GcRefKind(ARef) = wokInternalized) then
+    Exit(GcConvertInner(ARef));
+  Result := AllocConvert(wokExternalized, ARef);
+end;
+
+function TWasmGcHeap.InternalizeExtern(const ARef: TWasmRef): TWasmRef;
+begin
+  { any.convert_extern: extern -> any — the exact dual of ExternalizeAny.
+    Null stays null; a wokExternalized is unwrapped to its inner `any` value;
+    any other `extern` value (a host box) is wrapped so it presents as `any`
+    (but not `eq`). }
+  if RefIsNull(ARef) then
+    Exit(ARef);
+  if RefIsObject(ARef) and (GcRefKind(ARef) = wokExternalized) then
+    Exit(GcConvertInner(ARef));
+  Result := AllocConvert(wokInternalized, ARef);
 end;
 
 { --- field access -------------------------------------------------------- }
@@ -2245,6 +2347,13 @@ begin
             MarkRoot(PWasmValue(Base + WASM_EXN_ARGS_OFFSET +
               Layout^.RefArgSlots[Index] * SizeOf(TWasmValue))^.Ref);
       end;
+
+    wokExternalized, wokInternalized:
+      { A conversion wrapper's single inner reference is a root path: the
+        wrapped value is reachable only through the box, so a missed trace
+        here is a use-after-free the moment any.convert_extern /
+        extern.convert_any unwraps it. MarkRoot skips a null or i31 inner. }
+      MarkRoot(PWasmRef(Base + WASM_CONVERT_INNER_OFFSET)^);
   end;
   { wokFuncRef holds a funcaddr and wokHostBox an opaque payload; neither
     contains a reference, so neither is traced. }

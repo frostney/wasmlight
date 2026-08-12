@@ -125,7 +125,7 @@ type
     procedure TestVectorStorageRoundTrips;
     procedure TestVectorArrayRoundTrips;
     procedure TestVectorFieldSurvivesCollection;
-    procedure TestExternalizeIsInvisibleToAbstractKindStaged;
+    procedure TestM7ConversionWrappersReclassifyAndTraceInner;
   end;
 
 { --- fixture ------------------------------------------------------------- }
@@ -1560,33 +1560,68 @@ begin
   ExpectCount('unreachable', Integer(FHeap.ObjectCount), 0);
 end;
 
-procedure TRuntimeGcTests.TestExternalizeIsInvisibleToAbstractKindStaged;
+procedure TRuntimeGcTests.TestM7ConversionWrappersReclassifyAndTraceInner;
 var
-  StructRef: TWasmRef;
-  Box: TWasmRef;
+  StructRef, Box, Ext, Intl, RoundStruct, RoundBox, I31Ext: TWasmRef;
+  Handle: TWasmRootHandle;
+  Index: Integer;
+  Inner: TWasmRef;
 begin
-  { STAGED / KNOWN LIMITATION (M7), pinned so it is loud rather than silent.
-    extern.convert_any / any.convert_extern move a value between the `any`
-    and `extern` hierarchies (`syntax-heaptype`, a.k.a. `type-abstract`,
-    read from wasm-mcp 0.2.16 at commit d7b37e41…: the two "are
+  { M7 — extern.convert_any / any.convert_extern move a value between the
+    `any` and `extern` hierarchies (`syntax-heaptype`: the two "are
     interconvertible … an isomorphic set of values, but may have different,
-    incompatible representations in practice"). Both report can_trap:false
-    and are identity on the operand.
-
-    GcAbsKindOf derives the abstract hierarchy from the object KIND alone,
-    so it CANNOT record an externalization: a struct is always wahStruct
-    (under `any`), a host box always wahExtern. After
-    struct.new -> extern.convert_any, ref.test (ref extern) ought to answer
-    true and ref.test (ref any) false — the opposite of what a kind-only map
-    yields. This test pins the current, deliberately-limited answer; the
-    convert ops live in Track E and are unimplemented, so nothing observes
-    the wrong answer yet. When Track E lands them, the fix (a wrapper object
-    or a header flag set at the convert site) must flip these. }
+    incompatible representations in practice", wasm-mcp 0.2.16 at
+    d7b37e41…). GcAbsKindOf still keys on the object KIND, so the conversion
+    is realised as a WRAPPER whose kind carries the destination hierarchy. }
   StructRef := FHeap.AllocStruct(TY_BASE);
+  FHeap.StructSet(StructRef, 0, MakeValueI32($ABCDEF));
   Box := FHeap.AllocHostBox(NativeUInt($7), nil);
 
+  { The base kinds are unchanged: a struct is still `any`, a host box still
+    `extern`. }
   Expect<Boolean>(GcAbsKindOf(GcRefKind(StructRef)) = wahStruct).ToBe(True);
   Expect<Boolean>(GcAbsKindOf(GcRefKind(Box)) = wahExtern).ToBe(True);
+
+  { extern.convert_any(struct) presents the struct AS extern, and the inverse
+    recovers exactly the struct — a round trip with no residue. }
+  Ext := FHeap.ExternalizeAny(StructRef);
+  Expect<Boolean>(GcRefKind(Ext) = wokExternalized).ToBe(True);
+  Expect<Boolean>(GcAbsKindOf(GcRefKind(Ext)) = wahExtern).ToBe(True);
+  Expect<Boolean>(GcConvertInner(Ext) = StructRef).ToBe(True);
+  RoundStruct := FHeap.InternalizeExtern(Ext);
+  Expect<Boolean>(RoundStruct = StructRef).ToBe(True);
+
+  { any.convert_extern(host box) presents the host box AS `any` — but NOT
+    `eq` — and the inverse recovers the host box (corpus ref_test row 6). }
+  Intl := FHeap.InternalizeExtern(Box);
+  Expect<Boolean>(GcRefKind(Intl) = wokInternalized).ToBe(True);
+  Expect<Boolean>(GcAbsKindOf(GcRefKind(Intl)) = wahAny).ToBe(True);
+  Expect<Boolean>(GcConvertInner(Intl) = Box).ToBe(True);
+  RoundBox := FHeap.ExternalizeAny(Intl);
+  Expect<Boolean>(RoundBox = Box).ToBe(True);
+
+  { An externalized unboxed i31 needs the wrapper precisely because an i31
+    carries no header a flag could live in; the inverse still recovers it. }
+  I31Ext := FHeap.ExternalizeAny(MakeI31Ref(8));
+  Expect<Boolean>(GcAbsKindOf(GcRefKind(I31Ext)) = wahExtern).ToBe(True);
+  Expect<Boolean>(RefIsI31(FHeap.InternalizeExtern(I31Ext))).ToBe(True);
+
+  { Null crosses both directions unchanged (both ops are null-preserving). }
+  Expect<Boolean>(RefIsNull(FHeap.ExternalizeAny(WASM_REF_NULL))).ToBe(True);
+  Expect<Boolean>(RefIsNull(FHeap.InternalizeExtern(WASM_REF_NULL))).ToBe(True);
+
+  { The wrapper's inner reference is a root path: keep ONLY the wrapper
+    rooted, drop every other handle, force a collection, and the wrapped
+    struct must survive with its field intact — a missed trace here would be
+    a use-after-free the next unwrap hands back. }
+  Handle := FHeap.RootRegister(Ext);
+  for Index := 0 to 4 do
+    FHeap.AllocStruct(TY_NODE);
+  FHeap.Collect;
+  Inner := GcConvertInner(FHeap.RootGet(Handle));
+  Expect<Boolean>(Inner = StructRef).ToBe(True);
+  Expect<Int32>(FHeap.StructGet(Inner, 0).I32).ToBe(Int32($ABCDEF));
+  FHeap.RootRelease(Handle);
 end;
 
 procedure TRuntimeGcTests.SetupTests;
@@ -1672,8 +1707,9 @@ begin
     TestVectorArrayRoundTrips);
   Test('a struct with a v128 field survives collection intact',
     TestVectorFieldSurvivesCollection);
-  Test('externalization is invisible to the kind-only abstract map (staged)',
-    TestExternalizeIsInvisibleToAbstractKindStaged);
+  Test('M7 conversion wrappers reclassify across hierarchies and trace '
+    + 'their inner reference',
+    TestM7ConversionWrappersReclassifyAndTraceInner);
 end;
 
 begin

@@ -128,6 +128,7 @@ type
     procedure TestFuncRefHandlesComeFromTheCollector;
     procedure TestRuntimeCastIsCrossModule;
     procedure TestRuntimeCastKeepsTheHierarchiesApart;
+    procedure TestRuntimeCastSeesM7ConversionWrappers;
     procedure TestHostRootsGoThroughTheStore;
     procedure TestTrampolineContextCarriesTheStore;
     procedure TestFrameChainResetsAfterATrap;
@@ -1095,6 +1096,50 @@ begin
     MakeRefType(False, MakeConcreteHeapType(Ids[0])))).ToBe(False);
 end;
 
+procedure TRuntimeStoreTests.TestRuntimeCastSeesM7ConversionWrappers;
+var
+  Ids: TWasmEngineTypeIds;
+  Struct, Ext, Box, Intl: TWasmRef;
+begin
+  { M7 — the runtime cast surface must classify a value by the hierarchy it
+    CURRENTLY inhabits after extern.convert_any / any.convert_extern, not the
+    one its inner value was allocated in. The wrappers ride the same
+    IsRefOfRefType path as everything else (GcAbsKindOf on the wrapper kind),
+    so this is the store-level proof behind the ref_test/ref_cast corpus. }
+  Ids := InternOf(SubtypeChainModule);
+  Struct := FStore.Heap.AllocStruct(Ids[0]);
+
+  { externalize(struct): now `extern`, no longer `any` / `struct`. }
+  Ext := FStore.Heap.ExternalizeAny(Struct);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Ext,
+    MakeRefType(True, MakeAbsHeapType(wahExtern)))).ToBe(True);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Ext,
+    MakeRefType(True, MakeAbsHeapType(wahAny)))).ToBe(False);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Ext,
+    MakeRefType(True, MakeAbsHeapType(wahStruct)))).ToBe(False);
+  { The inverse recovers the exact struct, which still answers `struct`. }
+  Expect<Boolean>(FStore.Heap.InternalizeExtern(Ext) = Struct).ToBe(True);
+
+  { internalize(host box): now `any` — but deliberately NOT `eq` (an
+    internalized external is `any` and nothing more specific), and never a
+    concrete struct/array. }
+  Box := FStore.Heap.AllocHostBox(NativeUInt($42), nil);
+  Intl := FStore.Heap.InternalizeExtern(Box);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Intl,
+    MakeRefType(True, MakeAbsHeapType(wahAny)))).ToBe(True);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Intl,
+    MakeRefType(True, MakeAbsHeapType(wahEq)))).ToBe(False);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Intl,
+    MakeRefType(True, MakeAbsHeapType(wahStruct)))).ToBe(False);
+  Expect<Boolean>(IsRefOfRefType(FEngine, Intl,
+    MakeRefType(True, MakeAbsHeapType(wahExtern)))).ToBe(False);
+  { And the raw host box, unconverted, is still `extern`. }
+  Expect<Boolean>(IsRefOfRefType(FEngine, Box,
+    MakeRefType(True, MakeAbsHeapType(wahExtern)))).ToBe(True);
+  { The inverse recovers the exact host box. }
+  Expect<Boolean>(FStore.Heap.ExternalizeAny(Intl) = Box).ToBe(True);
+end;
+
 procedure TRuntimeStoreTests.TestHostRootsGoThroughTheStore;
 var
   Ids: TWasmEngineTypeIds;
@@ -1324,6 +1369,8 @@ begin
     TestRuntimeCastIsCrossModule);
   Test('a runtime cast keeps the reference hierarchies apart',
     TestRuntimeCastKeepsTheHierarchiesApart);
+  Test('a runtime cast classifies M7 extern/any conversion wrappers',
+    TestRuntimeCastSeesM7ConversionWrappers);
   Test('host roots register and release through the store',
     TestHostRootsGoThroughTheStore);
   Test('the trampoline context carries the store',

@@ -27,11 +27,10 @@
   GC frame discharge at every safepoint. call_indirect dispatch matches by
   deftype SUBTYPING (see ResolveIndirect).
 
-  DELIBERATELY STAGED, and named so nothing here is documented as more than it
-  is: throwing (iroThrow/iroThrowRef)
-  is Track H (interp-spec §4.6) and reaching it raises a clear not-implemented
-  error; extern.convert_any / any.convert_extern are representation-identity
-  only, the known M7 cross-hierarchy imprecision (interp-spec §3.9 O-4).
+  extern.convert_any / any.convert_extern (M7) cross the any<->extern
+  hierarchy boundary through Wasm.Runtime.Gc's ExternalizeAny /
+  InternalizeExtern wrapper pair, so a subsequent ref.test/ref.cast classifies
+  a converted value correctly (interp-spec §3.9 O-4).
 
   THE FP MASK. Wasm float ops never trap; the FPU exception-enable bits are
   masked per THREAD, and Wasm.Interp.Numeric's initialization masks only the
@@ -2650,12 +2649,22 @@ begin
         begin ExecArrayInitData(ACtx, Act, Ins); Inc(IP); end;
       iroArrayInitElem:
         begin ExecArrayInitElem(ACtx, Act, Ins); Inc(IP); end;
-      { extern.convert_any / any.convert_extern: identity on the
-        representation (KNOWN LIMITATION M7 — the kind-only abstract map does
-        not track the hierarchy switch, so a cross-hierarchy ref.test/cast
-        after a convert gives the wrong answer; see the report). }
-      iroAnyConvertExtern, iroExternConvertAny:
-        begin Reg[Ins^.Dest].Bits := Reg[Ins^.A].Bits; Inc(IP); end;
+      { extern.convert_any / any.convert_extern (M7). The wrap/unwrap and the
+        hierarchy switch live in the shared Gc helper so every tier gives the
+        same answer (ADR-0001); the operand stays in a frame slot the stack
+        map covers across the allocation safepoint inside the helper. }
+      iroAnyConvertExtern:
+        begin
+          ValueSetRef(Reg[Ins^.Dest],
+            Store.Heap.InternalizeExtern(Reg[Ins^.A].Ref));
+          Inc(IP);
+        end;
+      iroExternConvertAny:
+        begin
+          ValueSetRef(Reg[Ins^.Dest],
+            Store.Heap.ExternalizeAny(Reg[Ins^.A].Ref));
+          Inc(IP);
+        end;
       iroRefI31:
         begin
           Reg[Ins^.Dest].Bits := UInt64(MakeI31Ref(Reg[Ins^.A].I32));

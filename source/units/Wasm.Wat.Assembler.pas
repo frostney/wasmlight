@@ -280,7 +280,8 @@ type
     procedure DeclareImportField;
     procedure DeclareFuncField;
     procedure DeclareTableField;
-    procedure DeclareInlineTableElem(var ATable: TTableDecl);
+    procedure DeclareInlineTableElem(var ATable: TTableDecl;
+      const AAddr: TWasmAddrType);
     procedure DeclareMemField;
     procedure DeclareInlineMemData(var AMem: TMemDecl;
       const AAddr: TWasmAddrType);
@@ -341,7 +342,8 @@ type
       var AEntry: TWasmWriter);
     procedure EmitElemSegment(const AStart: Integer; var AOut: TWasmWriter);
     procedure EmitDataSegment(const AStart: Integer; var AOut: TWasmWriter);
-    procedure WriteZeroOffsetExpr(var AOut: TWasmWriter);
+    procedure WriteZeroOffsetExpr(var AOut: TWasmWriter;
+      const AAddr: TWasmAddrType);
     procedure EmitInlineElemSegment(const ADecl: TInlineElemDecl;
       var AOut: TWasmWriter);
     procedure EmitInlineDataSegment(const ADecl: TInlineDataDecl;
@@ -441,6 +443,20 @@ begin
     or (AKw = 'try') or (AKw = 'delegate') or (AKw = 'rethrow');
 end;
 
+{ Keywords removed from the grammar (the obsolete pre-1.0 spellings). Upstream
+  lexes them as reserved atoms, so meeting one WHEREVER a token is rejected is
+  `unknown operator <kw>`, never `unexpected token` — the instruction-position
+  spellings (get_local, current_memory, …) already surface that way through the
+  opcode table, and `anyfunc` (the removed funcref alias) must match in a
+  type position too (obsolete-keywords.wast:1-45; §4 text-keyword). }
+function IsObsoleteKeyword(const AKw: string): Boolean;
+begin
+  Result := (AKw = 'anyfunc')
+    or (AKw = 'get_local') or (AKw = 'set_local') or (AKw = 'tee_local')
+    or (AKw = 'get_global') or (AKw = 'set_global')
+    or (AKw = 'current_memory') or (AKw = 'grow_memory');
+end;
+
 function TextStartsWith(const AWhole, APrefix: string): Boolean;
 begin
   Result := (Length(AWhole) >= Length(APrefix))
@@ -520,7 +536,8 @@ begin
     position that rejects the current token reports `unknown operator <tok>`
     for a reserved run and `unexpected token` only for a valid token out of
     place (§4; token.wast:7-299). }
-  if Cur.Kind = wttReserved then
+  if (Cur.Kind = wttReserved)
+    or ((Cur.Kind = wttKeyword) and IsObsoleteKeyword(Cur.Text)) then
     RaiseUnknownOperator(Cur.Text)
   else
     RaiseText(MSG_UNEXPECTED_TOKEN);
@@ -1500,6 +1517,8 @@ var
   ImpModule, ImpName: string;
   Imp: TImpDecl;
   CloseIdx: Integer;
+  RefAt: Integer;
+  TableAddr: TWasmAddrType;
 begin
   ExpectLParen;
   ExpectKeyword('table');
@@ -1530,14 +1549,28 @@ begin
   NoteDefinition('table');
   T.InlineExports := Exports_;
 
-  { Inline `(table id? reftype (elem …))`: a reftype where a limits/addrtype
+  { Inline `(table id? addrtype? reftype (elem …))`: a reftype where a limits
     would start signals the sugar form. The table's min=max is the element
-    count, plus a synthetic active elem segment (§2(c.5)). }
-  if ((Cur.Kind = wttKeyword) and IsRefTypeShorthand(Cur.Text))
-    or ((Cur.Kind = wttLParen) and (At(1).Kind = wttKeyword)
-      and (At(1).Text = 'ref')) then
+    count, plus a synthetic active elem segment (§2(c.5)). An optional addrtype
+    (i32/i64) may precede the reftype for a 64-bit table (table64.wast:…,
+    call_indirect64.wast:11) — peek past it to recognise the sugar and carry the
+    address type into the synthesised limits. }
+  RefAt := 0;
+  TableAddr := watI32;
+  if IsKeyword('i64') then
   begin
-    DeclareInlineTableElem(T);
+    RefAt := 1;
+    TableAddr := watI64;
+  end
+  else if IsKeyword('i32') then
+    RefAt := 1;
+  if ((At(RefAt).Kind = wttKeyword) and IsRefTypeShorthand(At(RefAt).Text))
+    or ((At(RefAt).Kind = wttLParen) and (At(RefAt + 1).Kind = wttKeyword)
+      and (At(RefAt + 1).Text = 'ref')) then
+  begin
+    if RefAt = 1 then
+      Advance;   { consume the addrtype keyword before the reftype }
+    DeclareInlineTableElem(T, TableAddr);
     Exit;
   end;
 
@@ -1621,7 +1654,8 @@ begin
   FMems[High(FMems)] := M;
 end;
 
-procedure TWatAssembler.DeclareInlineTableElem(var ATable: TTableDecl);
+procedure TWatAssembler.DeclareInlineTableElem(var ATable: TTableDecl;
+  const AAddr: TWasmAddrType);
 var
   Rec: TInlineElemDecl;
   Count: Integer;
@@ -1658,7 +1692,7 @@ begin
   ExpectRParen;   { close (table …) }
 
   ATable.TableType := MakeTableType(Rec.RefType,
-    MakeLimitsWithMax(watI32, UInt64(Count), UInt64(Count)));
+    MakeLimitsWithMax(AAddr, UInt64(Count), UInt64(Count)));
   SetLength(FTables, Length(FTables) + 1);
   FTables[High(FTables)] := ATable;
 
@@ -3329,13 +3363,24 @@ begin
   AOut.AppendBytes(Payload);
 end;
 
-procedure TWatAssembler.WriteZeroOffsetExpr(var AOut: TWasmWriter);
+procedure TWatAssembler.WriteZeroOffsetExpr(var AOut: TWasmWriter;
+  const AAddr: TWasmAddrType);
 begin
   { The synthetic active-segment offset that desugared inline elem/data
-    segments all sit at: the const expr `(i32.const 0)`, i.e. i32.const ($41),
-    a zero sLEB, and the end delimiter ($0B). }
-  AOut.WriteByte($41);
-  AOut.WriteS32(0);
+    segments all sit at: the const expr `(iN.const 0)` then the end delimiter
+    ($0B). The offset type must match the table/memory address type — an i64
+    table/memory takes `i64.const 0` ($42), an i32 one `i32.const 0` ($41);
+    the validator checks this match (table64.wast, memory64.wast). }
+  if AAddr = watI64 then
+  begin
+    AOut.WriteByte($42);
+    AOut.WriteS64(0);
+  end
+  else
+  begin
+    AOut.WriteByte($41);
+    AOut.WriteS32(0);
+  end;
   AOut.WriteByte($0B);
 end;
 
@@ -3346,6 +3391,7 @@ var
   TableIdx: UInt32;
   IsFuncRef: Boolean;
   Off: TWasmWriter;
+  OffAddr: TWasmAddrType;
 begin
   { A desugared inline table-elem: an ACTIVE segment at offset (i32.const 0)
     over this table. The explicit-table flags (2 for a funcidx list, 6 for an
@@ -3358,6 +3404,7 @@ begin
     hardcoded funcref. }
   Saved := FPos;
   TableIdx := UInt32(FTables[ADecl.TableDeclIndex].FinalIndex);
+  OffAddr := FTables[ADecl.TableDeclIndex].TableType.Limits.AddrType;
   IsFuncRef := ADecl.RefType.Nullable and ADecl.RefType.Heap.IsAbstract
     and (ADecl.RefType.Heap.Abs = wahFunc);
   FPos := ADecl.ListStart;
@@ -3365,7 +3412,7 @@ begin
   begin
     AOut.WriteU32(6);
     AOut.WriteU32(TableIdx);
-    WriteZeroOffsetExpr(AOut);
+    WriteZeroOffsetExpr(AOut, OffAddr);
     AOut.WriteRefType(ADecl.RefType);
     AOut.WriteU32(UInt32(ADecl.ElemCount));
     while FPos < ADecl.ListEnd do
@@ -3392,7 +3439,7 @@ begin
       already yields a segment whose element type matches the table. }
     AOut.WriteU32(2);
     AOut.WriteU32(TableIdx);
-    WriteZeroOffsetExpr(AOut);
+    WriteZeroOffsetExpr(AOut, OffAddr);
     AOut.WriteByte($00);   { elemkind funcref }
     AOut.WriteU32(UInt32(ADecl.ElemCount));
     while FPos < ADecl.ListEnd do
@@ -3407,7 +3454,7 @@ begin
       cannot express a non-funcref element type. }
     AOut.WriteU32(6);
     AOut.WriteU32(TableIdx);
-    WriteZeroOffsetExpr(AOut);
+    WriteZeroOffsetExpr(AOut, OffAddr);
     AOut.WriteRefType(ADecl.RefType);
     AOut.WriteU32(UInt32(ADecl.ElemCount));
     while FPos < ADecl.ListEnd do
@@ -3432,16 +3479,9 @@ begin
   AOut.WriteU32(2);
   AOut.WriteU32(MemIdx);
   { The offset const-expr must match the memory's address type: an i64 memory
-    takes `i64.const 0` ($42), an i32 memory `i32.const 0` ($41). The validator
-    checks this match, so a hardcoded i32 offset would reject an i64 memory. }
-  if FMems[ADecl.MemDeclIndex].MemType.Limits.AddrType = watI64 then
-  begin
-    AOut.WriteByte($42);
-    AOut.WriteS64(0);
-    AOut.WriteByte($0B);
-  end
-  else
-    WriteZeroOffsetExpr(AOut);
+    takes `i64.const 0`, an i32 memory `i32.const 0`. The validator checks this
+    match, so a hardcoded i32 offset would reject an i64 memory. }
+  WriteZeroOffsetExpr(AOut, FMems[ADecl.MemDeclIndex].MemType.Limits.AddrType);
   AOut.WriteU32(UInt32(Length(ADecl.Payload)));
   AOut.AppendBytes(ADecl.Payload);
 end;

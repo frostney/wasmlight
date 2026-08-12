@@ -98,8 +98,22 @@ type
     FSize: NativeUInt;
     FPos: NativeUInt;
     FContext: TWasmReaderContext;
+    { The PHYSICAL bytes reachable from FData, always >= FSize. For a
+      top-level reader the two coincide; a section SubReader's FSize is the
+      declared section length, but FCapacity spans the rest of the module
+      buffer it borrows. The width-limited LEB readers scan against
+      FCapacity, never FSize: a uN/sN's byte count is bounded by the type
+      width (ceil(N/7)), a condition on the encoding itself and independent
+      of any framing — so an overlong or over-wide encoding is malformed
+      even when a section boundary falls inside it. Everything else (Need,
+      Remaining, Eof, Skip, ReadName, the section-exhaustion check) stays
+      on FSize, so framing and truncation reporting are unchanged.
+      https://webassembly.github.io/spec/core/binary/values.html#binary-int }
+    FCapacity: NativeUInt;
 
     procedure Need(const ACount: NativeUInt; const AWhat: string);
+    function ReadLebByte: Byte;
+    procedure RaiseSectionTruncated(const AOffset: NativeUInt);
     function ReadUnsigned(const ABits: Byte; const AWhat: string): UInt64;
     function ReadSigned(const ABits: Byte; const AWhat: string): Int64;
     procedure SetPosition(const AValue: NativeUInt);
@@ -200,6 +214,9 @@ begin
   FSize := ASize;
   FPos := 0;
   FContext := wrcTopLevel;
+  { A freestanding reader has nothing behind its logical size; SubReader
+    widens this for section bodies. }
+  FCapacity := ASize;
 end;
 
 procedure TWasmReader.InitFromBytes(const ABytes: TWasmBytes);
@@ -271,7 +288,44 @@ begin
   Need(ACount, 'sub-range');
   Result.Init(FData + FPos, ACount);
   Result.FContext := FContext;
+  { The sub-reader's declared size is ACount, but the buffer it borrows
+    runs to this reader's own physical end — that is what lets a
+    width-limited LEB read past a section boundary to decide overlong or
+    over-wide, exactly as the reference decoder reads from the whole
+    stream and checks the section size afterwards. Need(ACount) above
+    guarantees FCapacity - FPos >= ACount, so this never shrinks below the
+    logical size. }
+  Result.FCapacity := FCapacity - FPos;
   Inc(FPos, ACount);
+end;
+
+{ One continuation byte of a width-limited LEB, read against the PHYSICAL
+  buffer rather than the logical section size. A uN/sN may be at most
+  ceil(N/7) bytes; the reader must be able to inspect up to that many bytes
+  to tell an overlong or over-wide encoding apart from a genuine
+  truncation, and a section boundary landing inside the encoding must not
+  short-circuit that with an `unexpected end`. Only running off the whole
+  buffer is a real truncation here. }
+function TWasmReader.ReadLebByte: Byte;
+begin
+  if FPos >= FCapacity then
+    raise EWasmDecodeError.CreateFmt(
+      '%s: reading byte at offset %u (need 1 byte(s), 0 left)',
+      [EndOfInputPrefix, FPos]);
+  Result := FData[FPos];
+  Inc(FPos);
+end;
+
+{ A width-limited LEB completed only by consuming bytes past the section's
+  declared size: the section is too small to hold the field, which is the
+  same truncation the logical bound would have reported one byte earlier.
+  Reported at AOffset (the section end) so the wording matches a plain
+  `Need` failure at that point. }
+procedure TWasmReader.RaiseSectionTruncated(const AOffset: NativeUInt);
+begin
+  raise EWasmDecodeError.CreateFmt(
+    '%s: reading byte at offset %u (need 1 byte(s), 0 left)',
+    [EndOfInputPrefix, AOffset]);
 end;
 
 function TWasmReader.ReadUnsigned(const ABits: Byte;
@@ -281,22 +335,28 @@ var
   Shift: Integer;
   Count, MaxBytes: Integer;
   LastMask: Byte;
+  LogicalEnd: NativeUInt;
 begin
   { Single-byte values are the overwhelming majority (every index, every
-    small count), so take them before entering the loop. }
+    small count), so take them before entering the loop. This first byte
+    reads against the logical size: a field that cannot even begin within
+    its section is a plain truncation, not an overlong encoding. }
   B := ReadByte;
   if (B and $80) = 0 then
     Exit(B);
 
   MaxBytes := MaxLebBytes(ABits);
   LastMask := (Byte(1) shl LastByteBits(ABits)) - 1;
+  LogicalEnd := FSize;
 
   Result := B and $7F;
   Shift := 7;
   Count := 1;
 
+  { Continuation bytes read against the physical buffer, so the width
+    checks below fire even when a section boundary falls mid-encoding. }
   repeat
-    B := ReadByte;
+    B := ReadLebByte;
     Inc(Count);
 
     if Count = MaxBytes then
@@ -314,6 +374,14 @@ begin
     Result := Result or (UInt64(B and $7F) shl Shift);
     Inc(Shift, 7);
   until (B and $80) = 0;
+
+  { A within-width encoding that only completed past the section boundary:
+    report it as the truncation the logical bound stands for, preserving
+    the `unexpected end` wording for a section too small to hold a valid
+    field. Overlong/over-wide encodings never reach here — they raised at
+    MaxBytes above. }
+  if FPos > LogicalEnd then
+    RaiseSectionTruncated(LogicalEnd);
 end;
 
 function TWasmReader.ReadSigned(const ABits: Byte;
@@ -323,17 +391,26 @@ var
   Shift: Integer;
   Count, MaxBytes: Integer;
   SignMask, UpperMask: Byte;
+  LogicalEnd: NativeUInt;
 begin
   MaxBytes := MaxLebBytes(ABits);
   SignMask := Byte(1) shl (LastByteBits(ABits) - 1);
   UpperMask := $7F and not ((SignMask shl 1) - 1);
+
+  LogicalEnd := FSize;
 
   Result := 0;
   Shift := 0;
   Count := 0;
 
   repeat
-    B := ReadByte;
+    { First byte against the logical size (a field must at least begin
+      within its section); continuation bytes against the physical buffer,
+      so the width checks fire across a section boundary. }
+    if Count = 0 then
+      B := ReadByte
+    else
+      B := ReadLebByte;
     Inc(Count);
 
     if Count = MaxBytes then
@@ -362,6 +439,12 @@ begin
     Result := Result or (Int64(B and $7F) shl Shift);
     Inc(Shift, 7);
   until (B and $80) = 0;
+
+  { A within-width encoding that only completed past the section boundary
+    is the same truncation the logical bound stands for — see the unsigned
+    reader. Overlong/over-wide encodings raised at MaxBytes above. }
+  if FPos > LogicalEnd then
+    RaiseSectionTruncated(LogicalEnd);
 
   { Sign-extend by OR-ing in all-ones above the bits read, rather than by
     negating a power of two. `-(Int64(1) shl Shift)` is the textbook form

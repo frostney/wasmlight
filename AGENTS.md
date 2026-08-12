@@ -61,7 +61,17 @@ canonical vocabulary before planning anything.
   ([ADR-0009](docs/adr/0009-traps-unwind-to-a-per-invocation-trampoline.md)).
 - **Tiers must be observationally identical.** Any divergence between
   interpreter, baseline JIT, and AOT for the same module — including
-  which trap fires and when — is a bug, not a tier characteristic.
+  which trap fires and when — is a bug, not a tier characteristic. All
+  three tiers are shipped, and this is **enforced in CI**: `wasmspec
+  --tier=interp|jit|aot` over the pinned corpus must produce a
+  byte-identical tally (65,184 pass on both aarch64 and x86-64), and the
+  JIT/AOT legs assert that identity against the interpreter. The JIT and
+  AOT are a 64-bit-UNIX acceleration (`WASM_JIT_EXEC`, backends
+  `Wasm.Jit.Arm64` / `Wasm.Jit.X64`); on Windows and 32-bit targets the
+  runtime is interpreter-only — the tier of record, fully conformant, just
+  unaccelerated. AOT never bypasses validation: `run --aot` always
+  re-decodes and re-validates, and the `.waot` artifact is a per-module
+  perf cache bound by hash, not a trust boundary.
 - **The error hierarchy is load-bearing.** `EWasmDecodeError`,
   `EWasmValidationError`, `EWasmLinkError`, and `EWasmTrap` mean different
   things to a host; never collapse them or raise a bare `EWasmError` where
@@ -134,8 +144,9 @@ lwpt build             # all three programs (Linux, macOS, Windows)
 lwpt test              # co-located unit suites
 ./build/wasmlight inspect <module.wasm>   # decode + report sections and entity counts
 ./build/wasmlight validate <module.wasm>  # decode + validate, report the lowered IR
-./build/wasmlight run [--dir G=H] [--env K=V] [--] <module.wasm> [args...]  # run a WASI preview1 command to a process exit code
-./build/wasmspec <script.wast|dir>...     # run .wast conformance scripts (assemble, validate, execute)
+./build/wasmlight run [--dir G=H] [--env K=V] [--aot <art.waot>] [--no-aot] [--] <module.wasm> [args...]  # run a WASI preview1 command to a process exit code (--aot loads a precompiled artifact for instant startup, falling back to interpret)
+./build/wasmlight aot <module.wasm> [-o <artifact.waot>]  # compile ahead of time to a .waot artifact (64-bit UNIX)
+./build/wasmspec [--tier=interp|jit|aot] <script.wast|dir>...  # run .wast conformance scripts (assemble, validate, execute) in a chosen tier
 ./build/wasmbench                          # component benchmarks (measurement only)
 ```
 
@@ -163,8 +174,8 @@ they still belong in a test.
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `Wasm.Core` (vocabulary + errors), `Wasm.Binary` (bounds-checked reader, LEB128), `Wasm.Module` (decoded model), `Wasm.Decoder` + `Wasm.Decoder.*` (Common/Types/Entities/Segments/Expr — binary → model, all section bodies), `Wasm.Ir` (register IR data structures + disassembler; depends on `Wasm.Core` alone), `Wasm.Validator` (`ValidateModule`: module-shape rules, phase order, IR assembly) + `Wasm.Validator.Types` (type-section validity, canonicalisation, matching), `Wasm.Validator.Const` (constant expressions), `Wasm.Validator.Body` (the fused decode/type-check/emit body walk), the runtime layer: `Wasm.Runtime.Values` (the untagged value slot + reference encoding), `Wasm.Runtime.Traps` (trap vocabulary, fault handler, per-invocation trampoline), `Wasm.Runtime.Memory` (linear memory + the access chokepoint), `Wasm.Runtime.Store` (engine type table, store, instances), `Wasm.Runtime.Instantiate` (const-expr evaluator + instantiation sequence), `Wasm.Runtime.Gc` (precise non-moving mark-sweep collector, including GC-managed `exn` exception objects with a traced payload); the interpreter tier `Wasm.Interp` (explicit-frame dispatch over the IR, including `throw` / `throw_ref` / `try_table` by explicit activation-stack unwind) + `Wasm.Interp.Numeric` (bit-exact numeric leaf functions) + `Wasm.Interp.Vector` (bit-exact `v128` vector leaf functions); the wat text-format assembler `Wasm.Wat.Numbers` (numeric-literal text → exact bits), `Wasm.Wat.Lexer` (strict classified tokenizer for module text), `Wasm.Wat.Emit` (binary emitter: canonical LEB128, encoders, section backpatching), `Wasm.Wat.Opcodes` (mnemonic → opcode/immediate/alignment table), `Wasm.Wat.Names` (identifier/label resolution, implicit-typeuse dedup), `Wasm.Wat.Assembler` (module text + `(module quote …)` → bytes into the shipped decode/validate path); the conformance harness `Wasm.Wast` (.wast lexer/parser/classifier), `Wasm.Wast.Values` (assertion argument/result parser + matcher), `Wasm.Wast.Runner` (assembles text modules, decodes, validates, instantiates, and executes assertions through the interpreter); and the embedding + host surface `Wasm.Engine` (the host-facing facade over the runtime: load/link/instantiate/call, guest-memory read/write through the chokepoint, host-root registration for HOST-1, the typed `TWasmLinker`, and the `EWasmExit` clean-exit class), `Wasm.Wasi` (the deny-by-default WASI preview1 host module — args/env/clock/CSPRNG-random/stdio + wave-2 filesystem behind preopen containment) + `Wasm.Wasi.Types` (errno/filetype/rights/oflags/fdflags/clockid/whence witx constants) + `Wasm.Wasi.Memory` (bounds-checked guest-memory marshalling for the host functions), and `Wasm.Run` (the testable core of `wasmlight run`: decode/validate → link deny-by-default → run `_start` → map the outcome to a process exit code) |
-| `source/apps/` | Programs: `wasmlight` (CLI — `inspect` / `validate` / `run`), `wasmbench` (benchmarks), `wasmspec` (.wast conformance harness) |
+| `source/units/` | Library: `Wasm.Core` (vocabulary + errors), `Wasm.Binary` (bounds-checked reader, LEB128), `Wasm.Module` (decoded model), `Wasm.Decoder` + `Wasm.Decoder.*` (Common/Types/Entities/Segments/Expr — binary → model, all section bodies), `Wasm.Ir` (register IR data structures + disassembler; depends on `Wasm.Core` alone), `Wasm.Validator` (`ValidateModule`: module-shape rules, phase order, IR assembly) + `Wasm.Validator.Types` (type-section validity, canonicalisation, matching), `Wasm.Validator.Const` (constant expressions), `Wasm.Validator.Body` (the fused decode/type-check/emit body walk), the runtime layer: `Wasm.Runtime.Values` (the untagged value slot + reference encoding), `Wasm.Runtime.Traps` (trap vocabulary, fault handler, per-invocation trampoline), `Wasm.Runtime.Memory` (linear memory + the access chokepoint), `Wasm.Runtime.Store` (engine type table, store, instances), `Wasm.Runtime.Instantiate` (const-expr evaluator + instantiation sequence), `Wasm.Runtime.Gc` (precise non-moving mark-sweep collector, including GC-managed `exn` exception objects with a traced payload); the interpreter tier `Wasm.Interp` (explicit-frame dispatch over the IR, including `throw` / `throw_ref` / `try_table` by explicit activation-stack unwind) + `Wasm.Interp.Numeric` (bit-exact numeric leaf functions) + `Wasm.Interp.Vector` (bit-exact `v128` vector leaf functions); the two compiling tiers over the same seam (64-bit UNIX only) — the baseline JIT `Wasm.Jit` (the driver + per-store code cache + the `JitCanCompile` scope fence) over `Wasm.Jit.CodeBuffer` (W^X exec memory, emission, label/patch map) and the two backends `Wasm.Jit.Arm64` + `Wasm.Jit.X64` (per-op native codegen, position-independent), and the AOT layer `Wasm.Aot` (`AotCompileModule` over every function → serialize → re-validate-and-wire on load) + `Wasm.Aot.Artifact` (`.waot` read/write, module hash, self-checksum, the arch/IR-version/ABI-fingerprint guards); the wat text-format assembler `Wasm.Wat.Numbers` (numeric-literal text → exact bits), `Wasm.Wat.Lexer` (strict classified tokenizer for module text), `Wasm.Wat.Emit` (binary emitter: canonical LEB128, encoders, section backpatching), `Wasm.Wat.Opcodes` (mnemonic → opcode/immediate/alignment table), `Wasm.Wat.Names` (identifier/label resolution, implicit-typeuse dedup), `Wasm.Wat.Assembler` (module text + `(module quote …)` → bytes into the shipped decode/validate path); the conformance harness `Wasm.Wast` (.wast lexer/parser/classifier), `Wasm.Wast.Values` (assertion argument/result parser + matcher), `Wasm.Wast.Runner` (assembles text modules, decodes, validates, instantiates, and executes assertions through the interpreter); and the embedding + host surface `Wasm.Engine` (the host-facing facade over the runtime: load/link/instantiate/call, guest-memory read/write through the chokepoint, host-root registration for HOST-1, the typed `TWasmLinker`, and the `EWasmExit` clean-exit class), `Wasm.Wasi` (the deny-by-default WASI preview1 host module — args/env/clock/CSPRNG-random/stdio + wave-2 filesystem behind preopen containment) + `Wasm.Wasi.Types` (errno/filetype/rights/oflags/fdflags/clockid/whence witx constants) + `Wasm.Wasi.Memory` (bounds-checked guest-memory marshalling for the host functions), and `Wasm.Run` (the testable core of `wasmlight run`: decode/validate → link deny-by-default → run `_start` → map the outcome to a process exit code) |
+| `source/apps/` | Programs: `wasmlight` (CLI — `inspect` / `validate` / `run` [+ `--aot` / `--no-aot`] / `aot`), `wasmbench` (benchmarks), `wasmspec` (.wast conformance harness, `--tier=interp\|jit\|aot`) |
 | `scripts/` | InstantFPC automation (`stamp-version.pas`) |
 | `tests/fixtures/` | Real toolchain-compiled `.wasm` cross-check corpus (committed; regenerate with `regenerate.sh`) |
 | `tests/spec/` | The upstream conformance harness lands here |
@@ -179,10 +190,16 @@ executes the IR, the wat text-format assembler, the `.wast` runner that
 assembles, decodes, validates, instantiates, and executes over the whole
 corpus, and the embedding API and WASI preview1 host surface that run that
 core as real programs — `wasmlight run` executes a WASI command to a
-process exit code under deny-by-default capabilities (Track F). What is
-still staged in [docs/roadmap.md](docs/roadmap.md) is the baseline JIT and
-AOT tiers behind the seam. Do not document an unbuilt layer as if it
-exists. `$FD` vector support is shipped end to end
+process exit code under deny-by-default capabilities (Track F) — and both
+compiling tiers behind the seam: the baseline JIT (Track I) and the AOT
+compiler (Track J), two backends (aarch64 + x86-64) on a 64-bit UNIX host,
+each proven byte-identical to the interpreter over the corpus. **The whole
+roadmap A–J is delivered**; nothing in v1 is staged. What
+[docs/roadmap.md](docs/roadmap.md) still lists as future is *beyond* v1
+(threads, the Component Model) or is deferred JIT optimization and
+cross-platform CI validation — never a missing behaviour. Do not document
+an unbuilt layer as if it exists, and do not re-describe a shipped one as
+staged. `$FD` vector support is shipped end to end
 (Track G): the validator types the `$FD` space, the assembler emits the
 vector text forms, the interpreter's `Wasm.Interp.Vector` executes them,
 and the harness judges SIMD per lane. **Exception handling is shipped end

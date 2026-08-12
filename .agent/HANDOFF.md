@@ -3,6 +3,39 @@
 Updated: 2026-08-10 (Track I COMPLETE — both backends, cross-arch proven,
 all 4 review findings fixed; Track J AOT is next)
 
+## Post-roadmap follow-ups (this session)
+
+- **Corpus in CI (done):** pr.yml/ci.yml now fetch the testsuite at the
+  pinned tests/spec/testsuite.commit and run wasmspec — interp on every
+  platform, jit+aot three-tier IDENTITY check on the 64-bit UNIX legs.
+  Not yet run on the full matrix (still unpushed).
+- **Docs (done):** roadmap/README/architecture/AGENTS/testing updated to
+  roadmap-complete (three tiers, two arches, UNIX-64-only JIT/AOT scope).
+- **Corpus fails closed (done):** 408 -> 389 (+19 pass), all genuine
+  3.0-core gaps, cross-arch + cross-tier verified: binary-leb128 overlong-
+  past-section decode messages (+7); M7 extern/any convert now uses GC
+  wrapper objects wokExternalized/wokInternalized so ref.test/ref.cast
+  classify correctly (+4, wired through interp AND both JIT backends AND
+  the const-expr evaluator so all tiers stay identical); addrtype text
+  forms / anyfunc / id.wast lexer / ref.func-declared-set / throw wording
+  (+8). Remaining 389 = 356 post-3.0 proposals + 16 legacy EH (both out
+  of scope) + ~9 (module definition/instance) harness forms + a few
+  deferred decode/framing edges.
+- **Perf vs wasmtime (done, HONEST):** aarch64-darwin, min of 4 runs.
+  fib(35): interp 4682ms / aot 4567ms / wasmtime 38ms. loop(300M mul-add):
+  interp 1205 / aot 1194 / wasmtime 94. noop startup: interp 3 / aot 3 /
+  wasmtime 5. TAKEAWAYS, stated plainly: (1) wasmtime's optimizing
+  Cranelift JIT is 13-120x faster than wasmlight's baseline on throughput
+  — expected, and the VISION "rivals C/Rust" goal is NOT met by the
+  current tiers. (2) The baseline JIT/AOT is only ~1-3% faster than the
+  interpreter here: the memory-register-file design keeps all the
+  load/store traffic and calls go through the same helpers, so the JIT
+  removes only dispatch overhead. The real speedup lives in the DEFERRED
+  optimizations (machine-register allocation, guard-page inline memory,
+  native SIMD) — genuinely future work, not shipped. (3) wasmlight's AOT
+  startup marginally beats wasmtime for trivial modules (no run-time
+  compile), but the margin is small.
+
 ## THE ENTIRE ROADMAP (Tracks A-J) IS DELIVERED.
 
 Decode (A), validate + register IR (B), the .wast harness + wat assembler

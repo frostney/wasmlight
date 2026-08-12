@@ -34,9 +34,8 @@
   exits `0`, and a program granted a preopen reads the filesystem through
   it — the runtime does not merely execute every instruction, it **runs
   WASI preview1 programs**, hello-world through filesystem-via-preopens.
-  What is left is not a 3.0-core gap and no longer a host-surface gap — it
-  is the *performance* tiers (baseline JIT and AOT, Tracks I/J), which add
-  no behaviour and are differentially tested against this interpreter.
+  That execution core now runs behind **three interchangeable tiers**, not
+  one (see the tier bullet below); there is no remaining roadmap track.
 - **Garbage collection has landed (Track D).** It was the longest pole by
   structural reach, not by instruction count: it rewrote the type section,
   added a runtime subtyping check, and put a precise collector under the
@@ -57,6 +56,33 @@
   Exception objects are GC objects with a traced payload, and
   `assert_exception` is judged. `IR_FORMAT_VERSION` stays **2** — the
   handler tables were in the IR from day one.
+- **The performance tiers have landed (Tracks I and J).** The runtime now
+  executes behind **three interchangeable, observationally-identical
+  execution tiers**: the interpreter (the tier of record, on every
+  platform), a **baseline JIT** that compiles each function to native code
+  at run time, and an **ahead-of-time compiler** that compiles to a
+  `.waot` artifact loaded for instant startup. All three produce
+  **byte-identical** corpus results (65,184 pass) on both aarch64 and
+  x86-64. The JIT and AOT share **two backends** — `Wasm.Jit.Arm64` and
+  `Wasm.Jit.X64` — gated to a 64-bit UNIX host (`WASM_JIT_EXEC`); on
+  Windows and 32-bit targets the JIT/AOT are inactive and the runtime is
+  **interpreter-only**, which is fully conformant (the interpreter is the
+  tier of record) but unaccelerated. AOT always re-decodes and
+  re-validates the module: the artifact is a per-module perf cache bound
+  by hash, never a trust bypass. **There is no remaining roadmap track** —
+  the critical path *and* the performance tiers are complete.
+- **What honestly remains is not a track.** Three things. First, the
+  *deferred* JIT optimizations — guard-page inline memory access,
+  native-SIMD codegen, and machine-register allocation — which the
+  baseline leaves on the table (it uses explicit bounds checks, calls the
+  vector leaves, and keeps the register file in memory); they are
+  measured, optional, and never required for correctness. Second, the ~408
+  characterized corpus failures, none a 3.0-core gap (see Track C). Third,
+  cross-platform CI validation on the legs never yet run on real hardware:
+  the three-tier identity is proven locally on **aarch64-darwin** (native)
+  and **amd64-linux** (a Rosetta VM), and the corpus is **now wired into
+  CI** on every platform — but that matrix (Windows, 32-bit, native
+  x86-64) has not yet had its first run.
 - **No dates.** There is no delivery history to anchor them to (see
   Confidence). Tracks are sized against counted spec surface and ordered
   by dependency.
@@ -109,6 +135,8 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | Constant-expression evaluation and the instantiation sequence | `Wasm.Runtime.Instantiate` | `Wasm.Runtime.Instantiate.Test` (incl. fixture instantiation) |
 | Precise, non-moving, stop-the-world mark-sweep collector | `Wasm.Runtime.Gc` | `Wasm.Runtime.Gc.Test` |
 | Interpreter tier: explicit-frame dispatch over the register IR, tail-call frame replacement, epoch check, stack maps | `Wasm.Interp` | `Wasm.Interp.Test` |
+| Baseline JIT tier: per-function native codegen over the IR behind the seam, two backends (aarch64 / x86-64), byte-identical to the interpreter | `Wasm.Jit` (+ `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`) | `Wasm.Jit.Test` + `Wasm.Jit.CodeBuffer.Test` + `Wasm.Jit.Arm64.Test` + `Wasm.Jit.X64.Test` + the `--tier=jit` corpus |
+| AOT tier: compile ahead of time to a `.waot` artifact (arch + ABI + module-hash guarded), re-validate and load for instant startup, fall back to interpret on any mismatch | `Wasm.Aot` (+ `Wasm.Aot.Artifact`) | `Wasm.Aot.Test` + `Wasm.Aot.Artifact.Test` + the `--tier=aot` corpus |
 | Exception handling: `throw` / `throw_ref` / `try_table` executed by explicit activation-stack unwind, tag store-address matching, `EWasmException` for an uncaught throw | `Wasm.Interp` | `Wasm.Interp.Test` |
 | Exception objects (`exn`): GC-managed, tag address plus a traced payload | `Wasm.Runtime.Gc` + `Wasm.Runtime.Store` | `Wasm.Runtime.Gc.Test` + `Wasm.Runtime.Store.Test` |
 | Bit-exact numeric operators (integer, float, conversions, NaN classes) | `Wasm.Interp.Numeric` | `Wasm.Interp.Numeric.Test` |
@@ -125,19 +153,22 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | `.wast` runner: assembles text modules, decodes, validates, instantiates, and *executes* assertions through the interpreter | `Wasm.Wast.Runner` | `Wasm.Wast.Runner.Test` + the corpus |
 | Embedding API: load / link / instantiate / call, guest memory read/write through the chokepoint, host-root registration (contract HOST-1), the typed host-import linker, `EWasmExit` for a clean guest-requested exit | `Wasm.Engine` | `Wasm.Engine.Test` |
 | WASI preview1 host module: args/environ, clock, a real-CSPRNG `random_get`, stdio, and the wave-2 filesystem behind preopen containment — deny-by-default, no ambient authority | `Wasm.Wasi` (+ `Wasm.Wasi.Types`, `Wasm.Wasi.Memory`) | `Wasm.Wasi.Test` (+ `Wasm.Wasi.Types.Test`, `Wasm.Wasi.Memory.Test`) |
-| `wasmlight run`: decode + validate a WASI command, link it deny-by-default, run `_start`, map the outcome to a process exit code | `Wasm.Run` + `source/apps/wasmlight.pas` | `Wasm.Run.Test` + manual |
+| `wasmlight run`: decode + validate a WASI command, link it deny-by-default, run `_start`, map the outcome to a process exit code (`run --aot <artifact.waot>` loads an AOT artifact for instant startup, `--no-aot` forces interpret) | `Wasm.Run` + `source/apps/wasmlight.pas` | `Wasm.Run.Test` + manual |
+| `wasmlight aot`: compile a module ahead of time to a `.waot` artifact | `Wasm.Aot` + `source/apps/wasmlight.pas` | `Wasm.Aot.Test` + manual |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
-| `wasmspec` (judges the corpus: ~65,592 commands assembled, decoded, validated, and executed, SIMD and exception handling included) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
+| `wasmspec` (judges the corpus: ~65,592 commands assembled, decoded, validated, and executed, SIMD and exception handling included; `--tier=interp\|jit\|aot` runs each execution tier over the same corpus) | `source/apps/wasmspec.pas` | `Wasm.Wast.Runner.Test` + the corpus |
 | Decoder and LEB128 benchmarks | `source/apps/wasmbench.pas` | measurement only |
 
-Everything below is **Absent** unless marked otherwise. Tracks A, B, C, D,
-E, F, G, and H are delivered; the interpreter executes the whole 3.0
+**Every track A–J is delivered.** The interpreter executes the whole 3.0
 instruction set, including the `$FD` vector space and exception-handling
-throwing, and the embedding API and WASI preview1 host surface (Track F)
-now run that core as real programs. Nothing is staged in the interpreter
-any more. What is Absent is the performance tiers (Tracks I/J).
+throwing; the embedding API and WASI preview1 host surface (Track F) run
+that core as real programs; and the baseline JIT (Track I) and AOT
+(Track J) add two more execution tiers behind the one seam, byte-identical
+to the interpreter on both arches. Nothing in v1 is Absent or staged. What
+is listed further below under "After 3.0" and "Not planned" is future work
+*beyond* v1, not a gap inside it.
 
 ## The counted backlog
 
@@ -259,7 +290,11 @@ skip=1533 staged=0` with `errors=0` across 288 files — the split is
 `ROOT pass=64651 fail=52 staged=0` and `PROPOSALS pass=533 fail=356`.
 Judged commands (`pass + fail`) are **~65,592** of the corpus's ~67,000.
 The `staged` column is **0**: Track H shipped the throwing that used to
-sit there. See [testing.md](testing.md) and
+sit there. `--tier=jit` and `--tier=aot` produce the **same** tally,
+byte-for-byte (jit/aot `compiled=8562` on aarch64), which is the
+differential proof the two compiling tiers demand
+([ADR-0001](adr/0001-tiered-execution-seam.md)). See
+[testing.md](testing.md) and
 [`tests/spec/README.md`](../tests/spec/README.md) for the tallies and the
 failure breakdown.
 
@@ -470,17 +505,50 @@ The legacy `try` / `catch` / `delegate` / `rethrow` encoding is **not** in
 3.0 — it lives in `testsuite/legacy/` and stays out of scope, so those
 files stay failing.
 
-### Track I — Baseline JIT (needs E, plus F/G/H for coverage)
+### Track I — Baseline JIT (needs E, plus F/G/H for coverage) — **delivered**
 
-x86-64 and aarch64. Inherits three obligations from decisions already
-taken: emit the epoch check at every back-edge, produce a stack map at
-every safepoint, and keep live references discoverable by the collector —
-which constrains register allocation.
+A second execution tier behind the seam, in **two backends** —
+`Wasm.Jit.Arm64` (aarch64) and `Wasm.Jit.X64` (x86-64) — over a shared
+driver (`Wasm.Jit`) and W^X code buffer (`Wasm.Jit.CodeBuffer`). It
+compiles each function to native code the first time it runs and honours
+the three obligations decisions already fixed: it emits the epoch check at
+every back-edge, the compiled frame *is* the interpreter's frame so the
+GC's stack map and tail-call handling come for free, and live references
+stay discoverable. It carries the full non-EH op set; a function using
+`throw` / `throw_ref` or hosting a `try_table` handler is declined and
+stays interpreted, and the two tiers interoperate transparently across the
+seam. The correctness proof is differential: `--tier=jit` over the corpus
+is **byte-identical** to `--tier=interp` — `compiled=8562`,
+`pass=65184 fail=408` — on **both** aarch64 and x86-64.
 
-### Track J — Ahead-of-time compiler and artifact cache (needs I)
+The tier runs only where `WASM_JIT_EXEC` holds — a **64-bit UNIX host**.
+On Windows and 32-bit targets it is inactive and the runtime is
+interpreter-only, which is fully conformant (the interpreter is the tier
+of record). Three optimizations are **deferred and measured, never
+required for correctness**: guard-page inline memory access (the baseline
+uses explicit bounds checks), native-SIMD codegen (it calls the
+`Wasm.Interp.Vector` leaves), and machine-register allocation (it keeps the
+register file in memory).
 
-Artifacts record the IR version they were compiled from and are rejected
-on mismatch.
+### Track J — Ahead-of-time compiler and artifact cache (needs I) — **delivered**
+
+A third tier: `wasmlight aot <module.wasm> -o <artifact.waot>` compiles
+every function ahead of time to position-independent machine code and
+serializes it to a `.waot` artifact (`Wasm.Aot`, `Wasm.Aot.Artifact`);
+`wasmlight run --aot <artifact.waot> [--] <module.wasm> [args]` — with
+sibling `<module>.waot` auto-detect and a `--no-aot` opt-out — loads it in
+a fresh process for **instant startup**. It is proven not to be a re-JIT:
+the AOT-loaded executable memory is byte-identical to a fresh compile, and
+`--tier=aot` over the corpus is byte-identical to both other tiers
+(`compiled=8562` on aarch64). Same 64-bit-UNIX scope as Track I.
+
+**Security invariant.** AOT **always re-decodes and re-validates** the
+module at load. The artifact is a per-module perf cache, **never a trust
+bypass**: its code is used only if the artifact's magic, AOT version, IR
+version (2), target arch, ABI fingerprint, module hash, and self-checksum
+all match the freshly-validated module — any mismatch (stale, wrong module,
+wrong arch) is rejected with a distinct reason and the run transparently
+falls back to the interpreter, losing only the speedup.
 
 ## Dependency shape
 
@@ -502,13 +570,14 @@ graph LR
   C -.judges.-> H
 ```
 
-The execution core is complete and the host surface is on it:
-**A → B → C → D → E → F → G → H** are all delivered, so every guest
-instruction in core wasm 3.0 runs and the embedding API and WASI preview1
-host (F) run that core as real programs. What remains is off the
-correctness path: the **performance** tiers — baseline JIT (I) and AOT
-(J) — which add no behaviour and are differentially tested against the
-interpreter (E).
+**Every track is delivered — A → B → C → D → E → F → G → H → I → J.** The
+execution core runs every guest instruction in core wasm 3.0, the
+embedding API and WASI preview1 host (F) run that core as real programs,
+and the two performance tiers — baseline JIT (I) and AOT (J) — sit behind
+the same seam, adding no behaviour and proven byte-identical to the
+interpreter (E) on both arches. The performance tiers are a 64-bit-UNIX
+acceleration, not a behaviour: on Windows and 32-bit targets only the
+interpreter runs, and that is still fully conformant.
 
 ## Constraints discovered from the spec
 

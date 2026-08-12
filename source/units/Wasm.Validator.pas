@@ -31,7 +31,8 @@
   C.REFS IS THE ONE PLACE TWO UNITS HAVE TO BE UNIONED.
   Wasm.Validator.Body.BuildDeclaredFuncSet deliberately covers only what a
   caller holding the decoded model alone can see (element segments in the
-  funcidx-vector form, the export list, the start function); `ref.func`
+  funcidx-vector form and the export list — NOT the start function, which
+  the spec excludes from C.REFS); `ref.func`
   inside a CONSTANT EXPRESSION also declares a function, and only
   Wasm.Validator.&Const can read those. Every ValidateConstExpr call below
   appends to one accumulator, and the union of the two is what goes into

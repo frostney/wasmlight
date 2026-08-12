@@ -46,6 +46,7 @@ type
     TagSec: TWasmBytes;
     GlobalSec: TWasmBytes;
     ExportSec: TWasmBytes;
+    StartSec: TWasmBytes;
     ElemSec: TWasmBytes;
     DataCountSec: TWasmBytes;
     CodeSec: TWasmBytes;
@@ -181,6 +182,7 @@ type
     { --- references -------------------------------------------------- }
     procedure TestRefFuncDeclaredByExport;
     procedure TestRefFuncUndeclared;
+    procedure TestRefFuncStartDoesNotDeclare;
     procedure TestBrOnNullRefinement;
     procedure TestBrOnNonNullRefinement;
 
@@ -204,6 +206,7 @@ type
     procedure TestCatchRefDeliversNonNullExnRef;
     procedure TestThrowRefIsStackPolymorphic;
     procedure TestThrowWithNonEmptyResultTag;
+    procedure TestThrowTypeMismatchWording;
     procedure TestUnknownTag;
   end;
 
@@ -309,6 +312,7 @@ begin
   Bytes := Cat(Bytes, Section(Ord(wsTag), ASections.TagSec));
   Bytes := Cat(Bytes, Section(Ord(wsGlobal), ASections.GlobalSec));
   Bytes := Cat(Bytes, Section(Ord(wsExport), ASections.ExportSec));
+  Bytes := Cat(Bytes, Section(Ord(wsStart), ASections.StartSec));
   Bytes := Cat(Bytes, Section(Ord(wsElement), ASections.ElemSec));
   Bytes := Cat(Bytes, Section(Ord(wsDataCount), ASections.DataCountSec));
   Bytes := Cat(Bytes, Section(Ord(wsCode), ASections.CodeSec));
@@ -332,6 +336,7 @@ begin
   S.TagSec := nil;
   S.GlobalSec := nil;
   S.ExportSec := nil;
+  S.StartSec := nil;
   S.ElemSec := nil;
   S.DataCountSec := nil;
   S.CodeSec := ACodeSec;
@@ -351,6 +356,7 @@ begin
   Result.TagSec := nil;
   Result.GlobalSec := nil;
   Result.ExportSec := nil;
+  Result.StartSec := nil;
   Result.ElemSec := nil;
   Result.DataCountSec := nil;
   Result.CodeSec := nil;
@@ -1989,6 +1995,26 @@ begin
     MSG_UNDECLARED_FUNCTION_REFERENCE);
 end;
 
+{ The start function is NOT in C.REFS — the reference set is only the func
+  indices that occur OUTSIDE functions, in globals, elems, and exports
+  (`context`; ref_func.wast:112-115). So a module whose only reference to a
+  function is naming it as start, plus a `ref.func` of it in a body, is still
+  `undeclared function reference`. }
+procedure TValidatorBodyTests.TestRefFuncStartDoesNotDeclare;
+var
+  S: TModuleSections;
+begin
+  S := NoSections;
+  S.TypeSec := B([$01, $60, $00, $00]);   { one type: [] -> [] }
+  S.FuncSec := B([$01, $00]);             { one func of type 0 }
+  S.StartSec := B([$00]);                 { start = func 0 }
+  S.CodeSec := Code1(B([$00]), B([$D2, $00, $1A, $0B]));  { ref.func 0; drop }
+  BuildAll(S);
+
+  ExpectInvalid('ref.func of the start function, declared nowhere else',
+    MSG_UNDECLARED_FUNCTION_REFERENCE);
+end;
+
 { br_on_null branches when the reference IS null and refines on the
   FALL-THROUGH, which is the one conditional reference branch that can
   take the direct shape: its label receives no value, so there are no
@@ -2341,6 +2367,38 @@ begin
   ExpectInvalid('throw with a tag that has results', MSG_TYPE_MISMATCH);
 end;
 
+{ throw reports the reference's whole-signature wording: it names the tag's
+  full param list as what the instruction requires and the whole in-frame
+  operand stack as what is present — `type mismatch: instruction requires
+  [i32] but stack has [i64]` / `[]` (throw.wast:52,54;
+  appendix/algorithm-validation-of-opcode-sequences, throw). }
+procedure TValidatorBodyTests.TestThrowTypeMismatchWording;
+
+  procedure Setup(const ABody: TWasmBytes);
+  var
+    S: TModuleSections;
+  begin
+    S := NoSections;
+    { type0 = [] -> [] (the function), type1 = [i32] -> [] (the tag). }
+    S.TypeSec := B([$02, $60, $00, $00, $60, $01, $7F, $00]);
+    S.FuncSec := B([$01, $00]);
+    S.TagSec := B([$01, $00, $01]);   { one tag, attribute 0, typeidx 1 }
+    S.CodeSec := Code1(B([$00]), ABody);
+    BuildAll(S);
+  end;
+
+begin
+  { An i64 where the tag requires an i32. }
+  Setup(B([$42, $05, $08, $00, $0B]));   { i64.const 5; throw 0; end }
+  ExpectInvalid('throw 0 with an i64 where [i32] is required',
+    'type mismatch: instruction requires [i32] but stack has [i64]');
+
+  { Nothing where the tag requires an i32 (a reachable-frame shortfall). }
+  Setup(B([$08, $00, $0B]));   { throw 0; end }
+  ExpectInvalid('throw 0 on an empty operand stack',
+    'type mismatch: instruction requires [i32] but stack has []');
+end;
+
 procedure TValidatorBodyTests.TestUnknownTag;
 begin
   Build(B([$01, $60, $00, $00]), B([$01, $00]), nil,
@@ -2492,6 +2550,8 @@ begin
     TestRefFuncDeclaredByExport);
   Test('ref.func on an undeclared function is rejected',
     TestRefFuncUndeclared);
+  Test('naming a function as start does not declare it for ref.func',
+    TestRefFuncStartDoesNotDeclare);
   Test('br_on_null refines the reference on the fall-through',
     TestBrOnNullRefinement);
   Test('br_on_non_null delivers the refined reference to the label',
@@ -2531,6 +2591,8 @@ begin
   Test('throw_ref is stack-polymorphic', TestThrowRefIsStackPolymorphic);
   Test('throw with a non-empty tag result type is rejected',
     TestThrowWithNonEmptyResultTag);
+  Test('throw reports the whole-signature type-mismatch wording',
+    TestThrowTypeMismatchWording);
   Test('an out-of-range tag index is unknown', TestUnknownTag);
 
   Test('a v128 global emits global.get.v128 / global.set.v128',

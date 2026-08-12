@@ -36,9 +36,11 @@ jobs:
             lwpt-asset: linux-x64
             fpc-install: apt
             format-check: true   # platform-independent; one runner runs it
+            jit: true            # 64-bit UNIX → JIT/AOT tiers active
           - runner: macos-latest
             lwpt-asset: macos-arm64
             fpc-install: brew
+            jit: true
           - runner: windows-latest
             lwpt-asset: windows-x64
             lwpt-archive: zip
@@ -166,6 +168,43 @@ jobs:
           printf 'notwasm!' > "$RUNNER_TEMP/bad.wasm"
           if ./build/wasmlight${{ matrix.exe }} inspect "$RUNNER_TEMP/bad.wasm"; then
             echo "::error::a non-module was accepted"; exit 1
+          fi
+
+      # The upstream conformance corpus is the project's strongest oracle.
+      # It is fetched at a PINNED commit (never vendored — tests/spec/testsuite
+      # is gitignored; the SHA lives in tests/spec/testsuite.commit so the
+      # number is reproducible). The interpreter tier runs on EVERY platform;
+      # on the 64-bit UNIX legs (matrix.jit) the baseline-JIT and AOT tiers
+      # run too and must produce an IDENTICAL pass/fail/skip tally to the
+      # interpreter — the observational-identity invariant (ADR-0001) that a
+      # JIT or AOT codegen bug would break. errors=0 and a pass floor catch a
+      # crash or a catastrophic interpreter regression without hardcoding a
+      # count that shifts when a known-failing case is later closed.
+      - name: Conformance corpus (wasmspec, all tiers)
+        run: |
+          set -euo pipefail
+          COMMIT=$(tr -d '[:space:]' < tests/spec/testsuite.commit)
+          git clone --filter=blob:none --quiet \
+            https://github.com/WebAssembly/testsuite tests/spec/testsuite
+          git -C tests/spec/testsuite checkout --quiet "$COMMIT"
+          echo "testsuite @ $(git -C tests/spec/testsuite rev-parse HEAD)"
+          WS=./build/wasmspec${{ matrix.exe }}
+          FLOOR=64000
+          run_tier() { "$WS" --tier="$1" tests/spec/testsuite | grep '^TOTAL'; }
+          sig() { echo "$1" | grep -oE '(errors|pass|fail|skip)=[0-9]+' | sort | tr '\n' ' '; }
+          field() { echo "$1" | grep -oE "$2=[0-9]+" | head -1 | cut -d= -f2; }
+          IL=$(run_tier interp); echo "interp: $IL"
+          [ "$(field "$IL" errors)" = "0" ] || { echo "::error::interp errors!=0"; exit 1; }
+          [ "$(field "$IL" pass)" -ge "$FLOOR" ] || { echo "::error::interp pass below floor $FLOOR"; exit 1; }
+          IS=$(sig "$IL")
+          if [ "${{ matrix.jit }}" = "true" ]; then
+            JL=$(run_tier jit); echo "jit:    $JL"
+            AL=$(run_tier aot); echo "aot:    $AL"
+            [ "$(field "$JL" errors)" = "0" ] || { echo "::error::jit errors!=0"; exit 1; }
+            [ "$(field "$AL" errors)" = "0" ] || { echo "::error::aot errors!=0"; exit 1; }
+            [ "$(sig "$JL")" = "$IS" ] || { echo "::error::jit tally diverges from interpreter"; exit 1; }
+            [ "$(sig "$AL")" = "$IS" ] || { echo "::error::aot tally diverges from interpreter"; exit 1; }
+            echo "three-tier identity OK"
           fi
 
   docs:

@@ -40,6 +40,7 @@ uses
   SysUtils,
 
   Wasm.Core,
+  Wasm.Runtime.Gc,
   Wasm.Runtime.Values,
   Wasm.Wast,
   Wasm.Wat.Numbers;
@@ -948,6 +949,33 @@ begin
     and ((ABits and $0008000000000000) <> 0);
 end;
 
+{ Peel any M7 conversion wrapper (wokExternalized / wokInternalized) off a
+  produced reference so a `(ref.host N)` / `(ref.extern N)` matcher compares
+  the underlying host IDENTITY rather than the wrapper pointer. The runner
+  mints a single host box per id N and `ExpectedRefFor` hands that box to both
+  the extern and host matcher; a value that has crossed the any<->extern
+  boundary via extern.convert_any / any.convert_extern is that same host box
+  inside a wrapper (ADR-0001: the spec's two hierarchies "are inhabited by an
+  isomorphic set of values"), so unwrapping recovers the id. A plain host box
+  (never converted) resolves to itself, so this is a no-op for every prior
+  case and stays correct even when a tier still realises the convert ops as
+  representation identity. }
+function ResolveHostIdentity(const ARef: TWasmRef): TWasmRef;
+var
+  Cur: TWasmRef;
+  Kind: TWasmObjKind;
+begin
+  Cur := ARef;
+  while RefIsObject(Cur) do
+  begin
+    Kind := GcRefKind(Cur);
+    if (Kind <> wokExternalized) and (Kind <> wokInternalized) then
+      Break;
+    Cur := GcConvertInner(Cur);
+  end;
+  Result := Cur;
+end;
+
 function WastValMatches(const AExpected: TWastVal; const AActual: TWasmValue;
   const AExpectedRef: TWasmRef): Boolean;
 begin
@@ -978,7 +1006,7 @@ begin
         matcher's AExpectedRef null. Without the fallback a correct non-null
         externref is judged a mismatch against `AActual.Ref = WASM_REF_NULL`. }
       if AExpectedRef <> WASM_REF_NULL then
-        Result := AActual.Ref = AExpectedRef
+        Result := ResolveHostIdentity(AActual.Ref) = AExpectedRef
       else
         Result := not RefIsNull(AActual.Ref);
     wvcRefFunc:

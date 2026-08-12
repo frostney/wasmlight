@@ -216,7 +216,7 @@ type
     procedure TestHostCallRoundTrip;
     procedure TestHostCallTrapPropagates;
     procedure TestHostCallReentrancy;
-    procedure TestM7ExternConvertImprecision;
+    procedure TestM7ExternConvertCrossHierarchy;
     { SIMD / v128 (Track G). }
     procedure TestSimdSplatAddExtract;
     procedure TestSimdMemoryRoundTrip;
@@ -1556,42 +1556,46 @@ begin
   Expect<Int32>(Call1('cr', [MakeValueI32(21)]).I32).ToBe(42);
 end;
 
-{ --- M7: extern/any conversion imprecision (STAGED, interp-spec §3.9 O-4) -
-  KNOWN LIMITATION. extern.convert_any / any.convert_extern are implemented as
-  representation identity (matching EvalInitExpr and Wasm.Runtime.Gc's kind-only
-  GcAbsKindOf map). The value's abstract HIERARCHY is fixed at allocation by its
-  object kind, so a ref.test across hierarchies after a conversion gives the
-  WRONG answer. This test PINS the current (spec-incorrect) behaviour rather
-  than hiding it: after extern.convert_any on a struct, `ref.test (ref extern)`
-  MUST be 1 per the spec (the value now inhabits the extern hierarchy), but the
-  kind-only map still reports the struct kind, so the interpreter answers 0.
-
-  Corpus impact: the ref_test / ref_cast cases in the testsuite that internalise
-  an externref (any.convert_extern) or externalise an aggregate
-  (extern.convert_any) and then test/cast across the any<->extern boundary FAIL
-  under Track E — chiefly ref_test.wast and ref_cast.wast rows that pair an
-  extern.convert_any / any.convert_extern with a `(ref extern)` / `(ref any)`
-  test. The fix needs a wrapper object at the convert site or a header
-  hierarchy flag (neither is in Track E's scope, and a pure header flag cannot
-  cover an externalised unboxed i31 or null). Revisit when that lands. }
-procedure TInterpTests.TestM7ExternConvertImprecision;
+{ --- M7: extern/any conversion crosses the hierarchy (interp-spec §3.9 O-4) -
+  extern.convert_any / any.convert_extern move a value between the `any` and
+  `extern` hierarchies through Wasm.Runtime.Gc's wrapper pair, so a ref.test
+  after a conversion classifies the value by its NEW hierarchy. Both functions
+  externalize the same freshly allocated struct; the value that was `any` now
+  answers `(ref extern)` true and `(ref any)` false — the exact flip the
+  kind-only representation could not express before. The `.wast` corpus
+  (ref_test / ref_cast / extern) covers every shape; this pins the observable
+  interpreter behaviour directly. }
+procedure TInterpTests.TestM7ExternConvertCrossHierarchy;
 begin
-  { $m7 (result i32) struct.new_default 0; extern.convert_any;
-        ref.test (ref extern) }
+  { Both exports allocate a struct and cross the boundary. A ref.test may
+    only name a heap type in the operand's OWN hierarchy, so the flip is
+    observed by re-typing the value through the convert ops:
+      $m7e: struct.new_default; extern.convert_any;
+            ref.test (ref extern)                (0xFB 0x14 0x6F) -> 1
+            (the externalized struct now answers `extern`; before the fix
+             the kind-only map answered 0)
+      $m7r: struct.new_default; extern.convert_any; any.convert_extern;
+            ref.test (ref struct)                (0xFB 0x14 0x6B) -> 1
+            (the round trip recovers the concrete struct, which is a
+             struct again) }
   DecodeValidate(Cat([
     BLit(WASM_HEADER),
     Sect(1, VecOf([
       BLit([$5F, $01, $7F, $01]),
       BLit([$60, $00, $01, $7F])])),
-    Sect(3, VecOf([BLit([$01])])),
-    Sect(7, VecOf([BLit([$02, $6D, $37, $00, $00])])),
-    Sect(10, VecOf([CodeEntry([$00,
-      $FB, $01, $00, $FB, $1B, $FB, $14, $6F, $0B])]))
+    Sect(3, VecOf([BLit([$01]), BLit([$01])])),
+    Sect(7, VecOf([
+      BLit([$03, $6D, $37, $65, $00, $00]),
+      BLit([$03, $6D, $37, $72, $00, $01])])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $FB, $01, $00, $FB, $1B, $FB, $14, $6F, $0B]),
+      CodeEntry([$00, $FB, $01, $00, $FB, $1B, $FB, $1A,
+        $FB, $14, $6B, $0B])]))
   ]));
   DoInstantiate;
-  { SPEC-CORRECT answer is 1; the M7 kind-only map yields 0. Pinned as the
-    documented divergence, NOT a silent claim of correctness. }
-  Expect<Int32>(Call1('m7', []).I32).ToBe(0);
+  { Externalized struct answers `extern`; the round trip recovers a struct. }
+  Expect<Int32>(Call1('m7e', []).I32).ToBe(1);
+  Expect<Int32>(Call1('m7r', []).I32).ToBe(1);
 end;
 
 { --- SIMD / v128 (Track G) ----------------------------------------------- }
@@ -2454,8 +2458,8 @@ begin
   Test('a host call round-trips params and results', TestHostCallRoundTrip);
   Test('a host callback trap propagates', TestHostCallTrapPropagates);
   Test('a host callback re-enters guest code', TestHostCallReentrancy);
-  Test('STAGED (M7): extern/any conversion is representation identity, so a '
-    + 'cross-hierarchy ref.test is imprecise', TestM7ExternConvertImprecision);
+  Test('M7: extern.convert_any moves a struct into the extern hierarchy, so '
+    + 'ref.test flips across the boundary', TestM7ExternConvertCrossHierarchy);
   Test('v128 splat/add/extract_lane computes end to end',
     TestSimdSplatAddExtract);
   Test('v128.store/load round-trips through the memory chokepoint',

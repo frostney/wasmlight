@@ -534,8 +534,12 @@ begin
       Declare(Exp.Index);
   end;
 
-  if AModule.HasStart then
-    Declare(AModule.StartFuncIndex);
+  { The start function is NOT in C.REFS. The reference set is only the
+    function indices that occur OUTSIDE functions — in globals, element
+    segments, and exports (`context`: "the list of function indices that
+    occur in the module outside functions"). Naming a function as start does
+    not declare it, so `(module (start $f) (func $f (drop (ref.func $f))))`
+    is INVALID with `undeclared function reference` (ref_func.wast:112-115). }
 end;
 
 { Every index space in ONE pass over the import list, IMPORTS FIRST —
@@ -3275,15 +3279,66 @@ end;
   `pop_vals(tags[x].type.params); unreachable()`. `valid-throw` adds that
   "The THROW instruction is stack-polymorphic", which is what the
   unreachable() call encodes. }
+{ `[t1 t2 …]` — the reference's stack-type spelling, used only by throw's
+  whole-signature diagnostic below. }
+function FormatStackTypes(const ATypes: array of TWasmValueType): string;
+var
+  I: Integer;
+begin
+  Result := '[';
+  for I := 0 to High(ATypes) do
+  begin
+    if I > 0 then
+      Result := Result + ' ';
+    Result := Result + ATypes[I].Describe;
+  end;
+  Result := Result + ']';
+end;
+
 procedure TBodyWalker.HandleThrow(const AOffset: NativeUInt);
 var
   Idx: UInt32;
   Ft: TWasmFuncType;
   ArgRegs: TWasmRegList;
   Aux: UInt32;
+  Floor, Avail, I: Integer;
+  Ok: Boolean;
+  Have: TArray<TWasmValueType>;
 begin
   Idx := FReader.ReadU32;
   Ft := CheckTag(Idx, AOffset);
+
+  { valid-throw pops the tag's params. While the current frame is still
+    reachable, a shortfall or a param type mismatch is reported against the
+    WHOLE instruction signature and the whole in-frame operand stack —
+    `type mismatch: instruction requires [t*] but stack has [t*]`
+    (throw.wast:52,54; appendix/algorithm-validation-of-opcode-sequences,
+    throw). A polymorphic (unreachable) frame fills any shortfall with Bot,
+    so the generic pop below handles it. }
+  if not FCtrls[FCtrlCount - 1].Unreachable then
+  begin
+    Floor := FCtrls[FCtrlCount - 1].ValHeight;
+    Avail := FValCount - Floor;
+    Ok := Avail >= Length(Ft.Params);
+    if Ok then
+      for I := 0 to High(Ft.Params) do
+        if not FTypes.MatchesValType(
+          FVals[FValCount - Length(Ft.Params) + I].ValType, Ft.Params[I]) then
+        begin
+          Ok := False;
+          Break;
+        end;
+    if not Ok then
+    begin
+      SetLength(Have, Avail);
+      for I := 0 to Avail - 1 do
+        Have[I] := FVals[Floor + I].ValType;
+      ValErr(MSG_TYPE_MISMATCH,
+        'instruction requires ' + FormatStackTypes(Ft.Params)
+        + ' but stack has ' + FormatStackTypes(Have));
+    end;
+  end;
+
   ArgRegs := PopVals(CopyValTypes(Ft.Params));
 
   if Emitting then

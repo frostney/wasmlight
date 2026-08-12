@@ -591,8 +591,28 @@ begin
   while not Eof do
   begin
     case Cur of
-      ' ', #9, #10, #13, '(', ')', '"', ';':
+      ' ', #9, #10, #13, '(', ')', ';':
         Break;
+      '"':
+        begin
+          { A quoted string abutting an idchar run with no separator continues
+            the SAME token by longest match — this is how a quoted identifier
+            `$"name"` (spaces and escapes live inside the quotes) and reserved
+            runs like `foo"x"` are single tokens, not an atom then a string
+            (text-token; id.wast quoted-identifier forms). Consume the whole
+            string literal, honouring `\` escapes, as part of the atom's raw
+            text; the wat lexer re-tokenises and judges it. }
+          Advance;   { opening " }
+          while not Eof and (Cur <> '"') do
+          begin
+            if Cur = '\' then
+              Advance;   { the escape's backslash; the byte is consumed below }
+            if not Eof then
+              Advance;
+          end;
+          if not Eof then
+            Advance;   { closing " }
+        end;
     else
       if (Ord(Cur) < $20) or (Ord(Cur) = $7F) then
         Fault('control character outside a string or comment',

@@ -84,6 +84,8 @@ type
     procedure TestVectorImmediateErrors;
     procedure TestTableInitExpr;
     procedure TestInlineMemDataAddrType;
+    procedure TestTableAddrType;
+    procedure TestObsoleteKeywordIsUnknownOperator;
     procedure TestMemArgSignedIsUnknownOperator;
     procedure TestVectorConstCountBeforeValue;
   end;
@@ -1163,6 +1165,54 @@ begin
     .ToBe(True);
 end;
 
+procedure TWatAsmTests.TestTableAddrType;
+begin
+  { The 3.0 address-type keyword before a table's limits (table64.wast:1-12,
+    text-tabletype/text-addrtype). The explicit i32 form, the i64 form, and
+    the inline-elem sugar `(table addrtype? reftype (elem …))` (whose synthetic
+    active elem segment takes an offset const of the table's address type —
+    call_indirect64.wast:11) must all assemble, decode, and validate. }
+  Expect<string>(ValidateOutcome(
+    '(module (table i32 1 funcref))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (table i64 1 funcref))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (table i64 1 2 funcref))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (func $f) (table i64 funcref (elem $f)))')).ToBe('valid');
+  Expect<string>(ValidateOutcome(
+    '(module (func $f) (table i32 funcref (elem $f)))')).ToBe('valid');
+  { call_indirect on an i64-addressed table validates: the index operand is
+    an i64 for an i64 table (call_indirect64.wast). }
+  Expect<string>(ValidateOutcome(
+    '(module (type $t (func)) (table $t64 i64 1 funcref)'
+    + ' (func (i64.const 0) (call_indirect $t64 (type $t))))')).ToBe('valid');
+  { The same call_indirect with an i32 index on an i64 table is a type
+    mismatch — proof the address type reaches the operand check. }
+  Expect<string>(ValidateOutcome(
+    '(module (type $t (func)) (table $t64 i64 1 funcref)'
+    + ' (func (i32.const 0) (call_indirect $t64 (type $t))))'))
+    .ToBe('validation error');
+  { The address type and the synthetic elem offset type reach the model:
+    an i64 table's inline-elem segment must NOT be an i32.const 0 offset. }
+  AssembleAndDecode('(module (func $f) (table i64 funcref (elem $f)))');
+  Expect<Boolean>(FModule.Tables[0].TableType.Limits.AddrType = watI64)
+    .ToBe(True);
+end;
+
+procedure TWatAsmTests.TestObsoleteKeywordIsUnknownOperator;
+begin
+  { `anyfunc` is the removed pre-1.0 alias for funcref. Upstream lexes it as a
+    reserved atom, so meeting it where a type is expected is `unknown operator
+    anyfunc`, not `unexpected token` (obsolete-keywords.wast:40; §4). }
+  Expect<string>(AssembleError('(module (global $g anyfunc (ref.null func)))'))
+    .ToBe('unknown operator anyfunc');
+  { A VALID but misplaced keyword stays `unexpected token`. }
+  Expect<Boolean>(StartsWith(
+    AssembleError('(func (i32.const 0) (block (result i32) (param i32)))'),
+    'unexpected token')).ToBe(True);
+end;
+
 procedure TWatAsmTests.TestMemArgSignedIsUnknownOperator;
 begin
   { A memarg align/offset value is a uN — no sign. A leading `-`/`+` makes the
@@ -1283,6 +1333,10 @@ begin
     TestTableInitExpr);
   Test('inline (memory i64 (data …)) keeps the i64 address type',
     TestInlineMemDataAddrType);
+  Test('table addrtype text: (table i64 …) and inline-elem i64 (table64.wast)',
+    TestTableAddrType);
+  Test('an obsolete keyword (anyfunc) is unknown operator (obsolete-keywords)',
+    TestObsoleteKeywordIsUnknownOperator);
   Test('a signed align=/offset= is unknown operator (simd_align.wast:104)',
     TestMemArgSignedIsUnknownOperator);
   Test('v128.const checks lane COUNT before value (simd_const.wast:480)',

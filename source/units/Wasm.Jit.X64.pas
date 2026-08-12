@@ -1177,8 +1177,13 @@ begin
           Reg[IrAuxBlockItem(Fn^.AuxU32, Aux, 3)].U32);
       end;
 
-    iroAnyConvertExtern, iroExternConvertAny:
-      Reg[AIns^.Dest].Bits := Reg[AIns^.A].Bits;
+    { extern.convert_any / any.convert_extern via the same GC wrapper pair the
+      interpreter uses, so ref.test/ref.cast classify correctly (M7); the
+      differential oracle requires the JIT match the interpreter. }
+    iroExternConvertAny:
+      ValueSetRef(Reg[AIns^.Dest], AStore.Heap.ExternalizeAny(Reg[AIns^.A].Ref));
+    iroAnyConvertExtern:
+      ValueSetRef(Reg[AIns^.Dest], AStore.Heap.InternalizeExtern(Reg[AIns^.A].Ref));
     iroRefI31:
       Reg[AIns^.Dest].Bits := UInt64(MakeI31Ref(Reg[AIns^.A].I32));
     iroI31GetS:

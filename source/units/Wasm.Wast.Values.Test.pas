@@ -16,6 +16,7 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Runtime.Gc,
   Wasm.Runtime.Values,
   Wasm.Wast,
   Wasm.Wast.Values;
@@ -493,24 +494,59 @@ end;
 procedure TWastValuesTests.TestCompareRefExternIdentity;
 var
   Expected: TWastVal;
+  Types: TWasmGcTypes;
+  Heap: TWasmGcHeap;
+  Box: TWasmRef;
 begin
-  Expected := MakeRefExpect(wvcRefExtern);
-  { The resolved reference the runner would mint for this identity. }
-  Expect<Boolean>(WastValMatches(Expected, ActualBits(UInt64(16)),
-    TWasmRef(16))).ToBe(True);
+  { Real host boxes rather than synthetic pointers: the comparator now
+    resolves M7 conversion wrappers off the produced reference before
+    comparing host identity (a value that crossed the any<->extern boundary
+    is the same host box inside a wrapper), so it must be handed references
+    it can actually inspect. }
+  Types := TWasmGcTypes.Create;
+  Heap := TWasmGcHeap.Create(Types);
+  try
+    Box := Heap.AllocHostBox(NativeUInt($10), nil);
+    Expected := MakeRefExpect(wvcRefExtern);
+    { The plain host box the runner minted for this identity. }
+    Expect<Boolean>(WastValMatches(Expected, ActualBits(UInt64(Box)),
+      Box)).ToBe(True);
+    { The SAME host identity after any.convert_extern — a wokInternalized
+      wrapper — still matches, because the matcher unwraps it. }
+    Expect<Boolean>(WastValMatches(Expected,
+      ActualBits(UInt64(Heap.InternalizeExtern(Box))), Box)).ToBe(True);
+    { And after a full extern.convert_any round trip on that. }
+    Expect<Boolean>(WastValMatches(Expected, ActualBits(UInt64(
+      Heap.ExternalizeAny(Heap.InternalizeExtern(Box)))), Box)).ToBe(True);
+  finally
+    Heap.Free;
+    Types.Free;
+  end;
 end;
 
 procedure TWastValuesTests.TestCompareRefExternMismatch;
 var
   Expected: TWastVal;
+  Types: TWasmGcTypes;
+  Heap: TWasmGcHeap;
+  Box, Other: TWasmRef;
 begin
-  Expected := MakeRefExpect(wvcRefExtern);
-  { Different reference identity — no match. }
-  Expect<Boolean>(WastValMatches(Expected, ActualBits(UInt64(24)),
-    TWasmRef(16))).ToBe(False);
-  { A null result never matches a positive-identity extern. }
-  Expect<Boolean>(WastValMatches(Expected,
-    ActualBits(UInt64(WASM_REF_NULL)), TWasmRef(16))).ToBe(False);
+  Types := TWasmGcTypes.Create;
+  Heap := TWasmGcHeap.Create(Types);
+  try
+    Box := Heap.AllocHostBox(NativeUInt($10), nil);
+    Other := Heap.AllocHostBox(NativeUInt($18), nil);
+    Expected := MakeRefExpect(wvcRefExtern);
+    { A different host box — no match, even after resolving. }
+    Expect<Boolean>(WastValMatches(Expected, ActualBits(UInt64(Other)),
+      Box)).ToBe(False);
+    { A null result never matches a positive-identity extern. }
+    Expect<Boolean>(WastValMatches(Expected,
+      ActualBits(UInt64(WASM_REF_NULL)), Box)).ToBe(False);
+  finally
+    Heap.Free;
+    Types.Free;
+  end;
 end;
 
 procedure TWastValuesTests.TestCompareRefExternBareAnyNonNull;

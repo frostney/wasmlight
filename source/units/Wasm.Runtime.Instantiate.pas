@@ -414,14 +414,24 @@ begin
             Slot(Instr.Dest)^ := AStore.Globals[Addr].Value;
         end;
 
-      iroAnyConvertExtern, iroExternConvertAny:
+      iroExternConvertAny:
         begin
-          { Identity on the representation — an externref of a host value
-            is a pointer to the same heap object either way, and only the
-            static type changes. }
+          { Route through the same GC wrapper pair the interpreter uses so a
+            later ref.test/ref.cast classifies the value correctly (M7). Every
+            const-expr convert in the corpus is on null (where the wrapper is a
+            no-op), but keeping the semantics identical to the execution tiers
+            avoids a latent divergence. }
           CheckReg(Instr.Dest, Count, 'convert');
           CheckReg(Instr.A, Count, 'convert');
-          Slot(Instr.Dest)^ := Slot(Instr.A)^;
+          ValueSetRef(Slot(Instr.Dest)^,
+            AStore.Heap.ExternalizeAny(Slot(Instr.A)^.Ref));
+        end;
+      iroAnyConvertExtern:
+        begin
+          CheckReg(Instr.Dest, Count, 'convert');
+          CheckReg(Instr.A, Count, 'convert');
+          ValueSetRef(Slot(Instr.Dest)^,
+            AStore.Heap.InternalizeExtern(Slot(Instr.A)^.Ref));
         end;
 
       iroStructNew:

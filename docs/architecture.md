@@ -21,16 +21,21 @@
   not future additions to it.
 - Shipped today: decode, validation and the IR, the runtime state below
   the tier seam (store, instances, the memory chokepoint, traps,
-  instantiation, the precise collector), the interpreter tier that
-  executes the IR — the full `v128` vector set (Track G) and exception
-  handling (Track H) included, so **all of core wasm 3.0 executes** — the
+  instantiation, the precise collector), and **all three execution tiers**
+  over that IR — the interpreter (Track E), the baseline JIT (Track I), and
+  the AOT compiler (Track J) — each executing the full `v128` vector set
+  (Track G) and exception handling (Track H), so **all of core wasm 3.0
+  executes** and does so identically in every tier. Around that core: the
   wat text-format assembler, the `.wast` runner that assembles, decodes,
   validates, instantiates, and executes over the whole corpus, and the
   embedding API (`Wasm.Engine`) and WASI preview1 host surface
   (`Wasm.Wasi.*`) that run that core as real programs, deny-by-default,
-  from a Pascal host or from `wasmlight run` (Track F). Only the baseline
-  JIT and AOT tiers are staged in [roadmap.md](roadmap.md) and described
-  here as design, not as behaviour you can call.
+  from a Pascal host or from `wasmlight run` (Track F). The JIT and AOT are
+  a 64-bit-UNIX acceleration (two backends, aarch64 and x86-64); on Windows
+  and 32-bit targets the runtime is interpreter-only and still fully
+  conformant. [roadmap.md](roadmap.md) is the honest picture of what
+  remains — deferred JIT optimizations and cross-platform CI validation,
+  not any missing behaviour.
 
 ## Layering
 
@@ -41,7 +46,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Host surface | `Wasm.Wasi.*`, `Wasm.Run` | deny-by-default WASI preview1 host and the `wasmlight run` driver; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
-| Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT and AOT to come | three implementations of one seam — the interpreter is the tier of record | interpreter **shipped**; JIT/AOT planned |
+| Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
 | Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
 | IR | `Wasm.Ir` | register-based lowered form every tier consumes | **shipped** |
 | Validation | `Wasm.Validator` | the spec's static type check, run once, emitting the IR | **shipped** |
@@ -364,9 +369,47 @@ uncaught throw raises `EWasmException` — the exception route, distinct
 from the trap route. Every instruction the register IR emits dispatches
 here; nothing is staged.
 
-What is **not** built over the seam is the baseline JIT and the AOT
-compiler; both are staged in [roadmap.md](roadmap.md) and will be
-differentially tested against this interpreter.
+### The compiling tiers over the seam
+
+Two more tiers sit over the same seam, both differentially proven
+byte-identical to the interpreter — the seam's whole point
+([ADR-0001](adr/0001-tiered-execution-seam.md)): a tier is faster, never
+different.
+
+- **The baseline JIT** (`Wasm.Jit` driver, `Wasm.Jit.CodeBuffer` W^X code
+  buffer, and the two backends `Wasm.Jit.Arm64` / `Wasm.Jit.X64`) compiles
+  a function to native code the first time it runs. The design choice that
+  makes it cheap: the compiled frame *is* the interpreter's frame, so the
+  GC stack map, the tail-call frame replacement, and stack-exhaustion
+  handling are inherited rather than re-derived. It emits the epoch check
+  at every back-edge and keeps live references discoverable, honouring the
+  same safepoint obligations as the interpreter. It carries the full
+  non-EH op set; a function that throws or hosts a `try_table` handler is
+  declined and stays interpreted, and compiled and interpreted functions
+  interoperate transparently across the seam (a throw from a compiled
+  callee reaches an outer interpreted handler, and a cross-tier tail call
+  stays O(1)).
+- **The AOT compiler** (`Wasm.Aot`, `Wasm.Aot.Artifact`) runs the same
+  backends ahead of time, emitting **position-independent** code — helper
+  calls go through a per-process indirect table and the IR base arrives in
+  a pinned register, so nothing absolute is baked — and serializes it to a
+  `.waot` artifact. `run --aot` loads the artifact in a fresh process for
+  instant startup; it is not a re-JIT (the loaded executable memory is
+  byte-identical to a fresh compile). The **security invariant**: AOT
+  always re-decodes and re-validates the module, and the artifact's code is
+  used only if its magic, AOT version, IR version, target arch, ABI
+  fingerprint, module hash, and self-checksum all match the freshly
+  validated module — otherwise the run falls back to the interpreter. The
+  artifact is a per-module perf cache bound by hash, never a trust bypass.
+
+Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
+UNIX host**. On Windows and 32-bit targets they are inactive and the
+interpreter, the tier of record, runs alone; that leg is unaccelerated but
+fully conformant. Three JIT optimizations are deliberately **deferred and
+measured**, never required for correctness: guard-page inline memory access
+(the baseline uses explicit bounds checks through the chokepoint),
+native-SIMD codegen (it calls the `Wasm.Interp.Vector` leaves), and
+machine-register allocation (it keeps the register file in memory).
 
 `wasmspec` is the third shipped program: it runs the `.wast` corpus through
 `Wasm.Wast.Runner`, which assembles text modules, decodes, validates,

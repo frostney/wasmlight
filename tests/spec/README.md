@@ -14,16 +14,21 @@ Track C's remaining work.
 
 ## Fetching the corpus
 
-```bash
-git clone --depth 1 https://github.com/WebAssembly/testsuite tests/spec/testsuite
-```
-
-Record the commit you got — a conformance number without one is not
-reproducible:
+The pinned commit is recorded in [`testsuite.commit`](testsuite.commit) — a
+conformance number is only reproducible against a specific commit, and CI
+checks out exactly that SHA. Fetch it the same way:
 
 ```bash
-git -C tests/spec/testsuite rev-parse HEAD
+git clone --filter=blob:none https://github.com/WebAssembly/testsuite tests/spec/testsuite
+git -C tests/spec/testsuite checkout "$(tr -d '[:space:]' < tests/spec/testsuite.commit)"
+git -C tests/spec/testsuite rev-parse HEAD   # should match testsuite.commit
 ```
+
+CI (`.github/workflows/{pr,ci}.yml`) runs the corpus on every platform under
+`--tier=interp`, and on the 64-bit UNIX legs also under `--tier=jit` and
+`--tier=aot`, asserting all three tiers produce an identical pass/fail/skip
+tally (the observational-identity invariant, ADR-0001). To bump the pinned
+commit, edit `testsuite.commit` and re-check the tallies locally first.
 
 ## Running
 

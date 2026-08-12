@@ -21,6 +21,20 @@ type
     FBuffer: TWasmBytes;
 
     function ReaderOver(const AValues: array of Byte): TWasmReader;
+    { A section-body SubReader of ALogicalSize bytes over AValues, in the
+      wrcSection context — the shape a decoded section body takes. The
+      logical size is smaller than AValues on purpose: the bytes past it
+      stand for whatever follows the section in the module buffer, which a
+      width-limited LEB read is allowed to inspect. }
+    function SectionSubReaderOver(const AValues: array of Byte;
+      const ALogicalSize: NativeUInt): TWasmReader;
+    { Runs AReadKind over a section SubReader and asserts the raised
+      message STARTS with APrefix — the fix's core distinction lives here,
+      between an overlong/over-wide encoding clipped by a section boundary
+      (an integer error) and a genuine truncation (unexpected end). }
+    procedure ExpectSectionLebPrefix(const AReadKind, ADescription,
+      APrefix: string; const AValues: array of Byte;
+      const ALogicalSize: NativeUInt);
     { Runs AReadKind over AValues and asserts it raises EWasmDecodeError.
       AReadKind picks the primitive so one helper covers every width. }
     procedure ExpectRejected(const AReadKind, ADescription: string;
@@ -70,6 +84,9 @@ type
     procedure TestCanonicalLebAndNamePrefixes;
     procedure TestTruncationPrefixFollowsContext;
     procedure TestIllegalOpcodeMessageIsLowercaseHex;
+    procedure TestOverlongLebClippedBySectionIsTooLong;
+    procedure TestOverWideLebClippedBySectionIsTooLarge;
+    procedure TestTruncatedLebInSectionStaysUnexpectedEnd;
   end;
 
 function TBinaryTests.ReaderOver(const AValues: array of Byte): TWasmReader;
@@ -80,6 +97,52 @@ begin
   for I := 0 to High(AValues) do
     FBuffer[I] := AValues[I];
   Result.InitFromBytes(FBuffer);
+end;
+
+function TBinaryTests.SectionSubReaderOver(const AValues: array of Byte;
+  const ALogicalSize: NativeUInt): TWasmReader;
+var
+  Parent: TWasmReader;
+begin
+  Parent := ReaderOver(AValues);
+  Parent.Context := wrcSection;
+  Result := Parent.SubReader(ALogicalSize);
+end;
+
+procedure TBinaryTests.ExpectSectionLebPrefix(const AReadKind, ADescription,
+  APrefix: string; const AValues: array of Byte;
+  const ALogicalSize: NativeUInt);
+var
+  Reader: TWasmReader;
+  Actual: string;
+begin
+  Reader := SectionSubReaderOver(AValues, ALogicalSize);
+  Actual := '<not rejected>';
+
+  try
+    if AReadKind = 'u32' then
+      Reader.ReadU32
+    else if AReadKind = 'u64' then
+      Reader.ReadU64
+    else if AReadKind = 'i32' then
+      Reader.ReadI32
+    else if AReadKind = 'i64' then
+      Reader.ReadI64
+    else if AReadKind = 's33' then
+      Reader.ReadS33
+    else
+      Fail('unknown read kind ' + AReadKind);
+  except
+    on E: EWasmDecodeError do
+      Actual := E.Message;
+  end;
+
+  if Copy(Actual, 1, Length(APrefix)) = APrefix then
+    Expect<string>(ADescription + ': ' + APrefix)
+      .ToBe(ADescription + ': ' + APrefix)
+  else
+    Expect<string>(ADescription + ': ' + Actual)
+      .ToBe(ADescription + ': ' + APrefix + '...');
 end;
 
 procedure TBinaryTests.ExpectRejected(const AReadKind, ADescription: string;
@@ -581,6 +644,63 @@ begin
     .ToBe('illegal opcode 06');
 end;
 
+{ The fix's reason for being: a uN/sN's byte count is bounded by the type
+  width regardless of framing, so an overlong or over-wide encoding is
+  malformed even when a section boundary falls inside it. The reader must
+  look past the SubReader's declared size — into the bytes that follow the
+  section in the module buffer — to tell that apart from a real truncation,
+  exactly as the reference decoder reads LEBs from the whole stream and
+  checks the section size separately.
+  https://webassembly.github.io/spec/core/binary/values.html#binary-int }
+procedure TBinaryTests.TestOverlongLebClippedBySectionIsTooLong;
+begin
+  { A six-byte u32 whose fifth byte still sets its continuation bit, but a
+    two-byte section body: the overlong bytes lie past the boundary, and
+    the encoding is `too long` regardless. }
+  ExpectSectionLebPrefix('u32', 'overlong u32 clipped by a section',
+    MSG_INTEGER_TOO_LONG, [$80, $80, $80, $80, $80, $00, $AA, $BB], 2);
+  { The same for a u64 (max ten bytes) and an s33 (max five). }
+  ExpectSectionLebPrefix('u64', 'overlong u64 clipped by a section',
+    MSG_INTEGER_TOO_LONG,
+    [$80, $80, $80, $80, $80, $80, $80, $80, $80, $80, $00, $CC], 3);
+  ExpectSectionLebPrefix('s33', 'overlong s33 clipped by a section',
+    MSG_INTEGER_TOO_LONG, [$80, $80, $80, $80, $80, $00, $DD], 1);
+end;
+
+procedure TBinaryTests.TestOverWideLebClippedBySectionIsTooLarge;
+begin
+  { A five-byte u32 whose fifth byte carries bits above the 32nd, but a
+    one-byte section body: `too large`, read from past the boundary. }
+  ExpectSectionLebPrefix('u32', 'over-wide u32 clipped by a section',
+    MSG_INTEGER_TOO_LARGE, [$80, $80, $80, $80, $10, $EE], 1);
+  { A ten-byte u64 whose final byte sets unused bits — the exact shape of
+    binary-leb128.wast's `minimum with unused bits set`. }
+  ExpectSectionLebPrefix('u64', 'over-wide u64 clipped by a section',
+    MSG_INTEGER_TOO_LARGE,
+    [$82, $80, $80, $80, $80, $80, $80, $80, $80, $70, $FF], 4);
+  { A signed encoding whose top bits are neither sign extension nor zero
+    is `too large` as well, even when the section clips it. }
+  ExpectSectionLebPrefix('i32', 'over-wide i32 clipped by a section',
+    MSG_INTEGER_TOO_LARGE, [$FF, $FF, $FF, $FF, $4F, $99], 2);
+end;
+
+procedure TBinaryTests.TestTruncatedLebInSectionStaysUnexpectedEnd;
+begin
+  { The distinction that must NOT regress. A continuation runs to the end
+    of the WHOLE buffer within the width limit: a genuine truncation, so
+    `unexpected end`, not an integer error — the reader has no bytes left
+    to prove the encoding overlong. Logical size equals the buffer, so
+    there is nothing past the boundary either. }
+  ExpectSectionLebPrefix('u32', 'u32 truncated at the buffer end',
+    MSG_UNEXPECTED_END_OF_SECTION, [$80, $80], 2);
+  { A within-width encoding that only completes by spilling past the
+    section boundary is the same truncation the boundary stands for: the
+    section is too small to hold it, so `unexpected end`, not an integer
+    error — nothing here is overlong or over-wide. }
+  ExpectSectionLebPrefix('u32', 'valid u32 straddling the section boundary',
+    MSG_UNEXPECTED_END_OF_SECTION, [$81, $00, $AA], 1);
+end;
+
 procedure TBinaryTests.SetupTests;
 begin
   Test('ReadByte and PeekByte track position', TestReadByteAdvances);
@@ -620,6 +740,12 @@ begin
     TestTruncationPrefixFollowsContext);
   Test('the illegal-opcode message spells lowercase hex',
     TestIllegalOpcodeMessageIsLowercaseHex);
+  Test('an overlong LEB clipped by a section is too long',
+    TestOverlongLebClippedBySectionIsTooLong);
+  Test('an over-wide LEB clipped by a section is too large',
+    TestOverWideLebClippedBySectionIsTooLarge);
+  Test('a truncated LEB inside a section stays unexpected end',
+    TestTruncatedLebInSectionStaysUnexpectedEnd);
 end;
 
 begin
