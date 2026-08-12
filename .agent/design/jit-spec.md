@@ -527,7 +527,7 @@ against the value captured at frame entry (`EpochCache`), and on inequality
 call the trap stub `TrapNow(wtkEpochInterrupt)` (→ `MSG_TRAP_EPOCH_INTERRUPT
 = 'interrupt'`). Concretely at a back-edge, before taking the branch:
 
-```
+```text
 ; aarch64 sketch (UNCONFIRMED encodings)
 ldr   x9, [x21, #EPOCH_OFF]     ; x21 = Store; load Store.Epoch
 cmp   x9, xEPOCHCACHE           ; compare against frame-entry snapshot
@@ -714,7 +714,7 @@ and finds every live reference, **because §1's design keeps the register file
 in memory as the interpreter's frame**. The compiled prologue publishes the
 same record the interpreter publishes:
 
-```
+```text
 GcFrame.Slots        := @Values[Base];        { the register file, in memory }
 GcFrame.RefRegBits   := @Fn^.RefRegBits[0];   { the IR's precomputed projection }
 GcFrame.RegisterCount:= Fn^.RegisterCount;

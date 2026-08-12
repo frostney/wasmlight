@@ -107,7 +107,7 @@ record plus the frame allocator, not to the store.
 
 ### 1.3 References — pointer-or-i31, low-bit tagged
 
-```
+```text
 TWasmRef (NativeUInt), interpreted as:
 
   value = 0                → null
@@ -143,7 +143,7 @@ pattern can be observed" (`syntax-reftype`).
 "scalar references, containing a 31-bit integer" among the forms. The
 encoding:
 
-```
+```text
 ref.i31   x:i32     →  Ref := NativeUInt(UInt32((UInt32(x) shl 1) or 1))
 i31.get_s r         →  SarInt32(Int32(UInt32(r)), 1)      { arithmetic }
 i31.get_u r         →  UInt32(r) shr 1                    { 31 bits }
@@ -419,7 +419,7 @@ end;
 per (engine, IR module) pair, at first instantiation, and the result is
 cached on the IR module so a second instantiation is free.
 
-```
+```text
 for each group g in 0 .. High(Ir.GroupKeys):
     key := Ir.GroupKeys[g]                  { already rolled: internal
                                               type indices are group-
@@ -602,7 +602,7 @@ procedure MemCheck(var AMem: TWasmMemoryInst;
 
 Semantics of `MemAddress`, by strategy:
 
-```
+```text
 wmsGuardPages:      { i32 memory, 64-bit POSIX }
     { AIndex is u32-widened, AOffset <= 2^32-1 from the encoding, so
       AIndex+AOffset+ASize < 2^33 < reserve+guard. No check, no branch.
@@ -644,7 +644,7 @@ the trampoline and the fault (ADR-0009's skipped-frame rule).
 
 `wmsGuardPages` (i32 memory):
 
-```
+```text
 reserve = WASM_I32_RESERVE_BYTES + WASM_GUARD_BYTES        { 6 GiB }
 p = mmap(nil, reserve, PROT_NONE,
          MAP_PRIVATE or MAP_ANONYMOUS or MAP_NORESERVE, -1, 0)
@@ -679,7 +679,7 @@ reservation. Two mitigations, both required:
 
 `wmsGuardAssisted` (i64 memory, current-size + guard remap):
 
-```
+```text
 reserve = current_bytes + WASM_GUARD_BYTES
 p = mmap(nil, reserve, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
 mprotect(p, current_bytes, PROT_READ|PROT_WRITE)
@@ -689,6 +689,7 @@ The guard exists solely so static offsets fold; the index is always
 checked. On growth the reservation is remapped (§3.5).
 
 `wmsBoundsChecked`: plain allocation.
+
 - POSIX: `mmap(nil, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`.
 - Windows: `VirtualAlloc(nil, bytes, MEM_RESERVE or MEM_COMMIT, PAGE_READWRITE)`.
 No guard region — nothing reads past the bound because the check is
@@ -710,7 +711,7 @@ only way the signal handler can decide a fault is ours.
 `memory.grow n` (`exec-memory.grow`, `can_trap: false` — it returns −1 on
 failure, it does not trap):
 
-```
+```text
 old := Pages
 if HasMax and (old + n > MaxPages)          → return -1
 if old + n > address-type ceiling           → return -1   { §3.6 }
@@ -758,7 +759,7 @@ An i32 memory's size is capped at `WASM_MAX_I32_PAGES` (65536 pages =
 `MSG_MEMORY_SIZE_LIMIT` (`'memory size must be at most 65536 pages
 (4GiB)'`). The runtime re-derives the ceiling for `memory.grow`:
 
-```
+```text
 ceiling(watI32) = 65536
 ceiling(watI64) = 2^48 / WASM_PAGE_SIZE = 2^32      { see below }
 ```
@@ -900,7 +901,7 @@ exception-object layout now.
 
 ### 5.1 Shape
 
-```
+```text
   host
    └─ WasmInvoke(...)                 ← installs the trampoline (§5.4)
         sigsetjmp ────────────────────────────────┐
@@ -919,7 +920,7 @@ Per **process**, once, guarded by a module-level flag. Installed lazily at the
 first guard-strategy memory creation — a store with no guard-page memory
 (32-bit, Windows this wave) installs nothing.
 
-```
+```text
 { per process, once }
 install with sigaction, SA_SIGINFO | SA_NODEFER
   for SIGSEGV and SIGBUS.
@@ -1017,7 +1018,7 @@ threadvar CurrentTrampoline: PWasmTrampoline;
 
 `WasmInvoke`:
 
-```
+```text
 tr.Prev := CurrentTrampoline;  tr.Kind := wtkNone;  CurrentTrampoline := @tr
 if sigsetjmp(tr.JmpBuf, 1) = 0 then
     <enter guest>                          { the whole tier call }
@@ -1200,7 +1201,7 @@ all came back with `"prose": ""`. What *is* served and citable:
 The variance directions below are therefore stated as **the
 implementation contract**, each marked with its confidence.
 
-```
+```text
 { Wasm.Runtime.Store — MatchExternType }
 
 func:    CONFIRMED-shape (Externtype_sub/func → Deftype_sub)
@@ -1281,7 +1282,7 @@ a per-store scratch buffer (TRAP-1 rule 4 — no per-call dynamic array).
 The opcode set is **closed and small** — exactly what
 `Wasm.Validator.Const` emits:
 
-```
+```text
 iroI32Const iroI64Const iroF32Const iroF64Const
 iroI32Add iroI32Sub iroI32Mul  iroI64Add iroI64Sub iroI64Mul
 iroRefNull iroRefFunc iroRefI31
@@ -1415,7 +1416,7 @@ end;
 
 Layout by kind:
 
-```
+```text
 wokStruct:   [header:8][field 0][field 1]...      { §7.2 packing }
 wokArray:    [header:8][length:8][elem 0]...      { length is a
                                                     SEPARATE word: an
@@ -1448,7 +1449,7 @@ packed types "are NOT value types and never appear on the operand stack"
 
 Layout rule, chosen for simplicity over density:
 
-```
+```text
 storage width:  wpkI8 → 1 byte, wpkI16 → 2 bytes,
                 i32/f32 → 4, i64/f64 → 8, ref → SizeOf(TWasmRef),
                 v128 → 16 (Track G)
@@ -1727,7 +1728,7 @@ deliberately.
 
 O(1), from the object header and the engine displays.
 
-```
+```text
 RuntimeMatches(objTypeId, targetTypeId):
     dt := E.Types[targetTypeId].Depth
     do := E.Types[objTypeId].Depth
@@ -1743,7 +1744,7 @@ ids and the table is `TWasmEngine.Types`.
 
 Full `ref.cast rt` on value `v`:
 
-```
+```text
 if v = null then
     Result := rt.Nullable            { §1.3's argument }
 else if v and 1 = 1 then             { unboxed i31 }
@@ -1795,7 +1796,7 @@ different heap-object kind means changing the header enum, the trace
 loop, and the `AbsKindOf` map at a point where the collector is already
 under test.
 
-```
+```text
 wokExn:  [header:8][tagaddr:4][argc:4][arg 0 : TWasmValue]...
 ```
 

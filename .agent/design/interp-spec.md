@@ -72,7 +72,7 @@ per-store **interpreter context** (`TWasmInterpContext`), lazily created on
 first invoke and owned by the store's tier registration (§7.3). It holds two
 FIXED, NON-REALLOCATING reservations plus a depth cursor:
 
-```
+```text
 TWasmInterpContext = record
   { The value stack: every frame's register file is a contiguous slice of
     this one buffer. GetMem'd ONCE at a fixed capacity and never grown or
@@ -121,7 +121,7 @@ grown never, freed when the store is freed.
 
 ### 1.2 The activation record
 
-```
+```text
 TWasmActivation = record
   Fn: PWasmIrFunction;        { @Instance.Ir.Functions[irIndex]; the code
                                 being run. Stable — the IR is borrowed and
@@ -152,7 +152,7 @@ The register file is `PWasmValue(Values) + Base`, addressed as `Reg[k]` for
 `k in [0, Fn^.RegisterCount)`. The layout WITHIN the file is Track B's
 (`Wasm.Ir` `TWasmIrFunction` header):
 
-```
+```text
 [0 .. P-1]              parameters (P = ParamCount)
 [P .. P+L-1]            declared locals (L = LocalCount)
 [ReturnRegBase .. +R-1] return block (R = ResultCount, ReturnRegBase = P+L)
@@ -169,7 +169,7 @@ One flat loop, no Pascal recursion. The loop keeps the current activation's
 hot fields in locals for speed and writes them back to the record only when
 the frame changes (call/return). Sketch:
 
-```
+```text
 procedure Run(Ctx: PWasmInterpContext);
 var
   Act: PWasmActivation;   { = @Ctx^.Acts[Ctx^.Depth-1], the top frame }
@@ -235,7 +235,7 @@ Notes:
 **Ordinary call** (`iroCall`; args in aux block `A`, result-dest registers
 in aux block `B`, `Imm` = module function index):
 
-```
+```text
 procedure DoCall(Ctx; Caller: PWasmActivation; Ins: PWasmIrInstr);
 var Addr, IrIdx, ArgAux, DstAux, ArgN, i: UInt32;
     Callee: PWasmActivation; CalleeFn: PWasmIrFunction; NewBase: NativeUInt;
@@ -305,7 +305,7 @@ has no slots to trace).
 
 **Return** (`iroReturn`; the return block is `[ReturnRegBase .. +ResultCount)`):
 
-```
+```text
 procedure DoReturn(Ctx; Top: PWasmActivation);
 var i: UInt32; Src: PWasmValue;
 begin
@@ -331,7 +331,7 @@ value stack to unwind because the register file IS the frame.
 `Imm` = function index; NO result block — the callee returns to the current
 frame's caller):
 
-```
+```text
 procedure DoReturnCall(Ctx; Top: PWasmActivation; Ins: PWasmIrInstr);
 var Addr, IrIdx, ArgAux, ArgN, i: UInt32; CalleeFn: PWasmIrFunction;
     Tmp: array of TWasmValue;   { see aliasing note }
@@ -402,7 +402,7 @@ instruction (its own IP-0 safepoint).
 
 Track D wired the seam as `TWasmTierInvokeProc`:
 
-```
+```text
 procedure(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
           const AParams: PWasmValue; const AResults: PWasmValue);
 ```
@@ -419,7 +419,7 @@ impossible; the hook is per-store, so it must be set per-store.)
 
 `InterpTierInvoke` marshals into an entry frame and runs to completion:
 
-```
+```text
 procedure InterpTierInvoke(Store; Addr; AParams; AResults);
 var Ctx: PWasmInterpContext; Fn: PWasmIrFunction; Entry: PWasmActivation;
     SavedDepth, SavedTop: NativeUInt; i: UInt32;
@@ -865,7 +865,8 @@ use `Store.MemRangeAt`.
   `IR_OP_INFO` — note store ops use `DestKind: ifkSrcReg`, so the VALUE is in
   `Reg[Dest]` and the INDEX in `Reg[A]`; `B` = mem index): compute address,
   write the low `size` bytes of `Reg[Dest]`. `Store8`/`16`/`32` truncate.
-- `iroMemorySize` (`Dest`, `Imm ifkMemIndex`): `D := ` current pages. The
+- `iroMemorySize` (`Dest`, `Imm ifkMemIndex`): `D :=` followed by the current
+  page count. The
   store exposes pages only through metadata; add a `Store.MemoryPages(addr)`
   read accessor if not present (does not expose `Base`). Result type is the
   memory's address type (i32 or i64).
@@ -1112,7 +1113,7 @@ An imported function is a host callback. `TWasmFuncInst` with
 `Kind = wfkHost` carries `Callback: TWasmHostFunc` and `HostData: Pointer`.
 The signature (Track D, `Wasm.Runtime.Store`):
 
-```
+```text
 TWasmHostFunc = procedure(const AStore: TWasmStore; const AData: Pointer;
                           const AParams: PWasmValue; const AResults: PWasmValue);
 ```
@@ -1148,7 +1149,7 @@ At `iroCall`/`iroCallIndirect`/`iroCallRef` when
 activation. It marshals a param buffer, calls, and marshals results back
 into the caller's dest registers:
 
-```
+```text
 procedure HostCall(Ctx; Caller; Ins; Addr);
 var ArgAux, DstAux, ArgN, ResN, i: UInt32;
     ParamBuf, ResBuf: PWasmValue;   { context-owned scratch, NOT dynamic locals }

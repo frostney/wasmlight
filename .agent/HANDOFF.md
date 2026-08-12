@@ -1,7 +1,22 @@
 # Handoff
 
 Updated: 2026-08-12 (fifth measured optimization wave integrated and
-cross-architecture/cross-tier validated)
+cross-architecture/cross-tier validated; PR #1 open)
+
+## 2026-08-12 pull request delivery
+
+- Draft PR #1, `perf: accelerate compiled execution and restore tier CI`, is
+  open against `main` from `codex/fix-tests-tier-performance`.
+- The exact pre-PR gate passed on macOS: frozen install, formatting, all three
+  dev build entries, and 44/44 unit suites. The preceding optimization gate
+  also covered release builds and the full three-tier corpus on macOS/aarch64
+  and Linux/x86-64.
+- The first PR docs job exposed pre-existing markdownlint failures throughout
+  `.agent/design`. The blocking rule was kept intact; the internal design notes
+  were mechanically repaired with fence-language tags, real appendix headings,
+  spacing fixes, and no technical content changes. Repository-wide Markdown
+  lint now passes all 41 files. Keep the PR draft until the new exact-head CI
+  run is green, then mark it ready for review.
 
 ## 2026-08-12 fifth measured optimization wave complete
 

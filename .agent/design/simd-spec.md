@@ -158,7 +158,7 @@ iroI8x16Add:
   begin V8x16Add(VecAt(Reg, Ins^.A), VecAt(Reg, Ins^.B), VecAt(Reg, Ins^.Dest)); Inc(IP); end;
 ```
 
-**Why this dominates both (a) and (b).**
+### Why this dominates both (a) and (b)
 
 | Property | (a) side vector | (b) widen | **pair (chosen)** |
 | --- | --- | --- | --- |
@@ -340,7 +340,7 @@ bytes. Two immediates are 16 bytes wide: `v128.const`'s literal and
 one length-prefixed block of four `UInt32` words holding the vector's
 bytes in little-endian order:
 
-```
+```text
 AuxU32[k]     = 4
 AuxU32[k+1..k+4] = the 16 bytes, as four little-endian u32 words
 ```
@@ -444,7 +444,7 @@ assembler table, and the disassembler all agree on one spelling.
 The generic renderer covers most rows automatically. Five special arms
 are added to `IrOperands` (`Wasm.Ir.pas:1765-1893`):
 
-```
+```text
 0000  v128.const             r4 <- v128:000102030405060708090a0b0c0d0e0f
 0001  i8x16.shuffle          r6 <- r2, r4 lanes[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]
 0002  i8x16.extract_lane_s   r7 <- r6 lane=3
@@ -789,7 +789,7 @@ when either operand is NaN the comparison is false so the result is `z1`.
 
 The corpus states this unambiguously:
 
-```
+```text
 simd_f32x4.wast:940      (invoke "f32x4.min"  (f32x4 nan …) (f32x4 0 …))
                          → (v128.const f32x4 nan:canonical …)      ; CLASS match
 
@@ -1018,7 +1018,7 @@ spelling belongs to lane *indices*, not lane *literals* — see §5.4.
 Sixteen bare lane indices immediately after the mnemonic, before the two
 operands:
 
-```
+```text
 (i8x16.shuffle  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 (local.get 0) (local.get 1))
 (i8x16.shuffle 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 (local.get 0) (local.get 1))
 ```
@@ -1050,7 +1050,7 @@ the corpus demands, and the corpus is the authority. The evidence is
 clean: `i8 constant out of range` occurs 15 times and **only in
 `simd_lane.wast`**, always on a lane-index position:
 
-```
+```text
 (i8x16.extract_lane_s 256 …)
 (i8x16.extract_lane_u 256 …)
 (i8x16.replace_lane 256 …)
@@ -1072,7 +1072,7 @@ symmetry, marked `UNCONFIRMED` — no corpus case reaches it.
 Grammar, from `simd_memory-multi.wast` (a file that exists precisely to
 "test syntax for load/store_lane immediates"):
 
-```
+```text
 (v128.load8_lane 1 (i32.const 0) (local.get $v))                  ; lane 1, no memidx
 (v128.load8_lane 1 1 (i32.const 0) (local.get $v))                ; memidx 1, lane 1
 (v128.load8_lane 1 offset=0 align=1 1 (i32.const 0) (local.get $v))
@@ -1292,7 +1292,7 @@ code-organisation table and its two "deliberately staged" paragraphs.
 The waves are cut so that **concurrently-running waves own disjoint
 files**. No two parallel waves edit the same unit.
 
-```
+```text
         ┌──────────────── G2 (Wat.Numbers, Wat.Opcodes, Wat.Lexer, Wat.Assembler)
         │
   G1 ───┼──────────────── G3 (Validator*, Validator.Body, Validator.Const)  ──┐
@@ -1438,27 +1438,27 @@ Subopcodes are the `u32` LEB after the `$FD` prefix. `M` marks the 22
 instructions the spec files under *memory*; everything else is *vec*.
 IR member names follow §2.1's rule.
 
-**Memory: whole, packed, splat, store — memarg (0..11)**
+### Memory: whole, packed, splat, store — memarg (0..11)
 
 | 0 `v128.load` M · 1 `v128.load8x8_s` M · 2 `v128.load8x8_u` M · 3 `v128.load16x4_s` M · 4 `v128.load16x4_u` M · 5 `v128.load32x2_s` M · 6 `v128.load32x2_u` M · 7 `v128.load8_splat` M · 8 `v128.load16_splat` M · 9 `v128.load32_splat` M · 10 `v128.load64_splat` M · 11 `v128.store` M |
 | --- |
 
-**Const and shuffle — 16-byte immediate (12..13)**
+### Const and shuffle — 16-byte immediate (12..13)
 
 | 12 `v128.const` · 13 `i8x16.shuffle` |
 | --- |
 
-**Swizzle and splat (14..20)**
+### Swizzle and splat (14..20)
 
 | 14 `i8x16.swizzle` · 15 `i8x16.splat` · 16 `i16x8.splat` · 17 `i32x4.splat` · 18 `i64x2.splat` · 19 `f32x4.splat` · 20 `f64x2.splat` |
 | --- |
 
-**Lane access — one laneidx byte (21..34)**
+### Lane access — one laneidx byte (21..34)
 
 | 21 `i8x16.extract_lane_s` · 22 `i8x16.extract_lane_u` · 23 `i8x16.replace_lane` · 24 `i16x8.extract_lane_s` · 25 `i16x8.extract_lane_u` · 26 `i16x8.replace_lane` · 27 `i32x4.extract_lane` · 28 `i32x4.replace_lane` · 29 `i64x2.extract_lane` · 30 `i64x2.replace_lane` · 31 `f32x4.extract_lane` · 32 `f32x4.replace_lane` · 33 `f64x2.extract_lane` · 34 `f64x2.replace_lane` |
 | --- |
 
-**Comparisons (35..76)**
+### Comparisons (35..76)
 
 | 35..44 `i8x16.` `eq ne lt_s lt_u gt_s gt_u le_s le_u ge_s ge_u` |
 | --- |
@@ -1467,22 +1467,22 @@ IR member names follow §2.1's rule.
 | 65..70 `f32x4.` `eq ne lt gt le ge` |
 | 71..76 `f64x2.` `eq ne lt gt le ge` |
 
-**Bitwise and the whole-vector test (77..83)**
+### Bitwise and the whole-vector test (77..83)
 
 | 77 `v128.not` · 78 `v128.and` · 79 `v128.andnot` · 80 `v128.or` · 81 `v128.xor` · 82 `v128.bitselect` · 83 `v128.any_true` |
 | --- |
 
-**Memory: lane and zero — memarg + laneidx / memarg (84..93)**
+### Memory: lane and zero — memarg + laneidx / memarg (84..93)
 
 | 84 `v128.load8_lane` M · 85 `v128.load16_lane` M · 86 `v128.load32_lane` M · 87 `v128.load64_lane` M · 88 `v128.store8_lane` M · 89 `v128.store16_lane` M · 90 `v128.store32_lane` M · 91 `v128.store64_lane` M · 92 `v128.load32_zero` M · 93 `v128.load64_zero` M |
 | --- |
 
-**Float conversions (94..95)**
+### Float conversions (94..95)
 
 | 94 `f32x4.demote_f64x2_zero` · 95 `f64x2.promote_low_f32x4` |
 | --- |
 
-**i8x16 unary, narrow, f32x4 rounding, i8x16 arithmetic (96..127)**
+### i8x16 unary, narrow, f32x4 rounding, i8x16 arithmetic (96..127)
 
 | 96 `i8x16.abs` · 97 `i8x16.neg` · 98 `i8x16.popcnt` · 99 `i8x16.all_true` · 100 `i8x16.bitmask` · 101 `i8x16.narrow_i16x8_s` · 102 `i8x16.narrow_i16x8_u` |
 | --- |
@@ -1493,7 +1493,7 @@ IR member names follow §2.1's rule.
 | 122 `f64x2.trunc` · 123 `i8x16.avgr_u` |
 | 124 `i16x8.extadd_pairwise_i8x16_s` · 125 `i16x8.extadd_pairwise_i8x16_u` · 126 `i32x4.extadd_pairwise_i16x8_s` · 127 `i32x4.extadd_pairwise_i16x8_u` |
 
-**i16x8 (128..159; 154 unassigned)**
+### i16x8 (128..159; 154 unassigned)
 
 | 128 `i16x8.abs` · 129 `i16x8.neg` · 130 `i16x8.q15mulr_sat_s` · 131 `i16x8.all_true` · 132 `i16x8.bitmask` · 133 `i16x8.narrow_i32x4_s` · 134 `i16x8.narrow_i32x4_u` |
 | --- |
@@ -1502,7 +1502,7 @@ IR member names follow §2.1's rule.
 | 148 `f64x2.nearest` · 149 `i16x8.mul` · 150 `i16x8.min_s` · 151 `i16x8.min_u` · 152 `i16x8.max_s` · 153 `i16x8.max_u` · **154 —** · 155 `i16x8.avgr_u` |
 | 156 `i16x8.extmul_low_i8x16_s` · 157 `i16x8.extmul_high_i8x16_s` · 158 `i16x8.extmul_low_i8x16_u` · 159 `i16x8.extmul_high_i8x16_u` |
 
-**i32x4 (160..191; 162, 165, 166, 175, 176, 178..180, 187 unassigned)**
+### i32x4 (160..191; 162, 165, 166, 175, 176, 178..180, 187 unassigned)
 
 | 160 `i32x4.abs` · 161 `i32x4.neg` · **162 —** · 163 `i32x4.all_true` · 164 `i32x4.bitmask` · **165 —** · **166 —** |
 | --- |
@@ -1511,7 +1511,7 @@ IR member names follow §2.1's rule.
 | 182 `i32x4.min_s` · 183 `i32x4.min_u` · 184 `i32x4.max_s` · 185 `i32x4.max_u` · 186 `i32x4.dot_i16x8_s` · **187 —** |
 | 188 `i32x4.extmul_low_i16x8_s` · 189 `i32x4.extmul_high_i16x8_s` · 190 `i32x4.extmul_low_i16x8_u` · 191 `i32x4.extmul_high_i16x8_u` |
 
-**i64x2 (192..223; 194, 197, 198, 207, 208, 210..212 unassigned)**
+### i64x2 (192..223; 194, 197, 198, 207, 208, 210..212 unassigned)
 
 | 192 `i64x2.abs` · 193 `i64x2.neg` · **194 —** · 195 `i64x2.all_true` · 196 `i64x2.bitmask` · **197..198 —** |
 | --- |
@@ -1520,18 +1520,18 @@ IR member names follow §2.1's rule.
 | 214 `i64x2.eq` · 215 `i64x2.ne` · 216 `i64x2.lt_s` · 217 `i64x2.gt_s` · 218 `i64x2.le_s` · 219 `i64x2.ge_s` *(no unsigned i64x2 comparisons exist)* |
 | 220 `i64x2.extmul_low_i32x4_s` · 221 `i64x2.extmul_high_i32x4_s` · 222 `i64x2.extmul_low_i32x4_u` · 223 `i64x2.extmul_high_i32x4_u` |
 
-**f32x4 / f64x2 arithmetic (224..247; 226, 238 unassigned)**
+### f32x4 / f64x2 arithmetic (224..247; 226, 238 unassigned)
 
 | 224 `f32x4.abs` · 225 `f32x4.neg` · **226 —** · 227 `f32x4.sqrt` · 228 `f32x4.add` · 229 `f32x4.sub` · 230 `f32x4.mul` · 231 `f32x4.div` · 232 `f32x4.min` · 233 `f32x4.max` · 234 `f32x4.pmin` · 235 `f32x4.pmax` |
 | --- |
 | 236 `f64x2.abs` · 237 `f64x2.neg` · **238 —** · 239 `f64x2.sqrt` · 240 `f64x2.add` · 241 `f64x2.sub` · 242 `f64x2.mul` · 243 `f64x2.div` · 244 `f64x2.min` · 245 `f64x2.max` · 246 `f64x2.pmin` · 247 `f64x2.pmax` |
 
-**Conversions (248..255)**
+### Conversions (248..255)
 
 | 248 `i32x4.trunc_sat_f32x4_s` · 249 `i32x4.trunc_sat_f32x4_u` · 250 `f32x4.convert_i32x4_s` · 251 `f32x4.convert_i32x4_u` · 252 `i32x4.trunc_sat_f64x2_s_zero` · 253 `i32x4.trunc_sat_f64x2_u_zero` · 254 `f64x2.convert_low_i32x4_s` · 255 `f64x2.convert_low_i32x4_u` |
 | --- |
 
-**Relaxed SIMD — the 20 3.0 additions (256..275)**
+### Relaxed SIMD — the 20 3.0 additions (256..275)
 
 | 256 `i8x16.relaxed_swizzle` · 257 `i32x4.relaxed_trunc_f32x4_s` · 258 `i32x4.relaxed_trunc_f32x4_u` · 259 `i32x4.relaxed_trunc_f64x2_s_zero` · 260 `i32x4.relaxed_trunc_f64x2_u_zero` |
 | --- |

@@ -102,7 +102,7 @@ Hard obligations, inherited and non-negotiable:
 
 ### 0.1 Layering (bottom-up, AGENTS.md fixed layout)
 
-```
+```text
 source/units/
   Wasm.Engine              depends on Store, Instantiate, Interp, Decoder,
                            Validator, Module, Values, Memory(via Store), Gc
@@ -308,7 +308,7 @@ The mechanism, using only shipped APIs:
   definition and **creates the host func lazily at resolve time with the
   module's own import type id**:
 
-  ```
+  ```text
   Engine.InternModule(module.Ir, CanonIds, TypeIds)   { cached after 1st }
   for each func import i in module:
       def := lookup(module_name[i], name[i])           { EWasmLinkError if absent }
@@ -809,7 +809,7 @@ A new subcommand, registered in `wasmlight.pas` alongside `inspect` and
 `validate`, through the lwpt `cli` package (AGENTS.md: no hand-rolled
 `ParamStr` loops in `source/apps/`).
 
-```
+```text
 wasmlight run [--dir GUEST=HOST]... [--env KEY=VALUE]... [--] <module.wasm> [args...]
 ```
 
@@ -891,7 +891,7 @@ directory component (`./run.wasm`), which the aliasing check
 
 ### 4.3 The run sequence
 
-```
+```text
 1. Decode + validate:  LoadModuleFromFile(path)          { EWasmDecodeError / EWasmValidationError -> stderr, exit 1 }
 2. Build the capability set from flags:
      cfg := TWasmWasiConfig.Create
