@@ -124,6 +124,20 @@ begin
   Expect<UInt32>(Arm64FcvtSD(0, 0)).ToBe($1E624000);
   Expect<UInt32>(Arm64SxtwX(9, 9)).ToBe($93407D29);
 
+  { Native Advanced SIMD subset, independently assembled with clang. }
+  Expect<UInt32>(Arm64LdrQ(0, 19, 16)).ToBe($3DC00660);
+  Expect<UInt32>(Arm64StrQ(1, 19, 32)).ToBe($3D800A61);
+  Expect<UInt32>(Arm64VecAnd(0, 1, 2)).ToBe($4E221C20);
+  Expect<UInt32>(Arm64VecBic(0, 1, 2)).ToBe($4E621C20);
+  Expect<UInt32>(Arm64VecOrr(0, 1, 2)).ToBe($4EA21C20);
+  Expect<UInt32>(Arm64VecEor(0, 1, 2)).ToBe($6E221C20);
+  Expect<UInt32>(Arm64VecMvn(0, 1)).ToBe($6E205820);
+  Expect<UInt32>(Arm64VecAdd(0, 1, 2, 3)).ToBe($4EE28420);
+  Expect<UInt32>(Arm64VecSub(0, 1, 2, 2)).ToBe($6EA28420);
+  Expect<UInt32>(Arm64VecDup(0, 9, 1)).ToBe($4E020D20);
+  Expect<UInt32>(Arm64VecExtract(9, 0, 0, 15, True)).ToBe($0E1F2C09);
+  Expect<UInt32>(Arm64VecExtract(9, 0, 3, 1, False)).ToBe($4E183C09);
+
   { movk, add-immediate, blr, mov reg. }
   Expect<UInt32>(Arm64MovkW(0, 1, 1)).ToBe($72A00020);
   Expect<UInt32>(Arm64AddImmX(21, 20, 8)).ToBe($91002295);

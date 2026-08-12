@@ -37,7 +37,7 @@ lwpt build [target]    # binaries land under build/
 lwpt test              # discovers source/units/*.Test.pas
 ./build/wasmlight inspect <module.wasm>
 ./build/wasmbench      # execution workloads and tiers (measurement only)
-# isolate profiling with --workload loop|fib|memory|numeric|startup and --tier
+# isolate with --workload loop|fib|memory|numeric|simd|startup and --tier
 npx markdownlint-cli2 "**/*.md"   # docs gate, config .markdownlint-cli2.jsonc
 ```
 

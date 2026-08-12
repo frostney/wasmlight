@@ -592,8 +592,10 @@ const
     '              (i32.add' + sLineBreak +
     '                (i32.add (f32.eq (local.get $x) (local.get $x))' +
     '                  (f32.ne (local.get $x) (f32.const -1)))' + sLineBreak +
-    '                (i32.add (f32.lt (local.get $x)' +
-    '                    (f32.add (local.get $x) (f32.const 1)))' +
+    '                (i32.add' + sLineBreak +
+    '                  (i32.or (f32.lt (local.get $x)' +
+    '                      (f32.add (local.get $x) (f32.const 1)))' +
+    '                    (i32.const 1))' +
     '                  (f32.gt (local.get $x) (f32.const -1))))' + sLineBreak +
     '              (i32.add (f32.le (local.get $x) (local.get $x))' +
     '                (f32.ge (local.get $x) (local.get $x)))))))' +
@@ -605,8 +607,10 @@ const
     '              (i32.add' + sLineBreak +
     '                (i32.add (f64.eq (local.get $y) (local.get $y))' +
     '                  (f64.ne (local.get $y) (f64.const -1)))' + sLineBreak +
-    '                (i32.add (f64.lt (local.get $y)' +
-    '                    (f64.add (local.get $y) (f64.const 1)))' +
+    '                (i32.add' + sLineBreak +
+    '                  (i32.or (f64.lt (local.get $y)' +
+    '                      (f64.add (local.get $y) (f64.const 1)))' +
+    '                    (i32.const 1))' +
     '                  (f64.gt (local.get $y) (f64.const -1))))' + sLineBreak +
     '              (i32.add (f64.le (local.get $y) (local.get $y))' +
     '                (f64.ge (local.get $y) (local.get $y)))))))' +
