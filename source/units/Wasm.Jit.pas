@@ -422,11 +422,17 @@ begin
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
       Emitted := Arm64EmitOpCached(Buf, AFn^.Code[I], AFn^.AuxU32,
-        UInt32(I), ArmCache);
+        UInt32(I),
+        (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
+          (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
+          (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), ArmCache);
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
       Emitted := X64EmitOpCached(Buf, AFn^.Code[I], AFn^.AuxU32,
-        UInt32(I), X64Cache);
+        UInt32(I),
+        (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
+          (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
+          (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), X64Cache);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an

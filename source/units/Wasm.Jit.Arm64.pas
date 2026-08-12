@@ -385,7 +385,8 @@ procedure Arm64InitRegCache(out ACache: TArm64RegCache);
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; var ACache: TArm64RegCache): Boolean;
+  const AInsIndex: UInt32; const AAddr64: Boolean;
+  var ACache: TArm64RegCache): Boolean;
 
 { The INSTRUCTION-level half of the compile predicate (§4.4). Arm64CanEmitOp
   answers "is there a template for this op"; this answers "can this particular
@@ -418,6 +419,7 @@ uses
   Wasm.Interp.Numeric,
   Wasm.Interp.Vector,
   Wasm.Runtime.Gc,
+  Wasm.Runtime.Memory,
   Wasm.Runtime.Traps;
 
 procedure Arm64CachedLoad(const ABuf: TWasmCodeBuffer;
@@ -491,11 +493,179 @@ begin
   end;
 end;
 
+function Arm64ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32];
+end;
+
+procedure LdW(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const AReg: UInt32); forward;
+procedure LdX(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const AReg: UInt32); forward;
+procedure StX(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const AReg: UInt32); forward;
+procedure EmitBCondTo(const ABuf: TWasmCodeBuffer; const ACond: Byte;
+  const ATarget: TWasmJitLabel); forward;
+
+function Arm64MemoryAccessSize(const AOp: TWasmIrOp): UInt32;
+begin
+  case AOp of
+    iroI32Load8S, iroI32Load8U, iroI64Load8S, iroI64Load8U,
+    iroI32Store8, iroI64Store8: Result := 1;
+    iroI32Load16S, iroI32Load16U, iroI64Load16S, iroI64Load16U,
+    iroI32Store16, iroI64Store16: Result := 2;
+    iroI32Load, iroF32Load, iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroF32Store, iroI64Store32: Result := 4;
+  else
+    Result := 8;
+  end;
+end;
+
+function JitResolveMemory(const AStore: TWasmStore;
+  const AMemoryIndex: PtrUInt): PWasmMemoryInst; cdecl;
+var
+  Ctx: PWasmInterpContext;
+  Instance: TWasmModuleInstance;
+begin
+  Ctx := InterpContextFor(AStore);
+  Instance := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+  Result := AStore.JitMemoryAt(Instance.MemAddrs[AMemoryIndex]);
+end;
+
+procedure Arm64EmitTrapUnless(const ABuf: TWasmCodeBuffer;
+  const AGoodCondition: Byte);
+var
+  Good: TWasmJitLabel;
+begin
+  Good := ABuf.NewLabel;
+  EmitBCondTo(ABuf, AGoodCondition, Good);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkMemoryOutOfBounds)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(Good);
+end;
+
+procedure Arm64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean);
+var
+  Layout: TWasmMemoryInst;
+  AccessSize: UInt32;
+  Offset: UInt64;
+  Folded: Boolean;
+  LoadOp: UInt32;
+begin
+  AccessSize := Arm64MemoryAccessSize(AIns.Op);
+  Offset := UInt64(AIns.Imm);
+  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - AccessSize;
+
+  { Resolve the module memory index through the current activation. The helper
+    returns the live TWasmMemoryInst; generated code then applies that memory's
+    statically selected strategy. The helper-table call keeps AOT bytes free of
+    process addresses. }
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  Arm64EmitLoadImm32(ABuf, 1, AIns.B);
+  Arm64EmitCallHelper(ABuf, aohResolveMemory);       { x0 := memory instance }
+  Arm64EmitLdrX(ABuf, 14, 0, UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
+  Arm64EmitLdrX(ABuf, 15, 0,
+    UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
+  if AAddr64 then
+    LdX(ABuf, 10, AIns.A)
+  else
+    LdW(ABuf, 10, AIns.A);                          { zero-extended i32 index }
+
+  if AAddr64 and Folded then
+  begin
+    { Guard-assisted memory64: index > ByteSize can escape the reservation;
+      index <= ByteSize is safe because the static offset plus access width is
+      wholly absorbed by the reserved guard. }
+    ABuf.EmitU32(Arm64CmpX(10, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+  end
+  else if (not AAddr64) and Folded then
+    { i32 guard-page strategy on a 64-bit POSIX backend: the 4 GiB reservation
+      plus guard covers every widened index and this static offset. }
+  else
+  begin
+    { Exact MemInBounds subtraction form: index <= size; offset <= size-index;
+      access width <= size-index-offset. No addition can wrap. }
+    ABuf.EmitU32(Arm64CmpX(10, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+    ABuf.EmitU32(Arm64SubX(15, 15, 10));
+    Arm64EmitLoadImm64(ABuf, 11, Offset);
+    ABuf.EmitU32(Arm64CmpX(11, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+    ABuf.EmitU32(Arm64SubX(15, 15, 11));
+    Arm64EmitLoadImm32(ABuf, 11, AccessSize);
+    ABuf.EmitU32(Arm64CmpX(11, 15));
+    Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
+  end;
+
+  ABuf.EmitU32(Arm64AddX(14, 14, 10));
+  if Offset <> 0 then
+  begin
+    Arm64EmitLoadImm64(ABuf, 11, Offset);
+    ABuf.EmitU32(Arm64AddX(14, 14, 11));
+  end;
+
+  case AIns.Op of
+    iroI32Load8U, iroI64Load8U: LoadOp := $39400000;
+    iroI32Load8S: LoadOp := $39C00000;
+    iroI64Load8S: LoadOp := $39800000;
+    iroI32Load16U, iroI64Load16U: LoadOp := $79400000;
+    iroI32Load16S: LoadOp := $79C00000;
+    iroI64Load16S: LoadOp := $79800000;
+    iroI32Load, iroF32Load, iroI64Load32U: LoadOp := $B9400000;
+    iroI64Load32S: LoadOp := $B9800000;
+    iroI64Load, iroF64Load: LoadOp := $F9400000;
+    iroI32Store8, iroI64Store8:
+      begin
+        LdX(ABuf, 11, AIns.Dest);
+        ABuf.EmitU32($39000000 or (UInt32(14) shl 5) or 11);
+        Exit;
+      end;
+    iroI32Store16, iroI64Store16:
+      begin
+        LdX(ABuf, 11, AIns.Dest);
+        ABuf.EmitU32($79000000 or (UInt32(14) shl 5) or 11);
+        Exit;
+      end;
+    iroI32Store, iroF32Store, iroI64Store32:
+      begin
+        LdX(ABuf, 11, AIns.Dest);
+        ABuf.EmitU32($B9000000 or (UInt32(14) shl 5) or 11);
+        Exit;
+      end;
+    iroI64Store, iroF64Store:
+      begin
+        LdX(ABuf, 11, AIns.Dest);
+        ABuf.EmitU32($F9000000 or (UInt32(14) shl 5) or 11);
+        Exit;
+      end;
+  else
+    Exit;
+  end;
+  ABuf.EmitU32(LoadOp or (UInt32(14) shl 5) or 11);
+  StX(ABuf, 11, AIns.Dest);
+end;
+
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; var ACache: TArm64RegCache): Boolean;
+  const AInsIndex: UInt32; const AAddr64: Boolean;
+  var ACache: TArm64RegCache): Boolean;
 begin
   Result := True;
+  if Arm64ScalarMemoryOp(AIns.Op) then
+  begin
+    Arm64InvalidateRegCache(ACache);
+    Arm64EmitScalarMemory(ABuf, AIns, AAddr64);
+    Exit;
+  end;
   case AIns.Op of
     iroMove:
       begin
@@ -968,20 +1138,19 @@ end;
 {  §8, §9, §12.3 Waves 4-5)                                              }
 { ===================================================================== }
 
-{ THE PATTERN, and why it is the whole of these two waves. Every memory,
-  table, reference, global and GC op is a HELPER CALL, exactly as jit-spec
+{ THE PATTERN, and why it is the whole of these two waves. Every table,
+  reference, global and GC op is a HELPER CALL, exactly as jit-spec
   §1.4 prescribes ("if the interpreter dispatches to a store/heap method for
   an op, the JIT emits a call to that same function"). The emitted template is
   UNIFORM and tiny — marshal the store, the register-file base and a pointer
   to the IR instruction into x0/x1/x2, then `blr` a single cdecl dispatcher
   (JitRtDispatch) — and every subtlety lives in Pascal:
 
-    - MEMORY goes through the ONE chokepoint Store.MemAddressAt / MemRangeAt
-      (AGENTS.md's named top failure mode). The baseline emits NO raw
-      memory-base arithmetic and does NOT rely on guard-page faults; the
-      chokepoint runs the explicit full-precision bounds check and traps
-      'out of bounds memory access' via the same TrapNow the interpreter uses
-      (jit-spec §7.1 form 1).
+    - SCALAR MEMORY uses the generated-code half of the ONE chokepoint: the
+      address type selects the strategy statically, guard-page and
+      guard-assisted folds use the reservation, and the fallback reproduces
+      MemCheck's overflow-safe subtraction sequence. memory.grow and bulk/SIMD
+      operations remain on Store.MemAddressAt / MemRangeAt helpers.
     - TABLE reference stores go through the barriered store methods
       (TableSet/Fill/Grow/Init/Copy); reads are the free functions. Traps are
       'out of bounds table access' / 'undefined element' — the store's, not
@@ -3501,6 +3670,7 @@ begin
     GArm64HelperTable[aohReturnCallRef] := @JitReturnCallRefHelper;
     GArm64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
     GArm64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
+    GArm64HelperTable[aohResolveMemory] := @JitResolveMemory;
     GArm64HelperTableFilled := True;
   end;
   Result := @GArm64HelperTable[aohTrapKind];

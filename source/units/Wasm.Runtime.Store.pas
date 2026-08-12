@@ -603,6 +603,13 @@ type
       chokepoint exactly as a tier's would. }
     function MemoryCount: Integer;
     function MemoryAddrType(const AAddr: TWasmMemAddr): TWasmAddrType;
+    { JIT/AOT scalar-memory chokepoint. The generated access sequence selects
+      its strategy statically from the validated address type and reproduces
+      MemCheck's overflow-safe comparison before touching Base. No host or
+      interpreter caller may use this to perform its own memory access. The
+      pointer is stable while guest code runs: store categories grow only
+      during instantiation, outside an invocation. }
+    function JitMemoryAt(const AAddr: TWasmMemAddr): PWasmMemoryInst;
     { The two chokepoint forms, per memory address. ASize is 1/2/4/8/16. }
     function MemAddressAt(const AAddr: TWasmMemAddr;
       const AIndex, AOffset: UInt64; const ASize: NativeUInt): PByte;
@@ -907,7 +914,8 @@ type
     aohReturnCallIndirect,     { 10 return_call_indirect }
     aohReturnCallRef,          { 11 return_call_ref }
     aohDirectCallPrepare,      { 12 compiled direct-call frame entry }
-    aohDirectCallFinish        { 13 compiled direct-call frame exit }
+    aohDirectCallFinish,       { 13 compiled direct-call frame exit }
+    aohResolveMemory           { 14 scalar-memory instance resolution }
   );
 
 const
@@ -1805,6 +1813,12 @@ function TWasmStore.MemoryAddrType(
 begin
   CheckMemAddr(AAddr, Length(FMemories));
   Result := FMemories[AAddr].AddrType;
+end;
+
+function TWasmStore.JitMemoryAt(const AAddr: TWasmMemAddr): PWasmMemoryInst;
+begin
+  CheckMemAddr(AAddr, Length(FMemories));
+  Result := @FMemories[AAddr];
 end;
 
 function TWasmStore.MemAddressAt(const AAddr: TWasmMemAddr;

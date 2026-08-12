@@ -302,7 +302,8 @@ procedure X64InitRegCache(out ACache: TX64RegCache);
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; var ACache: TX64RegCache): Boolean;
+  const AInsIndex: UInt32; const AAddr64: Boolean;
+  var ACache: TX64RegCache): Boolean;
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -325,7 +326,11 @@ uses
   Wasm.Interp.Numeric,
   Wasm.Interp.Vector,
   Wasm.Runtime.Gc,
+  Wasm.Runtime.Memory,
   Wasm.Runtime.Traps;
+
+procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean); forward;
 
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
@@ -392,11 +397,44 @@ begin
   end;
 end;
 
+function X64ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32];
+end;
+
+function X64MemoryAccessSize(const AOp: TWasmIrOp): UInt32;
+begin
+  case AOp of
+    iroI32Load8S, iroI32Load8U, iroI64Load8S, iroI64Load8U,
+    iroI32Store8, iroI64Store8: Result := 1;
+    iroI32Load16S, iroI32Load16U, iroI64Load16S, iroI64Load16U,
+    iroI32Store16, iroI64Store16: Result := 2;
+    iroI32Load, iroF32Load, iroI64Load32S, iroI64Load32U,
+    iroI32Store, iroF32Store, iroI64Store32: Result := 4;
+  else
+    Result := 8;
+  end;
+end;
+
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; var ACache: TX64RegCache): Boolean;
+  const AInsIndex: UInt32; const AAddr64: Boolean;
+  var ACache: TX64RegCache): Boolean;
 begin
   Result := True;
+  if X64ScalarMemoryOp(AIns.Op) then
+  begin
+    X64InvalidateRegCache(ACache);
+    X64EmitScalarMemory(ABuf, AIns, AAddr64);
+    Exit;
+  end;
   case AIns.Op of
     iroMove:
       begin
@@ -669,6 +707,15 @@ begin
   Result := Ctx^.Acts[Ctx^.Depth - 1].Instance;
 end;
 
+function X64ResolveMemory(const AStore: TWasmStore;
+  const AMemoryIndex: PtrUInt): PWasmMemoryInst; cdecl;
+var
+  Instance: TWasmModuleInstance;
+begin
+  Instance := X64CallerInstance(AStore);
+  Result := AStore.JitMemoryAt(Instance.MemAddrs[AMemoryIndex]);
+end;
+
 { Run an INTERPRETED callee as one nested invocation over the shared context.
   TierInvoke carves the callee's frame through the same JitEnterFrame the
   compiled path uses. The epoch snapshot is saved/restored around it (§6): the
@@ -893,7 +940,7 @@ end;
 
 { ===================================================================== }
 {  Waves 4 & 5 — memory / table / reference / global / GC (jit-spec §7,  }
-{  §8, §9). Every op is the SAME uniform three-argument helper call (store,   }
+{  §8, §9). Non-scalar-memory ops use the uniform helper call (store,          }
 {  register-file base, IR-instruction pointer); the Pascal below reproduces    }
 {  the interpreter's Exec* bodies verbatim, so trap kind/message/order and the }
 {  final memory/table/global/GC-heap state are the interpreter's by            }
@@ -901,6 +948,8 @@ end;
 {  Store.MemAddressAt / MemRangeAt. The GC frame is walkable at every          }
 {  allocation because JitEnterFrame pushed Slots = @Values[Base] with          }
 {  publish-first preserved (§9.3). }
+{ Scalar loads/stores now use the generated-code half of the memory
+  chokepoint; grow, bulk and SIMD memory remain in this dispatcher. }
 { ===================================================================== }
 
 function X64TopActivation(const AStore: TWasmStore): PWasmActivation;
@@ -2015,6 +2064,147 @@ begin
   EmitMemOperand(ABuf, AReg, ABase, ADisp);
 end;
 
+procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean);
+begin
+  case ASize of
+    1, 2:
+      begin
+        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3, 0,
+          ABase shr 3);
+        ABuf.EmitByte($0F);
+        if ASigned then
+          ABuf.EmitByte($BE + Ord(ASize = 2))
+        else
+          ABuf.EmitByte($B6 + Ord(ASize = 2));
+        EmitMemOperand(ABuf, ADest, ABase, 0);
+      end;
+    4:
+      if ASigned and AResult64 then
+      begin
+        X64EmitRex(ABuf, 1, ADest shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($63);                    { movsxd r64, r/m32 }
+        EmitMemOperand(ABuf, ADest, ABase, 0);
+      end
+      else
+        X64EmitLoadMem32(ABuf, ADest, ABase, 0);
+  else
+    X64EmitLoadMem64(ABuf, ADest, ABase, 0);
+  end;
+end;
+
+procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase: Byte; const ASize: UInt32);
+begin
+  case ASize of
+    1:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($88);
+        EmitMemOperand(ABuf, ASource, ABase, 0);
+      end;
+    2:
+      begin
+        ABuf.EmitByte($66);
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+        EmitMemOperand(ABuf, ASource, ABase, 0);
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+        EmitMemOperand(ABuf, ASource, ABase, 0);
+      end;
+  else
+    X64EmitStoreMem64(ABuf, ASource, ABase, 0);
+  end;
+end;
+
+procedure X64EmitTrapUnless(const ABuf: TWasmCodeBuffer;
+  const AGoodCondition: Byte);
+var
+  Good: TWasmJitLabel;
+begin
+  Good := ABuf.NewLabel;
+  X64EmitJccTo(ABuf, AGoodCondition, Good);
+  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkMemoryOutOfBounds)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(Good);
+end;
+
+procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean);
+var
+  Layout: TWasmMemoryInst;
+  AccessSize: UInt32;
+  Offset: UInt64;
+  Folded: Boolean;
+  SignedLoad: Boolean;
+begin
+  AccessSize := X64MemoryAccessSize(AIns.Op);
+  Offset := UInt64(AIns.Imm);
+  Folded := Offset <= WASM_STATIC_OFFSET_FOLD - AccessSize;
+
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitMovRegImm32(ABuf, X64_ARG1, AIns.B);
+  X64EmitCallHelper(ABuf, aohResolveMemory);           { rax := memory instance }
+  X64EmitLoadMem64(ABuf, X64_R8, X64_RAX,
+    Int32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX,
+    Int32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
+  if AAddr64 then
+    X64EmitLoadSlot64(ABuf, X64_RCX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.A);
+
+  if AAddr64 and Folded then
+  begin
+    X64EmitAluRegReg(ABuf, $39, True, X64_RCX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+  end
+  else if (not AAddr64) and Folded then
+    { i32 guard pages need no explicit check for a folded static offset. }
+  else
+  begin
+    X64EmitAluRegReg(ABuf, $39, True, X64_RCX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+    X64EmitAluRegReg(ABuf, $29, True, X64_RDX, X64_RCX);
+    X64EmitMovRegImm64(ABuf, X64_RAX, Offset);
+    X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+    X64EmitAluRegReg(ABuf, $29, True, X64_RDX, X64_RAX);
+    X64EmitMovRegImm32(ABuf, X64_RAX, AccessSize);
+    X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_RDX);
+    X64EmitTrapUnless(ABuf, X64_CC_BE);
+  end;
+
+  X64EmitAluRegReg(ABuf, $01, True, X64_R8, X64_RCX);
+  if Offset <= UInt64(High(Int32)) then
+    X64EmitLea(ABuf, X64_R8, X64_R8, Int32(Offset))
+  else
+  begin
+    X64EmitMovRegImm64(ABuf, X64_RAX, Offset);
+    X64EmitAluRegReg(ABuf, $01, True, X64_R8, X64_RAX);
+  end;
+
+  if AIns.Op in [iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32] then
+  begin
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.Dest);
+    X64EmitStoreScalar(ABuf, X64_RAX, X64_R8, AccessSize);
+    Exit;
+  end;
+
+  SignedLoad := AIns.Op in [iroI32Load8S, iroI32Load16S,
+    iroI64Load8S, iroI64Load16S, iroI64Load32S];
+  X64EmitLoadScalar(ABuf, X64_RAX, X64_R8, AccessSize, SignedLoad,
+    AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S]);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
 procedure X64EmitLoadSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 begin
@@ -2936,6 +3126,7 @@ begin
     GX64HelperTable[aohReturnCallRef] := @X64ReturnCallRefHelper;
     GX64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
     GX64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
+    GX64HelperTable[aohResolveMemory] := @X64ResolveMemory;
     GX64HelperTableFilled := True;
   end;
   Result := @GX64HelperTable[aohTrapKind];
