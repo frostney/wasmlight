@@ -307,7 +307,7 @@ const
     template's byte layout, a pinned-register reassignment, the entry-ABI shape.
     Bump it whenever position-independent codegen changes in a way that would
     make an existing artifact's bytes wrong. }
-  AOT_ABI_REVISION = 3;
+  AOT_ABI_REVISION = 4;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on

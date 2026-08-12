@@ -356,6 +356,8 @@ var
   PlannedCode: TWasmIrCode;
   SkipPlanned: array of Boolean;
   UseStaticCache: Boolean;
+  UsePinnedMemory: Boolean;
+  PinnedMemoryIndex: UInt32;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -573,6 +575,38 @@ var
     AllocatedSlots[1] := UInt32(Second);
     UseStaticCache := True;
   end;
+
+  procedure AnalyzePinnedMemory;
+  var
+    K: Integer;
+    Index: UInt32;
+    Found, Multiple: Boolean;
+  begin
+    UsePinnedMemory := False;
+    PinnedMemoryIndex := 0;
+    Found := False;
+    Multiple := False;
+    for K := 0 to High(AFn^.Code) do
+      if AFn^.Code[K].Op in [
+        iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+        iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+        iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+        iroI64Load32S, iroI64Load32U,
+        iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+        iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+        iroI64Store32] then
+      begin
+        Index := AFn^.Code[K].B;
+        if not Found then
+        begin
+          Found := True;
+          PinnedMemoryIndex := Index;
+        end
+        else if Index <> PinnedMemoryIndex then
+          Multiple := True;
+      end;
+    UsePinnedMemory := Found and not Multiple;
+  end;
 begin
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
@@ -603,6 +637,7 @@ begin
       end;
 
     AnalyzeStaticCache;
+    AnalyzePinnedMemory;
     AnalyzeAdjacentMoves;
     AnalyzeFusion;
 
@@ -610,6 +645,8 @@ begin
     Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if UsePinnedMemory then
+      Arm64EmitPinMemory(Buf, PinnedMemoryIndex);
     Arm64InitRegCache(ArmCache);
     if UseStaticCache then
       Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
@@ -653,7 +690,8 @@ begin
           UInt32(I),
           (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
-            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), ArmCache);
+            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
+          UsePinnedMemory, ArmCache);
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
       if Fusion[I] >= 0 then
@@ -667,7 +705,8 @@ begin
           UInt32(I),
           (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
-            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64), X64Cache);
+            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
+          X64Cache);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an

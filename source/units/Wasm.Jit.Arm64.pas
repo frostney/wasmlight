@@ -135,6 +135,7 @@ const
   { --- position-independent pins (aot-spec §1.2/§1.3/§4.3) --------------- }
   ARM64_REG_IRBASE = 23;   { x23 = @Fn^.Code[0], the IR-code base (entry arg x2) }
   ARM64_REG_HELPERTABLE = 24;  { x24 = the per-process helper-table base }
+  ARM64_REG_MEMORY = 25;   { x25 = single static memory instance, when used }
   ARM64_REG_T0 = 9;        { x9/w9 scratch }
   ARM64_REG_T1 = 10;       { x10/w10 scratch }
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
@@ -395,6 +396,8 @@ procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
   compile path. AHelperTableOffset is WasmJitOffsets.StoreJitHelperTable. }
 procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
+procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32);
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
@@ -454,7 +457,7 @@ procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; const AAddr64: Boolean;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
   var ACache: TArm64RegCache): Boolean;
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
@@ -605,7 +608,7 @@ var
   Ctx: PWasmInterpContext;
   Instance: TWasmModuleInstance;
 begin
-  Ctx := InterpContextFor(AStore);
+  Ctx := PWasmInterpContext(AStore.TierContext);
   Instance := Ctx^.Acts[Ctx^.Depth - 1].Instance;
   Result := AStore.JitMemoryAt(Instance.MemAddrs[AMemoryIndex]);
 end;
@@ -623,7 +626,7 @@ begin
 end;
 
 procedure Arm64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAddr64: Boolean);
+  const AIns: TWasmIrInstr; const AAddr64, AUsePinnedMemory: Boolean);
 var
   Layout: TWasmMemoryInst;
   AccessSize: UInt32;
@@ -639,9 +642,14 @@ begin
     returns the live TWasmMemoryInst; generated code then applies that memory's
     statically selected strategy. The helper-table call keeps AOT bytes free of
     process addresses. }
-  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
-  Arm64EmitLoadImm32(ABuf, 1, AIns.B);
-  Arm64EmitCallHelper(ABuf, aohResolveMemory);       { x0 := memory instance }
+  if AUsePinnedMemory then
+    ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_MEMORY))
+  else
+  begin
+    ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+    Arm64EmitLoadImm32(ABuf, 1, AIns.B);
+    Arm64EmitCallHelper(ABuf, aohResolveMemory);     { x0 := memory instance }
+  end;
   Arm64EmitLdrX(ABuf, 14, 0, UInt32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
   Arm64EmitLdrX(ABuf, 15, 0,
     UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
@@ -727,14 +735,14 @@ end;
 
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; const AAddr64: Boolean;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
   var ACache: TArm64RegCache): Boolean;
 begin
   Result := True;
   if Arm64ScalarMemoryOp(AIns.Op) then
   begin
     Arm64InvalidateRegCache(ACache);
-    Arm64EmitScalarMemory(ABuf, AIns, AAddr64);
+    Arm64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
     Exit;
   end;
   case AIns.Op of
@@ -2985,6 +2993,7 @@ begin
   ABuf.EmitU32(Arm64StpX21X22Off16);           { stp x21,x22,[sp,#16] }
   ABuf.EmitU32(Arm64StpX23X24Off32);           { stp x23,x24,[sp,#32] }
   ABuf.EmitU32(Arm64StrX(ARM64_REG_LR, ARM64_REG_ZR, 48)); { str x30,[sp,#48] }
+  ABuf.EmitU32(Arm64StrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_REGFILE, 0));  { mov x19,x0 (regbase) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_STORE, 1));    { mov x20,x1 (store) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_IRBASE, 2));   { mov x23,x2 (IR base) }
@@ -3016,6 +3025,15 @@ begin
   Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_HELPERTABLE,
     UInt32(Ord(AHelper)) * 8);
   ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+end;
+
+procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32);
+begin
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  Arm64EmitLoadImm32(ABuf, 1, AMemoryIndex);
+  Arm64EmitCallHelper(ABuf, aohResolveMemory);
+  ABuf.EmitU32(Arm64MovReg(ARM64_REG_MEMORY, 0));
 end;
 
 procedure Arm64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
@@ -3068,6 +3086,7 @@ end;
 
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 begin
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
   ABuf.EmitU32(Arm64LdrX(ARM64_REG_LR, ARM64_REG_ZR, 48));  { ldr x30,[sp,#48] }
   ABuf.EmitU32(Arm64LdpX23X24Off32);           { ldp x23,x24,[sp,#32] }
   ABuf.EmitU32(Arm64LdpX21X22Off16);           { ldp x21,x22,[sp,#16] }
