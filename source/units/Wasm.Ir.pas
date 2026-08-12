@@ -2008,6 +2008,11 @@ type
       once, at the end of the function walk, by IrComputeRefRegBits. Both
       slots of a v128 are clear — see the frame-walk invariant above. }
     RefRegBits: TWasmIrBitset;
+    { Slot indices whose entry value must be zero: every declared
+      non-parameter local slot and every reference-typed register. Validation
+      precomputes this sparse list so recursive compiled entry does not scan or
+      clear definition-dominated numeric temporaries. }
+    EntryZeroRegs: TWasmIrAuxU32;
     AuxU32: TWasmIrAuxU32;
     AuxRefTypes: TWasmIrRefTypes;
     Handlers: TWasmIrHandlers;
@@ -2262,6 +2267,7 @@ function IrInstrIsSafepoint(const AInstr: TWasmIrInstr): Boolean;
 function IrOpMnemonic(const AOp: TWasmIrOp): string;
 
 procedure IrComputeRefRegBits(var AFn: TWasmIrFunction);
+procedure IrComputeEntryZeroRegs(var AFn: TWasmIrFunction);
 function IrRegIsRef(const AFn: TWasmIrFunction;
   const AReg: UInt32): Boolean;
 
@@ -2616,6 +2622,40 @@ begin
     if AFn.RegTypes[I].Kind = wvkRef then
       AFn.RefRegBits[I div 32] := AFn.RefRegBits[I div 32]
         or (UInt32(1) shl (I mod 32));
+end;
+
+procedure IrComputeEntryZeroRegs(var AFn: TWasmIrFunction);
+var
+  Count, I, Reg: Integer;
+
+  procedure Add(const AReg: UInt32);
+  begin
+    SetLength(AFn.EntryZeroRegs, Count + 1);
+    AFn.EntryZeroRegs[Count] := AReg;
+    Inc(Count);
+  end;
+
+begin
+  AFn.EntryZeroRegs := nil;
+  Count := 0;
+  I := Integer(AFn.ParamCount);
+  while I < Integer(AFn.ParamCount + AFn.LocalCount) do
+  begin
+    Reg := Integer(AFn.LocalRegs[I]);
+    case AFn.RegTypes[Reg].Kind of
+      wvkNum:
+        Add(UInt32(Reg));
+      wvkVec:
+        begin
+          Add(UInt32(Reg));
+          Add(UInt32(Reg + 1));
+        end;
+    end;
+    Inc(I);
+  end;
+  for I := 0 to High(AFn.RegTypes) do
+    if AFn.RegTypes[I].Kind = wvkRef then
+      Add(UInt32(I));
 end;
 
 function IrRegIsRef(const AFn: TWasmIrFunction;

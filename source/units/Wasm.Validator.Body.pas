@@ -4841,6 +4841,7 @@ begin
   FFn.SourceOffset := AEntry.Body.Offset;
   FFn.Code := nil;
   FFn.AuxU32 := nil;
+  FFn.EntryZeroRegs := nil;
   FFn.AuxRefTypes := nil;
   FFn.Handlers := nil;
   FFn.HandlerClauses := nil;
@@ -5060,6 +5061,7 @@ begin
   IrTrimAux(FFn.AuxU32, FAuxCount);
   FFn.RegisterCount := UInt32(FRegCount);
   IrComputeRefRegBits(FFn);
+  IrComputeEntryZeroRegs(FFn);
 
   { Nothing below relies on it, but a broken walk is much easier to find
     from here than from a tier: the invariant is one trailing iroReturn. }

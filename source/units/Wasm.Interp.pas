@@ -9,7 +9,7 @@
   recursion per wasm call — so a self-tail-recursive loop of a million
   iterations runs in bounded stack (return_call REPLACES the top frame in
   place, O(1)). Every frame is a TWasmGcFrame on Heap's chain: its register
-  file is zeroed at entry (GC-1), the frame is pushed before the IP-0
+  file's default locals and reference slots are zeroed at entry (GC-1), the frame is pushed before the IP-0
   safepoint, and a tail replacement is a PopFrame/PushFrame with zero
   intervening allocation so it never spans a safepoint (GC-1 obligation 3).
 
@@ -3119,6 +3119,7 @@ var
   Fn: PWasmIrFunction;
   Entry: PWasmActivation;
   Slots: PWasmValue;
+  I: Integer;
 begin
   Inst := AStore.Funcs[AFuncAddr].Instance;
   Fn := @Inst.Ir.Functions[AStore.Funcs[AFuncAddr].FuncIrIndex];
@@ -3136,10 +3137,17 @@ begin
   Entry^.IP := 0;
   ACtx^.ValueTop := Entry^.Base + Fn^.RegisterCount;
 
-  { GC-1: zero the whole register file — an unwritten ref slot reads null,
-    numeric locals default 0. }
+  { GC-1: default locals and every reference slot are zero before publication.
+    Validated numeric temporaries are definition-dominated and need no entry
+    value. Validation precomputes the sparse slot list so a numeric function
+    without declared locals (recursive fib) takes only the empty-loop check. }
   Slots := Frame(ACtx^.Values, Entry^.Base);
-  ValueZeroSlots(Slots, Fn^.RegisterCount);
+  I := 0;
+  while I < Length(Fn^.EntryZeroRegs) do
+  begin
+    Slots[Fn^.EntryZeroRegs[I]].Bits := 0;
+    Inc(I);
+  end;
 
   { Marshal AParams into the padded param registers. SEAM (simd-spec §1.6):
     AParams is a FLAT slot array in which a v128 param occupies TWO
