@@ -96,6 +96,7 @@ begin
     X64EmitVecBinary(Buf, $DB, 0, 1);
     X64EmitVecDup(Buf, 0, X64_RAX, 1);
     X64EmitVecExtract(Buf, X64_RAX, 0, 0, 15, True);
+    X64EmitVecExtract(Buf, X64_RAX, 0, 1, 7, False);
     X64EmitStoreVec(Buf, 0, 4);
     CheckSeq(Buf, [$48, $99, $48, $F7, $F9,
       $66, $0F, $6E, $C0,
@@ -110,6 +111,8 @@ begin
       $66, $0F, $70, $C0, $00,
       $66, $0F, $73, $D8, $0F, $66, $0F, $7E, $C0,
       $0F, $BE, $C0,
+      $66, $0F, $73, $D8, $0E, $66, $0F, $7E, $C0,
+      $0F, $B7, $C0,
       $F3, $0F, $7F, $43, $20]);
   finally
     Buf.Free;

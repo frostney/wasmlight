@@ -2474,8 +2474,20 @@ begin
   ABuf.EmitByte($0F);
   ABuf.EmitByte($7E);              { MOVD/MOVQ r32/r64, xmm }
   EmitModRMReg(ABuf, AXmm, AReg);
-  if ASigned and (ASize < 2) then
-    X64EmitSignExtendRax(ABuf, 8 shl ASize, False);
+  if ASize < 2 then
+  begin
+    if ASigned then
+      X64EmitSignExtendRax(ABuf, 8 shl ASize, False)
+    else
+    begin
+      ABuf.EmitByte($0F);
+      if ASize = 0 then
+        ABuf.EmitByte($B6)         { MOVZX eax,al }
+      else
+        ABuf.EmitByte($B7);        { MOVZX eax,ax }
+      ABuf.EmitByte($C0);
+    end;
+  end;
 end;
 
 procedure X64EmitAluRegReg(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
