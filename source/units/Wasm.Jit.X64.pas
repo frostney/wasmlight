@@ -307,6 +307,11 @@ procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer);
   right after the prologue; the exec-only encoder tests skip it. }
 procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
+{ Resolve a single function memory once and keep its stable instance pointer in
+  the prologue's otherwise-unused alignment slot at [rsp]. Scalar accesses
+  still reload live Base/ByteSize fields, so memory.grow semantics are unchanged. }
+procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32);
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer);
@@ -347,7 +352,7 @@ procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; const AAddr64: Boolean;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
   var ACache: TX64RegCache): Boolean;
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
@@ -377,7 +382,8 @@ uses
   Wasm.Runtime.Traps;
 
 procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAddr64: Boolean); forward;
+  const AIns: TWasmIrInstr; const AAddr64,
+  AUsePinnedMemory: Boolean); forward;
 
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
@@ -385,6 +391,9 @@ procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ASrc: Byte; const ASlot: UInt32); forward;
 procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
+  var ACache: TX64RegCache); forward;
+procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
   var ACache: TX64RegCache); forward;
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
@@ -472,14 +481,14 @@ end;
 
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32; const AAddr64: Boolean;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
   var ACache: TX64RegCache): Boolean;
 begin
   Result := True;
   if X64ScalarMemoryOp(AIns.Op) then
   begin
     X64InvalidateRegCache(ACache);
-    X64EmitScalarMemory(ABuf, AIns, AAddr64);
+    X64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
     Exit;
   end;
   case AIns.Op of
@@ -555,12 +564,20 @@ begin
     iroI32And: X64CachedAlu(ABuf, AIns, $21, False, False, ACache);
     iroI32Or: X64CachedAlu(ABuf, AIns, $09, False, False, ACache);
     iroI32Xor: X64CachedAlu(ABuf, AIns, $31, False, False, ACache);
+    iroI32Shl: X64CachedShift(ABuf, AIns, 4, False, ACache);
+    iroI32ShrS: X64CachedShift(ABuf, AIns, 7, False, ACache);
+    iroI32ShrU: X64CachedShift(ABuf, AIns, 5, False, ACache);
+    iroI32Rotr: X64CachedShift(ABuf, AIns, 1, False, ACache);
     iroI64Add: X64CachedAlu(ABuf, AIns, $01, True, False, ACache);
     iroI64Sub: X64CachedAlu(ABuf, AIns, $29, True, False, ACache);
     iroI64Mul: X64CachedAlu(ABuf, AIns, 0, True, True, ACache);
     iroI64And: X64CachedAlu(ABuf, AIns, $21, True, False, ACache);
     iroI64Or: X64CachedAlu(ABuf, AIns, $09, True, False, ACache);
     iroI64Xor: X64CachedAlu(ABuf, AIns, $31, True, False, ACache);
+    iroI64Shl: X64CachedShift(ABuf, AIns, 4, True, ACache);
+    iroI64ShrS: X64CachedShift(ABuf, AIns, 7, True, ACache);
+    iroI64ShrU: X64CachedShift(ABuf, AIns, 5, True, ACache);
+    iroI64Rotr: X64CachedShift(ABuf, AIns, 1, True, ACache);
   else
     X64InvalidateRegCache(ACache);
     Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
@@ -712,6 +729,16 @@ begin
     X64EmitImul(ABuf, AWide, X64_RAX, X64_RCX)
   else
     X64EmitAluRegReg(ABuf, AOpcode, AWide, X64_RAX, X64_RCX);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
+procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  X64EmitShiftCl(ABuf, ASubop, AWide, X64_RAX);
   X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
 end;
 
@@ -2302,7 +2329,7 @@ begin
 end;
 
 procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAddr64: Boolean);
+  const AIns: TWasmIrInstr; const AAddr64, AUsePinnedMemory: Boolean);
 var
   Layout: TWasmMemoryInst;
   AccessSize: UInt32;
@@ -2314,9 +2341,14 @@ begin
   Offset := UInt64(AIns.Imm);
   Folded := Offset <= WASM_STATIC_OFFSET_FOLD - AccessSize;
 
-  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
-  X64EmitMovRegImm32(ABuf, X64_ARG1, AIns.B);
-  X64EmitCallHelper(ABuf, aohResolveMemory);           { rax := memory instance }
+  if AUsePinnedMemory then
+    X64EmitLoadMem64(ABuf, X64_RAX, X64_RSP, 0)
+  else
+  begin
+    X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+    X64EmitMovRegImm32(ABuf, X64_ARG1, AIns.B);
+    X64EmitCallHelper(ABuf, aohResolveMemory);         { rax := memory instance }
+  end;
   X64EmitLoadMem64(ABuf, X64_R8, X64_RAX,
     Int32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
   X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX,
@@ -2798,6 +2830,15 @@ begin
     and held callee-saved so every helper call is `call [r15 + k*8]`. }
   X64EmitLoadMem64(ABuf, X64_REG_HELPERTABLE, X64_REG_STORE,
     Int32(AHelperTableOffset));
+end;
+
+procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
+  const AMemoryIndex: UInt32);
+begin
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitMovRegImm32(ABuf, X64_ARG1, AMemoryIndex);
+  X64EmitCallHelper(ABuf, aohResolveMemory);
+  X64EmitStoreMem64(ABuf, X64_RAX, X64_RSP, 0);
 end;
 
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;

@@ -703,6 +703,8 @@ begin
     X64EmitPrologue(Buf);
     X64EmitPinHelperTable(Buf, AHelperTableOffset);
     X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if UsePinnedMemory then
+      X64EmitPinMemory(Buf, PinnedMemoryIndex);
     X64InitRegCache(X64Cache);
     if UseStaticCache then
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
@@ -754,6 +756,7 @@ begin
           (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
+          UsePinnedMemory,
           X64Cache);
       {$ENDIF}
       if not Emitted then

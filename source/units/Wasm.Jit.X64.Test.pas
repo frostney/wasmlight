@@ -63,6 +63,7 @@ type
     procedure TestPredicateCoversWaves;
     procedure TestPredicateDeclinesEh;
     procedure TestCallArityFence;
+    procedure TestStaticCacheKeepsShiftResult;
 
     procedure TestExecPlaceholder;
   end;
@@ -511,6 +512,18 @@ begin
     Buf.Free;
   end;
 
+  { PinMemory: resolve memory 7 through the helper table, then retain the
+    stable instance pointer in the existing [rsp] alignment slot. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPinMemory(Buf, 7);
+    CheckSeq(Buf, [$4C, $89, $E7, $BE, $07, $00, $00, $00,
+      $41, $FF, $57, Byte(Ord(aohResolveMemory) * 8),
+      $48, $89, $04, $24]);
+  finally
+    Buf.Free;
+  end;
+
   { CallHelper: call qword [r15 + k*8] — the code holds only the slot index k.
     k = Ord(aohRtDispatch) = 3, disp = 24: 41 FF 57 18. }
   Buf := TWasmCodeBuffer.Create;
@@ -527,6 +540,36 @@ begin
   try
     X64EmitIrInsPtr(Buf, X64_ARG2, 1);
     CheckSeq(Buf, [$48, $8D, $55, Byte(SizeOf(TWasmIrInstr))]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestStaticCacheKeepsShiftResult;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  I: Integer;
+  Found: Boolean;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux,
+      0, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
+      1, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Shl, 4, 2, 3, 0), Aux,
+      2, False, False, Cache)).ToBe(True);
+    Found := False;
+    for I := 0 to High(Cache.Entries) do
+      Found := Found or (Cache.Entries[I].Valid and
+        (Cache.Entries[I].Slot = 4));
+    Expect<Boolean>(Found).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -623,6 +666,8 @@ begin
     TestPredicateCoversWaves);
   Test('predicate declines exception-handling ops', TestPredicateDeclinesEh);
   Test('the call-site arity fence admits a zero-slot call', TestCallArityFence);
+  Test('static allocation keeps a shifted expression result',
+    TestStaticCacheKeepsShiftResult);
   Test('executable proof is gated to a real x86-64 host', TestExecPlaceholder);
 end;
 
