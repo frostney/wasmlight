@@ -112,15 +112,16 @@ type
     Slot: UInt32;
   end;
 
-  { Compile-time state for two value caches. The normal mode is the original
+  { Compile-time state for value caches. The normal mode is the original
     clean, write-through block cache. Numeric loop functions may instead use a
-    function-wide static allocation: a slot owns x12/x13 on every control-flow
+    function-wide static allocation: a slot owns x12/x13/x26 on every control-flow
     edge, dirty values are written back only where the logical frame must be
     canonical, and a join needs no moves because all predecessors agree on the
     same slot-to-register map. }
   TArm64RegCache = record
-    Entries: array[0..5] of TArm64RegCacheEntry;
+    Entries: array[0..6] of TArm64RegCacheEntry;
     Next: Byte;
+    StaticCount: Byte;
     StaticAllocation: Boolean;
   end;
 
@@ -145,6 +146,7 @@ const
   ARM64_REG_CACHE3 = 15;   { dynamic cache beside a static allocation }
   ARM64_REG_CACHE4 = 16;   { dynamic cache beside a static allocation }
   ARM64_REG_CACHE5 = 17;   { dynamic cache beside a static allocation }
+  ARM64_REG_CACHE_STATIC2 = 26; { optional third function-wide allocation }
   ARM64_REG_LR = 30;       { x30, the link register }
   ARM64_REG_ZR = 31;       { in data-processing, 31 encodes the zero register }
   { The SAME encoding 31 means SP in load/store (unsigned offset) and in the
@@ -396,6 +398,7 @@ procedure Arm64EmitLoadImm64(const ABuf: TWasmCodeBuffer; const ARd: Byte;
   offset; ASnapshotOffset is Store.EpochSnapshot's. Arm64EmitEpilogue restores
   the set and returns (iroReturn emits it). }
 procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
+procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer);
 { Pin the per-process helper-table base in x24 (aot-spec §1.2/§4.3): loads it
   from the store field (x20 + AHelperTableOffset) ONCE, so every subsequent
   helper call is `ldr xT,[x24,#k*8]; blr xT`. Emitted by the driver right after
@@ -409,6 +412,7 @@ procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
+procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
 
 { Emit an indirect call to helper slot AHelper through the pinned helper table:
   `ldr x9,[x24,#Ord(AHelper)*8]; blr x9` (aot-spec §1.2). Position-independent —
@@ -466,7 +470,7 @@ procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
-  AUsePinnedMemoryBase: Boolean;
+  AUsePinnedMemoryBase, AExtendedFrame: Boolean;
   var ACache: TArm64RegCache): Boolean;
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
@@ -789,7 +793,7 @@ end;
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
-  AUsePinnedMemoryBase: Boolean;
+  AUsePinnedMemoryBase, AExtendedFrame: Boolean;
   var ACache: TArm64RegCache): Boolean;
 begin
   Result := True;
@@ -840,9 +844,17 @@ begin
           still flush the canonical logical frame below. }
         Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
-    iroReturn, iroUnreachable:
+    iroReturn:
       begin
         { Results and every observable exit are read from the logical frame. }
+        Arm64FlushRegCache(ABuf, ACache);
+        if AExtendedFrame then
+          Arm64EmitEpilogueExtended(ABuf)
+        else
+          Arm64EmitEpilogue(ABuf);
+      end;
+    iroUnreachable:
+      begin
         Arm64FlushRegCache(ABuf, ACache);
         Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
@@ -3082,6 +3094,15 @@ begin
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_IRBASE, 2));   { mov x23,x2 (IR base) }
 end;
 
+procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer);
+begin
+  { Reserve one aligned callee-saved slot above the established 64-byte frame.
+    Only functions with a measured-useful third static allocation pay this. }
+  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+  Arm64EmitPrologue(ABuf);
+  ABuf.EmitU32(Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_ZR, 64));
+end;
+
 procedure Arm64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
 begin
@@ -3183,6 +3204,18 @@ begin
   ABuf.EmitU32(Arm64Ret);
 end;
 
+procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
+begin
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_ZR, 64));
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
+  ABuf.EmitU32(Arm64LdrX(ARM64_REG_LR, ARM64_REG_ZR, 48));
+  ABuf.EmitU32(Arm64LdpX23X24Off32);
+  ABuf.EmitU32(Arm64LdpX21X22Off16);
+  ABuf.EmitU32(Arm64LdpX19X20PostIndex64);
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+  ABuf.EmitU32(Arm64Ret);
+end;
+
 procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
 var
   I: Integer;
@@ -3254,9 +3287,10 @@ begin
   case AIndex of
     0: Result := ARM64_REG_CACHE0;
     1: Result := ARM64_REG_CACHE1;
-    2: Result := ARM64_REG_CACHE2;
-    3: Result := ARM64_REG_CACHE3;
-    4: Result := ARM64_REG_CACHE4;
+    2: Result := ARM64_REG_CACHE_STATIC2;
+    3: Result := ARM64_REG_CACHE2;
+    4: Result := ARM64_REG_CACHE3;
+    5: Result := ARM64_REG_CACHE4;
   else Result := ARM64_REG_CACHE5;
   end;
 end;
@@ -3273,12 +3307,13 @@ var
 begin
   Arm64InitRegCache(ACache);
   ACache.StaticAllocation := True;
-  for I := 0 to 1 do
-    if I <= High(ASlots) then
+  for I := 0 to High(ASlots) do
+    if ASlots[I] <> High(UInt32) then
     begin
-      ACache.Entries[I].Valid := True;
-      ACache.Entries[I].Slot := ASlots[I];
-      LdX(ABuf, Arm64CacheHostReg(I), ASlots[I]);
+      ACache.Entries[ACache.StaticCount].Valid := True;
+      ACache.Entries[ACache.StaticCount].Slot := ASlots[I];
+      LdX(ABuf, Arm64CacheHostReg(ACache.StaticCount), ASlots[I]);
+      Inc(ACache.StaticCount);
     end;
 end;
 
@@ -3293,19 +3328,19 @@ begin
     not use compile-time dirty state: a forward branch may skip a writeback
     that the linear emitter visited, so path-independent stores are the safe
     reconciliation for all predecessors. }
-  for I := 0 to 1 do
+  for I := 0 to ACache.StaticCount - 1 do
     if ACache.Entries[I].Valid then
       StX(ABuf, Arm64CacheHostReg(I), ACache.Entries[I].Slot);
 end;
 
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
+var
+  I: Integer;
 begin
   if ACache.StaticAllocation then
   begin
-    ACache.Entries[2].Valid := False;
-    ACache.Entries[3].Valid := False;
-    ACache.Entries[4].Valid := False;
-    ACache.Entries[5].Valid := False;
+    for I := 3 to High(ACache.Entries) do
+      ACache.Entries[I].Valid := False;
     ACache.Next := 0;
     Exit;
   end;
@@ -3330,7 +3365,7 @@ begin
     end;
   if ACache.StaticAllocation then
   begin
-    Victim := 2 + ACache.Next;
+    Victim := 3 + ACache.Next;
     ACache.Next := Byte((ACache.Next + 1) and 3);
   end
   else
@@ -3358,19 +3393,19 @@ begin
       Victim := I;
   if ACache.StaticAllocation then
   begin
-    if (Victim >= 0) and (Victim <= 1) then
+    if (Victim >= 0) and (Victim < ACache.StaticCount) then
     begin
       Host := Arm64CacheHostReg(Victim);
       if ASrc <> Host then
         ABuf.EmitU32(Arm64MovReg(Host, ASrc));
       Exit;
     end;
-    { Unallocated expression values retain the old write-through cache in
-      x14/x15, so the static locals do not evict producer/consumer temporaries. }
+    { Unallocated expression values retain the write-through cache in
+      x14..x17, so static locals do not evict producer/consumer temporaries. }
     StX(ABuf, ASrc, ASlot);
-    if Victim < 2 then
+    if Victim < ACache.StaticCount then
     begin
-      Victim := 2 + ACache.Next;
+      Victim := 3 + ACache.Next;
       ACache.Next := Byte((ACache.Next + 1) and 3);
     end;
     Host := Arm64CacheHostReg(Victim);

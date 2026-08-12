@@ -350,12 +350,13 @@ var
   Emitted: Boolean;
   Targets: array of Boolean;
   TargetCount: UInt32;
-  AllocatedSlots: array[0..1] of UInt32;
+  AllocatedSlots: array[0..2] of UInt32;
   SlotScores: array of UInt32;
   Fusion: array of Integer;
   PlannedCode: TWasmIrCode;
   SkipPlanned: array of Boolean;
   UseStaticCache: Boolean;
+  UseThirdStatic: Boolean;
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
@@ -555,10 +556,11 @@ var
 
   procedure AnalyzeStaticCache;
   var
-    K, Best, Second: Integer;
+    K, Best, Second, Third: Integer;
     HasBackEdge, Eligible: Boolean;
   begin
     UseStaticCache := False;
+    AllocatedSlots[2] := High(UInt32);
     if AFn^.RegisterCount = 0 then
       Exit;
     SetLength(SlotScores, AFn^.RegisterCount);
@@ -577,14 +579,21 @@ var
 
     Best := -1;
     Second := -1;
+    Third := -1;
     for K := 0 to High(SlotScores) do
       if (Best < 0) or (SlotScores[K] > SlotScores[Best]) then
       begin
+        Third := Second;
         Second := Best;
         Best := K;
       end
       else if (Second < 0) or (SlotScores[K] > SlotScores[Second]) then
+      begin
+        Third := Second;
         Second := K;
+      end
+      else if (Third < 0) or (SlotScores[K] > SlotScores[Third]) then
+        Third := K;
     { Loading and preserving a one-use expression register costs more than the
       old write-through cache. Require both physical registers to serve slots
       that occur repeatedly in the loop-shaped function. }
@@ -593,6 +602,10 @@ var
       Exit;
     AllocatedSlots[0] := UInt32(Best);
     AllocatedSlots[1] := UInt32(Second);
+    if (Third >= 0) and (SlotScores[Third] >= 3) then
+      AllocatedSlots[2] := UInt32(Third)
+    else
+      AllocatedSlots[2] := High(UInt32);
     UseStaticCache := True;
   end;
 
@@ -686,11 +699,16 @@ begin
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
+    UseThirdStatic := UseStaticCache and
+      (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
     AnalyzeFusion;
 
     {$IFDEF WASM_JIT_ARM64}
-    Arm64EmitPrologue(Buf);
+    if UseThirdStatic then
+      Arm64EmitPrologueExtended(Buf)
+    else
+      Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     if UsePinnedMemory then
@@ -741,7 +759,7 @@ begin
           (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
-          UsePinnedMemory, UsePinnedMemoryBase, ArmCache);
+          UsePinnedMemory, UsePinnedMemoryBase, UseThirdStatic, ArmCache);
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
       if Fusion[I] >= 0 then

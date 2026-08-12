@@ -58,6 +58,8 @@ type
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
     procedure TestStaticCacheKeepsShiftResult;
+    procedure TestThirdStaticAllocation;
+    procedure TestExtendedFrameWords;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -77,6 +79,9 @@ begin
   Result.B := AB;
   Result.Imm := 0;
 end;
+
+function EmittedWord(const ABuf: TWasmCodeBuffer;
+  const AIndex: Integer): UInt32; forward;
 
 { --- portable bit assertions -------------------------------------------- }
 
@@ -194,11 +199,11 @@ begin
     for I := 0 to 3 do
       Expect<Boolean>(Arm64EmitOpCached(Buf,
         MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
-        UInt32(I), False, False, False, Cache)).ToBe(True);
+        UInt32(I), False, False, False, False, Cache)).ToBe(True);
     for I := 0 to 3 do
     begin
-      Expect<Boolean>(Cache.Entries[I + 2].Valid).ToBe(True);
-      Expect<UInt32>(Cache.Entries[I + 2].Slot).ToBe(UInt32(I + 2));
+      Expect<Boolean>(Cache.Entries[I + 3].Valid).ToBe(True);
+      Expect<UInt32>(Cache.Entries[I + 3].Slot).ToBe(UInt32(I + 2));
     end;
   finally
     Buf.Free;
@@ -218,18 +223,64 @@ begin
     Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
     Expect<Boolean>(Arm64EmitOpCached(Buf,
       MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux,
-      0, False, False, False, Cache)).ToBe(True);
+      0, False, False, False, False, Cache)).ToBe(True);
     Expect<Boolean>(Arm64EmitOpCached(Buf,
       MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
-      1, False, False, False, Cache)).ToBe(True);
+      1, False, False, False, False, Cache)).ToBe(True);
     Expect<Boolean>(Arm64EmitOpCached(Buf,
       MakeIrInstr(iroI32Shl, 4, 2, 3, 0), Aux,
-      2, False, False, False, Cache)).ToBe(True);
+      2, False, False, False, False, Cache)).ToBe(True);
     Found := False;
     for I := 0 to High(Cache.Entries) do
       Found := Found or (Cache.Entries[I].Valid and
         (Cache.Entries[I].Slot = 4));
     Expect<Boolean>(Found).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestThirdStaticAllocation;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [3, 5, 7]);
+    Expect<Byte>(Cache.StaticCount).ToBe(3);
+    Expect<Boolean>(Cache.Entries[2].Valid).ToBe(True);
+    Expect<UInt32>(Cache.Entries[2].Slot).ToBe(7);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestExtendedFrameWords;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitPrologueExtended(Buf);
+    Expect<Integer>(Buf.Size).ToBe(10 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
+      Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+    Expect<UInt32>(EmittedWord(Buf, 9)).ToBe(
+      Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
+  finally
+    Buf.Free;
+  end;
+
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitEpilogueExtended(Buf);
+    Expect<Integer>(Buf.Size).ToBe(8 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
+      Arm64LdrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
+    Expect<UInt32>(EmittedWord(Buf, 6)).ToBe(
+      Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
+    Expect<UInt32>(EmittedWord(Buf, 7)).ToBe(Arm64Ret);
   finally
     Buf.Free;
   end;
@@ -639,6 +690,10 @@ begin
     TestStaticCacheKeepsFourTemporaries);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
+  Test('static allocation can retain a third long-lived slot',
+    TestThirdStaticAllocation);
+  Test('the extended frame preserves its third static register',
+    TestExtendedFrameWords);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);
