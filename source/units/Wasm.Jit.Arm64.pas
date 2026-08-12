@@ -773,11 +773,12 @@ begin
       end;
     iroJump:
       begin
-        { A flagged back-edge is both an epoch check and a GC safepoint. Keep
-          the logical frame canonical there, but retain the function-wide
-          mapping so the target can reuse the values without reloading. }
-        if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
-          Arm64FlushRegCache(ABuf, ACache);
+        { Static allocation is enabled only for helper-free numeric functions.
+          Their flagged back-edge performs an epoch comparison and either
+          falls through or invokes a non-returning trap helper. No GC can run
+          on the one-thread-per-store fallthrough, and none of the allocated
+          slots is a reference. Keep numeric values in registers here; exits
+          still flush the canonical logical frame below. }
         Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
     iroReturn, iroUnreachable:

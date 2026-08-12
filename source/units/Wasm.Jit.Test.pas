@@ -66,6 +66,7 @@ uses
   Wasm.Module,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
+  Wasm.Runtime.Traps,
   Wasm.Runtime.Values,
   Wasm.Validator;
 
@@ -2077,6 +2078,19 @@ procedure TJitTests.TestEpochInterruptDifferential;
           Result.Trapped := True;
           Result.Msg := E.Message;
         end;
+      end;
+      { The leaf is a helper-free integer loop, so its instruction set and
+        back-edge make it eligible for the function-wide static register
+        cache. An epoch mismatch must still unwind past that cached frame and
+        leave no stale trampoline or GC frame. A fresh outermost invocation on
+        the same store re-captures the now-current epoch and must complete. }
+      Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+      Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
+      if Result.Trapped then
+      begin
+        InterpInvoke(Store, LeafAddr, nil, nil);
+        Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+        Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
       end;
     finally
       FreeAndNil(Jit);

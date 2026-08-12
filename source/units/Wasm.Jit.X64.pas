@@ -510,10 +510,10 @@ begin
       end;
     iroJump:
       begin
-        { Safepoint back-edges expose the logical frame to the runtime. Flush
-          dirty allocated values but retain their fixed register mapping. }
-        if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
-          X64FlushRegCache(ABuf, ACache);
+        { Static allocation is restricted to helper-free numeric functions.
+          The epoch-only back-edge cannot collect on its fallthrough and the
+          mismatch path traps without returning, so numeric slots need no
+          canonical writeback here. Observable exits still flush below. }
         Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
     iroReturn, iroUnreachable:
