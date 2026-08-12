@@ -1,7 +1,7 @@
 # Handoff
 
-Updated: 2026-08-12 (main CI repaired locally; tier benchmark corrected and
-validated; branch `codex/fix-tests-tier-performance`, changes uncommitted)
+Updated: 2026-08-12 (main CI repair committed and pushed as `c0b604a` on
+`codex/fix-tests-tier-performance`; Wasmtime comparison refreshed afterward)
 
 ## 2026-08-12 repair status
 
@@ -32,7 +32,20 @@ validated; branch `codex/fix-tests-tier-performance`, changes uncommitted)
   direct build links; exact local three-tier corpus identity passes; frozen
   install, formatting, YAML parsing and diff whitespace checks pass. The broad
   markdown lint still reports the repository's existing 100 issues in nine
-  `.agent` design/handoff files. Push/open CI only if requested.
+  `.agent` design/handoff files. The branch is pushed; no PR has been opened.
+- **Current Wasmtime comparison:** Apple Silicon/macOS, wasmlight `c0b604a`
+  release build, Wasmtime 47.0.3 at its default opt-level 2, one warmup per
+  command. The tier-verified 300M i32 mul-add loop (five wasmlight samples,
+  fifteen Wasmtime samples) has medians: wasmlight interp 4315ms, JIT 1132ms,
+  AOT 1119ms; Wasmtime JIT 85.24ms and precompiled 85.20ms. Wasmtime is 13.1x
+  faster than wasmlight's compiled tiers there. Recursive fib(35), measured as
+  end-to-end CLI commands, is wasmlight interp 1122ms, AOT 1044ms, Wasmtime JIT
+  36.43ms, precompiled 36.82ms: a 28.3x compiled-tier gap. No-op command startup
+  medians over 50 samples are wasmlight interp 2.85ms/AOT 2.83ms versus Wasmtime
+  JIT 4.88ms/precompiled 4.74ms, so wasmlight is about 1.7x faster on trivial
+  startup. The loop points at memory-register-file traffic; the much larger
+  recursive gap points at the per-call Pascal helper/seam. These are workload
+  measurements, not CI assertions or a general benchmark-suite claim.
 
 ## Post-roadmap follow-ups (this session)
 
