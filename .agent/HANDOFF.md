@@ -1,7 +1,53 @@
 # Handoff
 
-Updated: 2026-08-12 (fourth measured optimization wave integrated and
+Updated: 2026-08-12 (fifth measured optimization wave integrated and
 cross-architecture/cross-tier validated)
+
+## 2026-08-12 fifth measured optimization wave complete
+
+- **Two measured commits are integrated on
+  `codex/fix-tests-tier-performance`:** `e0bbd66` lets FPC inline the GC frame
+  chain's leaf push/pop operations; `02f2f7f` optionally retains a third hot
+  loop value in callee-saved `x26` on aarch64. Only functions whose third slot
+  scores at least three uses take the extended frame and its save/restore;
+  every other function retains the established 64-byte frame.
+- **Serialized Apple Silicon A/B, seven release samples in both orders:** the
+  300M varying-address scalar-memory loop moved from JIT/AOT 606/602ms to
+  560/561ms, and reverse-order confirmation moved from 595/593ms to 558/557ms
+  (about 6-8% faster). Recursive fib(35) JIT moved from 385ms to 373ms in the
+  forward run and 376ms to 368ms in reverse; AOT overlapped noise at
+  369-374ms versus 370-371ms. The material acceptance target is the memory
+  loop. Guards were flat: the 300M integer loop 327/326ms to 325/325ms,
+  constant-address memory 47/47ms, numeric 44-45ms, SIMD 136-137ms, and
+  startup 7/9ms.
+- **Rejected experiments were fully reverted:** four static long-lived slots
+  displaced the expression cache and nearly doubled loop time; direct
+  destination emission lost most of the smaller four-temporary gain; an
+  unconditional `x26` save/restore regressed fib by about 5%; fused epoch
+  branching and a third x86-64 static register were throughput-neutral; a
+  scalar direct-call specialization regressed fib by 2-3%.
+- **Safety boundaries:** `x26` is saved only by generated functions that use
+  it and restored on their normal return; existing epoch/trap unwind remains
+  non-returning. Static-cache eligibility is still the helper/call/reference/
+  allocation-free allowlist, and exits still flush the canonical logical
+  frame. The external generated-code ABI and artifact format are unchanged;
+  old `.waot` code never uses `x26` and remains valid. Tests pin the third-slot
+  mapping and exact extended prologue/epilogue words.
+- **Correctness is exact on both architectures:** frozen install, formatting,
+  release build, and all 44 unit suites pass. The complete interpreter/JIT/AOT
+  corpus is tier-identical on macOS and Linux: pass=65204, fail=389,
+  skip=1532, staged=0, errors=0; JIT/AOT compiled=8588 on aarch64 and 8589 on
+  x86-64. The shared GC-inline change is neutral within noise on the Rosetta
+  x86-64 host; the register change is aarch64-only.
+- **Refreshed Wasmtime 47.0.3 comparison:** both runtimes execute identical
+  precompiled command modules, one warmup discarded, seven samples. A fixture
+  that exported only `run` was rejected because invoking it as a command could
+  measure a no-op; the replacement exports memory and `_start`. On macOS, the
+  300M varying-address loop is Wasmlight AOT 564.054ms versus Wasmtime
+  94.163ms (5.99x), and fib(40) is 4.125s versus 348.578ms (11.83x). In the
+  Rosetta Linux VM, 50M varying accesses are 810ms versus 224ms (3.62x), and
+  fib(40) is 36.033s versus 3.699s (9.74x); Linux absolute timings describe
+  the VM, not native x86-64 hardware.
 
 ## 2026-08-12 fourth measured optimization wave complete
 
