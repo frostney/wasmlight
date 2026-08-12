@@ -39,13 +39,14 @@ const
   DEFAULT_FIB_INPUT = 35;
   DEFAULT_MEMORY_ITERATIONS = 10000000;
   DEFAULT_NUMERIC_ITERATIONS = 1000000;
+  DEFAULT_SIMD_ITERATIONS = 1000000;
   DEFAULT_SAMPLES = 1;
 
 type
   TExecutionTier = (etInterp, etJit, etAot);
   TExecutionTiers = set of TExecutionTier;
   TBenchmarkWorkload = (bwDecode, bwLeb128, bwStartup, bwLoop, bwFib,
-    bwMemory, bwNumeric);
+    bwMemory, bwNumeric, bwSimd);
   TBenchmarkWorkloads = set of TBenchmarkWorkload;
   TInt64Samples = array of Int64;
 
@@ -613,6 +614,50 @@ const
     '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
     '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
     '    (local.get $acc)))';
+  BENCH_SIMD_WAT =
+    '(module' + sLineBreak +
+    '  (func (export "run") (param $n i32) (result i64)' + sLineBreak +
+    '    (local $i i32) (local $v v128) (local $mask v128)' + sLineBreak +
+    '    (local $zero v128) (local $ones v128)' + sLineBreak +
+    '    (local.set $v (i64x2.splat (i64.const 0)))' + sLineBreak +
+    '    (local.set $mask' + sLineBreak +
+    '      (v128.const i64x2 81985529216486895 -81985529216486896))' +
+    sLineBreak +
+    '    (local.set $zero (v128.const i64x2 0 0))' + sLineBreak +
+    '    (local.set $ones (v128.const i64x2 -1 -1))' + sLineBreak +
+    '    (loop $l' + sLineBreak +
+    '      (local.set $v (v128.not (v128.not (local.get $v))))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (v128.xor (v128.xor (local.get $v) (local.get $mask))' +
+    '          (local.get $mask)))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (v128.and' + sLineBreak +
+    '          (v128.or (local.get $v) (local.get $zero))' + sLineBreak +
+    '          (local.get $ones)))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (v128.andnot (local.get $v) (local.get $zero)))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (i8x16.sub' + sLineBreak +
+    '          (i8x16.add (local.get $v) (i8x16.splat (local.get $i)))' +
+    '          (i8x16.splat (local.get $i))))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (i16x8.sub' + sLineBreak +
+    '          (i16x8.add (local.get $v) (i16x8.splat (local.get $i)))' +
+    '          (i16x8.splat (local.get $i))))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (i32x4.sub' + sLineBreak +
+    '          (i32x4.add (local.get $v) (i32x4.splat (local.get $i)))' +
+    '          (i32x4.splat (local.get $i))))' + sLineBreak +
+    '      (local.set $v' + sLineBreak +
+    '        (i64x2.sub' + sLineBreak +
+    '          (i64x2.add (local.get $v)' + sLineBreak +
+    '            (i64x2.splat (i64.extend_i32_u (local.get $i))))' +
+    sLineBreak +
+    '          (i64x2.splat (i64.extend_i32_u (local.get $i)))))' +
+    sLineBreak +
+    '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' + sLineBreak +
+    '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' + sLineBreak +
+    '    (i64x2.extract_lane 0 (local.get $v))))';
 
 function CompileArtifact(const ABytes: TWasmBytes): TWasmBytes;
 var
@@ -801,6 +846,8 @@ begin
     AWorkloads := [bwMemory]
   else if AValue = 'numeric' then
     AWorkloads := [bwNumeric]
+  else if AValue = 'simd' then
+    AWorkloads := [bwSimd]
   else
     Result := False;
 end;
@@ -825,18 +872,19 @@ var
   Positionals: TStringList;
   WorkloadOpt, TierOpt: TStringOption;
   IterationsOpt, ExecutionIterationsOpt, FibInputOpt,
-    MemoryIterationsOpt, NumericIterationsOpt, SamplesOpt: TIntegerOption;
+    MemoryIterationsOpt, NumericIterationsOpt, SimdIterationsOpt,
+    SamplesOpt: TIntegerOption;
   Workloads: TBenchmarkWorkloads;
   Tiers: TExecutionTiers;
   Iterations, ExecutionIterations, FibInput, MemoryIterations,
-    NumericIterations,
+    NumericIterations, SimdIterations,
     SampleCount: Integer;
   WorkloadValue, TierValue: string;
 begin
   Options := TOptionList.Create;
   try
     WorkloadOpt := Options.AddString('workload',
-      'all|decode|leb128|startup|loop|fib|memory|numeric (default: all)');
+      'all|decode|leb128|startup|loop|fib|memory|numeric|simd (default: all)');
     TierOpt := Options.AddString('tier',
       'all|interp|jit|aot for execution workloads (default: all)');
     IterationsOpt := Options.AddInteger('iterations',
@@ -852,6 +900,9 @@ begin
     NumericIterationsOpt := Options.AddInteger('numeric-iterations',
       'Scalar numeric loop iterations per tier (default: ' +
       IntToStr(DEFAULT_NUMERIC_ITERATIONS) + ')');
+    SimdIterationsOpt := Options.AddInteger('simd-iterations',
+      'SIMD loop iterations per tier (default: ' +
+      IntToStr(DEFAULT_SIMD_ITERATIONS) + ')');
     SamplesOpt := Options.AddInteger('samples',
       'Samples per execution workload and tier (default: ' +
       IntToStr(DEFAULT_SAMPLES) + ')');
@@ -876,6 +927,7 @@ begin
       DEFAULT_MEMORY_ITERATIONS);
     NumericIterations := NumericIterationsOpt.ValueOr(
       DEFAULT_NUMERIC_ITERATIONS);
+    SimdIterations := SimdIterationsOpt.ValueOr(DEFAULT_SIMD_ITERATIONS);
     SampleCount := SamplesOpt.ValueOr(DEFAULT_SAMPLES);
     WorkloadValue := LowerCase(WorkloadOpt.ValueOr('all'));
     TierValue := LowerCase(TierOpt.ValueOr('all'));
@@ -921,6 +973,12 @@ begin
       ExitCode := 1;
       Exit;
     end;
+    if SimdIterations <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --simd-iterations must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
     if SampleCount <= 0 then
     begin
       WriteLn(ErrOutput, 'wasmbench: --samples must be positive');
@@ -950,6 +1008,9 @@ begin
       BenchExecution('numeric', BENCH_NUMERIC_WAT, NumericIterations,
         NumericIterations, UInt64(NumericIterations) * UInt64(1975333344) +
         UInt64(4) * Triangle64(NumericIterations), SampleCount, Tiers);
+    if bwSimd in Workloads then
+      BenchExecution('simd', BENCH_SIMD_WAT, SimdIterations, SimdIterations,
+        0, SampleCount, Tiers);
   finally
     Options.Free;
   end;

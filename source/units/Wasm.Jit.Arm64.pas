@@ -283,6 +283,22 @@ function Arm64SxtbX(const AXd, AWn: Byte): UInt32;
 function Arm64SxthX(const AXd, AWn: Byte): UInt32;
 function Arm64SxtwX(const AXd, AWn: Byte): UInt32;
 
+{ Universally available Advanced SIMD encodings used by the conservative
+  native v128 subset. Register-file vectors occupy two adjacent slots and are
+  loaded/stored as one Q register. ASize is 0/1/2/3 for 8/16/32/64-bit lanes. }
+function Arm64LdrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+function Arm64StrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+function Arm64VecAnd(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecBic(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecOrr(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecEor(const AVd, AVn, AVm: Byte): UInt32;
+function Arm64VecMvn(const AVd, AVn: Byte): UInt32;
+function Arm64VecAdd(const AVd, AVn, AVm, ASize: Byte): UInt32;
+function Arm64VecSub(const AVd, AVn, AVm, ASize: Byte): UInt32;
+function Arm64VecDup(const AVd, ARn, ASize: Byte): UInt32;
+function Arm64VecExtract(const ARd, AVn, ASize, ALane: Byte;
+  const ASigned: Boolean): UInt32;
+
 { MOV Xd, Xn — register move, encoded as ORR Xd, XZR, Xn. }
 function Arm64MovReg(const ARd, ARn: Byte): UInt32;
 
@@ -339,6 +355,10 @@ procedure Arm64EmitLdrX(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
 procedure Arm64EmitStrW(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 procedure Arm64EmitStrX(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitMovzX(const ABuf: TWasmCodeBuffer; const ARd: Byte;
@@ -2370,6 +2390,76 @@ begin
     or ARt;
 end;
 
+function Arm64LdrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+begin
+  Result := $3DC00000 or ((AByteOffset div 16) shl 10)
+    or (UInt32(ARn) shl 5) or ARt;
+end;
+
+function Arm64StrQ(const ARt, ARn: Byte; const AByteOffset: UInt32): UInt32;
+begin
+  Result := $3D800000 or ((AByteOffset div 16) shl 10)
+    or (UInt32(ARn) shl 5) or ARt;
+end;
+
+function Arm64VecAnd(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $4E201C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecBic(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $4E601C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecOrr(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $4EA01C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecEor(const AVd, AVn, AVm: Byte): UInt32;
+begin
+  Result := $6E201C00 or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecMvn(const AVd, AVn: Byte): UInt32;
+begin
+  Result := $6E205800 or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecAdd(const AVd, AVn, AVm, ASize: Byte): UInt32;
+begin
+  Result := $4E208400 or (UInt32(ASize and 3) shl 22)
+    or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecSub(const AVd, AVn, AVm, ASize: Byte): UInt32;
+begin
+  Result := $6E208400 or (UInt32(ASize and 3) shl 22)
+    or (UInt32(AVm) shl 16) or (UInt32(AVn) shl 5) or AVd;
+end;
+
+function Arm64VecDup(const AVd, ARn, ASize: Byte): UInt32;
+begin
+  Result := $4E000C00 or (UInt32(1 shl ASize) shl 16)
+    or (UInt32(ARn) shl 5) or AVd;
+end;
+
+function Arm64VecExtract(const ARd, AVn, ASize, ALane: Byte;
+  const ASigned: Boolean): UInt32;
+var
+  Imm5: UInt32;
+begin
+  Imm5 := (UInt32(ALane) shl (ASize + 1)) or UInt32(1 shl ASize);
+  if (ASize = 3) and (not ASigned) then
+    Result := $4E003C00
+  else if ASigned then
+    Result := $0E002C00
+  else
+    Result := $0E003C00;
+  Result := Result or (Imm5 shl 16) or (UInt32(AVn) shl 5) or ARd;
+end;
+
 function Arm64AddW(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $0B000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
@@ -2837,6 +2927,18 @@ begin
   ABuf.EmitU32(Arm64StrX(ARt, ARn, AByteOffset));
 end;
 
+procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+begin
+  ABuf.EmitU32(Arm64LdrQ(ARt, ARn, AByteOffset));
+end;
+
+procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
+  const AByteOffset: UInt32);
+begin
+  ABuf.EmitU32(Arm64StrQ(ARt, ARn, AByteOffset));
+end;
+
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
 begin
   ABuf.EmitU32(Arm64Ret);
@@ -3027,6 +3129,16 @@ end;
 procedure StX(const ABuf: TWasmCodeBuffer; const ARt: Byte; const AReg: UInt32);
 begin
   Arm64EmitStrX(ABuf, ARt, ARM64_REG_REGFILE, Arm64SlotByteOffset(AReg));
+end;
+
+procedure LdQ(const ABuf: TWasmCodeBuffer; const AVt: Byte; const AReg: UInt32);
+begin
+  Arm64EmitLdrQ(ABuf, AVt, ARM64_REG_REGFILE, Arm64SlotByteOffset(AReg));
+end;
+
+procedure StQ(const ABuf: TWasmCodeBuffer; const AVt: Byte; const AReg: UInt32);
+begin
+  Arm64EmitStrQ(ABuf, AVt, ARM64_REG_REGFILE, Arm64SlotByteOffset(AReg));
 end;
 
 function Arm64CacheHostReg(const AIndex: Integer): Byte;
@@ -3849,6 +3961,98 @@ begin
   Arm64EmitCallHelper(ABuf, aohVecDispatch);
 end;
 
+function Arm64NativeVecOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    iroV128Not, iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+    iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+    iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub,
+    iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+    iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+    iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+    iroI32x4ExtractLane, iroI64x2ExtractLane:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+procedure EmitNativeVecBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ABase: UInt32);
+begin
+  LdQ(ABuf, 0, AIns.A);
+  LdQ(ABuf, 1, AIns.B);
+  ABuf.EmitU32(ABase or (UInt32(1) shl 16));
+  StQ(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecLaneBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte; const ASub: Boolean);
+begin
+  LdQ(ABuf, 0, AIns.A);
+  LdQ(ABuf, 1, AIns.B);
+  if ASub then
+    ABuf.EmitU32(Arm64VecSub(0, 0, 1, ASize))
+  else
+    ABuf.EmitU32(Arm64VecAdd(0, 0, 1, ASize));
+  StQ(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecSplat(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte);
+begin
+  if ASize = 3 then
+    LdX(ABuf, ARM64_REG_T0, AIns.A)
+  else
+    LdW(ABuf, ARM64_REG_T0, AIns.A);
+  ABuf.EmitU32(Arm64VecDup(0, ARM64_REG_T0, ASize));
+  StQ(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecExtract(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte; const ASigned: Boolean);
+begin
+  LdQ(ABuf, 0, AIns.A);
+  ABuf.EmitU32(Arm64VecExtract(ARM64_REG_T0, 0, ASize,
+    Byte(UInt32(AIns.Imm)), ASigned));
+  StX(ABuf, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure EmitNativeVec(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr);
+begin
+  case AIns.Op of
+    iroV128Not:
+      begin
+        LdQ(ABuf, 0, AIns.A);
+        ABuf.EmitU32(Arm64VecMvn(0, 0));
+        StQ(ABuf, 0, AIns.Dest);
+      end;
+    iroV128And: EmitNativeVecBinary(ABuf, AIns, $4E201C00);
+    iroV128Andnot: EmitNativeVecBinary(ABuf, AIns, $4E601C00);
+    iroV128Or: EmitNativeVecBinary(ABuf, AIns, $4EA01C00);
+    iroV128Xor: EmitNativeVecBinary(ABuf, AIns, $6E201C00);
+    iroI8x16Add: EmitNativeVecLaneBinary(ABuf, AIns, 0, False);
+    iroI8x16Sub: EmitNativeVecLaneBinary(ABuf, AIns, 0, True);
+    iroI16x8Add: EmitNativeVecLaneBinary(ABuf, AIns, 1, False);
+    iroI16x8Sub: EmitNativeVecLaneBinary(ABuf, AIns, 1, True);
+    iroI32x4Add: EmitNativeVecLaneBinary(ABuf, AIns, 2, False);
+    iroI32x4Sub: EmitNativeVecLaneBinary(ABuf, AIns, 2, True);
+    iroI64x2Add: EmitNativeVecLaneBinary(ABuf, AIns, 3, False);
+    iroI64x2Sub: EmitNativeVecLaneBinary(ABuf, AIns, 3, True);
+    iroI8x16Splat: EmitNativeVecSplat(ABuf, AIns, 0);
+    iroI16x8Splat: EmitNativeVecSplat(ABuf, AIns, 1);
+    iroI32x4Splat: EmitNativeVecSplat(ABuf, AIns, 2);
+    iroI64x2Splat: EmitNativeVecSplat(ABuf, AIns, 3);
+    iroI8x16ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 0, True);
+    iroI8x16ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 0, False);
+    iroI16x8ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 1, True);
+    iroI16x8ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 1, False);
+    iroI32x4ExtractLane: EmitNativeVecExtract(ABuf, AIns, 2, False);
+    iroI64x2ExtractLane: EmitNativeVecExtract(ABuf, AIns, 3, False);
+  end;
+end;
+
 { br_on_null / br_on_non_null / br_on_cast / br_on_cast_fail. Call the
   predicate helper (w0 = P: RefIsNull for the null forms, the cast match for
   the cast forms), branch to the target label on the op's taken polarity, then
@@ -4263,7 +4467,9 @@ begin
       EmitIntegerConversion(ABuf, AIns, 0, True);
 
   else
-    if Arm64LeafBinaryOp(AIns.Op) then
+    if Arm64NativeVecOp(AIns.Op) then
+      EmitNativeVec(ABuf, AIns)
+    else if Arm64LeafBinaryOp(AIns.Op) then
       EmitLeafBinary(ABuf, AIns)
     else if Arm64LeafUnaryOp(AIns.Op) then
       EmitLeafUnary(ABuf, AIns)

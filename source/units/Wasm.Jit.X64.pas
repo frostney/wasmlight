@@ -225,6 +225,21 @@ procedure X64EmitLoadSlot32(const ABuf: TWasmCodeBuffer; const AReg: Byte;
 procedure X64EmitStoreSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 
+{ Universally available SSE2 encodings used by the conservative native v128
+  subset. MOVDQU keeps the register-file representation independent of host
+  alignment; packed integer add/sub and bitwise operations are exact modulo
+  their lane width. }
+procedure X64EmitLoadVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+procedure X64EmitStoreVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+procedure X64EmitVecBinary(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
+  const ADestXmm, ASrcXmm: Byte);
+procedure X64EmitVecDup(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const AReg, ASize: Byte);
+procedure X64EmitVecExtract(const ABuf: TWasmCodeBuffer; const AReg,
+  AXmm, ASize, ALane: Byte; const ASigned: Boolean);
+
 { ALU register-register: <op> ADst, ASrc. AOpcode is the r/m,r opcode byte
   (ADD=01, OR=09, AND=21, SUB=29, XOR=31, CMP=39, TEST=85). AWide selects the
   REX.W 64-bit form. }
@@ -2376,6 +2391,93 @@ begin
     Int32(X64SlotByteOffset(ASlot)));
 end;
 
+procedure X64EmitLoadVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+begin
+  ABuf.EmitByte($F3);
+  X64EmitRex(ABuf, 0, AXmm shr 3, 0, X64_REG_REGFILE shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($6F);   { MOVDQU xmm, m128 }
+  EmitMemOperand(ABuf, AXmm, X64_REG_REGFILE,
+    Int32(X64SlotByteOffset(ASlot)));
+end;
+
+procedure X64EmitStoreVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ASlot: UInt32);
+begin
+  ABuf.EmitByte($F3);
+  X64EmitRex(ABuf, 0, AXmm shr 3, 0, X64_REG_REGFILE shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($7F);   { MOVDQU m128, xmm }
+  EmitMemOperand(ABuf, AXmm, X64_REG_REGFILE,
+    Int32(X64SlotByteOffset(ASlot)));
+end;
+
+procedure X64EmitVecBinary(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
+  const ADestXmm, ASrcXmm: Byte);
+begin
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, 0, ADestXmm shr 3, 0, ASrcXmm shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte(AOpcode);
+  EmitModRMReg(ABuf, ADestXmm, ASrcXmm);
+end;
+
+procedure X64EmitVecDup(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const AReg, ASize: Byte);
+begin
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, Ord(ASize = 3), AXmm shr 3, 0, AReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($6E);             { MOVD/MOVQ xmm, r32/r64 }
+  EmitModRMReg(ABuf, AXmm, AReg);
+  case ASize of
+    0:
+      begin
+        X64EmitVecBinary(ABuf, $60, AXmm, AXmm); { PUNPCKLBW }
+        X64EmitVecBinary(ABuf, $61, AXmm, AXmm); { PUNPCKLWD }
+        X64EmitVecBinary(ABuf, $70, AXmm, AXmm); { PSHUFD xmm,xmm,0 }
+        ABuf.EmitByte(0);
+      end;
+    1:
+      begin
+        X64EmitVecBinary(ABuf, $61, AXmm, AXmm); { PUNPCKLWD }
+        X64EmitVecBinary(ABuf, $70, AXmm, AXmm);
+        ABuf.EmitByte(0);
+      end;
+    2:
+      begin
+        X64EmitVecBinary(ABuf, $70, AXmm, AXmm);
+        ABuf.EmitByte(0);
+      end;
+  else
+    X64EmitVecBinary(ABuf, $6C, AXmm, AXmm);     { PUNPCKLQDQ }
+  end;
+end;
+
+procedure X64EmitVecExtract(const ABuf: TWasmCodeBuffer; const AReg,
+  AXmm, ASize, ALane: Byte; const ASigned: Boolean);
+var
+  Shift: Byte;
+begin
+  Shift := ALane shl ASize;
+  if Shift <> 0 then
+  begin
+    ABuf.EmitByte($66);
+    ABuf.EmitByte($0F);
+    ABuf.EmitByte($73);
+    EmitModRMReg(ABuf, 3, AXmm);   { PSRLDQ xmm, imm8 }
+    ABuf.EmitByte(Shift);
+  end;
+  ABuf.EmitByte($66);
+  X64EmitRex(ABuf, Ord(ASize = 3), AXmm shr 3, 0, AReg shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($7E);              { MOVD/MOVQ r32/r64, xmm }
+  EmitModRMReg(ABuf, AXmm, AReg);
+  if ASigned and (ASize < 2) then
+    X64EmitSignExtendRax(ABuf, 8 shl ASize, False);
+end;
+
 procedure X64EmitAluRegReg(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
   const AWide: Boolean; const ADst, ASrc: Byte);
 begin
@@ -3126,6 +3228,93 @@ begin
   X64EmitCallHelper(ABuf, aohVecDispatch);
 end;
 
+function X64NativeVecOp(const AOp: TWasmIrOp): Boolean;
+begin
+  case AOp of
+    iroV128Not, iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+    iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+    iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub,
+    iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+    iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+    iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+    iroI32x4ExtractLane, iroI64x2ExtractLane:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+procedure EmitNativeVecBinary(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AOpcode: Byte);
+begin
+  X64EmitLoadVec(ABuf, 0, AIns.A);
+  X64EmitLoadVec(ABuf, 1, AIns.B);
+  X64EmitVecBinary(ABuf, AOpcode, 0, 1);
+  X64EmitStoreVec(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecSplat(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte);
+begin
+  if ASize = 3 then
+    X64EmitLoadSlot64(ABuf, X64_RAX, AIns.A)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);
+  X64EmitVecDup(ABuf, 0, X64_RAX, ASize);
+  X64EmitStoreVec(ABuf, 0, AIns.Dest);
+end;
+
+procedure EmitNativeVecExtract(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const ASize: Byte; const ASigned: Boolean);
+begin
+  X64EmitLoadVec(ABuf, 0, AIns.A);
+  X64EmitVecExtract(ABuf, X64_RAX, 0, ASize, Byte(UInt32(AIns.Imm)), ASigned);
+  X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+procedure EmitNativeVec(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr);
+begin
+  case AIns.Op of
+    iroV128Not:
+      begin
+        X64EmitLoadVec(ABuf, 0, AIns.A);
+        X64EmitVecBinary(ABuf, $76, 1, 1); { PCMPEQD xmm1,xmm1 => all ones }
+        X64EmitVecBinary(ABuf, $EF, 0, 1);
+        X64EmitStoreVec(ABuf, 0, AIns.Dest);
+      end;
+    iroV128And: EmitNativeVecBinary(ABuf, AIns, $DB);
+    iroV128Andnot:
+      begin
+        { PANDN computes ~dest & src; reverse wasm's a & ~b operands. }
+        X64EmitLoadVec(ABuf, 0, AIns.B);
+        X64EmitLoadVec(ABuf, 1, AIns.A);
+        X64EmitVecBinary(ABuf, $DF, 0, 1);
+        X64EmitStoreVec(ABuf, 0, AIns.Dest);
+      end;
+    iroV128Or: EmitNativeVecBinary(ABuf, AIns, $EB);
+    iroV128Xor: EmitNativeVecBinary(ABuf, AIns, $EF);
+    iroI8x16Add: EmitNativeVecBinary(ABuf, AIns, $FC);
+    iroI8x16Sub: EmitNativeVecBinary(ABuf, AIns, $F8);
+    iroI16x8Add: EmitNativeVecBinary(ABuf, AIns, $FD);
+    iroI16x8Sub: EmitNativeVecBinary(ABuf, AIns, $F9);
+    iroI32x4Add: EmitNativeVecBinary(ABuf, AIns, $FE);
+    iroI32x4Sub: EmitNativeVecBinary(ABuf, AIns, $FA);
+    iroI64x2Add: EmitNativeVecBinary(ABuf, AIns, $D4);
+    iroI64x2Sub: EmitNativeVecBinary(ABuf, AIns, $FB);
+    iroI8x16Splat: EmitNativeVecSplat(ABuf, AIns, 0);
+    iroI16x8Splat: EmitNativeVecSplat(ABuf, AIns, 1);
+    iroI32x4Splat: EmitNativeVecSplat(ABuf, AIns, 2);
+    iroI64x2Splat: EmitNativeVecSplat(ABuf, AIns, 3);
+    iroI8x16ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 0, True);
+    iroI8x16ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 0, False);
+    iroI16x8ExtractLaneS: EmitNativeVecExtract(ABuf, AIns, 1, True);
+    iroI16x8ExtractLaneU: EmitNativeVecExtract(ABuf, AIns, 1, False);
+    iroI32x4ExtractLane: EmitNativeVecExtract(ABuf, AIns, 2, False);
+    iroI64x2ExtractLane: EmitNativeVecExtract(ABuf, AIns, 3, False);
+  end;
+end;
+
 procedure EmitBranchRef(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
   const AInsIndex: UInt32);
 begin
@@ -3610,7 +3799,9 @@ begin
       EmitIntegerConversion(ABuf, AIns, True, 0, True);
 
   else
-    if X64LeafBinaryOp(AIns.Op) then
+    if X64NativeVecOp(AIns.Op) then
+      EmitNativeVec(ABuf, AIns)
+    else if X64LeafBinaryOp(AIns.Op) then
       EmitLeafBinary(ABuf, AIns)
     else if X64LeafUnaryOp(AIns.Op) then
       EmitLeafUnary(ABuf, AIns)
