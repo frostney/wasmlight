@@ -882,12 +882,20 @@ begin
     iroI32And: Arm64CachedAlu(ABuf, AIns, @Arm64AndW, ACache);
     iroI32Or: Arm64CachedAlu(ABuf, AIns, @Arm64OrrW, ACache);
     iroI32Xor: Arm64CachedAlu(ABuf, AIns, @Arm64EorW, ACache);
+    iroI32Shl: Arm64CachedAlu(ABuf, AIns, @Arm64LslvW, ACache);
+    iroI32ShrS: Arm64CachedAlu(ABuf, AIns, @Arm64AsrvW, ACache);
+    iroI32ShrU: Arm64CachedAlu(ABuf, AIns, @Arm64LsrvW, ACache);
+    iroI32Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvW, ACache);
     iroI64Add: Arm64CachedAlu(ABuf, AIns, @Arm64AddX, ACache);
     iroI64Sub: Arm64CachedAlu(ABuf, AIns, @Arm64SubX, ACache);
     iroI64Mul: Arm64CachedAlu(ABuf, AIns, @Arm64MulX, ACache);
     iroI64And: Arm64CachedAlu(ABuf, AIns, @Arm64AndX, ACache);
     iroI64Or: Arm64CachedAlu(ABuf, AIns, @Arm64OrrX, ACache);
     iroI64Xor: Arm64CachedAlu(ABuf, AIns, @Arm64EorX, ACache);
+    iroI64Shl: Arm64CachedAlu(ABuf, AIns, @Arm64LslvX, ACache);
+    iroI64ShrS: Arm64CachedAlu(ABuf, AIns, @Arm64AsrvX, ACache);
+    iroI64ShrU: Arm64CachedAlu(ABuf, AIns, @Arm64LsrvX, ACache);
+    iroI64Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvX, ACache);
   else
     { Helpers, safepoints, complex control and currently uncached templates all
       observe/write the canonical memory register file. }

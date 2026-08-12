@@ -384,8 +384,9 @@ var
   begin
     Result := (AOp in [iroI32Const, iroI64Const, iroF32Const, iroF64Const,
       iroI32Eqz, iroI64Eqz, iroI32Add, iroI32Sub, iroI32Mul, iroI32And,
-      iroI32Or, iroI32Xor, iroI64Add, iroI64Sub, iroI64Mul, iroI64And,
-      iroI64Or, iroI64Xor]) or IntegerCompare(AOp);
+      iroI32Or, iroI32Xor, iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr]) or IntegerCompare(AOp);
   end;
 
   function SimpleUseCount(const AReg: UInt32): UInt32;
@@ -402,7 +403,9 @@ var
         iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
         iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
         iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
+        iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+        iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
           begin
             if AFn^.Code[K].A = AReg then Inc(Result);
             if AFn^.Code[K].B = AReg then Inc(Result);
@@ -487,7 +490,9 @@ var
       iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
       iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
       iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
         Result := True;
       {$IFDEF WASM_JIT_ARM64}
       iroI32Load, iroI64Load, iroF32Load, iroF64Load,
@@ -537,7 +542,9 @@ var
       iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
       iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
       iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor:
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
         begin
           ScoreSlot(AIns.A);
           ScoreSlot(AIns.B);

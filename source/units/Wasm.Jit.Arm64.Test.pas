@@ -57,6 +57,7 @@ type
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
+    procedure TestStaticCacheKeepsShiftResult;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -199,6 +200,36 @@ begin
       Expect<Boolean>(Cache.Entries[I + 2].Valid).ToBe(True);
       Expect<UInt32>(Cache.Entries[I + 2].Slot).ToBe(UInt32(I + 2));
     end;
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestStaticCacheKeepsShiftResult;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  I: Integer;
+  Found: Boolean;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux,
+      0, False, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
+      1, False, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Shl, 4, 2, 3, 0), Aux,
+      2, False, False, False, Cache)).ToBe(True);
+    Found := False;
+    for I := 0 to High(Cache.Entries) do
+      Found := Found or (Cache.Entries[I].Valid and
+        (Cache.Entries[I].Slot = 4));
+    Expect<Boolean>(Found).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -606,6 +637,8 @@ begin
     TestPositionIndependentSequences);
   Test('static allocation keeps four expression temporaries',
     TestStaticCacheKeepsFourTemporaries);
+  Test('static allocation keeps a shifted expression result',
+    TestStaticCacheKeepsShiftResult);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);
