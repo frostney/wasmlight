@@ -11,7 +11,8 @@ Updated: 2026-08-13 (main CI repair and corpus-residue audit)
   deep direct compiled recursion instead of trapping `call stack exhausted`.
 - The direct-call fast path consumes native stack per non-tail call. The shared
   logical cap of 8192 frames was too generous for the Intel macOS process
-  stack, so all tiers now share a conservative 1024-frame cap. This is an
+  stack. A 1024-frame cap still overflowed on the heavier indirect-call path,
+  so all tiers now share a conservative 256-frame cap. This is an
   implementation resource limit allowed by pinned-spec anchor `impl-exec` and
   keeps tier exhaustion identical rather than adding a Darwin-only carve-out.
 - CI now retains each tier's `--failures-only` output and prints a focused diff
@@ -25,8 +26,8 @@ Updated: 2026-08-13 (main CI repair and corpus-residue audit)
 
 - Root suite: 33 fail / 610 skip. Proposals: 356 fail / 922 skip.
 - Root failures are 10 decode-message/framing mismatches, 5 module-definition /
-  instance commands, 16 legacy EH assertions (explicitly out of the 3.0
-  target), and 2 other module-definition uses in memory/table coverage.
+  instance commands, 14 legacy EH assertions (explicitly out of the 3.0
+  target), and 4 other module-definition uses in memory/table coverage.
 - Root skips are 96 missing `spectest` imports, 291 cascaded commands after
   those modules do not instantiate, 200 `assert_unlinkable` commands the
   harness still does not judge, and 23 non-reference custom directives.
@@ -373,7 +374,7 @@ cross-architecture/cross-tier validated; PR #1 open)
   classify correctly (+4, wired through interp AND both JIT backends AND
   the const-expr evaluator so all tiers stay identical); addrtype text
   forms / anyfunc / id.wast lexer / ref.func-declared-set / throw wording
-  (+8). Remaining 389 = 356 post-3.0 proposals + 16 legacy EH (both out
+  (+8). Remaining 389 = 356 post-3.0 proposals + 14 legacy EH (both out
   of scope) + ~9 (module definition/instance) harness forms + a few
   deferred decode/framing edges.
 - **Superseded perf note (measurement was contaminated):** aarch64-darwin,

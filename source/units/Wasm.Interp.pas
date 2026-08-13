@@ -170,7 +170,7 @@ var
     assert_exhaustion trip a small cap deterministically. A push past EITHER
     cap traps 'call stack exhausted'. }
   WasmInterpValueSlots: NativeUInt = 1 shl 20;   { 1 Mi slots = 8 MiB }
-  WasmInterpMaxDepth: NativeUInt = 1 shl 10;     { 1 Ki activation records }
+  WasmInterpMaxDepth: NativeUInt = 1 shl 8;      { 256 activation records }
 
 { Set AStore.TierInvoke/TierContext/TierContextFree so the store runs guest
   code through this interpreter. Allocates the per-store context (the two

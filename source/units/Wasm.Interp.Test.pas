@@ -318,7 +318,7 @@ begin
   { Test-scale reservations: small enough to be cheap per store, large enough
     for every module here. A test may shrink them further before instantiate. }
   WasmInterpValueSlots := 1 shl 16;
-  WasmInterpMaxDepth := 1024;
+  WasmInterpMaxDepth := 256;
 end;
 
 procedure TInterpTests.AfterEach;

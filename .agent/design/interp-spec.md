@@ -95,7 +95,7 @@ end;
 
 Both caps are tunables (constants in `Wasm.Interp`, overridable for tests):
 `WASM_INTERP_VALUE_SLOTS` (default `1 shl 20` = 1 Mi slots = 8 MiB reserved)
-and `WASM_INTERP_MAX_DEPTH` (default `1024`). A push that would exceed
+and `WASM_INTERP_MAX_DEPTH` (default `256`). A push that would exceed
 EITHER cap is `TrapNow(wtkStackExhausted)` (§5.2) — this is how a
 non-recursive interpreter honours `assert_exhaustion`. Sizing note: 1 Mi
 slots is comfortably above any non-pathological program and the exhaustion
