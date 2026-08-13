@@ -1252,7 +1252,7 @@ begin
   FImports.Globals := nil;
   FImports.Tags := nil;
   WasmInterpValueSlots := 1 shl 16;
-  WasmInterpMaxDepth := 8192;
+  WasmInterpMaxDepth := 1024;
   FDiffCompile := nil;
   FDiffResultSlots := 1;
   FDiffCompiledAll := False;
@@ -2545,7 +2545,7 @@ begin
     Expect<string>(TrapMessageOf(RecurseModuleBytes, 'rec',
       [MakeValueI32(4000)])).ToBe('call stack exhausted');
   finally
-    WasmInterpMaxDepth := 8192;
+    WasmInterpMaxDepth := 1024;
   end;
 end;
 

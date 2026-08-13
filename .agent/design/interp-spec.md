@@ -95,12 +95,14 @@ end;
 
 Both caps are tunables (constants in `Wasm.Interp`, overridable for tests):
 `WASM_INTERP_VALUE_SLOTS` (default `1 shl 20` = 1 Mi slots = 8 MiB reserved)
-and `WASM_INTERP_MAX_DEPTH` (default `8192`). A push that would exceed
+and `WASM_INTERP_MAX_DEPTH` (default `1024`). A push that would exceed
 EITHER cap is `TrapNow(wtkStackExhausted)` (§5.2) — this is how a
 non-recursive interpreter honours `assert_exhaustion`. Sizing note: 1 Mi
 slots is comfortably above any non-pathological program and the exhaustion
-tests trip the depth cap first; both are deliberately generous and both are
-observable only as the `call stack exhausted` trap.
+tests trip the depth cap first. The frame cap also leaves headroom for a
+compiled non-tail call's native frame on supported hosts; every tier uses this
+same logical cap, so exhaustion remains observationally identical. Both caps
+are observable only as the `call stack exhausted` trap.
 
 Why fixed reservations rather than a growable value stack: a growable
 `array of TWasmValue` reallocates on growth, which moves every live frame's

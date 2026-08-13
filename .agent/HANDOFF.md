@@ -1,5 +1,41 @@
 # Handoff
 
+Updated: 2026-08-13 (main CI repair and corpus-residue audit)
+
+## Main CI repair
+
+- Synced from fetched `origin/main` at `12c1a4c` and created
+  `codex/fix-ci-skips`.
+- Main run `31645850311` failed only on native x86_64-darwin: the interpreter
+  passed `call.wast:337`, while JIT/AOT surfaced FPC `EStackOverflow` during
+  deep direct compiled recursion instead of trapping `call stack exhausted`.
+- The direct-call fast path consumes native stack per non-tail call. The shared
+  logical cap of 8192 frames was too generous for the Intel macOS process
+  stack, so all tiers now share a conservative 1024-frame cap. This is an
+  implementation resource limit allowed by pinned-spec anchor `impl-exec` and
+  keeps tier exhaustion identical rather than adding a Darwin-only carve-out.
+- CI now retains each tier's `--failures-only` output and prints a focused diff
+  on tally divergence. Diagnostic run `31673377733` proved the exact failing
+  assertion; the other five platform legs were green.
+- Local gates after the cap change: frozen install, format check, all three
+  builds, 44/44 unit suites, and full interpreter/JIT/AOT corpus identity at
+  `65204 pass / 389 fail / 1532 skip / 0 errors` (compiled=8588).
+
+## Remaining corpus residue audit
+
+- Root suite: 33 fail / 610 skip. Proposals: 356 fail / 922 skip.
+- Root failures are 10 decode-message/framing mismatches, 5 module-definition /
+  instance commands, 16 legacy EH assertions (explicitly out of the 3.0
+  target), and 2 other module-definition uses in memory/table coverage.
+- Root skips are 96 missing `spectest` imports, 291 cascaded commands after
+  those modules do not instantiate, 200 `assert_unlinkable` commands the
+  harness still does not judge, and 23 non-reference custom directives.
+- The actionable next conformance wave is harness plumbing, not runtime opcode
+  work: provide the standard `spectest` funcs/globals/table/table64/memory,
+  then judge `assert_unlinkable` through the existing instantiator/link errors.
+  That can retire most root skips. Keep proposal residue and legacy EH outside
+  the pinned core-3.0 claim.
+
 Updated: 2026-08-12 (fifth measured optimization wave integrated and
 cross-architecture/cross-tier validated; PR #1 open)
 
