@@ -49,6 +49,9 @@ const
     is satisfied by either. }
   MSG_UNEXPECTED_END = 'unexpected end';
   MSG_UNEXPECTED_END_OF_SECTION = 'unexpected end of section or function';
+  { A function-code expression reached its declared entry boundary while the
+    code section still contains a following entry. }
+  MSG_END_OPCODE_EXPECTED = 'END opcode expected';
 
   { LEB128. `too large` is a value that does not fit the width; `too
     long` is an encoding that spends more bytes than the width allows,
@@ -122,17 +125,25 @@ type
       the reader borrows the buffer and never owns it. }
     procedure Init(const AData: PByte; const ASize: NativeUInt);
     procedure InitFromBytes(const ABytes: TWasmBytes);
+    { A logically bounded span over a larger physical module buffer. LEB128
+      readers may inspect past the span to classify an overlong or over-wide
+      integer before the enclosing size mismatch is reported; every other
+      read remains bounded by ASize. }
+    procedure InitSpanFromBytes(const ABytes: TWasmBytes;
+      const AOffset, ASize: NativeUInt);
 
     function Eof: Boolean; inline;
     function Remaining: NativeUInt; inline;
 
     function ReadByte: Byte;
     function PeekByte: Byte;
+    function PeekPhysicalByte: Byte;
 
     { LEB128. The `A32`/`A64` suffix is the value's width, not the
       encoding's length. }
     function ReadU32: UInt32;
     function ReadU64: UInt64;
+    function ReadS7: Int8;
     function ReadI32: Int32;
     function ReadI64: Int64;
 
@@ -172,6 +183,10 @@ type
       callers that detect exhaustion themselves (a vector count larger
       than the bytes left) rather than by reading past the end. }
     function EndOfInputPrefix: string;
+    { Bytes physically present after the reader's logical span. Used only by
+      decoders whose reference diagnostic depends on whether the module
+      continues beyond an exhausted section. }
+    function PhysicalRemaining: NativeUInt;
 
     property Position: NativeUInt read FPos write SetPosition;
     property Size: NativeUInt read FSize;
@@ -227,6 +242,24 @@ begin
     Init(@ABytes[0], Length(ABytes));
 end;
 
+procedure TWasmReader.InitSpanFromBytes(const ABytes: TWasmBytes;
+  const AOffset, ASize: NativeUInt);
+var
+  BufferSize: NativeUInt;
+begin
+  BufferSize := NativeUInt(Length(ABytes));
+  if (AOffset > BufferSize) or (ASize > BufferSize - AOffset) then
+    raise EWasmDecodeError.CreateFmt(
+      'reader span [%u, %u) runs past a %u-byte buffer',
+      [AOffset, AOffset + ASize, BufferSize]);
+
+  if BufferSize = 0 then
+    Init(nil, 0)
+  else
+    Init(@ABytes[AOffset], ASize);
+  FCapacity := BufferSize - AOffset;
+end;
+
 function TWasmReader.Eof: Boolean;
 begin
   Result := FPos >= FSize;
@@ -238,6 +271,14 @@ begin
     Result := 0
   else
     Result := FSize - FPos;
+end;
+
+function TWasmReader.PhysicalRemaining: NativeUInt;
+begin
+  if FPos >= FCapacity then
+    Result := 0
+  else
+    Result := FCapacity - FPos;
 end;
 
 procedure TWasmReader.SetPosition(const AValue: NativeUInt);
@@ -274,6 +315,15 @@ end;
 function TWasmReader.PeekByte: Byte;
 begin
   Need(1, 'byte');
+  Result := FData[FPos];
+end;
+
+function TWasmReader.PeekPhysicalByte: Byte;
+begin
+  if FPos >= FCapacity then
+    raise EWasmDecodeError.CreateFmt(
+      '%s: reading byte at offset %u (need 1 byte(s), 0 left)',
+      [EndOfInputPrefix, FPos]);
   Result := FData[FPos];
 end;
 
@@ -471,6 +521,11 @@ begin
   Result := ReadUnsigned(64, 'u64');
 end;
 
+function TWasmReader.ReadS7: Int8;
+begin
+  Result := Int8(ReadSigned(7, 's7'));
+end;
+
 function TWasmReader.ReadI32: Int32;
 begin
   Result := Int32(ReadSigned(32, 's32'));
@@ -558,6 +613,17 @@ var
   Start: NativeUInt;
 begin
   Len := ReadU32;
+  { A name is a byte list (`binary-name` -> `binary-list`). Distinguish a
+    list whose declared byte length runs past the PHYSICAL module buffer
+    from one merely cut by its enclosing section: the former is the
+    reference decoder's `length out of bounds`, while the latter remains
+    the section-context truncation raised by Need below. Sub-readers retain
+    the physical capacity specifically so framing does not hide a malformed
+    width or length that can already be proved from the whole buffer. }
+  if NativeUInt(Len) > FCapacity - FPos then
+    raise EWasmDecodeError.CreateFmt(
+      '%s: name at offset %u declares %u byte(s) but only %u remain',
+      [MSG_LENGTH_OUT_OF_BOUNDS, FPos, Len, FCapacity - FPos]);
   Need(Len, 'name');
   Start := FPos;
 

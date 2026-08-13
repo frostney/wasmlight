@@ -77,6 +77,7 @@ type
     procedure TestPreamblePrefixesSplitMagicFromTruncation;
     procedure TestSectionWalkMessagePrefixes;
     procedure TestCustomSectionErrorKeepsItsPrefix;
+    procedure TestLebDiagnosticsSurviveCodeEntryFraming;
   end;
 
 procedure TDecoderTests.BuildModule(const AValues: array of Byte);
@@ -662,6 +663,55 @@ begin
     RejectionMessage([$00, $20, $01, $61]), MSG_LENGTH_OUT_OF_BOUNDS);
 end;
 
+procedure TDecoderTests.TestLebDiagnosticsSurviveCodeEntryFraming;
+const
+  PREFIX: array[0..16] of Byte = (
+    $01, $04, $01, $60, $00, $00,       { type: () -> () }
+    $03, $02, $01, $00,                   { one function of type 0 }
+    $05, $03, $01, $00, $01,              { one i32 memory }
+    $0A, $0B);                             { code section, 11-byte body }
+var
+  Values: TWasmBytes;
+
+  function WithTail(const ATail: array of Byte): TWasmBytes;
+  var
+    I: Integer;
+  begin
+    SetLength(Result, Length(PREFIX) + Length(ATail));
+    for I := 0 to High(PREFIX) do
+      Result[I] := PREFIX[I];
+    for I := 0 to High(ATail) do
+      Result[Length(PREFIX) + I] := ATail[I];
+  end;
+
+begin
+  { The code entry declares nine payload bytes. Its memarg u64 begins in
+    that span but completes beyond it. `binary-int` still owns the integer's
+    width diagnosis; the continuation bytes must not become section ids. }
+  Values := WithTail([
+    $01, $09,                               { one entry, size 9 }
+    $00, $41, $00, $28, $02,                { locals; i32.const; load; align }
+    $82, $80, $80, $80,                     { first four u64 bytes in entry }
+    $80, $80, $80, $80, $80, $80, $00]);   { overlong continuation }
+  AssertMessagePrefix('overlong memarg clipped by code entry',
+    RejectionMessage(Values), MSG_INTEGER_TOO_LONG);
+
+  Values := WithTail([
+    $01, $09,
+    $00, $41, $00, $28, $02,
+    $82, $80, $80, $80,
+    $80, $80, $80, $80, $80, $10]);        { unused u64 bits set }
+  AssertMessagePrefix('over-wide memarg clipped by code entry',
+    RejectionMessage(Values), MSG_INTEGER_TOO_LARGE);
+
+  { `binary-comptype` uses the signed seven-bit discriminator space. $E0
+    claims a continuation byte, which exceeds s7's one-byte limit before it
+    can be treated as an unknown composite form. }
+  AssertMessagePrefix('overlong composite-type discriminator',
+    RejectionMessage([$01, $05, $01, $E0, $7F, $00, $00]),
+    MSG_INTEGER_TOO_LONG);
+end;
+
 procedure TDecoderTests.SetupTests;
 begin
   Test('decodes a module with no sections', TestEmptyModule);
@@ -702,6 +752,8 @@ begin
     TestSectionWalkMessagePrefixes);
   Test('a custom section failure keeps its own prefix',
     TestCustomSectionErrorKeepsItsPrefix);
+  Test('LEB diagnostics survive code-entry framing',
+    TestLebDiagnosticsSurviveCodeEntryFraming);
 end;
 
 begin

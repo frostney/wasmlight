@@ -131,20 +131,27 @@ end;
 { comptype ::= $60 functype' | $5F structtype | $5E arraytype.
   https://webassembly.github.io/spec/core/binary/types.html#binary-comptype }
 function ReadCompType(var AReader: TWasmReader): TWasmCompType;
+const
+  COMP_FUNC = -32;   { s7 encoding $60 }
+  COMP_STRUCT = -33; { s7 encoding $5F }
+  COMP_ARRAY = -34;  { s7 encoding $5E }
 var
   Start: NativeUInt;
-  Form: Byte;
+  Form: Int8;
   StructType: TWasmStructType;
   ArrayType: TWasmArrayType;
   Count: UInt32;
   I: UInt32;
 begin
   Start := AReader.Position;
-  Form := AReader.ReadByte;
+  { `binary-comptype`'s discriminators inhabit the signed seven-bit code
+    space. Their legal encodings are therefore exactly one byte: an apparent
+    continuation is an overlong s7 integer, not an unrelated unknown form. }
+  Form := AReader.ReadS7;
   case Form of
-    BYTE_FUNC:
+    COMP_FUNC:
       Result := MakeFuncCompType(ReadFuncType(AReader));
-    BYTE_STRUCT:
+    COMP_STRUCT:
       begin
         Count := ReadVecCount(AReader, 'field');
         SetLength(StructType.Fields, Count);
@@ -152,14 +159,14 @@ begin
           StructType.Fields[I - 1] := ReadFieldType(AReader);
         Result := MakeStructCompType(StructType);
       end;
-    BYTE_ARRAY:
+    COMP_ARRAY:
       begin
         ArrayType.Elem := ReadFieldType(AReader);
         Result := MakeArrayCompType(ArrayType);
       end;
   else
     raise EWasmDecodeError.CreateFmt(
-      'malformed composite type $%.2x at offset %u', [Form, Start]);
+      'malformed composite type %d at offset %u', [Form, Start]);
   end;
 end;
 

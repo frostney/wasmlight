@@ -783,15 +783,18 @@ begin
 end;
 
 { (module quote "..."*) and (module binary "..."*), each optionally with
-  an id: the form marker is the atom right after `module` or after the
-  `$id`. A text module's elements there are lists — `(func ...)` and
-  friends — so a bare `binary` / `quote` atom is unambiguous. }
+  an id. A module definition inserts the literal `definition` before that
+  same optional id and form marker. A text module's elements there are lists
+  — `(func ...)` and friends — so a bare `binary` / `quote` atom remains
+  unambiguous in both command forms. }
 function DetectWastModuleForm(const ANode: TWastNode): TWastModuleForm;
 var
   Index: Integer;
 begin
   Result := wmfText;
   Index := 1;
+  if (Index < ANode.Count) and ANode[Index].IsAtom('definition') then
+    Inc(Index);
   if (Index < ANode.Count) and (ANode[Index].Kind = wnkAtom)
     and (Length(ANode[Index].Atom) > 0)
     and (ANode[Index].Atom[1] = '$') then

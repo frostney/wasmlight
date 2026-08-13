@@ -243,6 +243,23 @@ begin
   Count := ReadVecCount(ABody, 'export');
   for I := 1 to Count do
   begin
+    { The reference decoder consumes vector entries from the physical stream
+      before checking the export section's declared size. If the vector count
+      promises another named entry exactly at the section boundary and the
+      module continues, it reports the name list as out of bounds rather than
+      generic section truncation. Keep this narrow to exports: other entity
+      productions have different confirmed prefixes for the same geometry. }
+    if ABody.Eof and (ABody.PhysicalRemaining > 0)
+      { In binary.wast:737 the next section's one-byte id is consumed as the
+        missing export's one-byte name length, but the declared bytes do not
+        physically remain. Do not generalize this to `$00` (an empty name) or
+        a continued u32; those retain the ordinary section-truncation
+        diagnosis. }
+      and ((ABody.PeekPhysicalByte and $80) = 0)
+      and (ABody.PhysicalRemaining < 1 + ABody.PeekPhysicalByte) then
+      raise EWasmDecodeError.CreateFmt(
+        '%s: export name starts at section boundary offset %u',
+        [MSG_LENGTH_OUT_OF_BOUNDS, ABase + ABody.Position]);
     Entry.Name := ABody.ReadName;
     Entry.Kind := ReadExternKind(ABody, ABase, MSG_MALFORMED_EXPORT_KIND);
     Entry.Index := ABody.ReadU32;

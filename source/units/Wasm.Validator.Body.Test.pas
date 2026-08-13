@@ -1098,7 +1098,7 @@ begin
     Code1(B([$00]), B([$0B, $0B])));
 
   ExpectMalformed('a trailing byte after the body''s end',
-    MSG_BODY_SIZE_MISMATCH);
+    MSG_SECTION_SIZE_MISMATCH);
 end;
 
 { `binary-if` admits $05 in exactly one place and at most once. }

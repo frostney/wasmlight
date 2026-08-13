@@ -207,7 +207,12 @@ type
     procedure TestAssertMalformedTextNotMalformedFails;
     procedure TestAssertInvalidTextOperandPasses;
     procedure TestSimdTextModuleValidates;
-    procedure TestAssertUnlinkablePrechecksThenSkips;
+    procedure TestAssertUnlinkablePasses;
+    procedure TestAssertUnlinkableUnknownImportPasses;
+    procedure TestAssertUnlinkableWrongKindPasses;
+    procedure TestAssertUnlinkableWrongPrefixFails;
+    procedure TestAssertUnlinkableLinkableModuleFails;
+    procedure TestInlineModuleBodyRunsAsOneModule;
     procedure TestUnknownDirectiveSkipped;
     procedure TestExecutionCommandsSkipped;
     procedure TestAssertWithoutModuleOperandSkipped;
@@ -229,7 +234,15 @@ type
     procedure TestAssertExhaustion;
     procedure TestExternRefIdentityMatches;
     procedure TestExternRefIdentityMismatchFails;
+    procedure TestSpectestPrintFunctions;
+    procedure TestSpectestGlobals;
+    procedure TestSpectestTablesAndMemory;
+    procedure TestSpectestMemoryIsShared;
+    procedure TestRegisteredSpectestReplacesBuiltinWholeModule;
     procedure TestCrossModuleRegisterImport;
+    procedure TestModuleDefinitionDoesNotInstantiate;
+    procedure TestModuleInstancesAreGenerative;
+    procedure TestAnonymousModuleInstanceBecomesCurrent;
     procedure TestAssertTrapModuleOobSegmentPersists;
     procedure TestAssertTrapModuleTrappingStartPersists;
     procedure TestAssertTrapModuleNoTrapReportsFail;
@@ -556,17 +569,85 @@ begin
   Expect<string>(Item.Actual).ToBe('');
 end;
 
-procedure TWastRunnerTests.TestAssertUnlinkablePrechecksThenSkips;
+procedure TWastRunnerTests.TestAssertUnlinkablePasses;
 var
   Item: TWastCommandResult;
 begin
-  { assert_unlinkable pre-checks the operand (assemble + decode + validate),
-    which succeeds for this well-formed module, then skips because linkage is
-    not yet judgeable. A skip stays a skip; the failure path is what is new. }
+  Item := ResultAt(
+    '(module $m (func (export "f") (param i32)))' + sLineBreak
+    + '(register "m" $m)' + sLineBreak
+    + '(assert_unlinkable '
+    + '  (module (import "m" "f" (func (param i64))))'
+    + '  "incompatible import type")', 2);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('unlinkable');
+  ExpectStartsWith(Item.Actual, 'incompatible import type');
+end;
+
+procedure TWastRunnerTests.TestAssertUnlinkableUnknownImportPasses;
+var
+  Item: TWastCommandResult;
+begin
+  { A missing module/name is represented as WASM_NO_ADDR and handed to the
+    instantiator, which owns the `unknown import` link-error classification. }
   Item := FirstResult(
-    '(assert_unlinkable (module quote "(module)") "unknown import")');
-  Expect<string>(WastStatusName(Item.Status)).ToBe('skip');
-  Expect<string>(Item.Actual).ToBe(WAST_REASON_NEEDS_TIER);
+    '(assert_unlinkable (module (import "missing" "f" (func))) '
+    + '"unknown import")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('unlinkable');
+  ExpectStartsWith(Item.Actual, 'unknown import');
+end;
+
+procedure TWastRunnerTests.TestAssertUnlinkableWrongKindPasses;
+var
+  Item: TWastCommandResult;
+begin
+  { A known export of the wrong external kind is incompatible, not absent. }
+  Item := ResultAt(
+    '(module $m (memory (export "x") 1))' + sLineBreak
+    + '(register "m" $m)' + sLineBreak
+    + '(assert_unlinkable (module (import "m" "x" (func))) '
+    + '"incompatible import type")', 2);
+  Expect<string>(WastStatusName(Item.Status)).ToBe('pass');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('unlinkable');
+  ExpectStartsWith(Item.Actual, 'incompatible import type');
+end;
+
+procedure TWastRunnerTests.TestAssertUnlinkableWrongPrefixFails;
+var
+  Item: TWastCommandResult;
+begin
+  Item := FirstResult(
+    '(assert_unlinkable (module (import "missing" "f" (func))) '
+    + '"incompatible import type")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('unlinkable');
+  ExpectStartsWith(Item.Actual, 'unknown import');
+end;
+
+procedure TWastRunnerTests.TestAssertUnlinkableLinkableModuleFails;
+var
+  Item: TWastCommandResult;
+begin
+  Item := FirstResult(
+    '(assert_unlinkable (module) "unknown import")');
+  Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
+  Expect<string>(WastErrorKindName(Item.ActualKind)).ToBe('none');
+  Expect<string>(Item.Actual).ToBe(WAST_NO_ERROR);
+end;
+
+procedure TWastRunnerTests.TestInlineModuleBodyRunsAsOneModule;
+var
+  Run: TWastRunResult;
+begin
+  Run := RunWastSource('(func) (memory 0) (func (export "f"))');
+  try
+    Expect<Integer>(Run.Count).ToBe(1);
+    Expect<string>(WastCommandKindName(Run[0].Kind)).ToBe('module');
+    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
+  finally
+    Run.Free;
+  end;
 end;
 
 procedure TWastRunnerTests.TestUnknownDirectiveSkipped;
@@ -584,10 +665,10 @@ end;
 
 procedure TWastRunnerTests.TestExecutionCommandsSkipped;
 begin
-  { With a tier landed but NO module instantiated in the script, every
-    action/assertion still skips — there is nothing to run it against. The
-    reasons now name the real gap (no instance, text-only, exceptions)
-    rather than a blanket "needs a tier". }
+  { With a tier landed but NO module instantiated in the script, actions
+    still skip because there is nothing to run against. assert_unlinkable is
+    self-contained: this empty operand links, so the assertion is judged and
+    fails because it expected an error. }
   Expect<string>(StatusSignature(
     '(register "m")' + sLineBreak +
     '(invoke "f" (i32.const 1))' + sLineBreak +
@@ -598,7 +679,7 @@ begin
     '(assert_exhaustion (invoke "f") "call stack exhausted")' + sLineBreak +
     '(assert_exception (invoke "f"))'))
     .ToBe('register:skip invoke:skip assert_return:skip assert_trap:skip '
-      + 'assert_unlinkable:skip assert_exhaustion:skip assert_exception:skip');
+      + 'assert_unlinkable:fail assert_exhaustion:skip assert_exception:skip');
 
   { No module precedes it, so there is no current instance to register. }
   Expect<string>(FirstResult('(register "m")').Actual)
@@ -842,6 +923,123 @@ begin
   Expect<string>(WastStatusName(Item.Status)).ToBe('fail');
 end;
 
+procedure TWastRunnerTests.TestSpectestPrintFunctions;
+begin
+  { The pinned reference host exports seven no-result diagnostic functions.
+    wasmlight keeps the harness quiet, but every exact signature must link and
+    execute as a no-op rather than causing the module and its actions to skip. }
+  Expect<string>(StatusSignature(
+    '(module' + sLineBreak
+    + '  (import "spectest" "print" (func $p))' + sLineBreak
+    + '  (import "spectest" "print_i32" (func $pi32 (param i32)))'
+    + sLineBreak
+    + '  (import "spectest" "print_i64" (func $pi64 (param i64)))'
+    + sLineBreak
+    + '  (import "spectest" "print_f32" (func $pf32 (param f32)))'
+    + sLineBreak
+    + '  (import "spectest" "print_f64" (func $pf64 (param f64)))'
+    + sLineBreak
+    + '  (import "spectest" "print_i32_f32"'
+    + '    (func $pi32f32 (param i32 f32)))' + sLineBreak
+    + '  (import "spectest" "print_f64_f64"'
+    + '    (func $pf64f64 (param f64 f64)))' + sLineBreak
+    + '  (func (export "run")' + sLineBreak
+    + '    (call $p)' + sLineBreak
+    + '    (call $pi32 (i32.const 1))' + sLineBreak
+    + '    (call $pi64 (i64.const 2))' + sLineBreak
+    + '    (call $pf32 (f32.const 3))' + sLineBreak
+    + '    (call $pf64 (f64.const 4))' + sLineBreak
+    + '    (call $pi32f32 (i32.const 5) (f32.const 6))' + sLineBreak
+    + '    (call $pf64f64 (f64.const 7) (f64.const 8))))' + sLineBreak
+    + '(invoke "run")'))
+    .ToBe('module:pass invoke:pass');
+end;
+
+procedure TWastRunnerTests.TestSpectestGlobals;
+begin
+  { Values and const mutability match interpreter/host/spectest.ml: integers
+    are 666 and floating-point globals are their nearest 666.6 value. }
+  Expect<string>(StatusSignature(
+    '(module' + sLineBreak
+    + '  (global (export "i32") (import "spectest" "global_i32") i32)'
+    + sLineBreak
+    + '  (global (export "i64") (import "spectest" "global_i64") i64)'
+    + sLineBreak
+    + '  (global (export "f32") (import "spectest" "global_f32") f32)'
+    + sLineBreak
+    + '  (global (export "f64") (import "spectest" "global_f64") f64))'
+    + sLineBreak
+    + '(assert_return (get "i32") (i32.const 666))' + sLineBreak
+    + '(assert_return (get "i64") (i64.const 666))' + sLineBreak
+    + '(assert_return (get "f32") (f32.const 666.6))' + sLineBreak
+    + '(assert_return (get "f64") (f64.const 666.6))'))
+    .ToBe('module:pass assert_return:pass assert_return:pass '
+      + 'assert_return:pass assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestSpectestTablesAndMemory;
+begin
+  { The standard externals preserve their address types and initial sizes:
+    i32/i64 tables both start at 10 entries; the i32 memory starts at 1 page. }
+  Expect<string>(StatusSignature(
+    '(module' + sLineBreak
+    + '  (table $t (import "spectest" "table") 10 20 funcref)'
+    + sLineBreak
+    + '  (table $t64 (import "spectest" "table64")'
+    + '    i64 10 20 funcref)' + sLineBreak
+    + '  (memory $m (import "spectest" "memory") 1 2)' + sLineBreak
+    + '  (func (export "ts") (result i32) (table.size $t))'
+    + sLineBreak
+    + '  (func (export "ts64") (result i64) (table.size $t64))'
+    + sLineBreak
+    + '  (func (export "ms") (result i32) (memory.size $m)))'
+    + sLineBreak
+    + '(assert_return (invoke "ts") (i32.const 10))' + sLineBreak
+    + '(assert_return (invoke "ts64") (i64.const 10))' + sLineBreak
+    + '(assert_return (invoke "ms") (i32.const 1))'))
+    .ToBe('module:pass assert_return:pass assert_return:pass '
+      + 'assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestSpectestMemoryIsShared;
+begin
+  { Per-script host state is shared: a store through one module's imported
+    memory is observable through a later module importing the same memory. }
+  Expect<string>(StatusSignature(
+    '(module' + sLineBreak
+    + '  (memory $m (import "spectest" "memory") 1 2)' + sLineBreak
+    + '  (func (export "put")'
+    + '    (i32.store8 (i32.const 7) (i32.const 42))))' + sLineBreak
+    + '(invoke "put")' + sLineBreak
+    + '(module' + sLineBreak
+    + '  (memory $m (import "spectest" "memory") 1 2)' + sLineBreak
+    + '  (func (export "get") (result i32)'
+    + '    (i32.load8_u (i32.const 7))))' + sLineBreak
+    + '(assert_return (invoke "get") (i32.const 42))'))
+    .ToBe('module:pass invoke:pass module:pass assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestRegisteredSpectestReplacesBuiltinWholeModule;
+const
+  Src =
+    '(module $replacement (func (export "print") (result i32) (i32.const 7)))'
+    + sLineBreak + '(register "spectest" $replacement)' + sLineBreak
+    + '(module (import "spectest" "print" (func $p (result i32)))'
+    + ' (func (export "call") (result i32) (call $p)))' + sLineBreak
+    + '(assert_return (invoke "call") (i32.const 7))';
+var
+  Run: TWastRunResult;
+begin
+  Run := RunWastSource(Src);
+  try
+    Expect<Integer>(Run.Count).ToBe(4);
+    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
+    Expect<string>(WastStatusName(Run[3].Status)).ToBe('pass');
+  finally
+    Run.Free;
+  end;
+end;
+
 procedure TWastRunnerTests.TestCrossModuleRegisterImport;
 begin
   { An exporter registered under "M", then an importer that imports
@@ -852,6 +1050,48 @@ begin
     + MODULE_IMPORTER + sLineBreak
     + '(assert_return (invoke "f") (i32.const 5))'))
     .ToBe('module:pass register:pass module:pass assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestModuleDefinitionDoesNotInstantiate;
+begin
+  { The maximum valid i32 memory is intentionally impractical to allocate.
+    Definition formation validates it but must not create store state. }
+  Expect<string>(StatusSignature(
+    '(module definition (memory 65536))' + sLineBreak
+    + '(module (func (export "ok") (result i32) (i32.const 1)))'
+      + sLineBreak
+    + '(assert_return (invoke "ok") (i32.const 1))'))
+    .ToBe('module:pass module:pass assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestModuleInstancesAreGenerative;
+const
+  DEFINITION =
+    '(module definition $M'
+    + ' (global $g (export "g") (mut i32) (i32.const 0))'
+    + ' (func (export "set") (global.set $g (i32.const 1))))';
+begin
+  { Both instances borrow one immutable definition but own distinct globals. }
+  Expect<string>(StatusSignature(
+    DEFINITION + sLineBreak
+    + '(module instance $I1 $M)' + sLineBreak
+    + '(module instance $I2 $M)' + sLineBreak
+    + '(invoke $I1 "set")' + sLineBreak
+    + '(assert_return (get $I1 "g") (i32.const 1))' + sLineBreak
+    + '(assert_return (get $I2 "g") (i32.const 0))'))
+    .ToBe('module:pass module:pass module:pass invoke:pass '
+      + 'assert_return:pass assert_return:pass');
+end;
+
+procedure TWastRunnerTests.TestAnonymousModuleInstanceBecomesCurrent;
+begin
+  Expect<string>(StatusSignature(
+    '(module definition $M'
+    + ' (func (export "seven") (result i32) (i32.const 7)))'
+      + sLineBreak
+    + '(module instance $M)' + sLineBreak
+    + '(assert_return (invoke "seven") (i32.const 7))'))
+    .ToBe('module:pass module:pass assert_return:pass');
 end;
 
 procedure TWastRunnerTests.TestAssertTrapModuleOobSegmentPersists;
@@ -1352,8 +1592,18 @@ begin
     TestAssertInvalidTextOperandPasses);
   Test('a vector mnemonic in a text module validates and passes',
     TestSimdTextModuleValidates);
-  Test('assert_unlinkable pre-checks the operand then skips',
-    TestAssertUnlinkablePrechecksThenSkips);
+  Test('assert_unlinkable passes on an incompatible import',
+    TestAssertUnlinkablePasses);
+  Test('assert_unlinkable passes on an unknown import',
+    TestAssertUnlinkableUnknownImportPasses);
+  Test('assert_unlinkable passes on a wrong-kind import',
+    TestAssertUnlinkableWrongKindPasses);
+  Test('assert_unlinkable reports a fail on a wrong prefix',
+    TestAssertUnlinkableWrongPrefixFails);
+  Test('assert_unlinkable reports a fail when linkage succeeds',
+    TestAssertUnlinkableLinkableModuleFails);
+  Test('an inline module body runs as one module',
+    TestInlineModuleBodyRunsAsOneModule);
   Test('unknown directive skipped', TestUnknownDirectiveSkipped);
   Test('execution commands skipped', TestExecutionCommandsSkipped);
   Test('assert without a module operand skipped',
@@ -1385,8 +1635,23 @@ begin
     TestExternRefIdentityMatches);
   Test('assert_return reports a fail on externref mismatch',
     TestExternRefIdentityMismatchFails);
+  Test('spectest print functions link and execute',
+    TestSpectestPrintFunctions);
+  Test('spectest globals carry the pinned values', TestSpectestGlobals);
+  Test('spectest tables and memory carry pinned limits',
+    TestSpectestTablesAndMemory);
+  Test('spectest memory is shared for the whole script',
+    TestSpectestMemoryIsShared);
+  Test('a registered spectest replaces the built-in whole module',
+    TestRegisteredSpectestReplacesBuiltinWholeModule);
   Test('register binds an instance for cross-module import',
     TestCrossModuleRegisterImport);
+  Test('module definition validates without instantiating',
+    TestModuleDefinitionDoesNotInstantiate);
+  Test('module instances are fresh and generative',
+    TestModuleInstancesAreGenerative);
+  Test('anonymous module instance becomes current',
+    TestAnonymousModuleInstanceBecomesCurrent);
   Test('assert_trap over a module judges an OOB segment and persists earlier',
     TestAssertTrapModuleOobSegmentPersists);
   Test('assert_trap over a module judges a trapping start and persists data',
