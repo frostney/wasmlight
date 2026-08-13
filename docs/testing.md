@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-four suites today, 1,188 tests, all green.
+  independent programs. Forty-four suites today, 1,224 tests, all green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -11,9 +11,8 @@
   instantiates, and *executes* `assert_return` / `assert_trap` / `invoke`
   / `assert_exhaustion` / `assert_exception` through the interpreter — SIMD
   judged per lane (Track G) and exception-handling throwing judged (Track
-  H), so the `staged` column is 0. The measured conformance is reported
-  below; what still skips is a few host-import cases and
-  `assert_unlinkable`.
+  H), so the `staged` column is 0. The 257 pinned core scripts are fully
+  judged: 65,188 pass with no failures or skips.
 - Two framework gotchas bite newcomers; both are listed below.
 
 ## Running
@@ -35,7 +34,7 @@ non-zero if any test or compile fails.
 | --- | --- | --- |
 | Co-located unit suites | The decoder and validator match *our reading* of the spec | shipped |
 | Fixture cross-check | It matches *what toolchains actually emit* | shipped |
-| Spec testsuite | It matches *the spec*, judged externally, in every execution tier | shipped — assembles, validates, instantiates, and executes all of core wasm 3.0, SIMD and exception handling judged, over `--tier=interp\|jit\|aot` (all three byte-identical); a few host-import and `assert_unlinkable` edges still skip |
+| Spec testsuite | It matches *the spec*, judged externally, in every execution tier | shipped — assembles, validates, instantiates, and executes all of core wasm 3.0, including the standard `spectest` host, `assert_unlinkable`, module definitions/instances, SIMD, and exception handling, over `--tier=interp\|jit\|aot`; the pinned core tally is byte-identical with no failures or skips |
 
 The middle tier exists because the first two claims are not the same one.
 The section-order bug this project fixed was invisible to hand-written
@@ -181,17 +180,24 @@ through the interpreter and compare. Everything not judged is `SKIP` with a
 reason, and the skip column is never folded into the totals, so a report
 cannot read as more conformance than was measured.
 
-The current run over the whole checkout
-(`WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`):
+The pinned core target (the 257 top-level scripts) is clean:
 
 ```text
-ROOT      pass=64671 fail=33  skip=610  staged=0 total=65314
-PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
-TOTAL files=288 errors=0 pass=65204 fail=389 skip=1532 staged=0 total=67125
+ROOT pass=65188 fail=0 skip=0 staged=0 total=65188
+TOTAL files=257 errors=0 pass=65188 fail=0 skip=0 staged=0 total=65188
 ```
 
-Judged commands — `pass + fail` — are **~65,593** of the corpus's
-~67,000. The `staged` column is now **0**: Track H shipped the exception
+The current recursive run, which additionally includes `custom/`, `legacy/`,
+and post-3.0 `proposals/`, is:
+
+```text
+ROOT pass=65208 fail=14 skip=90 staged=0 total=65312
+PROPOSALS pass=643 fail=354 skip=814 staged=0 total=1811
+TOTAL files=288 errors=0 pass=65851 fail=368 skip=904 staged=0 total=67123
+```
+
+Judged commands — `pass + fail` — are **66,219** of the recursive mirror's
+67,123. The `staged` column is now **0**: Track H shipped the exception
 throwing that used to sit there, so `try_table`, `throw`, and `throw_ref`
 execute and `assert_exception` is judged.
 
@@ -200,13 +206,13 @@ This is honest conformance, and it now reaches execution across the
 assembler builds what upstream builds, the validator rejects what upstream
 rejects with the right class and a prefix-matching message, and the
 interpreter produces the results — lane by lane for `v128` — the traps, and
-the exceptions the corpus asserts. The 389 failures are **not** 3.0-core
-gaps — 356 of them are `PROPOSALS` (post-3.0 features outside the pinned
-target), and the 33 `ROOT` failures are the legacy `try`/`catch`/`delegate`/
-`rethrow` encoding (out of 3.0 scope), module-definition/instance harness
-forms, and a few deferred decode/framing edges (see
-[`tests/spec/README.md`](../tests/spec/README.md)). None is a SIMD or
-exception-handling execution failure.
+the exceptions the corpus asserts. The 368 recursive failures are **not**
+3.0-core gaps: 354 are `PROPOSALS` (post-3.0 features outside the pinned
+target), and all 14 `ROOT` failures are the legacy
+`try`/`catch`/`delegate`/`rethrow` encoding, which is explicitly outside the
+3.0 target. The 90 root skips are 20 testsuite-local custom directives and 70
+commands downstream of those legacy modules. The pinned core itself has no
+failure or skip.
 
 `STAGED` remains a distinct status in the harness — a case attempted and
 deliberately set aside, never counted as a pass — but nothing populates it
@@ -235,14 +241,21 @@ the column reads 0.
 5. **Per-lane SIMD comparison — met.** `assert_return` over a `v128`
    result compares each lane at the shape's width (Track G), so a
    `nan:canonical` lane can sit beside an exact one.
-6. **Host references** — `(ref.extern n)` (140) and `(ref.host n)` — parse
-   into identity matchers in `Wasm.Wast.Values`; imports the harness does
-   not provide still skip (`import not provided by the harness`).
+6. **Host references and imports — met.** `(ref.extern n)` (140) and
+   `(ref.host n)` parse into identity matchers. The pinned standard `spectest`
+   functions, globals, i32/i64 tables, and memory are allocated once per
+   script and shared by every module.
+7. **Linkage and script module forms — met.** `assert_unlinkable` is judged by
+   the real instantiator's `EWasmLinkError`; named definitions are retained and
+   instantiated generatively; an elided outer module wrapper is treated as one
+   inline module body.
 
-What still skips, never as a silent pass: host imports the harness does
-not provide, and `assert_unlinkable` (linkage is not yet judged).
-Exception handling no longer skips — `assert_exception` is judged and the
-throwing forms execute (Track H). Two traps, both handled:
+The pinned core has no skips. Recursive-only skips remain honest: the custom
+tree's `assert_malformed_custom` and `assert_invalid_custom` directives are
+testsuite-local extensions absent from the reference grammar, and legacy
+commands have no instance after their intentionally unsupported module form
+fails. Exception handling in core does not skip — `assert_exception` is judged
+and the 3.0 throwing forms execute (Track H). Two reporting traps remain:
 `assert_malformed_custom` and `assert_invalid_custom` are testsuite-local
 extensions absent from the reference grammar, so the runner classifies
 them as unknown and skips rather than choking; and `assert_return` is 83%
@@ -256,10 +269,10 @@ All three execution tiers exist, so the harness runs per tier —
 `wasmspec --tier=interp|jit|aot` — and the suite doubles as the
 differential test between them: every tier must produce identical outcomes
 ([ADR-0001](adr/0001-tiered-execution-seam.md)). It does. Over the pinned
-`testsuite@de54fd27`, all three tiers report `pass=65204 fail=389
-staged=0` byte-for-byte, with the two compiling tiers reporting
-`compiled=8588` functions on aarch64 (`compiled=8589` on x86-64 — one more
-function clears the scope fence there). The JIT and AOT tiers run only on a
+`testsuite@de54fd27`, all three tiers report the pinned-core tally
+`pass=65188 fail=0 skip=0 staged=0` byte-for-byte. The local aarch64 run
+compiled 8,703 functions in each compiling tier (8,799 over the recursive
+mirror). The JIT and AOT tiers run only on a
 64-bit UNIX host (`WASM_JIT_EXEC`); on Windows and 32-bit targets the
 interpreter runs alone.
 

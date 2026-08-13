@@ -110,6 +110,10 @@ path a binary module takes:
 
 - `(module ...)` / `(module quote ...)` / `(module binary ...)` at top level —
   assemble (text/quote), decode, validate, **instantiate**, run any start function
+- an inline sequence of module fields with the outer `(module ...)` elided —
+  assemble and run as one module, matching `inline-module.wast`
+- `(module definition ...)` / `(module instance ...)` — retain a validated
+  definition and instantiate fresh, generative instances against the registry
 - `(assert_malformed (module ...) "...")` — a TEXT/quote operand must raise
   `EWasmTextError` from the assembler; a BINARY operand must raise
   `EWasmDecodeError`. A decode error on the assembler's OWN output is an
@@ -125,15 +129,18 @@ path a binary module takes:
   the instantiation-trap form: the module is built and instantiated for real,
   an out-of-bounds active segment traps after earlier ones persist, and a
   trapping start function is judged
+- `(assert_unlinkable (module ...) "...")` — instantiate through the real
+  resolver and require a prefix-matching `EWasmLinkError`
+- imports from `spectest` — resolve the pinned standard print functions,
+  numeric globals, i32/i64 tables, and memory shared for the script lifetime
 
 Everything else is `SKIP` with a reason, never a silent pass:
 
 | Reason | Applies to |
 | --- | --- |
-| `no instantiated module` | An `assert_return` / `invoke` whose module did not instantiate — now mostly modules downstream of an unprovided import |
-| `needs an execution tier` | An action whose module the assembler cannot yet build for another reason |
-| `import not provided by the harness` | A module importing something the harness does not supply |
-| `assert_unlinkable` | Linkage is not yet judged (the operand is still assembled and validated as a pre-check) |
+| `no instantiated module` | An action downstream of a module that did not instantiate, retained for custom/legacy/proposal scripts |
+| `needs an execution tier` | A genuinely unavailable action path |
+| `import not provided by the harness` | A non-standard host module absent from both the script registry and pinned `spectest` host |
 | `directive not in the reference grammar` | `assert_malformed_custom`, `assert_invalid_custom`, anything else unrecognised |
 
 Modules are assembled and decoded at command-execution time, never at
@@ -154,12 +161,21 @@ reads 0. The status stays in the harness for the next deferred feature.
 
 ## Where the numbers stand
 
-`WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`, 288 scripts:
+`WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`.
+The 257 pinned core scripts are fully judged:
 
 ```text
-ROOT      pass=64671 fail=33  skip=610  staged=0 total=65314
-PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
-TOTAL files=288 errors=0 pass=65204 fail=389 skip=1532 staged=0 total=67125
+ROOT pass=65188 fail=0 skip=0 staged=0 total=65188
+TOTAL files=257 errors=0 pass=65188 fail=0 skip=0 staged=0 total=65188
+```
+
+The recursive 288-script mirror, including `custom/`, `legacy/`, and
+post-3.0 proposal trees, reports:
+
+```text
+ROOT pass=65208 fail=14 skip=90 staged=0 total=65312
+PROPOSALS pass=643 fail=354 skip=814 staged=0 total=1811
+TOTAL files=288 errors=0 pass=65851 fail=368 skip=904 staged=0 total=67123
 ```
 
 `ROOT` is everything outside `proposals/` (the 3.0 target plus the out-of-scope
@@ -169,21 +185,21 @@ runtime units — the interpreter's traps reach the runtime `MSG_*` strings the
 binary-only runs never did, and a raise site appends its context after the
 prefix rather than in front of it.
 
-Judged commands are `pass + fail` = **~65,593**. The `staged` column is **0**:
+Judged recursive commands are `pass + fail` = **66,219**. The `staged` column is **0**:
 Track H shipped exception-handling throwing, so `try_table`, `throw`, and
 `throw_ref` execute and `assert_exception` is judged — the whole core 3.0
-instruction set now runs. The `skip` column (~1,532) is the residue: assertions
-downstream of an unprovided import, host imports the harness does not provide,
-and `assert_unlinkable`.
+instruction set now runs. The pinned core `skip` column is 0. Recursive skips
+are proposal residue plus 20 testsuite-local custom directives and 70 legacy
+commands downstream of an intentionally unsupported legacy module.
 
-### What the 389 failures are
+### What the 368 recursive failures are
 
-The split is the headline: **356 are `PROPOSALS`** and only **33 are `ROOT`**, so
+The split is the headline: **354 are `PROPOSALS`** and only **14 are `ROOT`**, so
 the failures cluster in post-3.0 features, not in the 3.0 target — and none is a
 SIMD or exception-handling execution failure. None is a wrong-CLASS rejection
 between `malformed` and `invalid`.
 
-**`PROPOSALS` (356)** exercise features outside the pinned conformance target
+**`PROPOSALS` (354)** exercise features outside the pinned conformance target
 ([ADR-0004](../../docs/adr/0004-conformance-target-is-the-3-0-draft.md)):
 `custom-descriptors` (descriptor composite types, exact reference types, the
 `type … does not have a descriptor` family), `custom-page-sizes` (the `invalid
@@ -194,16 +210,16 @@ these must be accepted) and as **wording mismatches** on modules upstream also
 rejects. The justification holds — 3.0 does not have these features — but the
 honest label on the `expected=""` cases is *false rejection*, not diagnostics.
 
-**`ROOT` (33)** are three kinds:
+**`ROOT` (14)** are one deliberately excluded kind:
 
 - **Legacy exception handling** (`testsuite/legacy/try_catch.wast`,
-  `rethrow.wast`, `throw.wast`, `try_delegate.wast`, 16 cases) — the pre-3.0
+  `rethrow.wast`, `throw.wast`, `try_delegate.wast`, 14 cases) — the pre-3.0
   `try`/`catch`/`delegate`/`rethrow` encoding, out of 3.0 scope and staying
   failing (Track H covers the 3.0 `try_table` form only, which passes).
-- **Module-definition and instance harness forms** — commands the harness does
-  not yet model, rather than instruction or tier failures.
-- **A few assembler/decoder framing edges** — remaining text forms and message
-  boundaries that do not affect execution of accepted core 3.0 modules.
+
+Module definitions/instances, the standard `spectest` host,
+`assert_unlinkable`, inline module bodies, and the previously mismatched binary
+diagnostic boundaries are all judged in the clean pinned-core run.
 
 Extract the live signatures rather than trusting this list to stay exact — the
 grep in the "Reading the output" section keys on the `got=`/`expected=` pair and

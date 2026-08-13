@@ -33,7 +33,9 @@ it. It is driven by `wasmlight inspect` / `wasmlight validate` /
 conformance corpus in any tier (`--tier=interp|jit|aot`) — assembling text
 modules, validating, instantiating, and executing the assertions, SIMD
 judged per lane and `assert_exception` judged. All three tiers produce
-**byte-identical** corpus results (**65,204 pass**) on both arches.
+**byte-identical** pinned-core results (**65,188 pass, 0 fail, 0 skip**)
+on both compiling tiers locally; CI proves the same identity across the
+supported platform matrix.
 [docs/roadmap.md](docs/roadmap.md) is the honest picture of exactly what
 exists and what remains (broader optimizing-compiler work, the characterized
 non-3.0-core corpus failures, and cross-platform CI validation).
@@ -97,15 +99,17 @@ modules, validating, instantiating, and executing `assert_return` /
 ```text
 $ ./build/wasmspec tests/spec/testsuite
 ...
-ROOT      pass=64671 fail=33  skip=610  staged=0 total=65314
-PROPOSALS pass=533   fail=356 skip=922  staged=0 total=1811
-TOTAL files=288 errors=0 pass=65204 fail=389 skip=1532 staged=0 total=67125
+ROOT pass=65208 fail=14 skip=90 staged=0 total=65312
+PROPOSALS pass=643 fail=354 skip=814 staged=0 total=1811
+TOTAL files=288 errors=0 pass=65851 fail=368 skip=904 staged=0 total=67123
 ```
 
 SIMD is judged per lane (Track G) and exception handling is judged (Track
 H), so `staged` is 0 and the interpreter executes all of core wasm 3.0; the
-failures are dominated by post-3.0 proposals outside the pinned 3.0 target,
-not 3.0 regressions.
+the 257 pinned core scripts are separately clean at `pass=65188 fail=0
+skip=0`. The recursive residue is confined to post-3.0 proposals, the
+explicitly out-of-scope legacy exception encoding, and testsuite-local custom
+directives.
 
 For the full command set and every development command, see
 [docs/quick-start.md](docs/quick-start.md) and

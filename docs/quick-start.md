@@ -107,10 +107,12 @@ TOTAL files=1 errors=0 pass=460 fail=0 skip=0 staged=0 total=460
 ```
 
 A directory argument is walked recursively, and the aggregate splits `ROOT`
-(the 3.0 target) from `PROPOSALS` (post-3.0). Over the whole corpus that is
-`pass=65204 fail=389 skip=1532 staged=0` across 288 files — SIMD judged per
-lane (Track G) and exception handling judged (Track H), so `staged` is 0,
-and the failures are dominated by post-3.0 proposals, not 3.0 regressions.
+(core plus the mirror's `custom/` and `legacy/` trees) from `PROPOSALS`.
+The 257 pinned core scripts are clean at `pass=65188 fail=0 skip=0 staged=0`.
+Over the whole recursive mirror the tally is `pass=65851 fail=368 skip=904
+staged=0` across 288 files; the residue is confined to post-3.0 proposals,
+testsuite-local custom directives, and the explicitly out-of-scope legacy
+exception encoding.
 See [testing.md](testing.md) for what the tallies mean and
 [`tests/spec/README.md`](../tests/spec/README.md) for fetching the corpus.
 
@@ -142,7 +144,8 @@ absolute path is refused before any OS call. Arguments after the module
 Those three programs are the whole shipped surface today: decode, validate,
 instantiate, and execute the **complete core wasm 3.0 instruction set** —
 every numeric, reference, GC, SIMD, and exception-handling instruction —
-conformance-tested against the upstream corpus (~65,204 assertions pass),
+conformance-tested against the pinned core corpus (65,188 pass, no failures or
+skips),
 **and run WASI preview1 command modules** under deny-by-default sandboxing.
 See [roadmap.md](roadmap.md) for what comes next and in what order.
 

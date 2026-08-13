@@ -27,8 +27,8 @@
   Track H the runtime decodes, validates, instantiates, and **executes all
   of core wasm 3.0** — every category in the counted backlog, SIMD and
   exception handling included. Nothing in the interpreter is staged any
-  more: the harness's `STAGED` column is **0**. The corpus runs at
-  **~65,204 pass** of ~67,000 judged commands with `errors=0`. With Track
+  more: the harness's `STAGED` column is **0**. The 257 pinned core scripts
+  run at **65,188 pass, 0 fail, 0 skip** with `errors=0`. With Track
   F that execution core is now reachable from a host and from the command
   line: `wasmlight run tests/fixtures/wasi/hello.wasm` prints `hello` and
   exits `0`, and a program granted a preopen reads the filesystem through
@@ -62,7 +62,8 @@
   platform), a **baseline JIT** that compiles each function to native code
   at run time, and an **ahead-of-time compiler** that compiles to a
   `.waot` artifact loaded for instant startup. All three produce
-  **byte-identical** corpus results (65,204 pass) on both aarch64 and
+  **byte-identical** pinned-core results (65,188 pass, no failures or skips)
+  on both aarch64 and
   x86-64. The JIT and AOT share **two backends** — `Wasm.Jit.Arm64` and
   `Wasm.Jit.X64` — gated to a 64-bit UNIX host (`WASM_JIT_EXEC`); on
   Windows and 32-bit targets the JIT/AOT are inactive and the runtime is
@@ -81,8 +82,8 @@
   values and expression temporaries across epoch-only back-edges, sparsely
   initialize compiled frames from validation metadata, streamline resolved
   direct-call frame entry/exit, and pin eligible single-memory state in the
-  aarch64 backend. Second, the 389
-  characterized corpus failures, none a 3.0-core gap (see Track C). Third,
+  aarch64 backend. Second, the 368 recursively measured failures, all confined
+  to proposals or the out-of-scope legacy encoding (see Track C). Third,
   cross-platform CI validation on the legs never yet run on real hardware:
   the three-tier identity is proven locally on **aarch64-darwin** (native)
   and **amd64-linux** (a Rosetta VM), and the corpus is **now wired into
@@ -290,29 +291,30 @@ and `assert_invalid` judge the rejection (text operands via
 through the interpreter and compare. `wasmspec` (`source/apps/`) points it
 at the corpus.
 
-Over `WebAssembly/testsuite@de54fd27` that is `pass=65204 fail=389
-skip=1532 staged=0` with `errors=0` across 288 files — the split is
-`ROOT pass=64671 fail=33 staged=0` and `PROPOSALS pass=533 fail=356`.
-Judged commands (`pass + fail`) are **~65,593** of the corpus's ~67,000.
+Over the 257 pinned core scripts that is `pass=65188 fail=0 skip=0
+staged=0` with `errors=0`. The recursive mirror adds custom, legacy, and
+post-3.0 proposal trees and reports `pass=65851 fail=368 skip=904 staged=0`
+across 288 files: `ROOT pass=65208 fail=14 skip=90` and
+`PROPOSALS pass=643 fail=354 skip=814`. Judged recursive commands
+(`pass + fail`) are **66,219** of 67,123.
 The `staged` column is **0**: Track H shipped the throwing that used to
 sit there. `--tier=jit` and `--tier=aot` produce the **same** tally,
-byte-for-byte (jit/aot `compiled=8588` on aarch64), which is the
+byte-for-byte (locally, `compiled=8703` for the pinned core and 8,799 for the
+recursive mirror on aarch64), which is the
 differential proof the two compiling tiers demand
 ([ADR-0001](adr/0001-tiered-execution-seam.md)). See
 [testing.md](testing.md) and
 [`tests/spec/README.md`](../tests/spec/README.md) for the tallies and the
 failure breakdown.
 
-The 389 remaining failures are **not** 3.0-core gaps. `PROPOSALS`
-accounts for 356 of them — post-3.0 features outside the pinned target
+The 368 recursive failures are **not** 3.0-core gaps. `PROPOSALS`
+accounts for 354 of them — post-3.0 features outside the pinned target
 ([ADR-0004](adr/0004-conformance-target-is-the-3-0-draft.md)):
 custom-descriptors, custom-page-sizes, wide-arithmetic, and threads, as
-false rejections (`expected=""`) or wording mismatches. The `ROOT` 33 are
-the legacy `try`/`catch`/`delegate`/`rethrow` encoding (`testsuite/legacy/`,
-out of 3.0 scope — the 3.0 `try_table` form passes), module-definition and
-instance harness forms, and a handful of deferred assembler/decoder framing
-edges. None is a wrong-class rejection, and none is a SIMD or
-exception-handling execution failure.
+false rejections (`expected=""`) or wording mismatches. The 14 root failures
+are all the legacy `try`/`catch`/`delegate`/`rethrow` encoding
+(`testsuite/legacy/`, out of 3.0 scope — the 3.0 `try_table` form passes).
+The pinned core has no failures or skips.
 
 Requirements the corpus imposes, and where each stands:
 
@@ -521,8 +523,9 @@ stay discoverable. It carries the full non-EH op set; a function using
 `throw` / `throw_ref` or hosting a `try_table` handler is declined and
 stays interpreted, and the two tiers interoperate transparently across the
 seam. The correctness proof is differential: `--tier=jit` over the corpus
-is **byte-identical** to `--tier=interp` — `compiled=8588` on aarch64
-(`8589` on x86-64), `pass=65204 fail=389` — on **both** architectures.
+is **byte-identical** to `--tier=interp` — locally `compiled=8703` on
+aarch64, `pass=65188 fail=0 skip=0` — with cross-platform identity enforced
+in CI.
 
 The tier runs only where `WASM_JIT_EXEC` holds — a **64-bit UNIX host**.
 On Windows and 32-bit targets it is inactive and the runtime is
@@ -548,7 +551,8 @@ sibling `<module>.waot` auto-detect and a `--no-aot` opt-out — loads it in
 a fresh process for **instant startup**. It is proven not to be a re-JIT:
 the AOT-loaded executable memory is byte-identical to a fresh compile, and
 `--tier=aot` over the corpus is byte-identical to both other tiers
-(`compiled=8588` on aarch64). Same 64-bit-UNIX scope as Track I.
+(`compiled=8703` on aarch64 for the pinned core). Same 64-bit-UNIX scope as
+Track I.
 
 **Security invariant.** AOT **always re-decodes and re-validates** the
 module at load. The artifact is a per-module perf cache, **never a trust
