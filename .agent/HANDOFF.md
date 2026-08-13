@@ -1,5 +1,60 @@
 # Handoff
 
+Updated: 2026-08-14 (pinned core corpus fully judged and delivered)
+
+## Pinned core conformance residue eliminated
+
+- Continued `codex/fix-ci-skips` from fetched `origin/main@12c1a4c`; no merge
+  was needed because that remote head is already an ancestor. Toolchain is FPC
+  3.2.2 through lwpt 0.5.1 only.
+- The runner now provides the pinned standard `spectest` module: all seven
+  print functions, immutable numeric globals, i32/i64 tables, and memory. Its
+  store objects are allocated once per script and shared across modules. A
+  later script `(register "spectest" ...)` replaces the built-in as one whole
+  module; imports never splice exports from both.
+- `assert_unlinkable` now resolves and instantiates through the shipped path and
+  passes only on a prefix-matching `EWasmLinkError`. Named module definitions
+  retain validated model/IR/bytes; module instances are fresh and generative.
+  The corpus's elided-wrapper inline module body is assembled as one module.
+- The final 10 binary diagnostic mismatches are fixed at the grammar boundary:
+  signed s7 composite discriminators, physical LEB width checks across declared
+  body spans, missing-END versus code-section size classification, and the
+  confirmed export-name list overrun. Valid function bodies retain the single
+  fused validation walk; malformed-only probing is gated.
+- Spec evidence was checked at `spec/main@d7b37e4170d8315f2f1283aed4e8076591a9a333`
+  (`binary-int`, `binary-code`, `binary-section`, `binary-comptype`,
+  `binary-name`, `binary-list`, `exec-module`, `exec-instantiation`) and the
+  standard host against the pinned reference `spectest.ml`.
+
+## Final local evidence
+
+- `git diff --check`, `lwpt format --check`, `lwpt install --frozen`, and
+  `lwpt build`: green.
+- `lwpt test`: 44/44 suites, 1,224 tests, no compile/test failures.
+- Markdown lint: 41 files, 0 issues.
+- Pinned core, 257 scripts, identical in every tier:
+  `pass=65188 fail=0 skip=0 staged=0`; JIT/AOT `compiled=8703`.
+- Recursive 288-script mirror, identical in every tier:
+  `pass=65851 fail=368 skip=904 staged=0`; JIT/AOT `compiled=8799`.
+  The residue is explicitly outside core 3.0: 14 legacy EH failures; 354
+  post-3.0 proposal failures; 20 testsuite-local custom skips; and 884
+  downstream `no instantiated module` skips in legacy/proposals. There are
+  zero unresolved-import or `assert_unlinkable` skips.
+- Independent integration reviews found two edge risks (registered `spectest`
+  precedence and an over-broad export-boundary diagnostic); both were fixed
+  with counter-tests before the final gate.
+
+## Delivery
+
+- Implementation commit: `8dba9c1` (`fix: fully judge the pinned core corpus`).
+- Current-truth documentation commit: `e2bea80`
+  (`docs: record complete core conformance`).
+- Full six-platform CI run `31754666992` passed at exact source/docs head
+  `e2bea80`: aarch64/x86-64 macOS, aarch64/x86-64 Linux, and i386/x86-64
+  Windows. The branch is pushed as `origin/codex/fix-ci-skips`.
+- This handoff-only closure commit follows that tested source/docs head; no
+  implementation or generated state changed after the exact-head run.
+
 Updated: 2026-08-13 (main CI repair and corpus-residue audit)
 
 ## Main CI repair
