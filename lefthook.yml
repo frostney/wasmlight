@@ -2,10 +2,10 @@
 #
 # Install once per fresh clone:  lefthook install
 #
-# Local pre-commit runs the canonical formatter (`lwpt format`) and
-# re-stages any files it rewrites. The heavyweight gates — `lwpt build`,
-# `lwpt test` — run on the PR / CI workflows (see .github/workflows/) so
-# local commits stay fast.
+# Local pre-commit runs the canonical formatter (`lwpt format`) and refreshes
+# the generated agent command reference (`lwpt agents`), re-staging any files
+# they rewrite. The heavyweight gates — `lwpt build`, `lwpt test` — run on the
+# PR / CI workflows (see .github/workflows/) so local commits stay fast.
 #
 # lwpt is expected on PATH (`brew install frostney/tap/lwpt`, or the
 # release tarball — see docs/quick-start.md). Point WASMLIGHT_LWPT at
@@ -29,3 +29,11 @@ pre-commit:
         lwpt format failed. Inspect the output above; the formatter only
         fails when it cannot parse a file. If lwpt is missing entirely
         (fresh clone), install it first — see docs/quick-start.md.
+
+    agents:
+      glob: "*.{pas,toml,md}"
+      run: ${WASMLIGHT_LWPT:-lwpt} agents
+      stage_fixed: true
+      fail_text: |
+        lwpt agents failed. Inspect the output above and regenerate the
+        machine-owned AGENTS.md command block with `lwpt agents`.

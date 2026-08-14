@@ -6,7 +6,9 @@ interface
 
 uses
   Generics.Collections,
-  SysUtils;
+  SysUtils,
+
+  TestingPascalLibrary.Protocol;
 
 type
   // Forward declarations
@@ -100,6 +102,7 @@ type
 
     procedure AddSuite(const ASuiteClass: TTestSuiteClass); overload;
     procedure AddSuite(const ASuite: TTestSuite); overload;
+    function InventoryLine: string;
     procedure Run;
 
     property Results: TList<TTestResult> read FResults;
@@ -332,9 +335,15 @@ end;
 
 procedure TTestRunner.Run;
 var
+  InventoryMode: string;
   Suite: TTestSuite;
   Test: TTestRegistration;
+  TestResult: TTestResult;
 begin
+  InventoryMode := ConsumeCurrentTestInventoryMode;
+  if InventoryMode <> '' then WriteLn(InventoryLine);
+  if InventoryMode = TEST_INVENTORY_MODE_ONLY then Halt(0);
+
   WriteLn;
   WriteLn('Running tests...');
   WriteLn;
@@ -362,6 +371,34 @@ begin
 
   PrintResults;
   PrintSummary;
+
+  { A failing suite fails the process by default: lwpt test (and any
+    CI gating on it) reads the program's exit code, and requiring
+    every consumer test program to remember the
+    `ExitCode := TestResultToExitCode` boilerplate proved error-prone
+    — a program that omitted it exited 0 with failing assertions and
+    lwpt test reported the suite as passing. Computed from this
+    runner's own results; a nonzero ExitCode already set elsewhere is
+    never lowered. Harnesses that run a deliberately failing suite on
+    a throwaway runner (see the canary) reset ExitCode afterwards. }
+  for TestResult in FResults do
+    if TestResult.Status = tsFail then
+    begin
+      if ExitCode = 0 then
+        ExitCode := 1;
+      Break;
+    end;
+end;
+
+function TTestRunner.InventoryLine: string;
+var
+  Suite: TTestSuite;
+  TestCount: Integer;
+begin
+  TestCount := 0;
+  for Suite in FSuites do Inc(TestCount, Suite.Tests.Count);
+  Result := TEST_INVENTORY_PREFIX + IntToStr(FSuites.Count) + #9
+    + IntToStr(TestCount);
 end;
 
 procedure TTestRunner.PrintResults;

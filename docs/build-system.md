@@ -47,12 +47,15 @@ different baseline.
 
 ```toml
 [prebuild]
-stamp-version = { script = "scripts/stamp-version.pas",
+stamp-version = { command = "instantfpc",
+                  args = ["scripts/stamp-version.pas"],
                   inputs = ["lwpt.toml"],
                   output = "source/units/Version.inc" }
 ```
 
-`scripts/stamp-version.pas` is an InstantFPC script. It writes
+LWPT 0.6 runs lifecycle hooks as explicit commands, so the manifest selects
+`instantfpc` and passes `scripts/stamp-version.pas` as its first argument. The
+script writes
 `PROGRAM_VERSION` from `[package].version` in `lwpt.toml`, or from
 `$WASMLIGHT_VERSION_OVERRIDE` when set — which is how a release build
 stamps the git tag into the binary. `Wasm.Core` includes the result.

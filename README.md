@@ -34,11 +34,11 @@ conformance corpus in any tier (`--tier=interp|jit|aot`) — assembling text
 modules, validating, instantiating, and executing the assertions, SIMD
 judged per lane and `assert_exception` judged. All three tiers produce
 **byte-identical** pinned-core results (**65,188 pass, 0 fail, 0 skip**)
-on both compiling tiers locally; CI proves the same identity across the
-supported platform matrix.
+locally. Exact-head CI runs the interpreter on six platform/architecture
+lanes and proves the same three-tier identity on all four 64-bit UNIX lanes.
 [docs/roadmap.md](docs/roadmap.md) is the honest picture of exactly what
-exists and what remains (broader optimizing-compiler work, the characterized
-non-3.0-core corpus failures, and cross-platform CI validation).
+exists and what remains beyond v1 (broader optimizing-compiler work,
+post-3.0 proposals, and an external WASI conformance net).
 
 The project's durable direction and delivery gates live in
 [VISION.md](VISION.md), [DEFINITION_OF_READY.md](DEFINITION_OF_READY.md),
@@ -92,24 +92,38 @@ $ ./build/wasmlight run --aot hello.waot tests/fixtures/wasi/hello.wasm
 hello
 ```
 
-`wasmspec` runs the upstream `.wast` conformance corpus — assembling text
-modules, validating, instantiating, and executing `assert_return` /
-`assert_trap` / `invoke` through the interpreter:
+`wasmspec` runs the pinned upstream `.wast` conformance corpus — assembling
+text modules, validating, instantiating, and executing `assert_return` /
+`assert_trap` / `invoke` through the interpreter. The 257 top-level scripts
+are the core 3.0 target and are fully judged:
+
+```text
+$ ./build/wasmspec tests/spec/testsuite/*.wast
+ROOT pass=65188 fail=0 skip=0 staged=0 total=65188
+TOTAL files=257 errors=0 pass=65188 fail=0 skip=0 staged=0 total=65188
+```
+
+SIMD is judged per lane (Track G) and exception handling is judged (Track
+H), so `staged` is 0 and the interpreter executes all of core wasm 3.0.
+Interpreter, JIT, and AOT produce this tally byte-for-byte.
+
+Passing the checkout directory recursively also includes non-target trees:
 
 ```text
 $ ./build/wasmspec tests/spec/testsuite
-...
 ROOT pass=65208 fail=14 skip=90 staged=0 total=65312
 PROPOSALS pass=643 fail=354 skip=814 staged=0 total=1811
 TOTAL files=288 errors=0 pass=65851 fail=368 skip=904 staged=0 total=67123
 ```
 
-SIMD is judged per lane (Track G) and exception handling is judged (Track
-H), so `staged` is 0 and the interpreter executes all of core wasm 3.0; the
-the 257 pinned core scripts are separately clean at `pass=65188 fail=0
-skip=0`. The recursive residue is confined to post-3.0 proposals, the
-explicitly out-of-scope legacy exception encoding, and testsuite-local custom
-directives.
+Those 368 failures are 354 post-3.0 proposal cases (custom descriptors,
+threads, custom page sizes, and wide arithmetic) plus 14 cases using the
+explicitly out-of-scope legacy exception encoding. The 904 skips are 884
+commands downstream of a proposal or legacy module that did not instantiate,
+plus 20 testsuite-local custom directives absent from the reference grammar.
+None is a skipped or failing core 3.0 test. See
+[`tests/spec/README.md`](tests/spec/README.md) for the full breakdown and the
+pinned commit.
 
 For the full command set and every development command, see
 [docs/quick-start.md](docs/quick-start.md) and

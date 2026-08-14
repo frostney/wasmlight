@@ -14,8 +14,8 @@ units = ["source/units"]
 # fetch per package). `testing` is the assertion/suite/runner framework
 # behind the co-located *.Test.pas suites; `cli` is the option parser and
 # subcommand dispatcher the source/apps programs build their flags on.
-testing = { source = "frostney/lwpt", version = "^0.4.0", include = ["packages/testing/**"], exclude = ["**/*.Test.pas"] }
-cli = { source = "frostney/lwpt", version = "^0.4.0", include = ["packages/cli/**"], exclude = ["**/*.Test.pas"] }
+testing = { source = "frostney/lwpt", version = "^0.6.0", include = ["packages/testing/**"], exclude = ["**/*.Test.pas"] }
+cli = { source = "frostney/lwpt", version = "^0.6.0", include = ["packages/cli/**"], exclude = ["**/*.Test.pas"] }
 
 [build]
 wasmlight = { source = "source/apps/wasmlight.pas", output = "build/wasmlight" }
@@ -29,12 +29,14 @@ wasmspec = { source = "source/apps/wasmspec.pas", output = "build/wasmspec" }
 # hook runs; the hooks keep it in step. Registered on both build and test
 # because the test programs compile Wasm.Core too.
 [prebuild]
-stamp-version = { script = "scripts/stamp-version.pas",
+stamp-version = { command = "instantfpc",
+                  args = ["scripts/stamp-version.pas"],
                   inputs = ["lwpt.toml"],
                   output = "source/units/Version.inc" }
 
 [pretest]
-stamp-version = { script = "scripts/stamp-version.pas",
+stamp-version = { command = "instantfpc",
+                  args = ["scripts/stamp-version.pas"],
                   inputs = ["lwpt.toml"],
                   output = "source/units/Version.inc" }
 
