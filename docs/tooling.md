@@ -60,8 +60,11 @@ Never hand-edit any of these; change the input and re-run the owner.
 
 - **`.github/workflows/pr.yml`** — every PR: `install --frozen` →
   `format --check` + `agents --check` → `build` → `test` on Linux, macOS,
-  and Windows runners, plus a blocking markdownlint job. This is the
-  authoritative pre-merge signal.
+  and Windows runners, plus blocking markdownlint and runtime-comparison jobs.
+  The comparison builds base and PR release binaries, measures both on one
+  runner against checksum-pinned cached peers, uploads raw samples, and updates
+  a sticky PR comment. Execution is required; timing deltas are informational
+  and never become CI assertions. This is the authoritative pre-merge signal.
 - **`.github/workflows/ci.yml`** — push to `main` only: the full per-arch
   platform matrix. PRs do not trigger it, so the same commit is not built
   twice pre-merge.

@@ -105,6 +105,13 @@ The command is:
 python3 tools/runtime-comparison/bench.py --samples 7
 ```
 
+Pull requests run the `best` profile for the base and candidate release binaries
+on one Linux x86-64 runner. Pinned, checksum-verified peer executables are
+restored from an installer-content-addressed cache, raw reports are retained as
+a workflow artifact, and one sticky PR comment shows the same-runner delta plus
+the candidate's peer comparison. The job requires every build and self-checking
+execution to succeed; timing changes remain informational and cannot fail a PR.
+
 The boundary is a fresh process through a self-checking WASI `proc_exit`.
 Consequently, `startup` measures process launch, artifact/module loading,
 instantiation, a 2,000-iteration loop, and one host call. The heavy workloads

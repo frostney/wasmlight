@@ -1,5 +1,47 @@
 # Handoff
 
+Updated: 2026-08-15 (PR runtime-comparison gate and sticky report)
+
+## PR runtime-comparison gate
+
+- Extended `.github/workflows/pr.yml` with a Linux x86-64
+  `runtime-comparison` job and an always-running
+  `runtime-comparison-comment` reporter, following GocciaScript's same-runner
+  base-vs-PR artifact/comment shape.
+- The gate builds release binaries for the PR base and head, runs the four
+  self-checking workloads against both on the same runner, uploads raw JSON,
+  and upserts one comment identified by
+  `<!-- wasmlight-runtime-comparison -->`. A stale-run guard refuses to let an
+  older workflow overwrite a newer head's comment.
+- This is deliberately an executable gate, not a numeric threshold: build,
+  fixture validation, precompilation, result verification, or runtime-command
+  failure makes the job red. Timing deltas and range-overlap classifications
+  are informational and cannot fail a PR, preserving the project's honest
+  measurement rule.
+- Added `tools/runtime-comparison/install-ci-tools.sh`: Wasmtime 47.0.3,
+  Wasmer 7.2.1, WasmEdge 0.17.1, WAMR/wamrc 2.4.5, wazero 1.12.0, wasm3 0.5.0,
+  wasm-tools 1.256.0, and WABT 1.0.41 are pinned to exact release assets and
+  SHA-256 digests. The extracted executable tree is cached with a key derived
+  from the installer, so any version/digest edit invalidates it.
+- The Linux best-profile WAMR row now uses precompiled AOT. The harness passes
+  an explicit `--target=x86_64`/`aarch64` to `wamrc`; this was required after a
+  clean Ubuntu x86-64-emulation smoke exposed host-target misdetection. Hosts
+  without a runnable `wamrc` still fall back to a clearly labelled interpreter.
+- Added and unit-tested `render_comment.py`: the comment shows main vs PR,
+  overlap-aware deltas, every peer, the peer ratio, method, non-gating policy,
+  workflow link, and raw-artifact pointer. Missing candidate output renders a
+  failure comment rather than throwing away the reporting path.
+- Local verification: frozen install, formatting, generated-agent validation,
+  release build, and all 44 unit suites pass. Actionlint passes for the new
+  workflow (the existing SC2005 at pr.yml:91 is ignored), shellcheck passes,
+  renderer 4/4 tests pass, Python byte-compilation passes, Markdown lint passes,
+  YAML parsing and diff whitespace pass, and a clean Ubuntu container verified
+  every cached executable plus WAMR AOT compile and execution.
+- Live forge check found no branch protection or repository ruleset. The new
+  job makes the PR workflow red on failure, but it cannot become a mechanically
+  required merge check until a ruleset is added after the workflow exists on
+  the default branch.
+
 Updated: 2026-08-14 (reproducible seven-runtime comparison delivered)
 
 ## Runtime comparison and performance scorecard

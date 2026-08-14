@@ -70,7 +70,7 @@ def run_checked(command: tuple[str, ...] | list[str], timeout: int = 180) -> Non
         )
 
 
-def require_commands() -> None:
+def require_commands(wasmlight: Path) -> None:
     required = (
         "wat2wasm",
         "wasm-tools",
@@ -82,8 +82,8 @@ def require_commands() -> None:
         "wasm3",
     )
     missing = [name for name in required if shutil.which(name) is None]
-    if not (ROOT / "build" / "wasmlight").is_file():
-        missing.append("build/wasmlight (run `lwpt build --mode release`)")
+    if not wasmlight.is_file():
+        missing.append(f"{wasmlight} (run `lwpt build --mode release`)")
     if missing:
         raise RuntimeError("missing benchmark prerequisites: " + ", ".join(missing))
 
@@ -96,11 +96,13 @@ def assemble(workload: str) -> Path:
     return module
 
 
-def prepare(workloads: tuple[str, ...]) -> dict[str, dict[str, Path]]:
+def prepare(
+    workloads: tuple[str, ...], wasmlight: Path
+) -> dict[str, dict[str, Path | None]]:
     MODULE_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     WAZERO_CACHE.mkdir(parents=True, exist_ok=True)
-    outputs: dict[str, dict[str, Path]] = {}
+    outputs: dict[str, dict[str, Path | None]] = {}
     for workload in workloads:
         module = assemble(workload)
         artifacts = {
@@ -109,9 +111,10 @@ def prepare(workloads: tuple[str, ...]) -> dict[str, dict[str, Path]]:
             "wasmtime": ARTIFACT_DIR / f"{workload}.cwasm",
             "wasmer": ARTIFACT_DIR / f"{workload}.wasmu",
             "wasmedge": ARTIFACT_DIR / f"{workload}.aot.wasm",
+            "wamr": ARTIFACT_DIR / f"{workload}.aot",
         }
         run_checked([
-            str(ROOT / "build" / "wasmlight"),
+            str(wasmlight),
             "aot",
             str(module),
             "-o",
@@ -139,6 +142,25 @@ def prepare(workloads: tuple[str, ...]) -> dict[str, dict[str, Path]]:
             str(module),
             str(artifacts["wasmedge"]),
         ])
+        if shutil.which("wamrc") is not None:
+            wamr_targets = {
+                "x86_64": "x86_64",
+                "AMD64": "x86_64",
+                "arm64": "aarch64",
+                "aarch64": "aarch64",
+            }
+            wamr_target = wamr_targets.get(platform.machine())
+            if wamr_target is None:
+                raise RuntimeError(f"no WAMR AOT target mapping for {platform.machine()}")
+            run_checked([
+                "wamrc",
+                f"--target={wamr_target}",
+                "-o",
+                str(artifacts["wamr"]),
+                str(module),
+            ])
+        else:
+            artifacts["wamr"] = None
         run_checked([
             "wazero",
             "compile",
@@ -150,8 +172,28 @@ def prepare(workloads: tuple[str, ...]) -> dict[str, dict[str, Path]]:
     return outputs
 
 
-def configs(workload: str, artifacts: dict[str, Path]) -> tuple[RuntimeConfig, ...]:
+def configs(
+    workload: str,
+    artifacts: dict[str, Path | None],
+    wasmlight: Path,
+) -> tuple[RuntimeConfig, ...]:
+    assert artifacts["module"] is not None
+    assert artifacts["wasmlight"] is not None
+    assert artifacts["wasmtime"] is not None
+    assert artifacts["wasmer"] is not None
+    assert artifacts["wasmedge"] is not None
     module = str(artifacts["module"])
+    wamr_artifact = artifacts["wamr"]
+    if wamr_artifact is not None:
+        wamr_tier = "LLVM AOT"
+        wamr_command = ("iwasm", str(wamr_artifact))
+        wamr_note = "The module was precompiled with the pinned wamrc release."
+    else:
+        wamr_tier = "interpreter"
+        wamr_command = ("iwasm", "--interp", module)
+        wamr_note = (
+            "No runnable wamrc was available on this host, so AOT is not represented."
+        )
     return (
         RuntimeConfig(
             "wasmlight-aot",
@@ -159,7 +201,7 @@ def configs(workload: str, artifacts: dict[str, Path]) -> tuple[RuntimeConfig, .
             "best",
             "AOT",
             (
-                str(ROOT / "build" / "wasmlight"),
+                str(wasmlight),
                 "run",
                 "--aot",
                 str(artifacts["wasmlight"]),
@@ -192,15 +234,13 @@ def configs(workload: str, artifacts: dict[str, Path]) -> tuple[RuntimeConfig, .
             artifacts["wasmedge"],
         ),
         RuntimeConfig(
-            "wamr-interp-best",
+            "wamr-best",
             "WAMR",
             "best",
-            "interpreter",
-            ("iwasm", "--interp", module),
-            note=(
-                "The official WAMR 2.4.5 macOS wamrc binary is x86-64 only; "
-                "Rosetta is unavailable on this host, so AOT is not represented."
-            ),
+            wamr_tier,
+            wamr_command,
+            wamr_artifact,
+            note=wamr_note,
         ),
         RuntimeConfig(
             "wazero-compiler",
@@ -223,7 +263,7 @@ def configs(workload: str, artifacts: dict[str, Path]) -> tuple[RuntimeConfig, .
             "wasmlight",
             "interpreter",
             "interpreter",
-            (str(ROOT / "build" / "wasmlight"), "run", "--no-aot", module),
+            (str(wasmlight), "run", "--no-aot", module),
         ),
         RuntimeConfig(
             "wasmedge-interp",
@@ -273,15 +313,15 @@ def measure(command: tuple[str, ...]) -> float:
     return (time.perf_counter_ns() - started) / 1_000_000.0
 
 
-def runtime_versions() -> dict[str, str]:
+def runtime_versions(wasmlight: Path) -> dict[str, str]:
     version_commands = {
-        "wasmlight": [str(ROOT / "build" / "wasmlight"), "--version"],
+        "wasmlight": [str(wasmlight), "--version"],
         "Wasmtime": ["wasmtime", "--version"],
         "Wasmer": ["wasmer", "--version"],
         "WasmEdge": ["wasmedge", "--version"],
         "WAMR": ["iwasm", "--version"],
         "wazero": ["wazero", "version"],
-        "wasm3": ["brew", "list", "--versions", "wasm3"],
+        "wasm3": ["wasm3", "--version"],
     }
     versions = {}
     for name, command in version_commands.items():
@@ -291,8 +331,12 @@ def runtime_versions() -> dict[str, str]:
 
 
 def host_metadata() -> dict[str, str]:
-    cpu = command_output(["sysctl", "-n", "machdep.cpu.brand_string"])
-    model = command_output(["sysctl", "-n", "hw.model"])
+    if sys.platform == "darwin":
+        cpu = command_output(["sysctl", "-n", "machdep.cpu.brand_string"])
+        model = command_output(["sysctl", "-n", "hw.model"])
+    else:
+        cpu = platform.processor() or platform.machine()
+        model = os.environ.get("ImageOS") or platform.node()
     return {
         "os": platform.platform(),
         "architecture": platform.machine(),
@@ -302,9 +346,9 @@ def host_metadata() -> dict[str, str]:
     }
 
 
-def git_metadata() -> dict[str, str]:
+def git_metadata(source_commit: str | None) -> dict[str, str]:
     return {
-        "commit": command_output(["git", "rev-parse", "HEAD"]),
+        "commit": source_commit or command_output(["git", "rev-parse", "HEAD"]),
         "remote_default": command_output(["git", "rev-parse", "origin/main"]),
         "branch": command_output(["git", "branch", "--show-current"]),
     }
@@ -383,6 +427,16 @@ def parse_args() -> argparse.Namespace:
         dest="workloads",
     )
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--wasmlight",
+        type=Path,
+        default=ROOT / "build" / "wasmlight",
+        help="wasmlight executable to compile and run",
+    )
+    parser.add_argument(
+        "--source-commit",
+        help="commit recorded for --wasmlight (defaults to the checkout HEAD)",
+    )
     return parser.parse_args()
 
 
@@ -392,8 +446,9 @@ def main() -> int:
         raise RuntimeError("--samples must be positive and --warmups non-negative")
     profiles = tuple(args.profiles or ("best", "interpreter"))
     workloads = tuple(args.workloads or DEFAULT_WORKLOADS)
-    require_commands()
-    artifacts_by_workload = prepare(workloads)
+    wasmlight = args.wasmlight.resolve()
+    require_commands(wasmlight)
+    artifacts_by_workload = prepare(workloads, wasmlight)
     if args.prepare_only:
         print(f"prepared and validated {len(workloads)} workloads in {BUILD_DIR}")
         return 0
@@ -411,14 +466,16 @@ def main() -> int:
             "lock": str(LOCK_PATH),
         },
         "host": host_metadata(),
-        "git": git_metadata(),
-        "versions": runtime_versions(),
+        "git": git_metadata(args.source_commit),
+        "versions": runtime_versions(wasmlight),
+        "wasmlight_executable": str(wasmlight),
         "profiles": profiles,
         "workloads": workloads,
         "modules": {},
         "results": [],
     }
     for workload, artifacts in artifacts_by_workload.items():
+        assert artifacts["module"] is not None
         module_bytes = artifacts["module"].read_bytes()
         result["modules"][workload] = {
             "path": str(artifacts["module"].relative_to(ROOT)),
@@ -431,7 +488,9 @@ def main() -> int:
             for workload in workloads:
                 selected = [
                     config
-                    for config in configs(workload, artifacts_by_workload[workload])
+                    for config in configs(
+                        workload, artifacts_by_workload[workload], wasmlight
+                    )
                     if config.profile == profile
                 ]
                 for config in selected:
