@@ -1,5 +1,48 @@
 # Handoff
 
+Updated: 2026-08-14 (runtime comparison research from current main)
+
+## Runtime comparison research
+
+- Updated the clean detached research worktree from `fad3c41` to the fetched
+  remote default `origin/main@a7d9565304ee1138b4e76763810559e7ba1112d1`.
+  No branch or user change was stashed, discarded, rebased, or overwritten.
+- Compared the current implementation and its measured evidence with the
+  closest embeddable non-browser runtimes: Wasmtime, Wasmer, WasmEdge, WAMR,
+  wazero, and wasm3. The useful primary comparison set is Wasmtime (performance
+  and standards leader), WAMR (portable multi-tier embedded peer), and wazero
+  (single-language, dependency-light embedding peer). WasmEdge and Wasmer are
+  broader cloud/extension products; wasm3 is an interpreter-only portability
+  reference in minimal maintenance.
+- Wasmlight's defensible position is a native Object Pascal runtime with an
+  unusually complete pinned core-3.0 implementation, strict phase/error
+  boundaries, deny-by-default capabilities, and observational identity across
+  selected execution modes. Do not position it as a general Wasmtime
+  replacement: Component Model/WASI p2, threads/shared memory, host-surface
+  breadth, mature bindings/tooling, external security assurance, and peak
+  native performance are material gaps.
+- "Complete in every tier" is an observable-behaviour claim. The JIT and AOT
+  share native backends and conservatively fall back per function when
+  `JitCanCompile` declines a shape (including handler-table cases); it is not a
+  claim that every core-3.0 operation is natively lowered.
+- The latest controlled Wasmtime 47.0.3 comparison remains valid because main
+  has had no runtime change since it was recorded: identical precompiled WASI
+  command modules, one discarded warmup, seven samples on Apple Silicon. The
+  300M varying-address loop measured Wasmlight AOT 564.054 ms versus Wasmtime
+  94.163 ms (5.99x), and fib(40) measured 4.125 s versus 348.578 ms (11.83x).
+  These are workload results, not a general runtime ranking or parity claim.
+- A fresh frozen release build on `a7d9565` passed and produced a 1.6 MiB
+  unstripped arm64 macOS `wasmlight` CLI. This is not comparable to WAMR's
+  core-vmlib or wasm3's minimum-system figures; an isolated stripped embedding
+  binary, peak working set, module-load latency, and cold/warm instantiation
+  suite are still needed before making footprint claims.
+- Recommended next comparison artifact: one reproducible scorecard against
+  Wasmtime, WAMR, and wazero covering core feature/tier behavior, WASI program
+  compatibility, cold start and instantiation, steady-state execution, host
+  call overhead, binary/resident footprint, and failure/sandbox differentials.
+  Keep Component Model and threads as explicit product-direction decisions,
+  not assumed roadmap additions.
+
 Updated: 2026-08-14 (optimization skill PR refreshed on current main)
 
 ## Runtime optimization skill
