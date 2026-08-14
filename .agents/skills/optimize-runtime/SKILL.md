@@ -127,6 +127,7 @@ combined diff:
 ```sh
 lwpt install --frozen
 lwpt format --check
+lwpt agents --check
 lwpt build
 lwpt build --mode release
 lwpt test

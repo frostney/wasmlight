@@ -1,6 +1,6 @@
 # Handoff
 
-Updated: 2026-08-14 (benchmark-gated optimization workflow packaged)
+Updated: 2026-08-14 (optimization skill PR refreshed on current main)
 
 ## Runtime optimization skill
 
@@ -20,11 +20,54 @@ Updated: 2026-08-14 (benchmark-gated optimization workflow packaged)
 - The skill is intentionally repository-authored and therefore absent from
   `skills-lock.json`. Imported skills remain lock-managed; `docs/tooling.md`
   now records the distinction.
-- Branch: `codex/add-optimization-skill`, based on fetched
-  `origin/main@f3e9da5` after PR #1 and PR #2 merged. No runtime code or
-  benchmark result changed in this documentation/workflow-only branch.
+- PR #3, `feat: add benchmark-gated optimization skill`, is open from
+  `codex/add-optimization-skill`. The branch merged current
+  `origin/main@fad3c41` after PR #4 landed; no rebase or force-push was used.
+  No runtime code or benchmark result changed in this workflow-only PR.
+- The merged-state LWPT 0.6.0 gate is green: frozen install, formatting,
+  generated-agent validation, development and release builds, all 44 unit
+  suites, skill validation/discovery, CLI smoke checks, and Markdown lint.
 
-Updated: 2026-08-14 (pinned core corpus fully judged and delivered)
+Updated: 2026-08-14 (README status refreshed; LWPT 0.6.0 migration verified)
+
+## 2026-08-14 README and suite-status audit
+
+- Fetched the remote default and created
+  `codex/update-readme-suite-status` directly at
+  `origin/main@f3e9da573d796201ad64b60f27035dd253378f89`. The starting
+  detached worktree was clean; no user changes were stashed or discarded.
+- Draft PR #4, `chore: upgrade LWPT and clarify conformance status`, is open
+  against the remote default. The create-PR workflow owns the transition to
+  ready after the final exact-head PR and docs checks reach green.
+- Updated `README.md` to lead with the reproducible 257-script pinned-core
+  command and its clean result, distinguish it from the recursive mirror,
+  explain every remaining recursive failure/skip class, and replace the stale
+  cross-platform caveat with the exact-head six-lane CI result.
+- Local pinned-core verification is byte-identical in all tiers:
+  `pass=65188 fail=0 skip=0 staged=0`, with JIT/AOT `compiled=8703`.
+  The recursive interpreter run is
+  `pass=65851 fail=368 skip=904 staged=0 errors=0`: failures are 354 proposal
+  cases (219 custom descriptors, 78 threads, 47 custom page sizes, 10 wide
+  arithmetic) plus 14 legacy-EH cases; skips are 814 proposal actions and 70
+  legacy actions downstream of an uninstantiated module, plus 20 custom
+  directives outside the reference grammar.
+- Exact-head main CI run 31798063780 is green on all six jobs: aarch64/x86-64
+  macOS, aarch64/x86-64 Linux, and x86-64/i386 Windows. The four 64-bit UNIX
+  jobs run interpreter/JIT/AOT; Windows runs the tier-of-record interpreter.
+- The user expanded PR #4 to upgrade the project to LWPT 0.6.0. The manifest
+  now selects `instantfpc` explicitly through `command` + `args`, both filtered
+  dependencies resolve at 0.6.0, `lwpt install` owns the regenerated lock,
+  archives, and module snapshots, and both workflows download the
+  checksum-verified 0.6.0 release. The obsolete tracked 0.4.0 archives were
+  removed; they remain recoverable from Git history.
+- LWPT 0.6.0's generated AGENTS command block is present and enforced by
+  `lwpt agents --check` on the single format lane in PR and post-merge CI;
+  Lefthook refreshes it locally alongside formatting.
+- The full local 0.6.0 gate is green: frozen install, formatting, generated
+  agent reference, all three builds, 44/44 unit suites, Markdown lint, and the
+  pinned core in interpreter/JIT/AOT at `pass=65188 fail=0 skip=0 staged=0`.
+  The recursive diagnostic remains `pass=65851 fail=368 skip=904 staged=0`
+  with the same outside-target breakdown recorded above.
 
 ## Pinned core conformance residue eliminated
 

@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.4.0"
+  LWPT_VERSION: "0.6.0"
 
 jobs:
   build-and-test:
@@ -147,6 +147,10 @@ jobs:
       - name: lwpt format --check (formatting drift?)
         if: matrix.format-check == true
         run: lwpt format --check
+
+      - name: lwpt agents --check (generated command reference)
+        if: matrix.format-check == true
+        run: lwpt agents --check
 
       - name: lwpt build (compile every [build] entry)
         run: lwpt build
