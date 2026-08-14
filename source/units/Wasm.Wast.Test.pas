@@ -69,6 +69,7 @@ type
     procedure TestRealisticScript;
     procedure TestModuleBinaryFormKeepsExactBytes;
     procedure TestModuleQuoteFormWithId;
+    procedure TestModuleDefinitionForms;
     procedure TestNestedModuleFormDetection;
     procedure TestUnknownDirectiveTolerated;
     procedure TestUnbalancedParensRejected;
@@ -414,6 +415,29 @@ begin
   end;
 end;
 
+procedure TWastTests.TestModuleDefinitionForms;
+var
+  Script: TWastScript;
+begin
+  Script := ParseWastScript(
+    '(module definition $text (func))' + sLineBreak
+    + '(module definition $bin binary "\00asm\01\00\00\00")' + sLineBreak
+    + '(module definition quote "(module)")');
+  try
+    Expect<Integer>(Script.Count).ToBe(3);
+    Expect<Boolean>(Script[0].Kind = wcModule).ToBe(True);
+    Expect<Boolean>(Script[0].ModuleForm = wmfText).ToBe(True);
+    Expect<Boolean>(Script[1].ModuleForm = wmfBinary).ToBe(True);
+    Expect<Boolean>(Script[2].ModuleForm = wmfQuote).ToBe(True);
+    { Classification is lazy: `definition`, its optional id, and the
+      payload remain available to the runner. }
+    Expect<string>(Script[0].Node[1].Atom).ToBe('definition');
+    Expect<string>(Script[0].Node[2].Atom).ToBe('$text');
+  finally
+    Script.Free;
+  end;
+end;
+
 procedure TWastTests.TestNestedModuleFormDetection;
 var
   Script: TWastScript;
@@ -557,6 +581,7 @@ begin
   Test('module binary form keeps exact bytes',
     TestModuleBinaryFormKeepsExactBytes);
   Test('module quote form with id', TestModuleQuoteFormWithId);
+  Test('module definition forms are detected', TestModuleDefinitionForms);
   Test('nested module form detection', TestNestedModuleFormDetection);
   Test('unknown directive tolerated', TestUnknownDirectiveTolerated);
   Test('unbalanced parens rejected', TestUnbalancedParensRejected);

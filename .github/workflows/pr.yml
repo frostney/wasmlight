@@ -191,13 +191,14 @@ jobs:
           WS=./build/wasmspec${{ matrix.exe }}
           FLOOR=64000
           run_tier() {
-            local output total
+            local output_file total
+            output_file="$RUNNER_TEMP/wasmspec-$1.txt"
             set +e
-            output=$("$WS" --failures-only --tier="$1" tests/spec/testsuite)
+            "$WS" --failures-only --tier="$1" tests/spec/testsuite > "$output_file"
             set -e
-            total=$(printf '%s\n' "$output" | grep '^TOTAL' || true)
+            total=$(grep '^TOTAL' "$output_file" || true)
             if [ -z "$total" ]; then
-              printf '%s\n' "$output" >&2
+              cat "$output_file" >&2
               echo "::error::$1 did not produce a TOTAL tally" >&2
               return 1
             fi
@@ -214,8 +215,16 @@ jobs:
             AL=$(run_tier aot); echo "aot:    $AL"
             [ "$(field "$JL" errors)" = "0" ] || { echo "::error::jit errors!=0"; exit 1; }
             [ "$(field "$AL" errors)" = "0" ] || { echo "::error::aot errors!=0"; exit 1; }
-            [ "$(sig "$JL")" = "$IS" ] || { echo "::error::jit tally diverges from interpreter"; exit 1; }
-            [ "$(sig "$AL")" = "$IS" ] || { echo "::error::aot tally diverges from interpreter"; exit 1; }
+            if [ "$(sig "$JL")" != "$IS" ]; then
+              echo "::error::jit tally diverges from interpreter"
+              diff -u "$RUNNER_TEMP/wasmspec-interp.txt" "$RUNNER_TEMP/wasmspec-jit.txt" || true
+              exit 1
+            fi
+            if [ "$(sig "$AL")" != "$IS" ]; then
+              echo "::error::aot tally diverges from interpreter"
+              diff -u "$RUNNER_TEMP/wasmspec-interp.txt" "$RUNNER_TEMP/wasmspec-aot.txt" || true
+              exit 1
+            fi
             echo "three-tier identity OK"
           fi
 

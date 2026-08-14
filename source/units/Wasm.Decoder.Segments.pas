@@ -5,9 +5,11 @@
   spans (ADR-0003): element offset and init expressions, function
   bodies, and data bytes are located but never copied and never
   interpreted. Expressions are delimited by Wasm.Decoder.Expr's skipper;
-  function bodies are bounded by the code entry's size prefix and are
-  deliberately NOT instruction-walked here — the fused validation walk
-  owns the instruction grammar inside them (ADR-0007).
+  function bodies are bounded by the code entry's size prefix and are not
+  instruction-walked here on the valid path — the fused validation walk owns
+  their instruction grammar (ADR-0007). A body whose declared last byte is
+  not `end` gets a decode-only probe so an overlong integer split by that
+  framing boundary keeps its `binary-int` diagnosis.
 
   Everything raised here is EWasmDecodeError, because everything checked
   here is the binary grammar: an unassigned segment flag value, a
@@ -249,7 +251,7 @@ var
   I: UInt32;
   EntrySize: UInt32;
   EntryBase: NativeUInt;
-  Entry: TWasmReader;
+  Entry, Probe: TWasmReader;
   CodeEntry: TWasmCodeEntry;
   GroupCount: UInt32;
   G: UInt32;
@@ -298,6 +300,31 @@ begin
         'code entry at offset %u has no function body',
         [EntryBase]);
     CodeEntry.Body := MakeSpan(EntryBase + Entry.Position, Entry.Remaining);
+
+    { `binary-code` makes the size a framing assertion, not a license for an
+      integer encoding to escape the entry and be reinterpreted as section
+      ids. A correctly framed expression ends in $0B, so keep that overwhelmingly
+      common path on ADR-0007's single fused walk. Otherwise probe the grammar
+      on a COPY: ordinary syntax and typing remain fused in validation, but a
+      width-limited LEB may inspect physical bytes after the logical entry
+      bound. If that proves the integer overlong/over-wide, preserve its
+      binary-int diagnosis before the outer section walk sees continuation
+      bytes. }
+    Probe := Entry;
+    Probe.Position := Probe.Size - 1;
+    if Probe.ReadByte <> $0B then
+    begin
+      Probe := Entry;
+      try
+        SkipExpr(Probe, EntryBase);
+      except
+        on E: EWasmDecodeError do
+        begin
+          if Probe.Position > Probe.Size then
+            raise;
+        end;
+      end;
+    end;
 
     AModule.AddCodeEntry(CodeEntry);
   end;

@@ -29,6 +29,7 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Wasm.Binary,
   Wasm.Core,
   Wasm.Decoder,
   Wasm.Ir,
@@ -73,6 +74,8 @@ type
       else — 'ACCEPTED', a different message, a decode error — verbatim,
       so a case that fails for the wrong reason says which. }
     function RejectionOf(const APrefix: string): string;
+    { Like RejectionOf, but requires the malformed/decode class. }
+    function MalformedRejectionOf(const APrefix: string): string;
     { Builds the fixed multi-section module every positive leans on. }
     procedure BuildKitchenSink;
     procedure ExpectCount(const AWhat: string;
@@ -96,6 +99,8 @@ type
     procedure TestNonNullElemSegmentIntoAFuncrefTable;
     procedure TestFuncidxShorthandIntoANonNullableTable;
     procedure TestImpliedFuncrefExprFormIntoANonNullableTable;
+    procedure TestMissingEndBeforeNextCodeEntry;
+    procedure TestMissingEndConsumesNextSectionByte;
 
     procedure TestRejectsDuplicateExportName;
     procedure TestRejectsMemory64OverThePageLimit;
@@ -223,6 +228,19 @@ begin
       Result := PrefixOutcome(E.Message, APrefix);
     on E: EWasmDecodeError do
       Result := 'decode error: ' + E.Message;
+  end;
+end;
+
+function TValidatorTests.MalformedRejectionOf(const APrefix: string): string;
+begin
+  Result := 'ACCEPTED';
+  try
+    FinishAndValidate;
+  except
+    on E: EWasmDecodeError do
+      Result := PrefixOutcome(E.Message, APrefix);
+    on E: EWasmValidationError do
+      Result := 'validation error: ' + E.Message;
   end;
 end;
 
@@ -1042,6 +1060,43 @@ begin
   Expect<string>(Outcome).ToBe('rejected: ' + MSG_TYPE_MISMATCH);
 end;
 
+{ `binary-code`: the first entry's size ends after `drop`, with another entry
+  still inside the same code section. The fused body walk is the first pass to
+  see that the expression has no outer END and must diagnose that structural
+  condition, not generic reader exhaustion. Literal bytes mirror
+  binary.wast:55 so a framing change cannot be hidden by a size helper. }
+procedure TValidatorTests.TestMissingEndBeforeNextCodeEntry;
+begin
+  FBuf.Reset;
+  FBuf.AddMany([
+    $00, $61, $73, $6D, $01, $00, $00, $00,
+    $01, $04, $01, $60, $00, $00,
+    $03, $03, $02, $00, $00,
+    $0A, $0C, $02,
+    $04, $00, $41, $01, $1A,
+    $05, $00, $41, $01, $1A, $0B]);
+  Expect<string>(MalformedRejectionOf(MSG_END_OPCODE_EXPECTED))
+    .ToBe('rejected: ' + MSG_END_OPCODE_EXPECTED);
+end;
+
+{ `binary-section`: the code section declares six bytes and its lone entry
+  lacks END. The immediately following data-section id is also opcode $0B;
+  an unbounded reference decoder consumes it as END and then proves the code
+  section was larger than declared. The fused bounded walk reaches the same
+  structural result from the declared and physical extents. }
+procedure TValidatorTests.TestMissingEndConsumesNextSectionByte;
+begin
+  FBuf.Reset;
+  FBuf.AddMany([
+    $00, $61, $73, $6D, $01, $00, $00, $00,
+    $01, $04, $01, $60, $00, $00,
+    $03, $02, $01, $00,
+    $0A, $06, $01, $04, $00, $41, $01, $1A,
+    $0B, $03, $01, $01, $00]);
+  Expect<string>(MalformedRejectionOf(MSG_SECTION_SIZE_MISMATCH))
+    .ToBe('rejected: ' + MSG_SECTION_SIZE_MISMATCH);
+end;
+
 procedure TValidatorTests.SetupTests;
 begin
   Test('a module exercising every index space validates',
@@ -1070,6 +1125,10 @@ begin
     TestFuncidxShorthandIntoANonNullableTable);
   Test('the implied-funcref expr form does not fit a (ref func) table',
     TestImpliedFuncrefExprFormIntoANonNullableTable);
+  Test('missing END before the next code entry is malformed',
+    TestMissingEndBeforeNextCodeEntry);
+  Test('END outside the declared code section is a size mismatch',
+    TestMissingEndConsumesNextSectionByte);
 
   Test('rejects a duplicate export name',
     TestRejectsDuplicateExportName);

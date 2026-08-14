@@ -6,16 +6,14 @@
   Wasm.Wast.Runner judges the commands it can judge, and everything here
   is argument handling and reporting.
 
-  WHAT A RUN MEANS TODAY. The interpreter tier is wired in (Track E), so
-  `(module binary ...)` cases now decode, validate, INSTANTIATE, and run:
-  top-level modules, `assert_malformed`/`assert_invalid`, and the action
-  and result assertions (`assert_return`, `assert_trap`,
-  `assert_exhaustion`, `invoke`, `register`, `get`). There is still no
-  text-format assembler, so the overwhelming majority of the corpus — which
-  spells its modules in the text format — is SKIPPED with a reason until
-  that lands (Track C). The skip column is never folded into the totals: a
-  report from this program must not read as more conformance than was
-  actually measured.
+  WHAT A RUN MEANS TODAY. Text, quote, binary, and inline module bodies are
+  assembled or decoded, validated, instantiated, and run. The harness judges
+  malformed, invalid, unlinkable, return, trap, exhaustion, exception,
+  invoke, register, and get commands; provides the pinned standard `spectest`
+  imports; and supports generative module definitions/instances. The skip
+  column remains distinct for commands outside the reference grammar or an
+  unavailable instance, so a recursive proposal/custom run never reads as
+  more conformance than was actually measured.
 
   OUTPUT IS ONE LINE PER FACT, on stdout, in a fixed leading-token shape
   (`FAIL`, `STAGED`, `SKIP`, `PASS`, `FILE`, `TOTAL`, `ERROR`) so a run
@@ -253,9 +251,10 @@ begin
   Write(GenerateHelpText(TOOL_NAME, '[options] <script.wast|directory>...',
     AOptions));
   WriteLn;
-  WriteLn('Only (module binary ...) cases are judged: modules decode, validate,');
-  WriteLn('and run (assert_return/assert_trap/assert_exhaustion/invoke). Text-format');
-  WriteLn('modules still need the assembler and are reported as SKIP. Exit code is 0');
+  WriteLn('Text, quote, binary, and inline modules are assembled or decoded,');
+  WriteLn('validated, instantiated, and run through the selected tier. Standard');
+  WriteLn('spectest imports, linkage assertions, and module instances are judged.');
+  WriteLn('Exit code is 0');
   WriteLn('only when nothing failed and every script could be read and parsed.');
 end;
 

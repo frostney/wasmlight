@@ -1,5 +1,101 @@
 # Handoff
 
+Updated: 2026-08-14 (pinned core corpus fully judged and delivered)
+
+## Pinned core conformance residue eliminated
+
+- Continued `codex/fix-ci-skips` from fetched `origin/main@12c1a4c`; no merge
+  was needed because that remote head is already an ancestor. Toolchain is FPC
+  3.2.2 through lwpt 0.5.1 only.
+- The runner now provides the pinned standard `spectest` module: all seven
+  print functions, immutable numeric globals, i32/i64 tables, and memory. Its
+  store objects are allocated once per script and shared across modules. A
+  later script `(register "spectest" ...)` replaces the built-in as one whole
+  module; imports never splice exports from both.
+- `assert_unlinkable` now resolves and instantiates through the shipped path and
+  passes only on a prefix-matching `EWasmLinkError`. Named module definitions
+  retain validated model/IR/bytes; module instances are fresh and generative.
+  The corpus's elided-wrapper inline module body is assembled as one module.
+- The final 10 binary diagnostic mismatches are fixed at the grammar boundary:
+  signed s7 composite discriminators, physical LEB width checks across declared
+  body spans, missing-END versus code-section size classification, and the
+  confirmed export-name list overrun. Valid function bodies retain the single
+  fused validation walk; malformed-only probing is gated.
+- Spec evidence was checked at `spec/main@d7b37e4170d8315f2f1283aed4e8076591a9a333`
+  (`binary-int`, `binary-code`, `binary-section`, `binary-comptype`,
+  `binary-name`, `binary-list`, `exec-module`, `exec-instantiation`) and the
+  standard host against the pinned reference `spectest.ml`.
+
+## Final local evidence
+
+- `git diff --check`, `lwpt format --check`, `lwpt install --frozen`, and
+  `lwpt build`: green.
+- `lwpt test`: 44/44 suites, 1,224 tests, no compile/test failures.
+- Markdown lint: 41 files, 0 issues.
+- Pinned core, 257 scripts, identical in every tier:
+  `pass=65188 fail=0 skip=0 staged=0`; JIT/AOT `compiled=8703`.
+- Recursive 288-script mirror, identical in every tier:
+  `pass=65851 fail=368 skip=904 staged=0`; JIT/AOT `compiled=8799`.
+  The residue is explicitly outside core 3.0: 14 legacy EH failures; 354
+  post-3.0 proposal failures; 20 testsuite-local custom skips; and 884
+  downstream `no instantiated module` skips in legacy/proposals. There are
+  zero unresolved-import or `assert_unlinkable` skips.
+- Independent integration reviews found two edge risks (registered `spectest`
+  precedence and an over-broad export-boundary diagnostic); both were fixed
+  with counter-tests before the final gate.
+
+## Delivery
+
+- Draft PR [#2](https://github.com/frostney/wasmlight/pull/2),
+  `fix: restore tier CI and fully judge pinned core`, is open against `main`.
+  Keep it draft until the PR-triggered checks pass on the exact final head, then
+  mark it ready for review.
+- Implementation commit: `8dba9c1` (`fix: fully judge the pinned core corpus`).
+- Current-truth documentation commit: `e2bea80`
+  (`docs: record complete core conformance`).
+- Full six-platform CI run `31754666992` passed at exact source/docs head
+  `e2bea80`: aarch64/x86-64 macOS, aarch64/x86-64 Linux, and i386/x86-64
+  Windows. The branch is pushed as `origin/codex/fix-ci-skips`.
+- This handoff-only closure commit follows that tested source/docs head; no
+  implementation or generated state changed after the exact-head run.
+
+Updated: 2026-08-13 (main CI repair and corpus-residue audit)
+
+## Main CI repair
+
+- Synced from fetched `origin/main` at `12c1a4c` and created
+  `codex/fix-ci-skips`.
+- Main run `31645850311` failed only on native x86_64-darwin: the interpreter
+  passed `call.wast:337`, while JIT/AOT surfaced FPC `EStackOverflow` during
+  deep direct compiled recursion instead of trapping `call stack exhausted`.
+- The direct-call fast path consumes native stack per non-tail call. The shared
+  logical cap of 8192 frames was too generous for the Intel macOS process
+  stack. A 1024-frame cap still overflowed on the heavier indirect-call path,
+  so all tiers now share a conservative 256-frame cap. This is an
+  implementation resource limit allowed by pinned-spec anchor `impl-exec` and
+  keeps tier exhaustion identical rather than adding a Darwin-only carve-out.
+- CI now retains each tier's `--failures-only` output and prints a focused diff
+  on tally divergence. Diagnostic run `31673377733` proved the exact failing
+  assertion; the other five platform legs were green.
+- Local gates after the cap change: frozen install, format check, all three
+  builds, 44/44 unit suites, and full interpreter/JIT/AOT corpus identity at
+  `65204 pass / 389 fail / 1532 skip / 0 errors` (compiled=8588).
+
+## Remaining corpus residue audit
+
+- Root suite: 33 fail / 610 skip. Proposals: 356 fail / 922 skip.
+- Root failures are 10 decode-message/framing mismatches, 5 module-definition /
+  instance commands, 14 legacy EH assertions (explicitly out of the 3.0
+  target), and 4 other module-definition uses in memory/table coverage.
+- Root skips are 96 missing `spectest` imports, 291 cascaded commands after
+  those modules do not instantiate, 200 `assert_unlinkable` commands the
+  harness still does not judge, and 23 non-reference custom directives.
+- The actionable next conformance wave is harness plumbing, not runtime opcode
+  work: provide the standard `spectest` funcs/globals/table/table64/memory,
+  then judge `assert_unlinkable` through the existing instantiator/link errors.
+  That can retire most root skips. Keep proposal residue and legacy EH outside
+  the pinned core-3.0 claim.
+
 Updated: 2026-08-12 (fifth measured optimization wave integrated and
 cross-architecture/cross-tier validated; PR #1 open)
 
@@ -337,7 +433,7 @@ cross-architecture/cross-tier validated; PR #1 open)
   classify correctly (+4, wired through interp AND both JIT backends AND
   the const-expr evaluator so all tiers stay identical); addrtype text
   forms / anyfunc / id.wast lexer / ref.func-declared-set / throw wording
-  (+8). Remaining 389 = 356 post-3.0 proposals + 16 legacy EH (both out
+  (+8). Remaining 389 = 356 post-3.0 proposals + 14 legacy EH (both out
   of scope) + ~9 (module definition/instance) harness forms + a few
   deferred decode/framing edges.
 - **Superseded perf note (measurement was contaminated):** aarch64-darwin,

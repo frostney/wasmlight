@@ -64,7 +64,7 @@ canonical vocabulary before planning anything.
   which trap fires and when — is a bug, not a tier characteristic. All
   three tiers are shipped, and this is **enforced in CI**: `wasmspec
   --tier=interp|jit|aot` over the pinned corpus must produce a
-  byte-identical tally (65,204 pass on both aarch64 and x86-64), and the
+  byte-identical pinned-core tally (65,188 pass, 0 fail, 0 skip), and the
   JIT/AOT legs assert that identity against the interpreter. The JIT and
   AOT are a 64-bit-UNIX acceleration (`WASM_JIT_EXEC`, backends
   `Wasm.Jit.Arm64` / `Wasm.Jit.X64`); on Windows and 32-bit targets the
@@ -228,9 +228,12 @@ prefix no shipped path reaches yet still carries an `UNCONFIRMED` marker.
   `assert_return` / `assert_trap` / `invoke` / `assert_exhaustion` /
   `assert_exception` through the interpreter — SIMD judged per lane (Track
   G) and exception-handling throwing judged (Track H), so the `staged`
-  column is 0. What still skips is host imports the harness does not
-  provide and `assert_unlinkable`. See [docs/testing.md](docs/testing.md)
-  for what is judged versus skipped and the measured tallies.
+  column is 0. The 257 pinned core scripts have no failures or skips;
+  `assert_unlinkable`, the standard `spectest` host, module definitions /
+  instances, and inline-module bodies are judged. Recursive residue belongs
+  only to post-3.0 proposals, testsuite-local custom directives, and the
+  explicitly out-of-scope legacy exception encoding. See
+  [docs/testing.md](docs/testing.md) for the measured tallies.
 - Two framework gotchas, both already worked around in the existing
   suites: FPC will not parse a generic call (`Expect<T>(...)`) as the lone
   statement of an `on ... do`, and the runner fails any test that records

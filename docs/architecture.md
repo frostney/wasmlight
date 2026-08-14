@@ -428,8 +428,10 @@ table over the validated IR, so no optimization rewrites or re-validates it.
 `Wasm.Wast.Runner`, which assembles text modules, decodes, validates,
 instantiates, and executes assertions through the interpreter — SIMD judged
 per lane and `assert_exception` judged (Track H), so the `staged` column is
-0 — leaving only host imports and `assert_unlinkable` still ahead. See
-[testing.md](testing.md) for the measured tallies.
+0. It also supplies the standard `spectest` host, judges
+`assert_unlinkable`, and executes module definitions/instances; the pinned
+core scripts have no failures or skips. See [testing.md](testing.md) for the
+measured tallies and the separately classified recursive residue.
 
 ### The embedding API and the host surface
 

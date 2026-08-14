@@ -398,6 +398,9 @@ begin
   { Declares nine bytes, supplies two. }
   ExpectRejected('name', 'name longer than the input',
     [$09, Ord('a'), Ord('b')]);
+  ExpectMessagePrefix('name', 'name length past physical input',
+    MSG_LENGTH_OUT_OF_BOUNDS, [$09, Ord('a'), Ord('b')], wrcTopLevel);
+
 end;
 
 procedure TBinaryTests.TestSubReaderIsBounded;

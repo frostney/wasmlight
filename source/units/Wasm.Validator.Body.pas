@@ -72,20 +72,6 @@ const
     (RequireDataCount). }
   MSG_DATA_COUNT_REQUIRED = 'data count section required';
 
-  { The body's `end` is not the span's last byte. `binary-code`'s side
-    condition ("the size does not match the length of the respective
-    function code") is binary grammar however late it is found, so this
-    is a decode error; Wasm.Decoder.Common already unified the leftover-
-    bytes family on this prefix. UNCONFIRMED as a prefix match, and it
-    stays that way after the first corpus run: no `(module binary ...)`
-    case reaches it. The nearby case that looks like it does —
-    binary.wast's "missing end marker at end of code sections", which
-    upstream reports as `section size mismatch` — reaches the OPPOSITE
-    condition here, the span running out before the `end`, and that is
-    `unexpected end of section or function` by the reader's context.
-    See tests/spec/README.md on why the two cannot both be matched. }
-  MSG_BODY_SIZE_MISMATCH = 'section size mismatch';
-
   { An engine capacity refusal, and DELIBERATELY NOT A GRAMMAR RULE.
     `syntax-list` bounds a list at 2^32-1 elements and `binary-code`
     makes an expanded locals sequence above that MALFORMED — Track A's
@@ -1337,6 +1323,12 @@ type
     FReader: TWasmReader;
     FBase: NativeUInt;
     FBodySize: NativeUInt;
+    { Absolute code-section end, plus the physical byte just after this body.
+      The fused walk needs both encoded boundaries to classify a missing END
+      without widening the reader past its declared body span. }
+    FCodeSectionEnd: NativeUInt;
+    FHasByteAfterBody: Boolean;
+    FByteAfterBody: Byte;
 
     FFn: TWasmIrFunction;
     FCodeCount: Integer;
@@ -4735,6 +4727,8 @@ var
   C: UInt32;
   Total: UInt64;
   MergeRegs: TWasmRegList;
+  CodeSectionIndex: Integer;
+  BodyEnd: NativeUInt;
 begin
   FModule := AModule;
   FTypes := AContext;
@@ -4877,7 +4871,18 @@ begin
 
   FBase := AEntry.Body.Offset;
   FBodySize := AEntry.Body.Size;
-  FReader.Init(@ABytes[AEntry.Body.Offset], AEntry.Body.Size);
+  BodyEnd := FBase + FBodySize;
+  FCodeSectionEnd := BodyEnd;
+  CodeSectionIndex := AModule.IndexOfSection(wsCode);
+  if CodeSectionIndex >= 0 then
+    FCodeSectionEnd := AModule[CodeSectionIndex].BodyOffset
+      + AModule[CodeSectionIndex].BodySize;
+  FHasByteAfterBody := BodyEnd < NativeUInt(Length(ABytes));
+  if FHasByteAfterBody then
+    FByteAfterBody := ABytes[BodyEnd]
+  else
+    FByteAfterBody := 0;
+  FReader.InitSpanFromBytes(ABytes, AEntry.Body.Offset, AEntry.Body.Size);
   { A function body is one of the two things upstream means by "section
     or function": running off its end reports as such, not as running off
     the end of the module. }
@@ -4901,6 +4906,22 @@ begin
   Done := False;
   while not Done do
   begin
+    { The reference decoder reads the expression before checking code and
+      section sizes (`binary-code`, `binary-section`). This fused walk stays
+      bounded, so reproduce that structural classification from the encoded
+      extents before the reader reports generic truncation. A true physical
+      EOF deliberately falls through and remains `unexpected end of section
+      or function`. }
+    if FReader.Eof then
+    begin
+      if FBase + FBodySize < FCodeSectionEnd then
+        DecErr(Format('%s: function body at offset %u',
+          [MSG_END_OPCODE_EXPECTED, FBase]));
+      if (FBase + FBodySize = FCodeSectionEnd) and FHasByteAfterBody
+        and (FByteAfterBody = $0B) then
+        DecErr(Format('%s: function body at offset %u terminates outside '
+          + 'the declared code section', [MSG_SECTION_SIZE_MISMATCH, FBase]));
+    end;
     OpOffset := FBase + FReader.Position;
     Op := FReader.ReadByte;
 
@@ -5040,7 +5061,7 @@ begin
     a function body, so if the check is not made here it is made nowhere. }
   if FReader.Position <> FBodySize then
     DecErr(Format('%s: function body at offset %u ends %u byte(s) before '
-      + 'its declared extent', [MSG_BODY_SIZE_MISMATCH, FBase,
+      + 'its declared extent', [MSG_SECTION_SIZE_MISMATCH, FBase,
       FBodySize - FReader.Position]));
 
   { The three geometrically grown arrays are trimmed HERE, in the same

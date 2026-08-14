@@ -61,6 +61,8 @@ type
     procedure TestGlobalRejectsMalformed;
     procedure TestExportsIncludingDuplicateName;
     procedure TestExportRejectsMalformed;
+    procedure TestExportCountPastSectionIsLengthOutOfBounds;
+    procedure TestEmptyNamePastExportSectionStaysUnexpectedEnd;
     procedure TestStartSection;
     procedure TestStartRejectsMalformed;
     procedure TestTagSection;
@@ -389,6 +391,46 @@ begin
   ExpectRejected('export', 'leftover byte after content', [$00, $00]);
 end;
 
+procedure TDecoderEntitiesTests.TestExportCountPastSectionIsLengthOutOfBounds;
+var
+  Parent, Body: TWasmReader;
+  Actual: string;
+begin
+  { The export body declares two entries but contains one. The trailing $0A
+    is the next section id in the physical module, outside the six-byte body. }
+  Parent := ReaderOver([$02, $02, $66, $31, $00, $00, $0A]);
+  Parent.Context := wrcSection;
+  Body := Parent.SubReader(6);
+  Actual := '<not rejected>';
+  try
+    DecodeExportSection(Body, 0, FModule);
+  except
+    on E: EWasmDecodeError do
+      Actual := E.Message;
+  end;
+  Expect<string>(Copy(Actual, 1, Length(MSG_LENGTH_OUT_OF_BOUNDS)))
+    .ToBe(MSG_LENGTH_OUT_OF_BOUNDS);
+end;
+
+procedure TDecoderEntitiesTests.TestEmptyNamePastExportSectionStaysUnexpectedEnd;
+var
+  Parent, Body: TWasmReader;
+  Actual: string;
+begin
+  Parent := ReaderOver([$02, $02, $66, $31, $00, $00, $00]);
+  Parent.Context := wrcSection;
+  Body := Parent.SubReader(6);
+  Actual := '<not rejected>';
+  try
+    DecodeExportSection(Body, 0, FModule);
+  except
+    on E: EWasmDecodeError do
+      Actual := E.Message;
+  end;
+  Expect<string>(Copy(Actual, 1, Length(MSG_UNEXPECTED_END_OF_SECTION)))
+    .ToBe(MSG_UNEXPECTED_END_OF_SECTION);
+end;
+
 procedure TDecoderEntitiesTests.TestStartSection;
 var
   R: TWasmReader;
@@ -488,6 +530,10 @@ begin
   Test('exports including a duplicate name',
     TestExportsIncludingDuplicateName);
   Test('exports reject malformed forms', TestExportRejectsMalformed);
+  Test('export count past section is length out of bounds',
+    TestExportCountPastSectionIsLengthOutOfBounds);
+  Test('empty name past export section stays unexpected end',
+    TestEmptyNamePastExportSectionStaysUnexpectedEnd);
   Test('start section', TestStartSection);
   Test('start section rejects malformed forms', TestStartRejectsMalformed);
   Test('tag section', TestTagSection);

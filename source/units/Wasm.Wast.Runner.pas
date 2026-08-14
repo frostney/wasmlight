@@ -35,12 +35,12 @@
       function is run through the tier, so a trapping start is judged too.
       The trap message is prefix-matched like an action trap
 
-  Still SKIPPED, never silently a pass: `assert_unlinkable` (a pre-check
-  assembles+validates the operand — a false rejection there is a FAIL, §4 —
-  but linkage we cannot yet judge), an `assert_return`/`invoke` whose module
-  never instantiated, imports the harness cannot satisfy (no host `spectest`
-  module), and the `_custom` directives outside the reference grammar. A
-  skip is an honest "not judged".
+  Still SKIPPED, never silently a pass: an `assert_return`/`invoke` whose
+  module never instantiated, imports outside the standard `spectest` host
+  module and script registry, and the `_custom` directives outside the
+  reference grammar. `assert_unlinkable` is judged through the same resolver
+  and InstantiateModule path as a top-level module; only an EWasmLinkError
+  satisfies it. A skip is an honest "not judged".
 
   THE PER-SCRIPT LIFECYCLE. One engine and one store back a whole script,
   mirroring the reference interpreter's per-script state. Modules
@@ -93,16 +93,16 @@ const
     WAST_REASON_TEXT_FORMAT is gone (design §4, wave 6): text and quote
     modules now assemble through Wasm.Wat.Assembler and re-enter the shipped
     decode -> validate -> instantiate path, so a text module is no longer a
-    skip — it is judged, exactly like a binary one. What still skips are the
-    genuinely-unjudgeable cases below (no instance, unresolved host import,
-    linkage we cannot check without more plumbing). }
+    skip — it is judged, exactly like a binary one. The standard `spectest`
+    host and `assert_unlinkable` are now judged too. Remaining skip reasons are
+    retained for non-standard/custom directives and scripts that genuinely
+    have no usable instance. }
   WAST_REASON_NEEDS_TIER = 'needs an execution tier';
   WAST_REASON_UNKNOWN_DIRECTIVE = 'directive not in the reference grammar';
   WAST_REASON_NO_MODULE_OPERAND = 'no module operand';
 
-  { An action or assertion whose current module never instantiated — a text
-    module, or one whose imports could not be satisfied. Not a divergence,
-    just nothing to run it against. }
+  { An action or assertion whose current module never instantiated. Not a
+    divergence, just nothing to run it against. }
   WAST_REASON_NO_INSTANCE = 'no instantiated module';
   WAST_REASON_UNRESOLVED_IMPORT = 'import not provided by the harness';
   WAST_REASON_NO_EXPORT = 'no such export';
@@ -159,7 +159,8 @@ type
   TWastTierMode = (wtmInterp, wtmJit, wtmAot);
 
   { Which error class a module attempt produced. The hierarchy is
-    load-bearing (AGENTS.md): malformed and invalid are different answers.
+    load-bearing (AGENTS.md): malformed, invalid, and unlinkable are different
+    answers.
     wekText is a TEXT-format syntax error from the assembler — what
     `assert_malformed` over a text/quote module expects, kept apart from
     wekDecode so a decode error on the assembler's OWN output can be flagged
@@ -171,6 +172,7 @@ type
     wekDecode,
     wekValidation,
     wekText,
+    wekLink,
     wekOther
   );
 
@@ -348,6 +350,7 @@ begin
     wekDecode: Result := 'malformed';
     wekValidation: Result := 'invalid';
     wekText: Result := 'text';
+    wekLink: Result := 'unlinkable';
     wekOther: Result := 'internal';
   else
     Result := '?';
@@ -458,6 +461,26 @@ begin
       ADst := ADst + ')';
     end;
   end;
+end;
+
+{ Re-render `(module definition $id? fields...)` as the ordinary text-module
+  form the WAT assembler owns. `definition` is script syntax, not a module
+  declaration; the optional id is retained as the module's documentary id. }
+function RenderDefinitionBytes(const ANode: TWastNode): TWasmBytes;
+var
+  S: string;
+  I, J: Integer;
+begin
+  S := '(module';
+  for I := 2 to ANode.Count - 1 do
+  begin
+    S := S + ' ';
+    RenderNodeInto(ANode[I], S);
+  end;
+  S := S + ')';
+  SetLength(Result, Length(S));
+  for J := 1 to Length(S) do
+    Result[J - 1] := Byte(Ord(S[J]));
 end;
 
 function RenderNodeBytes(const ANode: TWastNode): TWasmBytes;
@@ -619,6 +642,8 @@ begin
   try
     if AForm = wmfQuote then
       ABytes := AssembleQuote(ModuleBinaryBytes(ANode))
+    else if (ANode.Count >= 2) and ANode[1].IsAtom('definition') then
+      ABytes := AssembleWat(RenderDefinitionBytes(ANode))
     else
       ABytes := AssembleWat(RenderNodeBytes(ANode));
     Result := wasOk;
@@ -671,6 +696,16 @@ type
     Instance: TWasmModuleInstance;
   end;
 
+  { A script-level module definition is validated but not instantiated. Its
+    IR and bytes are retained so every `(module instance ...)` can allocate a
+    fresh instance from the same immutable definition. }
+  TWastDefinition = record
+    Name: string;
+    Model: TWasmModule;
+    Ir: TWasmIrModule;
+    Bytes: TWasmBytes;
+  end;
+
   TWastHostRef = record
     Id: UInt32;
     Ref: TWasmRef;
@@ -686,7 +721,19 @@ type
     FCurrent: TWasmModuleInstance;   { last instantiated, nil if none }
     FNamed: array of TWastBinding;   { by $id (with the leading $) }
     FRegistry: array of TWastBinding;{ by register name }
+    FDefinitions: array of TWastDefinition; { by definition $id }
     FHostRefs: array of TWastHostRef;
+    { The reference interpreter's per-script `spectest` externals. These are
+      allocated once and shared by every module in the script, exactly like a
+      registered module's exports. Host functions are minted lazily per
+      importing engine functype; their identity is not observable. }
+    FSpectestTable: TWasmTableAddr;
+    FSpectestTable64: TWasmTableAddr;
+    FSpectestMemory: TWasmMemAddr;
+    FSpectestGlobalI32: TWasmGlobalAddr;
+    FSpectestGlobalI64: TWasmGlobalAddr;
+    FSpectestGlobalF32: TWasmGlobalAddr;
+    FSpectestGlobalF64: TWasmGlobalAddr;
     { Instances borrow these; they must outlive the store (ADR-0003). }
     FIrs: array of TWasmIrModule;
     FBuffers: array of TWasmBytes;
@@ -708,7 +755,10 @@ type
 
     function LookupNamed(const AId: string): TWasmModuleInstance;
     function LookupRegistry(const AName: string): TWasmModuleInstance;
+    function LookupDefinition(const AId: string): Integer;
     procedure BindNamed(const AId: string; const AInst: TWasmModuleInstance);
+    procedure BindDefinition(const AId: string; const AModel: TWasmModule;
+      const AIr: TWasmIrModule; const ABytes: TWasmBytes);
     procedure RegisterName(const AName: string;
       const AInst: TWasmModuleInstance);
     { Mint (once) and return a stable host box carrying identity AId, kept
@@ -729,6 +779,7 @@ type
       shows up as a lower loaded count). }
     procedure AotLoadInstance(const AInst: TWasmModuleInstance;
       const AIr: TWasmIrModule; const ABytes: TWasmBytes);
+    procedure InitSpectest;
 
     property Engine: TWasmEngine read FEngine;
     property Store: TWasmStore read FStore;
@@ -753,6 +804,7 @@ begin
   FCurrent := nil;
   FJit := nil;
   FCompiledCount := 0;
+  InitSpectest;
   { Register the JIT companion on the store (§4.1): it points the store's
     JitInvokeCompiled hook at the compiled-function dispatcher but leaves
     TierInvoke on the interpreter and compiles nothing until a function is
@@ -761,6 +813,42 @@ begin
     interpreter with the same tallies. }
   if FMode = wtmJit then
     FJit := RegisterJit(FStore);
+end;
+
+procedure SpectestPrint(const AStore: TWasmStore; const AData: Pointer;
+  const AParams: PWasmValue; const AResults: PWasmValue);
+begin
+  { The spec-tests host prints only for human diagnostics. The conformance
+    harness is intentionally quiet; the function has no results or side
+    effects visible to wasm, so a no-op is observationally equivalent. }
+end;
+
+procedure TWastRunner.InitSpectest;
+var
+  TableType: TWasmTableType;
+  MemType: TWasmMemType;
+begin
+  { Pinned reference host: interpreter/host/spectest.ml at the matching spec
+    revision. Tables are 10..20 nullable funcref (one per address type), the
+    memory is 1..2 i32 pages, and immutable numeric globals carry 666/666.6. }
+  TableType := MakeTableType(
+    MakeRefType(True, MakeAbsHeapType(wahFunc)),
+    MakeLimitsWithMax(watI32, 10, 20));
+  FSpectestTable := FStore.AddTable(TableType, WASM_REF_NULL);
+  TableType.Limits.AddrType := watI64;
+  FSpectestTable64 := FStore.AddTable(TableType, WASM_REF_NULL);
+
+  MemType := MakeMemType(MakeLimitsWithMax(watI32, 1, 2));
+  FSpectestMemory := FStore.AddMemory(MemType);
+
+  FSpectestGlobalI32 := FStore.AddGlobal(
+    MakeGlobalType(False, MakeNumValueType(wntI32)), MakeValueI32(666));
+  FSpectestGlobalI64 := FStore.AddGlobal(
+    MakeGlobalType(False, MakeNumValueType(wntI64)), MakeValueI64(666));
+  FSpectestGlobalF32 := FStore.AddGlobal(
+    MakeGlobalType(False, MakeNumValueType(wntF32)), MakeValueF32(666.6));
+  FSpectestGlobalF64 := FStore.AddGlobal(
+    MakeGlobalType(False, MakeNumValueType(wntF64)), MakeValueF64(666.6));
 end;
 
 destructor TWastRunner.Destroy;
@@ -777,6 +865,11 @@ begin
     FAotJits[I].Free;
   FStore.Free;
   FEngine.Free;
+  for I := 0 to High(FDefinitions) do
+  begin
+    FDefinitions[I].Ir.Free;
+    FDefinitions[I].Model.Free;
+  end;
   for I := 0 to High(FIrs) do
     FIrs[I].Free;
   FModel.Free;
@@ -888,12 +981,36 @@ begin
       Exit(FRegistry[I].Instance);
 end;
 
+function TWastRunner.LookupDefinition(const AId: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := High(FDefinitions) downto 0 do
+    if FDefinitions[I].Name = AId then
+      Exit(I);
+end;
+
 procedure TWastRunner.BindNamed(const AId: string;
   const AInst: TWasmModuleInstance);
 begin
   SetLength(FNamed, Length(FNamed) + 1);
   FNamed[High(FNamed)].Name := AId;
   FNamed[High(FNamed)].Instance := AInst;
+end;
+
+procedure TWastRunner.BindDefinition(const AId: string;
+  const AModel: TWasmModule; const AIr: TWasmIrModule;
+  const ABytes: TWasmBytes);
+var
+  Index: Integer;
+begin
+  Index := Length(FDefinitions);
+  SetLength(FDefinitions, Index + 1);
+  FDefinitions[Index].Name := AId;
+  FDefinitions[Index].Model := AModel;
+  FDefinitions[Index].Ir := AIr;
+  FDefinitions[Index].Bytes := ABytes;
 end;
 
 procedure TWastRunner.RegisterName(const AName: string;
@@ -1217,68 +1334,232 @@ end;
 
 { --- import resolution --------------------------------------------------- }
 
-{ Build the import addresses AModel needs from the registry, in index-space
-  order per kind. Returns False (with AWhy) when any import cannot be
-  satisfied — the harness provides no host `spectest` module, so those
-  modules are skipped rather than failed. }
-function ResolveImports(const ARunner: TWastRunner; const AModel: TWasmModule;
-  out AImports: TWasmImports; out AWhy: string): Boolean;
+type
+  TSpectestImportStatus = (
+    sisNotSpectest,
+    sisResolved,
+    sisUnknown,
+    sisIncompatible
+  );
+
+function FuncTypeIs(const AType: TWasmFuncType;
+  const AParams: array of TWasmNumType): Boolean;
 var
+  I: Integer;
+begin
+  if (Length(AType.Params) <> Length(AParams)) or
+    (Length(AType.Results) <> 0) then
+    Exit(False);
+  for I := 0 to High(AParams) do
+    if (AType.Params[I].Kind <> wvkNum) or
+      (AType.Params[I].Num <> AParams[I]) then
+      Exit(False);
+  Result := True;
+end;
+
+{ Resolve one import from the standard host module in the pinned reference
+  interpreter. The declared function type has already been interned into
+  engine space; using that exact id for the host function keeps import
+  matching nominal while the explicit signature check rejects a misspelled
+  spectest contract. }
+function ResolveSpectestImport(const ARunner: TWastRunner;
+  const AImp: TWasmImport; const ATypeIds: TWasmEngineTypeIds;
+  out AAddr: UInt32): TSpectestImportStatus;
+var
+  ExpectedKind: TWasmExternKind;
+  ExpectedId: TWasmEngineTypeId;
+  FuncType: TWasmFuncType;
+  SignatureOk: Boolean;
+begin
+  AAddr := WASM_NO_ADDR;
+  if AImp.ModuleName <> 'spectest' then
+    Exit(sisNotSpectest);
+
+  SignatureOk := True;
+  if AImp.Name = 'print' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'print_i32' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'print_i64' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'print_f32' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'print_f64' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'print_i32_f32' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'print_f64_f64' then
+    ExpectedKind := wxkFunc
+  else if AImp.Name = 'global_i32' then
+    ExpectedKind := wxkGlobal
+  else if AImp.Name = 'global_i64' then
+    ExpectedKind := wxkGlobal
+  else if AImp.Name = 'global_f32' then
+    ExpectedKind := wxkGlobal
+  else if AImp.Name = 'global_f64' then
+    ExpectedKind := wxkGlobal
+  else if AImp.Name = 'table' then
+    ExpectedKind := wxkTable
+  else if AImp.Name = 'table64' then
+    ExpectedKind := wxkTable
+  else if AImp.Name = 'memory' then
+    ExpectedKind := wxkMem
+  else
+    Exit(sisUnknown);
+
+  if AImp.Kind <> ExpectedKind then
+    Exit(sisIncompatible);
+
+  case ExpectedKind of
+    wxkFunc:
+      begin
+        if AImp.FuncTypeIndex >= UInt32(Length(ATypeIds)) then
+          Exit(sisIncompatible);
+        ExpectedId := ATypeIds[AImp.FuncTypeIndex];
+        FuncType := ARunner.Engine.EngineType(ExpectedId).Comp.Func;
+        if AImp.Name = 'print' then
+          SignatureOk := FuncTypeIs(FuncType, [])
+        else if AImp.Name = 'print_i32' then
+          SignatureOk := FuncTypeIs(FuncType, [wntI32])
+        else if AImp.Name = 'print_i64' then
+          SignatureOk := FuncTypeIs(FuncType, [wntI64])
+        else if AImp.Name = 'print_f32' then
+          SignatureOk := FuncTypeIs(FuncType, [wntF32])
+        else if AImp.Name = 'print_f64' then
+          SignatureOk := FuncTypeIs(FuncType, [wntF64])
+        else if AImp.Name = 'print_i32_f32' then
+          SignatureOk := FuncTypeIs(FuncType, [wntI32, wntF32])
+        else if AImp.Name = 'print_f64_f64' then
+          SignatureOk := FuncTypeIs(FuncType, [wntF64, wntF64]);
+        if not SignatureOk then
+          Exit(sisIncompatible);
+        AAddr := ARunner.Store.AddHostFunc(ExpectedId, @SpectestPrint, nil);
+      end;
+    wxkTable:
+      if AImp.Name = 'table64' then
+        AAddr := ARunner.FSpectestTable64
+      else
+        AAddr := ARunner.FSpectestTable;
+    wxkMem:
+      AAddr := ARunner.FSpectestMemory;
+    wxkGlobal:
+      if AImp.Name = 'global_i32' then
+        AAddr := ARunner.FSpectestGlobalI32
+      else if AImp.Name = 'global_i64' then
+        AAddr := ARunner.FSpectestGlobalI64
+      else if AImp.Name = 'global_f32' then
+        AAddr := ARunner.FSpectestGlobalF32
+      else
+        AAddr := ARunner.FSpectestGlobalF64;
+  end;
+  Result := sisResolved;
+end;
+
+procedure AppendImportAddr(var AImports: TWasmImports;
+  const AKind: TWasmExternKind; const AAddr: UInt32);
+begin
+  case AKind of
+    wxkFunc:
+      begin
+        SetLength(AImports.Funcs, Length(AImports.Funcs) + 1);
+        AImports.Funcs[High(AImports.Funcs)] := AAddr;
+      end;
+    wxkTable:
+      begin
+        SetLength(AImports.Tables, Length(AImports.Tables) + 1);
+        AImports.Tables[High(AImports.Tables)] := AAddr;
+      end;
+    wxkMem:
+      begin
+        SetLength(AImports.Mems, Length(AImports.Mems) + 1);
+        AImports.Mems[High(AImports.Mems)] := AAddr;
+      end;
+    wxkGlobal:
+      begin
+        SetLength(AImports.Globals, Length(AImports.Globals) + 1);
+        AImports.Globals[High(AImports.Globals)] := AAddr;
+      end;
+    wxkTag:
+      begin
+        SetLength(AImports.Tags, Length(AImports.Tags) + 1);
+        AImports.Tags[High(AImports.Tags)] := AAddr;
+      end;
+  end;
+end;
+
+{ Build the import addresses AModel needs from the script registry and the
+  pinned standard `spectest` host module, in index-space order per kind.
+  AAllowMissing is used by assert_unlinkable: a genuinely absent export is
+  represented by WASM_NO_ADDR so instantiation judges it as `unknown import`.
+  A known export of the wrong kind remains an incompatible-import result. }
+function ResolveImports(const ARunner: TWastRunner; const AModel: TWasmModule;
+  const AIr: TWasmIrModule; out AImports: TWasmImports; out AWhy: string;
+  const AAllowMissing: Boolean = False): Boolean;
+var
+  CanonIds, TypeIds: TWasmEngineTypeIds;
   I: Integer;
   Imp: TWasmImport;
   Exporter: TWasmModuleInstance;
   Kind: TWasmExternKind;
   Addr: UInt32;
+  SpectestStatus: TSpectestImportStatus;
 begin
   Result := False;
+  AWhy := '';
   AImports.Funcs := nil;
   AImports.Tables := nil;
   AImports.Mems := nil;
   AImports.Globals := nil;
   AImports.Tags := nil;
+  ARunner.Engine.InternModule(AIr, CanonIds, TypeIds);
   for I := 0 to AModel.ImportCount - 1 do
   begin
     Imp := AModel.Imports[I];
+    { A script registration is a whole-module binding and is last-definition
+      wins. In particular, `(register "spectest" ...)` replaces the standard
+      host; never splice some names from that instance and others from the
+      built-in module. }
     Exporter := ARunner.LookupRegistry(Imp.ModuleName);
     if Exporter = nil then
     begin
+      SpectestStatus := ResolveSpectestImport(ARunner, Imp, TypeIds, Addr);
+      if SpectestStatus = sisResolved then
+      begin
+        AppendImportAddr(AImports, Imp.Kind, Addr);
+        Continue;
+      end;
+      if SpectestStatus = sisIncompatible then
+      begin
+        AWhy := string(MSG_LINK_INCOMPATIBLE_IMPORT);
+        Exit;
+      end;
+    end;
+    if Exporter = nil then
+    begin
+      if AAllowMissing then
+      begin
+        AppendImportAddr(AImports, Imp.Kind, WASM_NO_ADDR);
+        Continue;
+      end;
       AWhy := Format('%s: "%s"."%s"', [WAST_REASON_UNRESOLVED_IMPORT,
         Imp.ModuleName, Imp.Name]);
       Exit;
     end;
     if not Exporter.FindExport(Imp.Name, Kind, Addr) or (Kind <> Imp.Kind) then
     begin
+      if AAllowMissing and (not Exporter.FindExport(Imp.Name, Kind, Addr)) then
+      begin
+        AppendImportAddr(AImports, Imp.Kind, WASM_NO_ADDR);
+        Continue;
+      end;
+      if AAllowMissing then
+        AWhy := string(MSG_LINK_INCOMPATIBLE_IMPORT)
+      else
       AWhy := Format('%s: "%s"."%s"', [WAST_REASON_UNRESOLVED_IMPORT,
         Imp.ModuleName, Imp.Name]);
       Exit;
     end;
-    case Imp.Kind of
-      wxkFunc:
-        begin
-          SetLength(AImports.Funcs, Length(AImports.Funcs) + 1);
-          AImports.Funcs[High(AImports.Funcs)] := Addr;
-        end;
-      wxkTable:
-        begin
-          SetLength(AImports.Tables, Length(AImports.Tables) + 1);
-          AImports.Tables[High(AImports.Tables)] := Addr;
-        end;
-      wxkMem:
-        begin
-          SetLength(AImports.Mems, Length(AImports.Mems) + 1);
-          AImports.Mems[High(AImports.Mems)] := Addr;
-        end;
-      wxkGlobal:
-        begin
-          SetLength(AImports.Globals, Length(AImports.Globals) + 1);
-          AImports.Globals[High(AImports.Globals)] := Addr;
-        end;
-      wxkTag:
-        begin
-          SetLength(AImports.Tags, Length(AImports.Tags) + 1);
-          AImports.Tags[High(AImports.Tags)] := Addr;
-        end;
-    end;
+    AppendImportAddr(AImports, Imp.Kind, Addr);
   end;
   Result := True;
 end;
@@ -1291,6 +1572,47 @@ begin
   if (ANode.Count >= 2) and (ANode[1].Kind = wnkAtom)
     and (Length(ANode[1].Atom) > 0) and (ANode[1].Atom[1] = '$') then
     Result := ANode[1].Atom;
+end;
+
+function IsModuleDefinition(const ANode: TWastNode): Boolean;
+begin
+  Result := (ANode.Count >= 2) and ANode[1].IsAtom('definition');
+end;
+
+function IsModuleInstance(const ANode: TWastNode): Boolean;
+begin
+  Result := (ANode.Count >= 2) and ANode[1].IsAtom('instance');
+end;
+
+function DefinitionId(const ANode: TWastNode): string;
+begin
+  Result := '';
+  if (ANode.Count >= 3) and (ANode[2].Kind = wnkAtom)
+    and (Length(ANode[2].Atom) > 0) and (ANode[2].Atom[1] = '$') then
+    Result := ANode[2].Atom;
+end;
+
+{ `(module instance $instance? $definition)`: with two ids the first names
+  the fresh instance; with one id it identifies the definition and leaves the
+  instance anonymous. }
+function InstanceIds(const ANode: TWastNode; out AInstanceId,
+  ADefinitionId: string): Boolean;
+begin
+  Result := False;
+  AInstanceId := '';
+  ADefinitionId := '';
+  if (ANode.Count = 3) and (ANode[2].Kind = wnkAtom) then
+    ADefinitionId := ANode[2].Atom
+  else if (ANode.Count = 4) and (ANode[2].Kind = wnkAtom)
+    and (ANode[3].Kind = wnkAtom) then
+  begin
+    AInstanceId := ANode[2].Atom;
+    ADefinitionId := ANode[3].Atom;
+  end
+  else
+    Exit;
+  Result := (Length(ADefinitionId) > 0) and (ADefinitionId[1] = '$')
+    and ((AInstanceId = '') or (AInstanceId[1] = '$'));
 end;
 
 { --- command execution --------------------------------------------------- }
@@ -1314,7 +1636,8 @@ end;
 function PrepareModule(const ARunner: TWastRunner; const ANode: TWastNode;
   const AForm: TWastModuleForm; var AResult: TWastCommandResult;
   out AIr: TWasmIrModule; out ABytes: TWasmBytes;
-  out AImports: TWasmImports): Boolean;
+  out AImports: TWasmImports;
+  const AAllowMissing: Boolean = False): Boolean;
 var
   Bytes: TWasmBytes;
   Ir: TWasmIrModule;
@@ -1390,7 +1713,8 @@ begin
     end;
   end;
 
-  if not ResolveImports(ARunner, ARunner.Model, AImports, Why) then
+  if not ResolveImports(ARunner, ARunner.Model, Ir, AImports, Why,
+    AAllowMissing) then
   begin
     Skipped(AResult, Why);
     Ir.Free;
@@ -1407,6 +1731,159 @@ begin
   Result := True;
 end;
 
+{ Validate a script-level module definition without instantiating it. A named
+  definition retains its decoded model, IR, and bytes for later generative
+  instantiation; an anonymous definition releases them after this command.
+  Imports are deliberately not resolved here: definition formation is a
+  decode/validation operation, while each instance links against the registry
+  state visible at its own command. }
+procedure RunModuleDefinition(const ARunner: TWastRunner;
+  const ACommand: TWastCommand; var AResult: TWastCommandResult);
+var
+  Bytes: TWasmBytes;
+  Ir: TWasmIrModule;
+  Model: TWasmModule;
+  Msg, Id: string;
+  Assembled: Boolean;
+begin
+  Ir := nil;
+  Model := nil;
+  Assembled := ACommand.ModuleForm <> wmfBinary;
+  if Assembled then
+  begin
+    case AssembleOperand(ACommand.Node, ACommand.ModuleForm, Bytes, Msg) of
+      wasTextError:
+        begin
+          AResult.ActualKind := wekText;
+          AResult.Actual := Msg;
+          AResult.Status := wrsFail;
+          Exit;
+        end;
+      wasInternal:
+        begin
+          AResult.ActualKind := wekOther;
+          AResult.Actual := Msg;
+          AResult.Status := wrsFail;
+          Exit;
+        end;
+    end;
+  end
+  else
+    Bytes := ModuleBinaryBytes(ACommand.Node);
+
+  try
+    Model := TWasmModule.Create;
+    DecodeModule(Bytes, Model);
+    Ir := ValidateModule(Model, Bytes);
+  except
+    on E: EWasmDecodeError do
+    begin
+      if Assembled then
+      begin
+        AResult.ActualKind := wekOther;
+        AResult.Actual := 'internal: assembler output failed to decode: '
+          + E.Message;
+      end
+      else
+      begin
+        AResult.ActualKind := wekDecode;
+        AResult.Actual := E.Message;
+      end;
+      AResult.Status := wrsFail;
+      Ir.Free;
+      Model.Free;
+      Exit;
+    end;
+    on E: EWasmValidationError do
+    begin
+      AResult.ActualKind := wekValidation;
+      AResult.Actual := E.Message;
+      AResult.Status := wrsFail;
+      Ir.Free;
+      Model.Free;
+      Exit;
+    end;
+    on E: Exception do
+    begin
+      AResult.ActualKind := wekOther;
+      AResult.Actual := E.ClassName + ': ' + E.Message;
+      AResult.Status := wrsFail;
+      Ir.Free;
+      Model.Free;
+      Exit;
+    end;
+  end;
+
+  Id := DefinitionId(ACommand.Node);
+  if Id <> '' then
+    ARunner.BindDefinition(Id, Model, Ir, Bytes)
+  else
+  begin
+    Ir.Free;
+    Model.Free;
+  end;
+  AResult.Status := wrsPass;
+end;
+
+{ Instantiate a retained definition afresh. The retained definition is
+  immutable; only its store-side state is allocated anew, so repeated instance
+  commands are generative while imports remain shared by address. }
+procedure RunModuleInstance(const ARunner: TWastRunner;
+  const ACommand: TWastCommand; var AResult: TWastCommandResult);
+var
+  InstanceId, DefId, Why: string;
+  DefIndex: Integer;
+  Def: TWastDefinition;
+  Imports: TWasmImports;
+  Inst: TWasmModuleInstance;
+begin
+  ARunner.Current := nil;
+  if not InstanceIds(ACommand.Node, InstanceId, DefId) then
+  begin
+    AResult.ActualKind := wekText;
+    AResult.Actual := 'malformed module instance command';
+    AResult.Status := wrsFail;
+    Exit;
+  end;
+  DefIndex := ARunner.LookupDefinition(DefId);
+  if DefIndex < 0 then
+  begin
+    AResult.ActualKind := wekText;
+    AResult.Actual := 'unknown module definition ' + DefId;
+    AResult.Status := wrsFail;
+    Exit;
+  end;
+  Def := ARunner.FDefinitions[DefIndex];
+  if not ResolveImports(ARunner, Def.Model, Def.Ir, Imports, Why) then
+  begin
+    Skipped(AResult, Why);
+    Exit;
+  end;
+  try
+    Inst := InstantiateModule(ARunner.Store, Def.Ir, @Def.Bytes[0],
+      NativeUInt(Length(Def.Bytes)), Imports);
+    ARunner.Store.RunPendingStart(Inst);
+  except
+    on E: EWasmLinkError do
+    begin
+      Skipped(AResult, WAST_REASON_UNRESOLVED_IMPORT + ': ' + E.Message);
+      Exit;
+    end;
+    on E: EWasmError do
+    begin
+      AResult.Actual := E.ClassName + ': ' + E.Message;
+      AResult.Status := wrsFail;
+      Exit;
+    end;
+  end;
+  ARunner.Current := Inst;
+  if InstanceId <> '' then
+    ARunner.BindNamed(InstanceId, Inst);
+  ARunner.ForceCompileInstance(Inst);
+  ARunner.AotLoadInstance(Inst, Def.Ir, Def.Bytes);
+  AResult.Status := wrsPass;
+end;
+
 { Decode, validate, instantiate, and run the start function of a top-level
   module. The IR and bytes are retained so the instance can borrow them for
   the life of the script. }
@@ -1419,6 +1896,17 @@ var
   Inst: TWasmModuleInstance;
   Id: string;
 begin
+  if IsModuleDefinition(ACommand.Node) then
+  begin
+    RunModuleDefinition(ARunner, ACommand, AResult);
+    Exit;
+  end;
+  if IsModuleInstance(ACommand.Node) then
+  begin
+    RunModuleInstance(ARunner, ACommand, AResult);
+    Exit;
+  end;
+
   { A module that fails to build leaves no instance — clear Current so later
     actions skip honestly rather than run against a stale module. }
   ARunner.Current := nil;
@@ -1592,35 +2080,27 @@ begin
   AResult.Status := wrsFail;
 end;
 
-{ `assert_unlinkable` over a MODULE operand: the module is well-formed and
-  valid by construction, so it is assembled, decoded, and validated as a
-  PRE-CHECK (a failure there is a false rejection — INV-2 — or a real decoder/
-  validator bug on a newly-reachable module, and is reported). When the
-  pre-check passes, the command still SKIPS: judging linkage needs plumbing
-  this wave does not add, and a skip stays a skip (§4). }
-procedure RunModulePrecheck(const ARunner: TWastRunner;
-  const AOperand: TWastNode; var AResult: TWastCommandResult);
-var
-  Kind: TWastErrorKind;
-  Msg: string;
+{ Finish an `assert_unlinkable` verdict from the EWasmLinkError message. The
+  script's expected string is a PREFIX, exactly like malformed, invalid, and
+  trap assertions. }
+procedure JudgeLinkError(const AMsg: string;
+  var AResult: TWastCommandResult);
 begin
-  Kind := AttemptOperand(ARunner.Model, AOperand,
-    DetectWastModuleForm(AOperand), Msg);
-  if Kind = wekNone then
-  begin
-    { Assembled, decoded, validated — we simply cannot judge the rest. }
-    Skipped(AResult, WAST_REASON_NEEDS_TIER);
-    Exit;
-  end;
-  AResult.ActualKind := Kind;
-  AResult.Actual := Msg;
-  AResult.Status := wrsFail;
+  AResult.ActualKind := wekLink;
+  AResult.Actual := AMsg;
+  if WastMessageMatches(AResult.Expected, AMsg) then
+    AResult.Status := wrsPass
+  else
+    AResult.Status := wrsFail;
 end;
 
 procedure RunAssertUnlinkable(const ARunner: TWastRunner;
   const ACommand: TWastCommand; var AResult: TWastCommandResult);
 var
   Operand: TWastNode;
+  Ir: TWasmIrModule;
+  Bytes: TWasmBytes;
+  Imports: TWasmImports;
 begin
   Operand := FindModuleOperand(ACommand.Node);
   if Operand = nil then
@@ -1629,7 +2109,47 @@ begin
     Exit;
   end;
   AResult.Expected := ExpectedFailure(ACommand.Node);
-  RunModulePrecheck(ARunner, Operand, AResult);
+
+  { The operand must first assemble, decode, and validate. PrepareModule also
+    resolves every available import, but in this arm deliberately preserves a
+    missing import as WASM_NO_ADDR so the shipped instantiator — the one link
+    authority — produces EWasmLinkError. A resolver-detected kind mismatch is
+    already a link error and is returned as the skipped-shaped resolution
+    result; promote it to a judged verdict here. }
+  if not PrepareModule(ARunner, Operand, DetectWastModuleForm(Operand),
+    AResult, Ir, Bytes, Imports, True) then
+  begin
+    if AResult.Status = wrsSkip then
+      JudgeLinkError(AResult.Actual, AResult);
+    Exit;
+  end;
+
+  try
+    InstantiateModule(ARunner.Store, Ir, @Bytes[0],
+      NativeUInt(Length(Bytes)), Imports);
+  except
+    on E: EWasmLinkError do
+    begin
+      JudgeLinkError(E.Message, AResult);
+      Exit;
+    end;
+    on E: EWasmError do
+    begin
+      { A trap, resource failure, or internal error is not an unlinkable
+        module. Keep the specific failure visible instead of mis-scoring it. }
+      ARunner.Store.Heap.ResetFrames;
+      ResetInterpContext(ARunner.Store);
+      AResult.ActualKind := wekOther;
+      AResult.Actual := E.ClassName + ': ' + E.Message;
+      AResult.Status := wrsFail;
+      Exit;
+    end;
+  end;
+
+  { Instantiation succeeded where a link error was required. }
+  AResult.ActualKind := wekNone;
+  AResult.Actual := WAST_NO_ERROR;
+  AResult.Status := wrsFail;
 end;
 
 { Resolve the expected reference identity a matcher compares against —
@@ -2064,6 +2584,32 @@ begin
   end;
 end;
 
+function IsModuleFieldHead(const AHead: string): Boolean;
+begin
+  Result := (AHead = 'type') or (AHead = 'rec') or (AHead = 'import')
+    or (AHead = 'func') or (AHead = 'table') or (AHead = 'memory')
+    or (AHead = 'global') or (AHead = 'export') or (AHead = 'start')
+    or (AHead = 'elem') or (AHead = 'data') or (AHead = 'tag');
+end;
+
+{ The reference tools also accept a text module written as a sequence of
+  module fields with the outer `(module ...)` elided. `inline-module.wast` in
+  the pinned core corpus is exactly this form. It is one module, not a script
+  containing several unknown directives, so detect the shape structurally and
+  feed the same WAT assembler by restoring only the omitted wrapper. }
+function IsInlineModuleBody(const AScript: TWastScript): Boolean;
+var
+  I: Integer;
+begin
+  if AScript.Count = 0 then
+    Exit(False);
+  for I := 0 to AScript.Count - 1 do
+    if (AScript[I].Kind <> wcUnknown)
+      or not IsModuleFieldHead(AScript[I].Node.HeadAtom) then
+      Exit(False);
+  Result := True;
+end;
+
 function RunWastSource(const ASource: string): TWastRunResult;
 begin
   Result := RunWastSource(ASource, wtmInterp);
@@ -2076,6 +2622,11 @@ var
 begin
   Script := ParseWastScript(ASource);
   try
+    if IsInlineModuleBody(Script) then
+    begin
+      FreeAndNil(Script);
+      Script := ParseWastScript('(module ' + ASource + sLineBreak + ')');
+    end;
     Result := RunWastScript(Script, AMode);
   finally
     Script.Free;
