@@ -1,6 +1,6 @@
 # Handoff
 
-Updated: 2026-08-14 (latest main synced; README conformance status refreshed)
+Updated: 2026-08-14 (README status refreshed; LWPT 0.6.0 migration verified)
 
 ## 2026-08-14 README and suite-status audit
 
@@ -8,9 +8,9 @@ Updated: 2026-08-14 (latest main synced; README conformance status refreshed)
   `codex/update-readme-suite-status` directly at
   `origin/main@f3e9da573d796201ad64b60f27035dd253378f89`. The starting
   detached worktree was clean; no user changes were stashed or discarded.
-- Draft PR #4, `docs: clarify conformance suite status`, is open against the
-  remote default. The create-PR workflow owns the transition to ready after
-  the final exact-head PR and docs checks reach green.
+- Draft PR #4, `chore: upgrade LWPT and clarify conformance status`, is open
+  against the remote default. The create-PR workflow owns the transition to
+  ready after the final exact-head PR and docs checks reach green.
 - Updated `README.md` to lead with the reproducible 257-script pinned-core
   command and its clean result, distinguish it from the recursive mirror,
   explain every remaining recursive failure/skip class, and replace the stale
@@ -26,11 +26,20 @@ Updated: 2026-08-14 (latest main synced; README conformance status refreshed)
 - Exact-head main CI run 31798063780 is green on all six jobs: aarch64/x86-64
   macOS, aarch64/x86-64 Linux, and x86-64/i386 Windows. The four 64-bit UNIX
   jobs run interpreter/JIT/AOT; Windows runs the tier-of-record interpreter.
-- Verification with the checksum-verified CI toolchain (`lwpt 0.4.0`) passed:
-  frozen install, formatting, all three builds, and 44/44 unit suites. The
-  locally installed `lwpt 0.6.0` rejects the manifest's legacy `script` hook
-  field before build; migrating the manifest and CI to the current hook schema
-  is a separate follow-up and was not folded into this documentation task.
+- The user expanded PR #4 to upgrade the project to LWPT 0.6.0. The manifest
+  now selects `instantfpc` explicitly through `command` + `args`, both filtered
+  dependencies resolve at 0.6.0, `lwpt install` owns the regenerated lock,
+  archives, and module snapshots, and both workflows download the
+  checksum-verified 0.6.0 release. The obsolete tracked 0.4.0 archives were
+  removed; they remain recoverable from Git history.
+- LWPT 0.6.0's generated AGENTS command block is present and enforced by
+  `lwpt agents --check` on the single format lane in PR and post-merge CI;
+  Lefthook refreshes it locally alongside formatting.
+- The full local 0.6.0 gate is green: frozen install, formatting, generated
+  agent reference, all three builds, 44/44 unit suites, Markdown lint, and the
+  pinned core in interpreter/JIT/AOT at `pass=65188 fail=0 skip=0 staged=0`.
+  The recursive diagnostic remains `pass=65851 fail=368 skip=904 staged=0`
+  with the same outside-target breakdown recorded above.
 
 ## Pinned core conformance residue eliminated
 
