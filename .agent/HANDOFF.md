@@ -1,5 +1,29 @@
 # Handoff
 
+Updated: 2026-08-14 (benchmark-gated optimization workflow packaged)
+
+## Runtime optimization skill
+
+- Added the repository-authored `optimize-runtime` skill under
+  `.agents/skills/optimize-runtime/`. It turns the workflow used for PR #1
+  into a repeatable protocol: exact release baseline, profiling, bounded
+  isolated candidate lanes, serialized same-load A/B measurement, guard
+  workloads, combined-state re-measurement, and cross-tier/platform gates.
+- Candidate changes remain rejected unless their improvement is repeatable and
+  larger than observed noise. Each accepted lane is re-measured after
+  integration against the immediately previous accepted head; isolated wins
+  are not assumed to compose.
+- The workflow preserves shared validation, memory chokepoints, epoch/stack-map
+  safepoints, invocation-trampoline unwinding, and interpreter/JIT/AOT identity.
+  Generated-code changes require the full pinned corpus on macOS/aarch64 and
+  Linux/x86-64 before delivery.
+- The skill is intentionally repository-authored and therefore absent from
+  `skills-lock.json`. Imported skills remain lock-managed; `docs/tooling.md`
+  now records the distinction.
+- Branch: `codex/add-optimization-skill`, based on fetched
+  `origin/main@f3e9da5` after PR #1 and PR #2 merged. No runtime code or
+  benchmark result changed in this documentation/workflow-only branch.
+
 Updated: 2026-08-14 (pinned core corpus fully judged and delivered)
 
 ## Pinned core conformance residue eliminated

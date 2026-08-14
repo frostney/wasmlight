@@ -91,11 +91,16 @@ runs, which defeats the point of citing it.
 
 ## Agent skills
 
-Project skills are lock-managed under `.agents/skills/`, with
-`.claude/skills` symlinked to it. They are generated — refresh them with
-the `skills` CLI rather than editing the tree:
+Imported project skills are lock-managed under `.agents/skills/`, with
+`.claude/skills` symlinked to it. Refresh imported skills with the `skills`
+CLI rather than editing their generated trees:
 
 ```bash
 npx -y skills@1.5.17 update --project --yes
 npx -y skills@1.5.17 list --json
 ```
+
+Repository-authored skills also live under `.agents/skills/`, but are committed
+directly and intentionally absent from `skills-lock.json`: the repository is
+their source of truth. A skills update leaves these local folders in place.
+Use `$optimize-runtime` for benchmark-gated runtime optimization waves.
