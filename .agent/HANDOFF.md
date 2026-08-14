@@ -8,6 +8,9 @@ Updated: 2026-08-14 (latest main synced; README conformance status refreshed)
   `codex/update-readme-suite-status` directly at
   `origin/main@f3e9da573d796201ad64b60f27035dd253378f89`. The starting
   detached worktree was clean; no user changes were stashed or discarded.
+- Draft PR #4, `docs: clarify conformance suite status`, is open against the
+  remote default. The create-PR workflow owns the transition to ready after
+  the final exact-head PR and docs checks reach green.
 - Updated `README.md` to lead with the reproducible 257-script pinned-core
   command and its clean result, distinguish it from the recursive mirror,
   explain every remaining recursive failure/skip class, and replace the stale
