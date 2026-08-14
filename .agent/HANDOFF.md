@@ -1,5 +1,33 @@
 # Handoff
 
+Updated: 2026-08-14 (optimization skill PR refreshed on current main)
+
+## Runtime optimization skill
+
+- Added the repository-authored `optimize-runtime` skill under
+  `.agents/skills/optimize-runtime/`. It turns the workflow used for PR #1
+  into a repeatable protocol: exact release baseline, profiling, bounded
+  isolated candidate lanes, serialized same-load A/B measurement, guard
+  workloads, combined-state re-measurement, and cross-tier/platform gates.
+- Candidate changes remain rejected unless their improvement is repeatable and
+  larger than observed noise. Each accepted lane is re-measured after
+  integration against the immediately previous accepted head; isolated wins
+  are not assumed to compose.
+- The workflow preserves shared validation, memory chokepoints, epoch/stack-map
+  safepoints, invocation-trampoline unwinding, and interpreter/JIT/AOT identity.
+  Generated-code changes require the full pinned corpus on macOS/aarch64 and
+  Linux/x86-64 before delivery.
+- The skill is intentionally repository-authored and therefore absent from
+  `skills-lock.json`. Imported skills remain lock-managed; `docs/tooling.md`
+  now records the distinction.
+- PR #3, `feat: add benchmark-gated optimization skill`, is open from
+  `codex/add-optimization-skill`. The branch merged current
+  `origin/main@fad3c41` after PR #4 landed; no rebase or force-push was used.
+  No runtime code or benchmark result changed in this workflow-only PR.
+- The merged-state LWPT 0.6.0 gate is green: frozen install, formatting,
+  generated-agent validation, development and release builds, all 44 unit
+  suites, skill validation/discovery, CLI smoke checks, and Markdown lint.
+
 Updated: 2026-08-14 (README status refreshed; LWPT 0.6.0 migration verified)
 
 ## 2026-08-14 README and suite-status audit
