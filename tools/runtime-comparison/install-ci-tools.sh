@@ -123,12 +123,12 @@ archive=$(fetch wasm3-source.tar.gz \
   https://codeload.github.com/wasm3/wasm3/tar.gz/6b8bcb1e07bf26ebef09a7211b0a37a446eafd52 \
   d3d7a1cabbdc534e83c24be5181c637b03968f60a97fe0aac6cb515ee803b229)
 unpack_gz wasm3 "$archive"
-wasm3_source=$(find "$tool_root/packages/wasm3" -type f -name CMakeLists.txt -print -quit)
-if [ -z "$wasm3_source" ]; then
+wasm3_source=$(find "$tool_root/packages/wasm3" -mindepth 1 -maxdepth 1 \
+  -type d -name 'wasm3-*' -print -quit)
+if [ -z "$wasm3_source" ] || [ ! -f "$wasm3_source/CMakeLists.txt" ]; then
   echo "could not find the wasm3 source root" >&2
   exit 1
 fi
-wasm3_source=$(dirname "$wasm3_source")
 cmake -S "$wasm3_source" -B "$tool_root/packages/wasm3-build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_NATIVE=OFF \

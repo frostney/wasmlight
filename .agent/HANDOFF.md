@@ -41,7 +41,9 @@ Updated: 2026-08-15 (PR runtime-comparison gate and sticky report)
   x86-64 ELF exiting on GitHub's runner with SIGILL before measurement. The
   installer now builds wasm3 once from the checksum-verified archive for pinned
   commit `6b8bcb1e07bf26ebef09a7211b0a37a446eafd52`; the installer-derived cache
-  retains that executable for later runs.
+  retains that executable for later runs. The source-root lookup is constrained
+  to the archive's top-level directory: an unconstrained `find CMakeLists.txt`
+  selected wasm3's Android JNI subproject on one hosted filesystem traversal.
 - Live forge check found no branch protection or repository ruleset. The new
   job makes the PR workflow red on failure, but it cannot become a mechanically
   required merge check until a ruleset is added after the workflow exists on
