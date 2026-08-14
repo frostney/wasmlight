@@ -117,11 +117,25 @@ archive=$(fetch wazero.tar.gz \
 unpack_gz wazero "$archive"
 link_binary wazero wazero
 
-wasm3=$(fetch wasm3 \
-  https://github.com/wasm3/wasm3/releases/download/v0.5.0/wasm3-linux-x64.elf \
-  905292b6700413dd7f2293e0f44dbc853a743ef2d0a6d0043490acf34526e4de)
-mkdir -p "$tool_root/packages/wasm3"
-install -m 755 "$wasm3" "$tool_root/packages/wasm3/wasm3"
+command -v cmake >/dev/null
+command -v cc >/dev/null
+archive=$(fetch wasm3-source.tar.gz \
+  https://codeload.github.com/wasm3/wasm3/tar.gz/6b8bcb1e07bf26ebef09a7211b0a37a446eafd52 \
+  d3d7a1cabbdc534e83c24be5181c637b03968f60a97fe0aac6cb515ee803b229)
+unpack_gz wasm3 "$archive"
+wasm3_source=$(find "$tool_root/packages/wasm3" -type f -name CMakeLists.txt -print -quit)
+if [ -z "$wasm3_source" ]; then
+  echo "could not find the wasm3 source root" >&2
+  exit 1
+fi
+wasm3_source=$(dirname "$wasm3_source")
+cmake -S "$wasm3_source" -B "$tool_root/packages/wasm3-build" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_NATIVE=OFF \
+  -DBUILD_WASI=simple
+cmake --build "$tool_root/packages/wasm3-build" --parallel 2
+install -m 755 "$tool_root/packages/wasm3-build/wasm3" \
+  "$tool_root/packages/wasm3/wasm3"
 ln -sfn "$tool_root/packages/wasm3/wasm3" "$tool_root/bin/wasm3"
 
 archive=$(fetch wasm-tools.tar.gz \

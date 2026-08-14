@@ -53,9 +53,11 @@ runner. It runs the `best` profile against every pinned peer, uploads both raw
 JSON reports, and the `runtime-comparison-comment` job updates one marker-based
 PR comment.
 
-Peer executables are immutable release assets with checked-in SHA-256 digests.
-The prepared tree is cached under the GitHub runner tool cache with a key derived
-from `install-ci-tools.sh`; changing any version or digest invalidates the whole
+Peer executables are immutable release assets, except wasm3, which is built from
+a pinned commit archive because its published x86-64 ELF traps on GitHub's
+runner CPU. Every download has a checked-in SHA-256 digest. The prepared tree is
+cached under the GitHub runner tool cache with a key derived from
+`install-ci-tools.sh`; changing any version or digest invalidates the whole
 cache deliberately.
 
 This is an executable gate, not a numeric performance gate. A broken build,

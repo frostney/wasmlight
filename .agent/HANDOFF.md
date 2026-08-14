@@ -37,6 +37,11 @@ Updated: 2026-08-15 (PR runtime-comparison gate and sticky report)
   renderer 4/4 tests pass, Python byte-compilation passes, Markdown lint passes,
   YAML parsing and diff whitespace pass, and a clean Ubuntu container verified
   every cached executable plus WAMR AOT compile and execution.
+- PR #5's first runtime-comparison run exposed the published wasm3 0.5.0
+  x86-64 ELF exiting on GitHub's runner with SIGILL before measurement. The
+  installer now builds wasm3 once from the checksum-verified archive for pinned
+  commit `6b8bcb1e07bf26ebef09a7211b0a37a446eafd52`; the installer-derived cache
+  retains that executable for later runs.
 - Live forge check found no branch protection or repository ruleset. The new
   job makes the PR workflow red on failure, but it cannot become a mechanically
   required merge check until a ruleset is added after the workflow exists on
