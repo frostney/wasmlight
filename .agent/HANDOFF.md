@@ -46,6 +46,10 @@ Updated: 2026-08-14 (pinned core corpus fully judged and delivered)
 
 ## Delivery
 
+- Draft PR [#2](https://github.com/frostney/wasmlight/pull/2),
+  `fix: restore tier CI and fully judge pinned core`, is open against `main`.
+  Keep it draft until the PR-triggered checks pass on the exact final head, then
+  mark it ready for review.
 - Implementation commit: `8dba9c1` (`fix: fully judge the pinned core corpus`).
 - Current-truth documentation commit: `e2bea80`
   (`docs: record complete core conformance`).
