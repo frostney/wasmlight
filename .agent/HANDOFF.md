@@ -1,19 +1,21 @@
 # Handoff
 
-Updated: 2026-08-14 (runtime comparison research from current main)
+Updated: 2026-08-14 (reproducible seven-runtime comparison delivered)
 
-## Runtime comparison research
+## Runtime comparison and performance scorecard
 
-- Updated the clean detached research worktree from `fad3c41` to the fetched
-  remote default `origin/main@a7d9565304ee1138b4e76763810559e7ba1112d1`.
-  No branch or user change was stashed, discarded, rebased, or overwritten.
-- Compared the current implementation and its measured evidence with the
-  closest embeddable non-browser runtimes: Wasmtime, Wasmer, WasmEdge, WAMR,
-  wazero, and wasm3. The useful primary comparison set is Wasmtime (performance
-  and standards leader), WAMR (portable multi-tier embedded peer), and wazero
-  (single-language, dependency-light embedding peer). WasmEdge and Wasmer are
-  broader cloud/extension products; wasm3 is an interpreter-only portability
-  reference in minimal maintenance.
+- Fetched `origin/main@a7d9565304ee1138b4e76763810559e7ba1112d1` and created
+  `codex/compare-runtimes` without a rebase, force-push, or upstream tracking
+  branch. The prior handoff-only change was retained in commit `3e25018`.
+- Added the reusable comparison harness and four self-checking WASI workloads
+  under `tools/runtime-comparison/`. Commit `83c132b9d52a` is the exact clean
+  measured head. Compilation happens outside the timer; the run uses one
+  warm-up, seven measured samples, a rotated round-robin schedule, and the
+  shared `/tmp/wasmlight-perf-gate.lock`. Raw samples are generated under
+  `build/runtime-comparison/` and are not committed.
+- Added `docs/runtime-comparison.md` with a current product-shape comparison of
+  Wasmtime 47.0.3, Wasmer 7.2.1, WasmEdge 0.17.1, WAMR 2.4.5, wazero 1.12.0,
+  and wasm3 0.5.0, plus the full performance snapshot and limitations.
 - Wasmlight's defensible position is a native Object Pascal runtime with an
   unusually complete pinned core-3.0 implementation, strict phase/error
   boundaries, deny-by-default capabilities, and observational identity across
@@ -25,21 +27,22 @@ Updated: 2026-08-14 (runtime comparison research from current main)
   share native backends and conservatively fall back per function when
   `JitCanCompile` declines a shape (including handler-table cases); it is not a
   claim that every core-3.0 operation is natively lowered.
-- The latest controlled Wasmtime 47.0.3 comparison remains valid because main
-  has had no runtime change since it was recorded: identical precompiled WASI
-  command modules, one discarded warmup, seven samples on Apple Silicon. The
-  300M varying-address loop measured Wasmlight AOT 564.054 ms versus Wasmtime
-  94.163 ms (5.99x), and fib(40) measured 4.125 s versus 348.578 ms (11.83x).
-  These are workload results, not a general runtime ranking or parity claim.
-- A fresh frozen release build on `a7d9565` passed and produced a 1.6 MiB
-  unstripped arm64 macOS `wasmlight` CLI. This is not comparable to WAMR's
-  core-vmlib or wasm3's minimum-system figures; an isolated stripped embedding
-  binary, peak working set, module-load latency, and cold/warm instantiation
-  suite are still needed before making footprint claims.
-- Recommended next comparison artifact: one reproducible scorecard against
-  Wasmtime, WAMR, and wazero covering core feature/tier behavior, WASI program
-  compatibility, cold start and instantiation, steady-state execution, host
-  call overhead, binary/resident footprint, and failure/sandbox differentials.
+- Clean-head Apple M5 Max medians: wasmlight AOT startup 2.191 ms (fastest);
+  nonlinear 300M loop 503.042 ms (Wasmtime/Wasmer/WasmEdge/wazero compiled
+  configurations are 1.48-1.51x faster); fib(35) 353.371 ms (compiled peers
+  7.96-15.64x faster); varying-address 50M memory 82.054 ms (compiled peers
+  2.66-4.66x faster). WAMR and wasm3 were interpreter-only in the installed
+  best-profile configurations.
+- Wasmlight's interpreter starts fastest and beats the explicit WasmEdge and
+  wazero interpreters on all three heavy workloads, but WAMR and wasm3 are
+  4.62-9.32x faster. The strongest optimization targets are recursive
+  call/return first, then the memory chokepoint; preserve startup and artifact
+  size while changing either.
+- WAMR AOT/JIT remains unmeasured: WAMR supports both, but its official 2.4.5
+  macOS `wamrc` asset is x86-64-only and this arm64 host has no Rosetta. Build a
+  native arm64 compiler before claiming WAMR's performance ceiling.
+- Next scorecard extensions are host-call and repeated-instantiation throughput,
+  peak RSS/multi-instance density, then one real toolchain-compiled WASI app.
   Keep Component Model and threads as explicit product-direction decisions,
   not assumed roadmap additions.
 
