@@ -1280,6 +1280,7 @@ type
     procedure TestMemoryLoadStore;
     procedure TestForwardedMemoryLoadKeepsStoreEffect;
     procedure TestForwardedMemoryLoadKeepsStoreOobTrap;
+    procedure TestMemoryLocalAliasCodeShape;
     procedure TestMemoryLoopCache;
     procedure TestMemoryLoopCarriedCache;
     procedure TestMemoryOobTraps;
@@ -2750,6 +2751,32 @@ begin
     .ToBe('out of bounds memory access');
 end;
 
+procedure TJitTests.TestMemoryLocalAliasCodeShape;
+{$IFDEF WASM_JIT_ARM64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_ARM64}
+  FBytes := MemForwardModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, @FIr.Functions[0], EntryOffset,
+    RegisterCount);
+  { The bounded local aliases remove seven loop-body copies while every
+    original IR label remains represented. Pin the resulting A64 shape so the
+    transform cannot silently stop applying while differential behavior stays
+    correct. }
+  Expect<Integer>(Length(Code)).ToBe(196);
+  Expect<NativeUInt>(EntryOffset).ToBe(0);
+  Expect<UInt32>(RegisterCount).ToBe(FIr.Functions[0].RegisterCount);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestMemoryLoopCache;
 begin
   Expect<Boolean>(DiffFresh(MemLoopModuleBytes, 'run', [MakeValueI32(100)]))
@@ -3101,6 +3128,8 @@ begin
     TestForwardedMemoryLoadKeepsStoreEffect);
   Test('a forwarded memory load keeps the store out-of-bounds trap',
     TestForwardedMemoryLoadKeepsStoreOobTrap);
+  Test('a scalar memory loop forwards bounded local aliases',
+    TestMemoryLocalAliasCodeShape);
   Test('a scalar memory loop retains cached values identically',
     TestMemoryLoopCache);
   Test('a scalar memory loop reconciles dynamic loop-carried values',
