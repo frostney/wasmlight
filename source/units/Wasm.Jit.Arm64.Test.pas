@@ -60,6 +60,7 @@ type
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestThirdStaticAllocation;
     procedure TestExtendedFrameWords;
+    procedure TestDynamicWriteBackSpillsOnlyLiveValues;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -281,6 +282,56 @@ begin
     Expect<UInt32>(EmittedWord(Buf, 6)).ToBe(
       Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
     Expect<UInt32>(EmittedWord(Buf, 7)).ToBe(Arm64Ret);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestDynamicWriteBackSpillsOnlyLiveValues;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..9] of UInt32;
+  Visible: array[0..9] of Boolean;
+  I: Integer;
+begin
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0],
+      Length(UseCounts));
+    for I := 0 to 4 do
+      Expect<Boolean>(Arm64EmitOpCached(Buf,
+        MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
+        UInt32(I), False, False, False, False, Cache)).ToBe(True);
+    { The fifth value evicts the first after its last use count reached zero.
+      Two static loads plus two words per constant: no canonical spill. }
+    Expect<Integer>(Buf.Size).ToBe(12 * SizeOf(UInt32));
+  finally
+    Buf.Free;
+  end;
+
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0],
+      Length(UseCounts));
+    for I := 0 to 4 do
+      Expect<Boolean>(Arm64EmitOpCached(Buf,
+        MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
+        UInt32(I), False, False, False, False, Cache)).ToBe(True);
+    { Slot 2 still has a future use, so its eviction writes one canonical
+      value before x14 is reassigned. }
+    Expect<Integer>(Buf.Size).ToBe(13 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 11)).ToBe(
+      Arm64StrX(ARM64_REG_CACHE2, ARM64_REG_REGFILE,
+        Arm64SlotByteOffset(2)));
   finally
     Buf.Free;
   end;
@@ -694,6 +745,8 @@ begin
     TestThirdStaticAllocation);
   Test('the extended frame preserves its third static register',
     TestExtendedFrameWords);
+  Test('dynamic write-back spills live values and discards dead values',
+    TestDynamicWriteBackSpillsOnlyLiveValues);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);
