@@ -553,8 +553,9 @@ function Arm64CachedSourceReg(const ABuf: TWasmCodeBuffer;
 procedure Arm64CachedBinarySourceRegs(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ALeftSlot, ARightSlot: UInt32;
   out ALeft, ARight: Byte); forward;
-function Arm64CachedStaticDestReg(const ACache: TArm64RegCache;
-  const ASlot: UInt32; const ADefault: Byte): Byte; forward;
+function Arm64CachedDestReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const AExclude0, AExclude1, ADefault: Byte): Byte; forward;
 procedure EmitCbnzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
 procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
@@ -854,6 +855,8 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
   AUsePinnedMemoryBase, AExtendedFrame: Boolean;
   var ACache: TArm64RegCache): Boolean;
+var
+  Source, Dest: Byte;
 begin
   Result := True;
   if Arm64ScalarMemoryOp(AIns.Op) then
@@ -870,8 +873,13 @@ begin
   case AIns.Op of
     iroMove:
       begin
-        Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
-        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+        Source := Arm64CachedSourceReg(ABuf, ACache, AIns.A,
+          ARM64_REG_T0);
+        Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest, Source,
+          ARM64_REG_ZR, ARM64_REG_T0);
+        if Dest <> Source then
+          ABuf.EmitU32(Arm64MovReg(Dest, Source));
+        Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
       end;
     iroI32Const, iroF32Const:
       begin
@@ -3575,15 +3583,49 @@ begin
   Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
 end;
 
-function Arm64CachedStaticDestReg(const ACache: TArm64RegCache;
-  const ASlot: UInt32; const ADefault: Byte): Byte;
+function Arm64CachedDestReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const AExclude0, AExclude1, ADefault: Byte): Byte;
 var
-  I: Integer;
+  I, Offset, Attempt: Integer;
+  Host: Byte;
 begin
   Result := ADefault;
   for I := 0 to ACache.StaticCount - 1 do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
       Exit(Arm64CacheHostReg(I));
+  if not ACache.StaticAllocation then
+    Exit;
+  { Reuse an established dynamic destination only when it is not an operand.
+    If it is an operand, retain the scratch path so the input survives until
+    the instruction has read it and no duplicate slot mapping is created. }
+  for I := 3 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      Host := Arm64CacheHostReg(I);
+      if (Host = AExclude0) or (Host = AExclude1) then
+        Exit;
+      ACache.Entries[I].Dirty := False;
+      Exit(Host);
+    end;
+  { Reserve a non-source entry before emission. Its previous value is spilled
+    through the existing liveness predicate; CachedStore marks the new value
+    dirty after the instruction writes it. }
+  for Attempt := 0 to 3 do
+  begin
+    Offset := (Integer(ACache.Next) + Attempt) and 3;
+    I := 3 + Offset;
+    Host := Arm64CacheHostReg(I);
+    if (Host = AExclude0) or (Host = AExclude1) then
+      Continue;
+    if ACache.WriteBackDynamics then
+      Arm64SpillCacheEntry(ABuf, ACache, I);
+    ACache.Entries[I].Valid := True;
+    ACache.Entries[I].Dirty := False;
+    ACache.Entries[I].Slot := ASlot;
+    ACache.Next := Byte((Offset + 1) and 3);
+    Exit(Host);
+  end;
 end;
 
 procedure Arm64CachedStore(const ABuf: TWasmCodeBuffer;
@@ -3645,7 +3687,8 @@ var
   Left, Right, Dest: Byte;
 begin
   Arm64CachedBinarySourceRegs(ABuf, ACache, AIns.A, AIns.B, Left, Right);
-  Dest := Arm64CachedStaticDestReg(ACache, AIns.Dest, ARM64_REG_T0);
+  Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest, Left, Right,
+    ARM64_REG_T0);
   ABuf.EmitU32(AWb(Dest, Left, Right));
   Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
 end;
@@ -3676,7 +3719,8 @@ begin
   if not Result then
     Exit;
   Source := Arm64CachedSourceReg(ABuf, ACache, AIns.A, ARM64_REG_T0);
-  Dest := Arm64CachedStaticDestReg(ACache, AIns.Dest, ARM64_REG_T0);
+  Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest, Source, ARM64_REG_ZR,
+    ARM64_REG_T0);
   case AIns.Op of
     iroI32Add:
       ABuf.EmitU32(Arm64AddImmW(Dest, Source, AValue));
@@ -3705,7 +3749,8 @@ var
   Source, Dest: Byte;
 begin
   Source := Arm64CachedSourceReg(ABuf, ACache, ASource, ARM64_REG_T0);
-  Dest := Arm64CachedStaticDestReg(ACache, ADest, ARM64_REG_T0);
+  Dest := Arm64CachedDestReg(ABuf, ACache, ADest, Source, ARM64_REG_ZR,
+    ARM64_REG_T0);
   ABuf.EmitU32(Arm64UbfizW(Dest, Source, AShift, AWidth));
   Arm64CachedStore(ABuf, ACache, Dest, ADest);
 end;

@@ -59,6 +59,7 @@ type
     procedure TestStaticCacheKeepsFourTemporaries;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheUsesHostRegsForAlu;
+    procedure TestDynamicDestReservation;
     procedure TestThirdStaticAllocation;
     procedure TestExtendedFrameWords;
     procedure TestDynamicWriteBackSpillsOnlyLiveValues;
@@ -273,6 +274,44 @@ begin
     Expect<UInt32>(UseCounts[0]).ToBe(0);
     Expect<UInt32>(UseCounts[1]).ToBe(0);
     Expect<Boolean>(Cache.Entries[0].Dirty).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestDynamicDestReservation;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..3] of UInt32;
+  Visible: array[0..3] of Boolean;
+begin
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[0] := 2;
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 4);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroMove, 2, 0, 0, 0), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 3, 0, 2, 0), Aux,
+      1, False, False, False, False, Cache)).ToBe(True);
+    { The move writes x14 directly from x12; the add then reserves non-source
+      x15 and consumes x12/x14 without scratch shuffles. }
+    Expect<Integer>(Buf.Size).ToBe(4 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 2)).ToBe(
+      Arm64MovReg(ARM64_REG_CACHE2, ARM64_REG_CACHE0));
+    Expect<UInt32>(EmittedWord(Buf, 3)).ToBe(
+      Arm64AddW(ARM64_REG_CACHE3, ARM64_REG_CACHE0, ARM64_REG_CACHE2));
+    Expect<UInt32>(UseCounts[0]).ToBe(0);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+    Expect<Boolean>(Cache.Entries[3].Dirty).ToBe(True);
+    Expect<Boolean>(Cache.Entries[4].Dirty).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -780,6 +819,8 @@ begin
     TestStaticCacheKeepsShiftResult);
   Test('static allocation feeds ALU host registers directly',
     TestStaticCacheUsesHostRegsForAlu);
+  Test('dynamic destinations reserve a non-source cache register',
+    TestDynamicDestReservation);
   Test('static allocation can retain a third long-lived slot',
     TestThirdStaticAllocation);
   Test('the extended frame preserves its third static register',
