@@ -39,8 +39,10 @@
   recursion and edits only the shared Depth/ValueTop counters. Its external
   AAPCS wrapper saves and pins the full callee-saved state once, then calls a
   local position-independent core; recursion preserves only x19/LR beside the
-  native register file. It checks both caps before mutation; ordinary calls do
-  not invent epoch safepoints, while IR-marked loop back-edges still poll;
+  native register file. The wrapper pins the exact remaining depth/value-frame
+  budget in x26; recursion checks and adjusts it without publishing counters.
+  Ordinary calls do not invent epoch safepoints, while IR-marked loop
+  back-edges still poll;
   references, allocation, handlers, host/interpreted escape, indirect/tail
   calls, and cross-function calls all retain the full shared-frame path above.
 
@@ -441,6 +443,7 @@ var
   NativeParamReg: UInt32;
   NativeResultReg: UInt32;
   NativeCoreLabel: TWasmJitLabel;
+  NativeExhaustedLabel: TWasmJitLabel;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -1060,6 +1063,8 @@ var
   end;
 
   procedure CountInstructionUses(const AIns: TWasmIrInstr);
+  var
+    N: Integer;
   begin
     case AIns.Op of
       iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
@@ -1088,6 +1093,9 @@ var
           CountSlotUse(AIns.A);
           CountSlotUse(AIns.Dest);
         end;
+      iroCall:
+        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, AIns.A)) - 1 do
+          CountSlotUse(IrAuxBlockItem(AFn^.AuxU32, AIns.A, UInt32(N)));
     end;
   end;
 
@@ -1331,6 +1339,7 @@ begin
     NativeParamReg := 0;
     NativeResultReg := 0;
     NativeCoreLabel := -1;
+    NativeExhaustedLabel := -1;
     if UseNativeScalarSelf then
     begin
       NativeParamReg := AFn^.LocalRegs[0];
@@ -1341,7 +1350,10 @@ begin
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
     if UseNativeScalarSelf then
+    begin
       NativeCoreLabel := Buf.NewLabel;
+      NativeExhaustedLabel := Buf.NewLabel;
+    end;
 
     { A cache is valid only along one straight-line predecessor. Mark every IR
       branch destination up front so a join invalidates compile-time cache
@@ -1365,6 +1377,10 @@ begin
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
+    if UseNativeScalarSelf then
+      { x26 is the wrapper-pinned additional-frame budget, never a cached
+        wasm slot, for the lifetime of the local recursive core. }
+      AllocatedSlots[2] := High(UInt32);
     UseThirdStatic := UseStaticCache and
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
@@ -1381,20 +1397,23 @@ begin
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
-    UseExtendedFrame := UseThirdStatic;
+    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
     if UseExtendedFrame then
       Arm64EmitPrologueExtended(Buf)
     else
       Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if UseNativeScalarSelf then
+      Arm64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
       Arm64EmitPinMemory(Buf, PinnedMemoryIndex, UsePinnedMemoryBase);
     if UseNativeScalarSelf then
     begin
       { The external AAPCS entry owns the full callee-saved frame once. The
         recursive path targets this position-independent local core directly. }
-      Arm64EmitBlTo(Buf, NativeCoreLabel);
+      Arm64EmitNativeCoreWrapperCall(Buf, NativeParamReg, NativeResultReg,
+        NativeCoreLabel);
       if UseExtendedFrame then
         Arm64EmitEpilogueExtended(Buf)
       else
@@ -1409,6 +1428,14 @@ begin
         Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
           @VisibleSlots[0], AFn^.RegisterCount);
     end;
+    if UseNativeScalarSelf then
+      { The closed helper-free native core may defer block-local numeric
+        stores. Calls flush only values the lexical liveness plan still needs;
+        generic call-bearing functions never enable this mode. }
+      Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
+    if UseNativeScalarSelf then
+      Arm64SeedNativeCoreCache(ArmCache, NativeParamReg);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     X64EmitPrologue(Buf);
@@ -1467,7 +1494,7 @@ begin
               (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarSelf, AFn^.RegisterCount, NativeParamReg,
-            NativeResultReg, NativeCoreLabel, ArmCache);
+            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache);
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
@@ -1495,6 +1522,15 @@ begin
     end;
 
     {$IFDEF WASM_JIT_ARM64}
+    if UseNativeScalarSelf then
+    begin
+      { All ordinary native-core paths return through iroReturn. Keep the rare
+        exhaustion helper out of line so successful recursive calls need no
+        branch around a per-call trap block. }
+      Buf.BindLabel(NativeExhaustedLabel);
+      Arm64EmitLoadImm32(Buf, 0, UInt32(Ord(wtkStackExhausted)));
+      Arm64EmitCallHelper(Buf, aohTrapKind);
+    end;
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
