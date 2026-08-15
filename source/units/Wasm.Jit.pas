@@ -199,9 +199,12 @@ function JitForceCompile(const AJit: TWasmJitContext;
   or when the emitter cannot fit the branch displacements — the caller records
   the function un-compiled, exactly as the on-hot JIT would decline it. }
 function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
+function JitStageFunctionBytes(const AStore: TWasmStore;
   const AFn: PWasmIrFunctionRec; const AFuncIdx: UInt32;
   out AEntryOffset: NativeUInt;
-  out ARegisterCount: UInt32): TWasmBytes;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
 
 implementation
 
@@ -1523,6 +1526,17 @@ begin
 end;
 
 { --- registration -------------------------------------------------------- }
+
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
+begin
+  { Preserve the pre-native staging surface for code-shape tests and callers
+    that do not have a module function index. High(UInt32) cannot match a
+    validated call target, so the proof-gated self-call ABI stays disabled. }
+  Result := JitStageFunctionBytes(AStore, AFn, High(UInt32), AEntryOffset,
+    ARegisterCount);
+end;
 
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AFn: PWasmIrFunctionRec; const AFuncIdx: UInt32;
