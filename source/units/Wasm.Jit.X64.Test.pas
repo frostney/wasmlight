@@ -57,6 +57,7 @@ type
     procedure TestEpilogueBytes;
     procedure TestEpochCaptureBytes;
     procedure TestEpochCheckCoreBytes;
+    procedure TestNativeSelfCallBytes;
     procedure TestRuntimeCallMarshalBytes;
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
@@ -365,6 +366,17 @@ procedure TX64Tests.TestBranchPlaceholders;
 var
   Buf: TWasmCodeBuffer;
 begin
+  { call rel32 placeholder = E8 00 00 00 00. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    X64EmitCallTo(Buf, 0);
+    CheckSeq(Buf, [$E8, $00, $00, $00, $00]);
+    Expect<Integer>(Buf.PatchCount).ToBe(1);
+  finally
+    Buf.Free;
+  end;
+
   { jmp rel32 placeholder = E9 00 00 00 00. }
   Buf := TWasmCodeBuffer.Create;
   try
@@ -418,16 +430,29 @@ procedure TX64Tests.TestPrologueBytes;
 var
   Buf: TWasmCodeBuffer;
 begin
-  { Position-independent prologue: SIX callee-saved pins pushed (rbx, r12-r15,
-    rbp) + alignment pad + arg moves (aot-spec §1.2/§1.3/§4.3).
-    push rbx = 53 ; push r12 = 41 54 ; push r13 = 41 55 ; push r14 = 41 56 ;
-    push r15 = 41 57 ; push rbp = 55 ; sub rsp,8 = 48 83 EC 08 ;
-    mov rbx,rdi = 48 89 FB ; mov r12,rsi = 49 89 F4 ; mov rbp,rdx = 48 89 D5. }
+  { The ordinary frame retains its original single alignment/memory slot. }
   Buf := TWasmCodeBuffer.Create;
   try
     X64EmitPrologue(Buf);
     CheckSeq(Buf, [$53, $41, $54, $41, $55, $41, $56, $41, $57, $55,
       $48, $83, $EC, $08, $48, $89, $FB, $49, $89, $F4, $48, $89, $D5]);
+  finally
+    Buf.Free;
+  end;
+
+  { Position-independent scalar-call prologue: SIX callee-saved pins pushed
+    (rbx, r12-r15, rbp) + context/memory/alignment slots + arg moves and
+    context retention.
+    push rbx = 53 ; push r12 = 41 54 ; push r13 = 41 55 ; push r14 = 41 56 ;
+    push r15 = 41 57 ; push rbp = 55 ; sub rsp,24 = 48 83 EC 18 ;
+    mov rbx,rdi = 48 89 FB ; mov r12,rsi = 49 89 F4 ; mov rbp,rdx = 48 89 D5 ;
+    mov [rsp+8],rcx = 48 89 4C 24 08. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPrologue(Buf, True);
+    CheckSeq(Buf, [$53, $41, $54, $41, $55, $41, $56, $41, $57, $55,
+      $48, $83, $EC, $18, $48, $89, $FB, $49, $89, $F4, $48, $89, $D5,
+      $48, $89, $4C, $24, $08]);
   finally
     Buf.Free;
   end;
@@ -437,12 +462,21 @@ procedure TX64Tests.TestEpilogueBytes;
 var
   Buf: TWasmCodeBuffer;
 begin
-  { add rsp,8; pop rbp; pop r15; pop r14; pop r13; pop r12; pop rbx; ret.
-    48 83 C4 08 | 5D | 41 5F | 41 5E | 41 5D | 41 5C | 5B | C3. }
+  { The ordinary frame restores its single alignment/memory slot. }
   Buf := TWasmCodeBuffer.Create;
   try
     X64EmitEpilogue(Buf);
     CheckSeq(Buf, [$48, $83, $C4, $08, $5D, $41, $5F, $41, $5E, $41, $5D,
+      $41, $5C, $5B, $C3]);
+  finally
+    Buf.Free;
+  end;
+
+  { add rsp,24; pop rbp; pop r15; pop r14; pop r13; pop r12; pop rbx; ret. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitEpilogue(Buf, True);
+    CheckSeq(Buf, [$48, $83, $C4, $18, $5D, $41, $5F, $41, $5E, $41, $5D,
       $41, $5C, $5B, $C3]);
   finally
     Buf.Free;
@@ -480,6 +514,29 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestNativeSelfCallBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { test r12; je exhausted; r12--; push rbx; 16-byte regfile; rbx:=rsp;
+    store r8 parameter; call core; restore; r12++. Both branches are rel32
+    placeholders resolved after the complete function is emitted. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    Buf.NewLabel;
+    X64EmitNativeSelfCall(Buf, 2, 0, 0, 1);
+    CheckSeq(Buf, [$4D, $85, $E4, $0F, $84, $00, $00, $00, $00,
+      $B8, $01, $00, $00, $00, $49, $29, $C4, $53,
+      $48, $83, $EC, $10, $48, $89, $E3, $4C, $89, $03,
+      $E8, $00, $00, $00, $00, $48, $83, $C4, $10, $5B,
+      $B8, $01, $00, $00, $00, $49, $01, $C4]);
+    Expect<Integer>(Buf.PatchCount).ToBe(2);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestRuntimeCallMarshalBytes;
 var
   Buf: TWasmCodeBuffer;
@@ -512,8 +569,7 @@ begin
     Buf.Free;
   end;
 
-  { PinMemory: resolve memory 7 through the helper table, then retain the
-    stable instance pointer in the existing [rsp] alignment slot. }
+  { PinMemory: retain the stable instance pointer in the first frame slot. }
   Buf := TWasmCodeBuffer.Create;
   try
     X64EmitPinMemory(Buf, 7);
@@ -657,6 +713,8 @@ begin
   Test('the epoch capture emits the asserted bytes', TestEpochCaptureBytes);
   Test('the epoch-check load+compare core emits the asserted bytes',
     TestEpochCheckCoreBytes);
+  Test('the native self-call frame emits the asserted bytes',
+    TestNativeSelfCallBytes);
   Test('the runtime/vec helper-call marshaling emits the asserted bytes',
     TestRuntimeCallMarshalBytes);
   Test('helper calls and the IR pointer are position-independent',

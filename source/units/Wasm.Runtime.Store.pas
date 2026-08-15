@@ -302,8 +302,9 @@ type
       and re-dispatches its pending target. }
     CompiledDirectEntry: Pointer;
     { Same entry address for a proof-gated one/two-parameter numeric leaf. A
-      zero x4 selects its lightweight native-stack ABI; ordinary entries pass
-      the non-zero canonical address and retain the published logical frame. }
+      zero selector (x4 on Arm64, rcx on x64) chooses its lightweight native-
+      stack ABI; ordinary entries pass a non-zero context/address selector and
+      retain the published logical frame. }
     CompiledNativeScalarEntry: Pointer;
     CallCount: UInt32;
     DirectMeta: TWasmDirectCallMeta;

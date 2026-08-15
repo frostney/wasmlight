@@ -364,6 +364,47 @@ begin
   ]);
 end;
 
+{ Native leaf coverage for the two operations whose x64 forms otherwise use
+  memory-backed templates: rotate-left and select. Each caller forces a real
+  compiled-to-compiled scalar entry rather than invoking the helper directly. }
+function LeafSelectRotateModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $02, $7F, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$00]), BLit([$00])])),
+    Sect(7, VecOf([
+      ExportEntry('rotl_helper', $00, 0),
+      ExportEntry('rotl', $00, 1),
+      ExportEntry('select_helper', $00, 2),
+      ExportEntry('select', $00, 3)])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $20, $00, $20, $01, $77, $0B]),
+      CodeEntry([$00, $20, $00, $20, $01, $10, $00, $0B]),
+      CodeEntry([$00, $20, $00, $20, $01, $20, $00, $1B, $0B]),
+      CodeEntry([$00, $20, $00, $20, $01, $10, $02, $0B])]))
+  ]);
+end;
+
+{ A scalar call selects the retained-context x64 frame, then return_call exits
+  through the tail channel. Both exits must restore the same frame shape. }
+function MixedScalarTailModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$00])])),
+    Sect(7, VecOf([
+      ExportEntry('helper', $00, 0),
+      ExportEntry('target', $00, 1),
+      ExportEntry('run', $00, 2)])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $20, $00, $41, $01, $6A, $0B]),
+      CodeEntry([$00, $20, $00, $0B]),
+      CodeEntry([$00, $20, $00, $10, $00, $12, $01, $0B])]))
+  ]);
+end;
+
 { call_indirect over a 4-entry table holding [$double, $other, null, null]:
 
     (func $double (param i32) (result i32) (i32.mul (local.get 0) 2))  ; type 0
@@ -1750,10 +1791,8 @@ begin
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(True);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry =
     FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
-  {$IFDEF WASM_JIT_ARM64}
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledNativeScalarEntry =
     FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
-  {$ENDIF}
   Expect<Boolean>(FJit.ForceCompile(AddAddr)).ToBe(True);
   {$ELSE}
   Expect<Boolean>(Compiled).ToBe(False);
@@ -2714,7 +2753,7 @@ begin
     DecodeModule(Bytes, Module);
     Ir := ValidateModule(Module, Bytes);
     Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
-      Ir.FuncImportCount)).ToBe({$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+      Ir.FuncImportCount)).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   finally
     Ir.Free;
     Module.Free;
@@ -2766,7 +2805,7 @@ begin
     Ir := ValidateModule(Module, Bytes);
     Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
       Ir.FuncImportCount)).ToBe(
-      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+      {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   finally
     Ir.Free;
     Module.Free;
@@ -2793,7 +2832,7 @@ begin
     DecodeModule(Bytes, Module);
     Ir := ValidateModule(Module, Bytes);
     Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[0])).ToBe(
-      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+      {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
     Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[1])).ToBe(False);
     RunRegisterCount := Ir.Functions[1].RegisterCount;
   finally
@@ -2816,6 +2855,16 @@ begin
   CompileExports(['helper', 'run']);
   Expect<Boolean>(DiffModule(LeafLocalSetModuleBytes, 'run',
     [MakeValueI32(1)])).ToBe(JIT_BACKEND_AVAILABLE);
+
+  CompileExports(['rotl_helper', 'rotl', 'select_helper', 'select']);
+  Expect<Boolean>(DiffModule(LeafSelectRotateModuleBytes, 'rotl',
+    [MakeValueI32(1), MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(LeafSelectRotateModuleBytes, 'select',
+    [MakeValueI32(7), MakeValueI32(9)])).ToBe(JIT_BACKEND_AVAILABLE);
+
+  CompileExports(['helper', 'target', 'run']);
+  Expect<Boolean>(DiffModule(MixedScalarTailModuleBytes, 'run',
+    [MakeValueI32(41)])).ToBe(JIT_BACKEND_AVAILABLE);
 
   { The lightweight call must enforce the same logical depth boundary as the
     interpreter before touching native stack state. DiffModule also asserts

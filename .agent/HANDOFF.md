@@ -1,5 +1,75 @@
 # Handoff
 
+Updated: 2026-08-15 (x64 scalar-call specialization)
+
+## x64 scalar leaf calls and self-recursion
+
+- Fetched the remote default and created `codex/optimize-x64-jit` from exact
+  `origin/main@ed8d5d693bad9356feb914576d0dfe3f98ecec10`, after PR #6 had
+  landed the accepted Arm64 optimization waves. No rebase, force-push, remote
+  push, or PR creation was performed.
+- The two accepted commits are `cd21c4d` (`perf(jit): specialize x64 scalar
+  leaf calls`) and `9e68bb4` (`perf(jit): specialize x64 scalar self calls`).
+  The final source tree is `69aeb6eee23f7d10d69b8602d4e0f180845ecd27`.
+- The leaf wave adds a proof-gated x64 native scalar entry/core ABI. Eligible
+  one- or two-argument numeric leaves receive arguments in r8/r9 and return in
+  r8 through an aligned native-stack register file. The caller resolves the
+  live function/native entry, checks the exact shared depth and value limits,
+  and retains the generic compiled/interpreted/host fallback. The proof filter
+  prevents ineligible targets from paying the native-entry probe.
+- The self-recursion wave gives eligible one-argument numeric recursion a
+  local-core path. It computes the exact additional-frame budget as the
+  minimum of remaining depth and remaining value slots divided by the
+  function register count. Ordinary calls do not invent an epoch safepoint;
+  real IR backedges retain their existing checks. AOT ABI revision 14 rejects
+  artifacts produced for older x64 entry layouts.
+- Review initially found and prevented two leaf correctness defects: a mixed
+  scalar-call/tail-call function restored the wrong frame shape, and
+  select/rotate fallback emission could read unmaterialized parameter slots.
+  The final implementation threads the retained-frame shape through every
+  tail exit, materializes/coheres native parameters, and covers select and
+  both rotate widths in the x64 cache. Differential tests cover those paths,
+  local.set coherence, exact depth/value exhaustion and cleanup, sequential
+  self-calls, store reuse, JIT, and AOT. Final focused reviews found no
+  remaining ABI, PIC, cache-liveness, epoch, trap, or AOT issue.
+- Exact-main release baseline and evidence remain inside OrbStack `wasmx64`
+  at `/tmp/wasmlight-x64-ed8d5d6-baseline.Igxi43`. The VM-local baseline
+  binary hash is `3b816d...eea3`. All measurements used the explicit,
+  checksum-verified LWPT 0.6.0 binary under `/tmp/lwpt-0.6.0.Uq7icT/`, never
+  the stale LWPT 0.4.0 found on the VM PATH.
+- Serialized AOT command-level A/B used self-checking fresh processes,
+  compilation outside timing, one warm-up plus seven samples per binary and
+  order, and `/tmp/wasmlight-perf-gate.lock`. The accepted leaf path reduced
+  the 50-million-call workload from 7146.799 to 1905.832 ms forward and from
+  5540.303 to 1487.807 ms in reverse: 73.33% and 73.15% faster. A deliberately
+  ineligible scalar target was flat at +0.03% in its stable reversed schedule.
+- Against that accepted leaf baseline, native self-recursion reduced fib from
+  2984.799 to 533.784 ms forward and from 2982.862 to 534.782 ms in reverse:
+  82.12% and 82.07% faster. Its guard deltas were call -0.17%/+0.25%,
+  ineligible fallback -0.51%/+0.20%, loop -0.04%/-0.12%, memory
+  -0.13%/+0.04%, and startup order-flipped inside 10-24% short-process noise.
+  Raw accepted evidence is under `/tmp/wasmlight-x64-leaf-proof/measurement/`
+  and `/tmp/wasmlight-x64-self/measurement/` inside `wasmx64`.
+- One reviewed intermediate leaf candidate was rejected because every
+  syntactically qualifying call probed a nil native entry, producing a stable
+  2.25% regression across 50 million ineligible calls. The target-proof
+  filter removed that tax before acceptance. An earlier non-compact leaf
+  frame was also rejected after a repeatable roughly 1% memory regression.
+  Neither rejected form remains in the tree.
+- Final native macOS gates on exact head: frozen install, format, generated
+  agent reference, whitespace, Markdown lint, clean release/development
+  builds, and all 44 suites pass. The pinned 257-script core corpus at
+  `de54fd27` is byte-identical in interpreter/JIT/AOT at 65,188 pass and zero
+  fail/skip/staged/errors; JIT/AOT each compile 8,703 functions.
+- Final Linux/x86-64 proof used a fresh exact archive in OrbStack at
+  `/tmp/wasmlight-x64-final-9e68bb4.ujf8iw` (archive SHA-256
+  `cf431e7bfbf7223e5a7162917a0c67a99c2407a8f66f766c836c9be7cfc22961`).
+  FPC 3.2.2, frozen install, format, agents, clean release/development builds,
+  and all 44 suites pass. The same pinned core corpus is byte-identical at
+  65,188/0/0/0 in interpreter/JIT/AOT; x64 JIT/AOT each compile 8,704
+  functions. Timings are valid same-VM A/B evidence on virtualized amd64 over
+  an Arm host, not a native x64 hardware claim.
+
 Updated: 2026-08-15 (generic scalar direct-call specialization)
 
 ## Two-argument cross-function call path
