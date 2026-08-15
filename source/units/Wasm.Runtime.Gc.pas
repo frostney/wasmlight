@@ -300,6 +300,7 @@ type
   PWasmGcRefBits = ^UInt32;
 
   PWasmGcFrame = ^TWasmGcFrame;
+  PPWasmGcFrame = ^PWasmGcFrame;
 
   { CONTRACT GC-1, as implemented — the frame chain the collector walks.
 
@@ -667,6 +668,10 @@ type
       caller only fills Slots, RefRegBits and RegisterCount. }
     procedure PushFrame(const AFrame: PWasmGcFrame); inline;
     procedure PopFrame; inline;
+    { The generated direct-call normal-return leaf updates the same chain
+      without crossing a generic Pascal method frame. The heap is stable for
+      the store lifetime, so this borrowed slot remains valid for the call. }
+    function FrameSlot: PPWasmGcFrame; inline;
     { Drop the whole chain. The trampoline's obligation after a trap: a
       siglongjmp skips every PopFrame between the fault and the landing
       pad, so the chain must be re-established rather than trusted.
@@ -2201,6 +2206,11 @@ begin
   if FFrames = nil then
     raise EWasmError.Create('internal: popping an empty frame chain');
   FFrames := FFrames^.Prev;
+end;
+
+function TWasmGcHeap.FrameSlot: PPWasmGcFrame;
+begin
+  Result := @FFrames;
 end;
 
 procedure TWasmGcHeap.ResetFrames;

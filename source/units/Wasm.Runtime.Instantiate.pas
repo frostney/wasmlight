@@ -1017,8 +1017,39 @@ begin
 
   { --- 8: back-patch the MODULE field and publish the exports --- }
   for Index := 0 to DefinedFuncs - 1 do
-    AStore.Funcs[Instance.FuncAddrs[AIr.FuncImportCount + UInt32(Index)]]
-      .Instance := Instance;
+  begin
+    Addr := Instance.FuncAddrs[AIr.FuncImportCount + UInt32(Index)];
+    AStore.Funcs[Addr].Instance := Instance;
+    AStore.Funcs[Addr].DirectMeta.Fn := @AIr.Functions[Index];
+    if Length(AIr.Functions[Index].Code) > 0 then
+      AStore.Funcs[Addr].DirectMeta.IrBase := @AIr.Functions[Index].Code[0];
+    if Length(Instance.FuncAddrs) > 0 then
+      AStore.Funcs[Addr].DirectMeta.FuncAddrs := @Instance.FuncAddrs[0];
+    if Length(AIr.Functions[Index].EntryZeroRegs) > 0 then
+      AStore.Funcs[Addr].DirectMeta.EntryZeroRegs :=
+        @AIr.Functions[Index].EntryZeroRegs[0];
+    if AIr.Functions[Index].RegisterCount > 0 then
+      AStore.Funcs[Addr].DirectMeta.RefRegBits :=
+        @AIr.Functions[Index].RefRegBits[0];
+    AStore.Funcs[Addr].DirectMeta.RegisterCount :=
+      AIr.Functions[Index].RegisterCount;
+    AStore.Funcs[Addr].DirectMeta.EntryZeroCount :=
+      UInt32(Length(AIr.Functions[Index].EntryZeroRegs));
+    if Length(AIr.Functions[Index].LocalRegs) > 0 then
+      AStore.Funcs[Addr].DirectMeta.Param0Reg :=
+        AIr.Functions[Index].LocalRegs[0];
+    if Length(AIr.Functions[Index].LocalRegs) > 1 then
+      AStore.Funcs[Addr].DirectMeta.Param1Reg :=
+        AIr.Functions[Index].LocalRegs[1]
+    else if (Length(AIr.Functions[Index].LocalRegs) = 1) and
+      (AIr.Functions[Index].RegTypes[
+        AIr.Functions[Index].LocalRegs[0]].Kind = wvkVec) then
+      AStore.Funcs[Addr].DirectMeta.Param1Reg :=
+        AIr.Functions[Index].LocalRegs[0] + 1;
+    if Length(AIr.Functions[Index].ResultRegs) > 0 then
+      AStore.Funcs[Addr].DirectMeta.Result0Reg :=
+        AIr.Functions[Index].ResultRegs[0];
+  end;
 
   SetLength(Instance.ExportNames, Length(AIr.ExportList));
   SetLength(Instance.ExportKinds, Length(AIr.ExportList));

@@ -109,6 +109,7 @@ type
 
   TArm64RegCacheEntry = record
     Valid: Boolean;
+    Dirty: Boolean;
     Slot: UInt32;
   end;
 
@@ -123,6 +124,10 @@ type
     Next: Byte;
     StaticCount: Byte;
     StaticAllocation: Boolean;
+    WriteBackDynamics: Boolean;
+    UseCounts: PUInt32;
+    VisibleSlots: PBoolean;
+    SlotCount: UInt32;
   end;
 
   TArm64WordBin = function(const ARd, ARn, ARm: Byte): UInt32;
@@ -147,6 +152,10 @@ const
   ARM64_REG_CACHE4 = 16;   { dynamic cache beside a static allocation }
   ARM64_REG_CACHE5 = 17;   { dynamic cache beside a static allocation }
   ARM64_REG_CACHE_STATIC2 = 26; { optional third function-wide allocation }
+  { The proof-gated native self-recursion ABI reserves the same callee-saved
+    register for its remaining logical-frame budget. Static allocation is
+    explicitly denied this register whenever that ABI is selected. }
+  ARM64_REG_NATIVE_BUDGET = 26;
   ARM64_REG_LR = 30;       { x30, the link register }
   ARM64_REG_ZR = 31;       { in data-processing, 31 encodes the zero register }
   { The SAME encoding 31 means SP in load/store (unsigned offset) and in the
@@ -223,11 +232,19 @@ function Arm64UdivX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64MsubW(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64MsubX(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64AndW(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64AndLowMaskImmW(const ARd, ARn, AOnes: Byte): UInt32;
+function Arm64LslImmW(const ARd, ARn, AShift: Byte): UInt32;
+function Arm64AddImmW(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 function Arm64AndX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64OrrW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64OrrX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64EorW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64EorX(const ARd, ARn, ARm: Byte): UInt32;
+
+{ UBFIZ Wd,Wn,lsb,width: retain the low width bits and shift them left by
+  lsb. The bounded (x & low_mask) << shift address idiom maps to this one
+  instruction when width + shift <= 32. }
+function Arm64UbfizW(const ARd, ARn, ALsb, AWidth: Byte): UInt32;
 
 { Variable shifts/rotates (LSLV/LSRV/ASRV/RORV); the shift amount is taken
   modulo the register width by the hardware, exactly wasm's `count and (N-1)`. }
@@ -327,6 +344,8 @@ function Arm64AddImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 { SUB Xd,Xn,#imm12 (unsigned immediate, no shift). Used as
   `sub sp, sp, #frame` to reserve the call-marshaling scratch (§4.4). }
 function Arm64SubImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
+{ SUBS Xd,Xn,#imm12, setting NZCV for a fused budget decrement/test. }
+function Arm64SubsImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 
 { BLR Xn — branch with link to register (C6.2.35). Clobbers x30. }
 function Arm64Blr(const ARn: Byte): UInt32;
@@ -343,6 +362,10 @@ function Arm64StpX23X24Off32: UInt32;        { stp x23,x24,[sp,#32] }
 function Arm64LdpX23X24Off32: UInt32;        { ldp x23,x24,[sp,#32] }
 function Arm64LdpX21X22Off16: UInt32;        { ldp x21,x22,[sp,#16] }
 function Arm64LdpX19X20PostIndex64: UInt32;  { ldp x19,x20,[sp],#64 }
+function Arm64StpX19Lr(const AByteOffset: UInt32): UInt32;
+function Arm64LdpX19Lr(const AByteOffset: UInt32): UInt32;
+function Arm64StpX19LrPre(const AFrameBytes: UInt32): UInt32;
+function Arm64LdpX19LrPost(const AFrameBytes: UInt32): UInt32;
 
 { True iff AValue fits a two's-complement signed field of ABits bits, i.e.
   -2^(ABits-1) <= AValue <= 2^(ABits-1)-1. The branch-displacement range guard
@@ -354,6 +377,7 @@ function Arm64SignedImmFits(const AValue: Integer; const ABits: Byte): Boolean;
 { Branch instruction words with a ZERO displacement (the placeholder the patch
   list later fills). B is imm26<<2; B.cond / CBZ / CBNZ are imm19<<2. }
 function Arm64BPlaceholder: UInt32;
+function Arm64BlPlaceholder: UInt32;
 function Arm64BCondPlaceholder(const ACond: Byte): UInt32;
 function Arm64CbzWPlaceholder(const ARt: Byte): UInt32;
 function Arm64CbnzWPlaceholder(const ARt: Byte): UInt32;
@@ -372,6 +396,8 @@ procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
 procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
+procedure Arm64EmitBlTo(const ABuf: TWasmCodeBuffer;
+  const ATarget: TWasmJitLabel);
 procedure Arm64EmitMovzX(const ABuf: TWasmCodeBuffer; const ARd: Byte;
   const AImm16: UInt16; const AHw: Byte);
 procedure Arm64EmitMovkX(const ABuf: TWasmCodeBuffer; const ARd: Byte;
@@ -411,6 +437,14 @@ procedure Arm64EmitPinMemory(const ABuf: TWasmCodeBuffer;
   const AMemoryIndex: UInt32; const ABaseOnly: Boolean);
 procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
+procedure Arm64EmitNativeSelfBudget(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32);
+procedure Arm64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
+  const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
+  const ACoreLabel: TWasmJitLabel);
+procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32; const ACoreLabel,
+  AExternalLabel: TWasmJitLabel);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
 
@@ -460,18 +494,47 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
 function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32): Boolean;
+  const AInsIndex: UInt32; const AUsePinnedMemory: Boolean = False;
+  const ANativeScalarSelf: Boolean = False;
+  const ANativeRegisterCount: UInt32 = 0;
+  const ANativeParamReg: UInt32 = 0;
+  const ANativeResultReg: UInt32 = 0;
+  const ANativeCoreLabel: TWasmJitLabel = 0;
+  const ANativeExhaustedLabel: TWasmJitLabel = 0): Boolean;
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
 procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASlots: array of UInt32);
+procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
+  const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
+  const ASlotCount: UInt32);
+procedure Arm64SeedNativeCoreCache(var ACache: TArm64RegCache;
+  const AParamCount, AParam0Slot, AParam1Slot: UInt32;
+  const AUseLeafCapacity: Boolean);
 procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+procedure Arm64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache);
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
   AUsePinnedMemoryBase, AExtendedFrame: Boolean;
+  var ACache: TArm64RegCache): Boolean; overload;
+function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase, AExtendedFrame, ANativeScalarSelf: Boolean;
+  const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
+  const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
+  var ACache: TArm64RegCache): Boolean; overload;
+function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
+  const AValue: UInt32): Boolean;
+function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AValue: UInt32;
   var ACache: TArm64RegCache): Boolean;
+procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
+  const ASource, ADest: UInt32; const AShift, AWidth: Byte;
+  var ACache: TArm64RegCache);
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
 
@@ -519,10 +582,24 @@ procedure Arm64CachedAlu(const ABuf: TWasmCodeBuffer;
 procedure Arm64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACond: Byte; const AWide: Boolean;
   var ACache: TArm64RegCache); forward;
+function Arm64CachedHostForSlot(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean; forward;
+function Arm64CachedSourceReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const ADefault: Byte): Byte; forward;
+procedure Arm64CachedBinarySourceRegs(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ALeftSlot, ARightSlot: UInt32;
+  out ALeft, ARight: Byte); forward;
+function Arm64CachedDestReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const AExclude0, AExclude1, ADefault: Byte): Byte; forward;
 procedure EmitCbnzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
 procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
+procedure EmitNativeScalarSelfCallReg(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32;
+  const ACoreLabel, AExhaustedLabel: TWasmJitLabel); forward;
 
 { ===================================================================== }
 {  cdecl helper thunks — the ABI boundary the emitted code calls (§1.4) }
@@ -601,6 +678,38 @@ procedure StX(const ABuf: TWasmCodeBuffer; const ARt: Byte;
 procedure EmitBCondTo(const ABuf: TWasmCodeBuffer; const ACond: Byte;
   const ATarget: TWasmJitLabel); forward;
 
+procedure Arm64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
+  const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
+  const ACoreLabel: TWasmJitLabel);
+begin
+  { The external AAPCS wrapper bridges the canonical register file to the
+    local scalar core ABI once. Recursive calls use x12; two-parameter leaves
+    additionally receive their second scalar in x13. }
+  LdX(ABuf, 12, AParam0Reg);
+  if AParamCount = 2 then
+    LdX(ABuf, 13, AParam1Reg);
+  Arm64EmitBlTo(ABuf, ACoreLabel);
+  StX(ABuf, 12, AResultReg);
+end;
+
+procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32; const ACoreLabel,
+  AExternalLabel: TWasmJitLabel);
+var
+  FrameBytes: UInt32;
+begin
+  { Canonical entries pass their non-zero entry address in x4. A lightweight
+    caller passes zero with the scalar arguments already in x12/x13. }
+  EmitCbnzTo(ABuf, 4, UInt32(AExternalLabel));
+  FrameBytes := ((ARegisterCount * ARM64_SLOT_SIZE + 15) and not UInt32(15))
+    + 16;
+  ABuf.EmitU32(Arm64StpX19LrPre(FrameBytes));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_REGFILE, ARM64_REG_SP, 16));
+  Arm64EmitBlTo(ABuf, ACoreLabel);
+  ABuf.EmitU32(Arm64LdpX19LrPost(FrameBytes));
+  Arm64EmitRet(ABuf);
+end;
+
 function Arm64MemoryAccessSize(const AOp: TWasmIrOp): UInt32;
 begin
   case AOp of
@@ -650,6 +759,22 @@ var
   Folded: Boolean;
   LoadOp: UInt32;
   UseRegOffset: Boolean;
+  AddrReg: Byte;
+  ValueReg: Byte;
+
+  procedure ResolveOperandReg(const ASlot: UInt32; const ADefault: Byte;
+    out AReg: Byte);
+  var
+    Host: Byte;
+  begin
+    AReg := ADefault;
+    if AUsePinnedMemoryBase and ACache.StaticAllocation and
+      Arm64CachedHostForSlot(ACache, ASlot, Host) then
+      AReg := Host
+    else
+      Arm64CachedLoad(ABuf, ACache, AReg, ASlot);
+  end;
+
 begin
   AccessSize := Arm64MemoryAccessSize(AIns.Op);
   { Imm stores the memarg's u64 bit pattern in the IR's signed immediate slot.
@@ -693,17 +818,17 @@ begin
       Arm64EmitLdrX(ABuf, 15, MemoryReg,
         UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
   end;
-  if AAddr64 then
-    Arm64CachedLoad(ABuf, ACache, 10, AIns.A)
-  else
-    Arm64CachedLoad(ABuf, ACache, 10, AIns.A);      { canonical i32 is zero-extended }
+  { A helper-free base-pinned access may consume a statically allocated local
+    directly as the register-offset index. Other shapes retain x10 because
+    they reuse cache registers for the live memory instance fields. }
+  ResolveOperandReg(AIns.A, 10, AddrReg);
 
   if AAddr64 and Folded then
   begin
     { Guard-assisted memory64: index > ByteSize can escape the reservation;
       index <= ByteSize is safe because the static offset plus access width is
       wholly absorbed by the reserved guard. }
-    ABuf.EmitU32(Arm64CmpX(10, 15));
+    ABuf.EmitU32(Arm64CmpX(AddrReg, 15));
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
   end
   else if (not AAddr64) and Folded then
@@ -713,9 +838,9 @@ begin
   begin
     { Exact MemInBounds subtraction form: index <= size; offset <= size-index;
       access width <= size-index-offset. No addition can wrap. }
-    ABuf.EmitU32(Arm64CmpX(10, 15));
+    ABuf.EmitU32(Arm64CmpX(AddrReg, 15));
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
-    ABuf.EmitU32(Arm64SubX(15, 15, 10));
+    ABuf.EmitU32(Arm64SubX(15, 15, AddrReg));
     Arm64EmitLoadImm64(ABuf, 11, Offset);
     ABuf.EmitU32(Arm64CmpX(11, 15));
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
@@ -732,7 +857,7 @@ begin
       ABuf.EmitU32(Arm64MovReg(14, BaseReg));
       BaseReg := 14;
     end;
-    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 10));
+    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, AddrReg));
     Arm64EmitLoadImm64(ABuf, 11, Offset);
     ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 11));
   end;
@@ -749,45 +874,49 @@ begin
     iroI64Load, iroF64Load: LoadOp := $F9400000;
     iroI32Store8, iroI64Store8:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($39000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($39000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($39000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($39000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
     iroI32Store16, iroI64Store16:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($79000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($79000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($79000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($79000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
     iroI32Store, iroF32Store, iroI64Store32:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($B9000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($B9000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($B9000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($B9000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
     iroI64Store, iroF64Store:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($F9000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($F9000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($F9000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($F9000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
   else
     Exit;
   end;
   if UseRegOffset then
-    ABuf.EmitU32(Arm64MemRegOffset(LoadOp, 11, BaseReg, 10, AAddr64))
+    ABuf.EmitU32(Arm64MemRegOffset(LoadOp, 11, BaseReg, AddrReg, AAddr64))
   else
     ABuf.EmitU32(LoadOp or (UInt32(BaseReg) shl 5) or 11);
   Arm64CachedStore(ABuf, ACache, 11, AIns.Dest);
@@ -797,7 +926,23 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
   AUsePinnedMemoryBase, AExtendedFrame: Boolean;
-  var ACache: TArm64RegCache): Boolean;
+  var ACache: TArm64RegCache): Boolean; overload;
+begin
+  Result := Arm64EmitOpCached(ABuf, AIns, AAux, AInsIndex, AAddr64,
+    AUsePinnedMemory, AUsePinnedMemoryBase, AExtendedFrame, False, 0, 0, 0,
+    0, 0, ACache);
+end;
+
+function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  AUsePinnedMemoryBase, AExtendedFrame, ANativeScalarSelf: Boolean;
+  const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
+  const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
+  var ACache: TArm64RegCache): Boolean; overload;
+var
+  Source, Dest: Byte;
+  ArgSlot, ResultSlot: UInt32;
 begin
   Result := True;
   if Arm64ScalarMemoryOp(AIns.Op) then
@@ -814,8 +959,13 @@ begin
   case AIns.Op of
     iroMove:
       begin
-        Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
-        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+        Source := Arm64CachedSourceReg(ABuf, ACache, AIns.A,
+          ARM64_REG_T0);
+        Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest, Source,
+          ARM64_REG_ZR, ARM64_REG_T0);
+        if Dest <> Source then
+          ABuf.EmitU32(Arm64MovReg(Dest, Source));
+        Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
       end;
     iroI32Const, iroF32Const:
       begin
@@ -831,6 +981,10 @@ begin
     iroBranchIf, iroBranchIfNot:
       begin
         Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+        { Taken and fallthrough successors must see the same canonical frame.
+          The condition itself is already safe in x9 while dirty expression
+          values that remain live are reconciled before control splits. }
+        Arm64FlushDynamicRegCache(ABuf, ACache);
         if AIns.Op = iroBranchIf then
           EmitCbnzTo(ABuf, ARM64_REG_T0, AIns.B)
         else
@@ -845,16 +999,51 @@ begin
           on the one-thread-per-store fallthrough, and none of the allocated
           slots is a reference. Keep numeric values in registers here; exits
           still flush the canonical logical frame below. }
+        Arm64FlushDynamicRegCache(ABuf, ACache);
         Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+      end;
+    iroCall:
+      if ANativeScalarSelf then
+      begin
+        { x12 carries the local core's one numeric parameter and result.
+          Consume the argument before flushing so a dead expression need not
+          be canonicalized; every other live value survives the local BL. }
+        ArgSlot := IrAuxBlockItem(AAux, AIns.A, 0);
+        ResultSlot := IrAuxBlockItem(AAux, AIns.B, 0);
+        Source := Arm64CachedSourceReg(ABuf, ACache, ArgSlot, 12);
+        Arm64FlushDynamicRegCache(ABuf, ACache);
+        if Source <> 12 then
+          ABuf.EmitU32(Arm64MovReg(12, Source));
+        Arm64InvalidateRegCache(ACache);
+        EmitNativeScalarSelfCallReg(ABuf, ANativeRegisterCount,
+          ANativeCoreLabel, ANativeExhaustedLabel);
+        Arm64CachedStore(ABuf, ACache, 12, ResultSlot);
+      end
+      else
+      begin
+        Arm64FlushDynamicRegCache(ABuf, ACache);
+        Arm64InvalidateRegCache(ACache);
+        Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex,
+          AUsePinnedMemory);
       end;
     iroReturn:
       begin
-        { Results and every observable exit are read from the logical frame. }
-        Arm64FlushRegCache(ABuf, ACache);
-        if AExtendedFrame then
-          Arm64EmitEpilogueExtended(ABuf)
+        if ANativeScalarSelf then
+        begin
+          { The external wrapper publishes x12 once; recursive callers adopt
+            it directly into their own lexical cache. }
+          Arm64CachedLoad(ABuf, ACache, 12, ANativeResultReg);
+          Arm64EmitRet(ABuf)
+        end
         else
-          Arm64EmitEpilogue(ABuf);
+        begin
+          { Results and every observable exit are read from the logical frame. }
+          Arm64FlushRegCache(ABuf, ACache);
+          if AExtendedFrame then
+            Arm64EmitEpilogueExtended(ABuf)
+          else
+            Arm64EmitEpilogue(ABuf);
+        end;
       end;
     iroUnreachable:
       begin
@@ -912,10 +1101,15 @@ begin
     iroI64ShrU: Arm64CachedAlu(ABuf, AIns, @Arm64LsrvX, ACache);
     iroI64Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvX, ACache);
   else
+  begin
     { Helpers, safepoints, complex control and currently uncached templates all
       observe/write the canonical memory register file. }
+    Arm64FlushDynamicRegCache(ABuf, ACache);
     Arm64InvalidateRegCache(ACache);
-    Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+    Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex, AUsePinnedMemory,
+      ANativeScalarSelf, ANativeRegisterCount, ANativeParamReg,
+      ANativeResultReg, ANativeCoreLabel, ANativeExhaustedLabel);
+  end;
   end;
 end;
 
@@ -1015,16 +1209,16 @@ end;
   observationally identical (§13). }
 
 type
-  { The compiled entry's ABI, mirroring Wasm.Jit.TWasmJitCompiledEntry (kept
-    local so this unit stays below the driver). THREE arguments now
-    (aot-spec §1.3/§4.3): the register-file base (x0 -> pinned x19), the store
-    (x1 -> pinned x20, from which the prologue pins &Epoch, the snapshot, and
-    the helper-table base), and the IR-code base @Fn^.Code[0] (x2 -> pinned x23),
-    from which every runtime-op template computes @Fn^.Code[i]. The IR base is a
-    live per-invocation value, never baked, which is what makes the code
-    position-independent. }
+  { The AArch64 compiled-entry ABI (kept local so this unit stays below the
+    driver): the register-file base (x0 -> pinned x19), the store (x1 -> pinned
+    x20), the IR-code base @Fn^.Code[0] (x2 -> pinned x23), and the interpreter
+    context (x3 -> x25 unless the function pins memory there), plus the live
+    function entry in x4 retained by the generic direct-call ABI. IR, context,
+    and entry are live per-invocation values, never baked. Proof-gated scalar
+    recursion instead uses a local BL patch within the same PIC code blob. }
   TArm64CompiledEntry = procedure(const ARegBase: PWasmValue;
-    const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
+    const AStore: TWasmStore; const AIrBase: PWasmIrInstr;
+    const ACtx: PWasmInterpContext; const ASelfEntry: Pointer); cdecl;
 
 { Fix A: the pending tail-call channel is now the SHARED Wasm.Interp.GTierTail
   (TierTailSlot), written by BOTH a compiled body's return_call* helper AND the
@@ -1294,7 +1488,8 @@ begin
       UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
       Exit;
     end;
-    Entry(Base, AStore, IrBase);
+    Entry(Base, AStore, IrBase, Ctx,
+      AStore.Funcs[CurAddr].CompiledEntry);
     CurrentSeamCatch := Seam.Prev;
 
     { Pop (reuses ONE frame-teardown path; on a tail the body wrote no results,
@@ -2634,6 +2829,28 @@ begin
   Result := $0A000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
 end;
 
+function Arm64AndLowMaskImmW(const ARd, ARn, AOnes: Byte): UInt32;
+begin
+  Result := $12000000 or (UInt32(AOnes - 1) shl 10) or
+    (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64LslImmW(const ARd, ARn, AShift: Byte): UInt32;
+var
+  Shift: Byte;
+begin
+  Shift := AShift and 31;
+  Result := $53000000 or (UInt32((32 - Shift) and 31) shl 16) or
+    (UInt32(31 - Shift) shl 10) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64AddImmW(const ARd, ARn: Byte;
+  const AImm12: UInt32): UInt32;
+begin
+  Result := $11000000 or ((AImm12 and $FFF) shl 10) or
+    (UInt32(ARn) shl 5) or ARd;
+end;
+
 function Arm64AndX(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $8A000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
@@ -2657,6 +2874,12 @@ end;
 function Arm64EorX(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $CA000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64UbfizW(const ARd, ARn, ALsb, AWidth: Byte): UInt32;
+begin
+  Result := $53000000 or (UInt32((32 - ALsb) and 31) shl 16) or
+    (UInt32(AWidth - 1) shl 10) or (UInt32(ARn) shl 5) or ARd;
 end;
 
 function Arm64LslvW(const ARd, ARn, ARm: Byte): UInt32;
@@ -2936,6 +3159,13 @@ begin
     or ARd;
 end;
 
+function Arm64SubsImmX(const ARd, ARn: Byte;
+  const AImm12: UInt32): UInt32;
+begin
+  Result := $F1000000 or ((AImm12 and $FFF) shl 10) or
+    (UInt32(ARn) shl 5) or ARd;
+end;
+
 function Arm64Blr(const ARn: Byte): UInt32;
 begin
   Result := $D63F0000 or (UInt32(ARn) shl 5);
@@ -2976,6 +3206,38 @@ begin
   Result := $A8C453F3;   { ldp x19, x20, [sp], #64 }
 end;
 
+function Arm64StpX19Lr(const AByteOffset: UInt32): UInt32;
+begin
+  Result := $A9000000 or (((AByteOffset shr 3) and $7F) shl 15)
+    or (UInt32(ARM64_REG_LR) shl 10) or
+    (UInt32(ARM64_REG_SP) shl 5) or ARM64_REG_REGFILE;
+end;
+
+function Arm64LdpX19Lr(const AByteOffset: UInt32): UInt32;
+begin
+  Result := $A9400000 or (((AByteOffset shr 3) and $7F) shl 15)
+    or (UInt32(ARM64_REG_LR) shl 10) or
+    (UInt32(ARM64_REG_SP) shl 5) or ARM64_REG_REGFILE;
+end;
+
+function Arm64StpX19LrPre(const AFrameBytes: UInt32): UInt32;
+begin
+  { STP x19,x30,[sp,#-frame]!: signed imm7 scaled by 8. The native-self proof
+    caps register files at 32 slots, so its 32..272-byte frames fit exactly. }
+  Result := $A9800000 or
+    ((UInt32(-(Int64(AFrameBytes) div 8)) and $7F) shl 15) or
+    (UInt32(ARM64_REG_LR) shl 10) or
+    (UInt32(ARM64_REG_SP) shl 5) or ARM64_REG_REGFILE;
+end;
+
+function Arm64LdpX19LrPost(const AFrameBytes: UInt32): UInt32;
+begin
+  { LDP x19,x30,[sp],#frame: the matching signed imm7 post-index form. }
+  Result := $A8C00000 or (((AFrameBytes div 8) and $7F) shl 15) or
+    (UInt32(ARM64_REG_LR) shl 10) or
+    (UInt32(ARM64_REG_SP) shl 5) or ARM64_REG_REGFILE;
+end;
+
 function Arm64SignedImmFits(const AValue: Integer; const ABits: Byte): Boolean;
 var
   Limit: Integer;
@@ -2988,6 +3250,11 @@ end;
 function Arm64BPlaceholder: UInt32;
 begin
   Result := $14000000;   { b #0 }
+end;
+
+function Arm64BlPlaceholder: UInt32;
+begin
+  Result := $94000000;   { bl #0 }
 end;
 
 function Arm64BCondPlaceholder(const ACond: Byte): UInt32;
@@ -3095,12 +3362,14 @@ begin
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_REGFILE, 0));  { mov x19,x0 (regbase) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_STORE, 1));    { mov x20,x1 (store) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_IRBASE, 2));   { mov x23,x2 (IR base) }
+  ABuf.EmitU32(Arm64MovReg(ARM64_REG_MEMORY, 3));   { mov x25,x3 (context) }
 end;
 
 procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer);
 begin
   { Reserve one aligned callee-saved slot above the established 64-byte frame.
-    Only functions with a measured-useful third static allocation pay this. }
+    Functions with a measured-useful third static allocation or a pinned
+    native-self entry pay this. }
   ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
   Arm64EmitPrologue(ABuf);
   ABuf.EmitU32(Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_ZR, 64));
@@ -3197,6 +3466,33 @@ begin
   end;
 end;
 
+procedure Arm64EmitNativeSelfBudget(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32);
+var
+  FO: TWasmJitFrameOffsets;
+begin
+  FO := WasmJitFrameOffsets;
+  { The external wrapper already owns one fully visible logical/value/GC
+    activation. Pin the exact number of additional lightweight activations
+    admitted by both interpreter limits:
+
+      min(DepthCap - Depth, (ValueCap - ValueTop) div RegisterCount)
+
+    The proof gate guarantees RegisterCount is in 1..32. The wrapper prologue
+    preserves x26 for AAPCS callers; the local recursive core shares it. }
+  Arm64EmitLdrX(ABuf, 9, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
+  Arm64EmitLdrX(ABuf, 10, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubX(ARM64_REG_NATIVE_BUDGET, 9, 10));
+  Arm64EmitLdrX(ABuf, 9, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
+  Arm64EmitLdrX(ABuf, 10, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+  ABuf.EmitU32(Arm64SubX(9, 9, 10));
+  Arm64EmitLoadImm64(ABuf, 10, ARegisterCount);
+  ABuf.EmitU32(Arm64UdivX(9, 9, 10));
+  ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_NATIVE_BUDGET));
+  ABuf.EmitU32(Arm64CselX(ARM64_REG_NATIVE_BUDGET, 9,
+    ARM64_REG_NATIVE_BUDGET, ARM64_COND_LO));
+end;
+
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 begin
   ABuf.EmitU32(Arm64LdrX(ARM64_REG_MEMORY, ARM64_REG_ZR, 56));
@@ -3232,14 +3528,13 @@ begin
     Base := UInt32(P.Kind);
     Delta := ABuf.PatchDelta(I);   { signed byte displacement, multiple of 4 }
     Imm := Delta div 4;
-    if (Base and $FC000000) = $14000000 then
+    if (Base and $7C000000) = $14000000 then
     begin
-      { B: imm26 in bits [25:0]. A displacement that overflows the field would
-        silently wrap into a wrong jump; refuse it so the driver abandons the
-        compile and the function stays interpreted (jit-spec §4.3). }
+      { B/BL: imm26 in bits [25:0]. An overflowing displacement would silently
+        wrap into a wrong jump; refuse it so the function stays interpreted. }
       if not Arm64SignedImmFits(Imm, 26) then
         raise EWasmJitBranchRange.CreateFmt(
-          'JIT: B displacement %d does not fit imm26', [Delta]);
+          'JIT: B/BL displacement %d does not fit imm26', [Delta]);
       Instr := Base or (UInt32(Imm) and $03FFFFFF);
     end
     else
@@ -3317,7 +3612,82 @@ begin
       ACache.Entries[ACache.StaticCount].Slot := ASlots[I];
       LdX(ABuf, Arm64CacheHostReg(ACache.StaticCount), ASlots[I]);
       Inc(ACache.StaticCount);
-    end;
+  end;
+end;
+
+procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
+  const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
+  const ASlotCount: UInt32);
+begin
+  ACache.WriteBackDynamics := True;
+  ACache.UseCounts := AUseCounts;
+  ACache.VisibleSlots := AVisibleSlots;
+  ACache.SlotCount := ASlotCount;
+end;
+
+procedure Arm64SeedNativeCoreCache(var ACache: TArm64RegCache;
+  const AParamCount, AParam0Slot, AParam1Slot: UInt32;
+  const AUseLeafCapacity: Boolean);
+begin
+  { x12/x13 are populated by the external wrapper or lightweight caller. The
+    callee slots stay absent until a flush proves they must be materialized.
+    A non-recursive leaf may also use x14-x17: unlike the self-recursive ABI it
+    does not reserve x26 for a frame budget, and it has no nested call whose
+    register boundary would require the deliberately smaller two-entry cache. }
+  if AUseLeafCapacity then
+  begin
+    ACache.StaticAllocation := True;
+    { Keep the incoming slots fixed in x12/x13. A later local.set must update
+      that exact mapping rather than create a duplicate dynamic entry whose
+      older fixed mapping would win the next lookup. }
+    ACache.StaticCount := Byte(AParamCount);
+  end;
+  ACache.Entries[0].Valid := True;
+  ACache.Entries[0].Dirty := True;
+  ACache.Entries[0].Slot := AParam0Slot;
+  if AParamCount = 2 then
+  begin
+    ACache.Entries[1].Valid := True;
+    ACache.Entries[1].Dirty := True;
+    ACache.Entries[1].Slot := AParam1Slot;
+    ACache.Next := 0;
+  end
+  else
+    ACache.Next := 1;
+end;
+
+function Arm64EntryNeedsWriteBack(const ACache: TArm64RegCache;
+  const AIndex: Integer): Boolean;
+var
+  Slot: UInt32;
+begin
+  Result := False;
+  if not ACache.Entries[AIndex].Valid or
+    not ACache.Entries[AIndex].Dirty then
+    Exit;
+  Slot := ACache.Entries[AIndex].Slot;
+  if Slot >= ACache.SlotCount then
+    Exit(True);
+  Result := ACache.VisibleSlots[Slot] or (ACache.UseCounts[Slot] > 0);
+end;
+
+procedure Arm64SpillCacheEntry(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const AIndex: Integer);
+begin
+  if Arm64EntryNeedsWriteBack(ACache, AIndex) then
+    StX(ABuf, Arm64CacheHostReg(AIndex), ACache.Entries[AIndex].Slot);
+  ACache.Entries[AIndex].Dirty := False;
+end;
+
+procedure Arm64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.WriteBackDynamics then
+    Exit;
+  for I := ACache.StaticCount to High(ACache.Entries) do
+    Arm64SpillCacheEntry(ABuf, ACache, I);
 end;
 
 procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
@@ -3326,7 +3696,10 @@ var
   I: Integer;
 begin
   if not ACache.StaticAllocation then
+  begin
+    Arm64FlushDynamicRegCache(ABuf, ACache);
     Exit;
+  end;
   { Emit the fixed allocation at every canonical point. This deliberately does
     not use compile-time dirty state: a forward branch may skip a writeback
     that the linear emitter visited, so path-independent stores are the safe
@@ -3334,6 +3707,7 @@ begin
   for I := 0 to ACache.StaticCount - 1 do
     if ACache.Entries[I].Valid then
       StX(ABuf, Arm64CacheHostReg(I), ACache.Entries[I].Slot);
+  Arm64FlushDynamicRegCache(ABuf, ACache);
 end;
 
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
@@ -3357,6 +3731,13 @@ procedure Arm64CachedLoad(const ABuf: TWasmCodeBuffer;
 var
   I, Victim: Integer;
   Host: Byte;
+
+  procedure ConsumeUse;
+  begin
+    if ACache.WriteBackDynamics and (ASlot < ACache.SlotCount) and
+      (ACache.UseCounts[ASlot] > 0) then
+      Dec(ACache.UseCounts[ASlot]);
+  end;
 begin
   for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
@@ -3364,6 +3745,7 @@ begin
       Host := Arm64CacheHostReg(I);
       if ADest <> Host then
         ABuf.EmitU32(Arm64MovReg(ADest, Host));
+      ConsumeUse;
       Exit;
     end;
   if ACache.StaticAllocation then
@@ -3376,12 +3758,190 @@ begin
     Victim := ACache.Next;
     ACache.Next := Byte(1 - ACache.Next);
   end;
+  if ACache.WriteBackDynamics then
+    Arm64SpillCacheEntry(ABuf, ACache, Victim);
   Host := Arm64CacheHostReg(Victim);
   LdX(ABuf, Host, ASlot);
   ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Dirty := False;
   ACache.Entries[Victim].Slot := ASlot;
   if ADest <> Host then
     ABuf.EmitU32(Arm64MovReg(ADest, Host));
+  ConsumeUse;
+end;
+
+function Arm64CachedHostForSlot(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := Arm64CacheHostReg(I);
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+function Arm64CachedSourceReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const ADefault: Byte): Byte;
+var
+  Victim: Integer;
+begin
+  if Arm64CachedHostForSlot(ACache, ASlot, Result) then
+  begin
+    { Keep the existing load path as the one place that consumes the planned
+      use count. The established host emits no move. }
+    Arm64CachedLoad(ABuf, ACache, Result, ASlot);
+    Exit;
+  end;
+  if ACache.StaticAllocation then
+  begin
+    { A one-source cached operation can load a missing expression directly
+      into its selected dynamic entry. This is the same round-robin victim and
+      liveness spill used by CachedLoad, without an unnecessary scratch copy. }
+    Victim := 3 + ACache.Next;
+    ACache.Next := Byte((ACache.Next + 1) and 3);
+    if ACache.WriteBackDynamics then
+      Arm64SpillCacheEntry(ABuf, ACache, Victim);
+    Result := Arm64CacheHostReg(Victim);
+    LdX(ABuf, Result, ASlot);
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Dirty := False;
+    ACache.Entries[Victim].Slot := ASlot;
+    if ACache.WriteBackDynamics and (ASlot < ACache.SlotCount) and
+      (ACache.UseCounts[ASlot] > 0) then
+      Dec(ACache.UseCounts[ASlot]);
+    Exit;
+  end;
+  Result := ADefault;
+  { Keep the existing load path as the one place that consumes the planned use
+    count in the original write-through cache. }
+  Arm64CachedLoad(ABuf, ACache, Result, ASlot);
+end;
+
+function Arm64CachedStaticHostForSlot(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to ACache.StaticCount - 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := Arm64CacheHostReg(I);
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+procedure Arm64CachedBinarySourceRegs(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ALeftSlot, ARightSlot: UInt32;
+  out ALeft, ARight: Byte);
+begin
+  { A missing right operand can evict a dynamic entry holding the left one.
+    Use host registers directly only when both lookups are already stable;
+    otherwise preserve both values in the established scratch pair. }
+  if Arm64CachedHostForSlot(ACache, ALeftSlot, ALeft) and
+    Arm64CachedHostForSlot(ACache, ARightSlot, ARight) then
+  begin
+    Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+    Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
+    Exit;
+  end;
+  { A static allocation cannot be evicted by resolving the other operand into
+    x14..x17. Keep that side in its host register and load the missing side
+    directly into a dynamic entry. }
+  if Arm64CachedStaticHostForSlot(ACache, ALeftSlot, ALeft) then
+  begin
+    Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+    ARight := Arm64CachedSourceReg(ABuf, ACache, ARightSlot,
+      ARM64_REG_T1);
+    Exit;
+  end;
+  if Arm64CachedStaticHostForSlot(ACache, ARightSlot, ARight) then
+  begin
+    ALeft := Arm64CachedSourceReg(ABuf, ACache, ALeftSlot,
+      ARM64_REG_T0);
+    Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
+    Exit;
+  end;
+  ALeft := ARM64_REG_T0;
+  ARight := ARM64_REG_T1;
+  Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+  Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
+end;
+
+function Arm64CachedDestReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const AExclude0, AExclude1, ADefault: Byte): Byte;
+var
+  I, Offset, Attempt: Integer;
+  Host: Byte;
+begin
+  Result := ADefault;
+  for I := 0 to ACache.StaticCount - 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Exit(Arm64CacheHostReg(I));
+  if not ACache.StaticAllocation then
+  begin
+    if not ACache.WriteBackDynamics then
+      Exit;
+    for I := 0 to 1 do
+      if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      begin
+        Host := Arm64CacheHostReg(I);
+        if (Host = AExclude0) or (Host = AExclude1) then
+          Exit;
+        ACache.Entries[I].Dirty := False;
+        Exit(Host);
+      end;
+    for Attempt := 0 to 1 do
+    begin
+      I := (Integer(ACache.Next) + Attempt) and 1;
+      Host := Arm64CacheHostReg(I);
+      if (Host = AExclude0) or (Host = AExclude1) then
+        Continue;
+      Arm64SpillCacheEntry(ABuf, ACache, I);
+      ACache.Entries[I].Valid := True;
+      ACache.Entries[I].Dirty := False;
+      ACache.Entries[I].Slot := ASlot;
+      ACache.Next := Byte(1 - I);
+      Exit(Host);
+    end;
+    Exit;
+  end;
+  { Reuse an established dynamic destination only when it is not an operand.
+    If it is an operand, retain the scratch path so the input survives until
+    the instruction has read it and no duplicate slot mapping is created. }
+  for I := 3 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      Host := Arm64CacheHostReg(I);
+      if (Host = AExclude0) or (Host = AExclude1) then
+        Exit;
+      ACache.Entries[I].Dirty := False;
+      Exit(Host);
+    end;
+  { Reserve a non-source entry before emission. Its previous value is spilled
+    through the existing liveness predicate; CachedStore marks the new value
+    dirty after the instruction writes it. }
+  for Attempt := 0 to 3 do
+  begin
+    Offset := (Integer(ACache.Next) + Attempt) and 3;
+    I := 3 + Offset;
+    Host := Arm64CacheHostReg(I);
+    if (Host = AExclude0) or (Host = AExclude1) then
+      Continue;
+    if ACache.WriteBackDynamics then
+      Arm64SpillCacheEntry(ABuf, ACache, I);
+    ACache.Entries[I].Valid := True;
+    ACache.Entries[I].Dirty := False;
+    ACache.Entries[I].Slot := ASlot;
+    ACache.Next := Byte((Offset + 1) and 3);
+    Exit(Host);
+  end;
 end;
 
 procedure Arm64CachedStore(const ABuf: TWasmCodeBuffer;
@@ -3401,20 +3961,41 @@ begin
       Host := Arm64CacheHostReg(Victim);
       if ASrc <> Host then
         ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+      ACache.Entries[Victim].Dirty := True;
       Exit;
     end;
     { Unallocated expression values retain the write-through cache in
       x14..x17, so static locals do not evict producer/consumer temporaries. }
-    StX(ABuf, ASrc, ASlot);
+    if not ACache.WriteBackDynamics then
+      StX(ABuf, ASrc, ASlot);
     if Victim < ACache.StaticCount then
     begin
       Victim := 3 + ACache.Next;
       ACache.Next := Byte((ACache.Next + 1) and 3);
     end;
+    if ACache.WriteBackDynamics then
+      Arm64SpillCacheEntry(ABuf, ACache, Victim);
     Host := Arm64CacheHostReg(Victim);
     if ASrc <> Host then
       ABuf.EmitU32(Arm64MovReg(Host, ASrc));
     ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Dirty := ACache.WriteBackDynamics;
+    ACache.Entries[Victim].Slot := ASlot;
+    Exit;
+  end;
+  if ACache.WriteBackDynamics then
+  begin
+    if Victim < 0 then
+    begin
+      Victim := ACache.Next;
+      ACache.Next := Byte(1 - Victim);
+      Arm64SpillCacheEntry(ABuf, ACache, Victim);
+    end;
+    Host := Arm64CacheHostReg(Victim);
+    if ASrc <> Host then
+      ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Dirty := True;
     ACache.Entries[Victim].Slot := ASlot;
     Exit;
   end;
@@ -3434,11 +4015,76 @@ end;
 procedure Arm64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AWb: TArm64WordBin;
   var ACache: TArm64RegCache);
+var
+  Left, Right, Dest: Byte;
 begin
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, AIns.B);
-  ABuf.EmitU32(AWb(ARM64_REG_T0, ARM64_REG_T0, ARM64_REG_T1));
-  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+  Arm64CachedBinarySourceRegs(ABuf, ACache, AIns.A, AIns.B, Left, Right);
+  Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest, Left, Right,
+    ARM64_REG_T0);
+  ABuf.EmitU32(AWb(Dest, Left, Right));
+  Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
+end;
+
+function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
+  const AValue: UInt32): Boolean;
+begin
+  case AOp of
+    iroI32Add: Result := AValue <= $FFF;
+    iroI32And:
+      Result := (AValue <> 0) and (AValue <> High(UInt32)) and
+        ((AValue and (AValue + 1)) = 0);
+    iroI32Shl: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AValue: UInt32;
+  var ACache: TArm64RegCache): Boolean;
+var
+  Mask: UInt32;
+  Ones: Byte;
+  Source, Dest: Byte;
+begin
+  Result := Arm64CanUseI32Immediate(AIns.Op, AValue);
+  if not Result then
+    Exit;
+  Source := Arm64CachedSourceReg(ABuf, ACache, AIns.A, ARM64_REG_T0);
+  Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest, Source, ARM64_REG_ZR,
+    ARM64_REG_T0);
+  case AIns.Op of
+    iroI32Add:
+      ABuf.EmitU32(Arm64AddImmW(Dest, Source, AValue));
+    iroI32And:
+      begin
+        Mask := AValue;
+        Ones := 0;
+        while Mask <> 0 do
+        begin
+          Inc(Ones);
+          Mask := Mask shr 1;
+        end;
+        ABuf.EmitU32(Arm64AndLowMaskImmW(Dest, Source, Ones));
+      end;
+    iroI32Shl:
+      ABuf.EmitU32(Arm64LslImmW(Dest, Source,
+        Byte(AValue and 31)));
+  end;
+  Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
+end;
+
+procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
+  const ASource, ADest: UInt32; const AShift, AWidth: Byte;
+  var ACache: TArm64RegCache);
+var
+  Source, Dest: Byte;
+begin
+  Source := Arm64CachedSourceReg(ABuf, ACache, ASource, ARM64_REG_T0);
+  Dest := Arm64CachedDestReg(ABuf, ACache, ADest, Source, ARM64_REG_ZR,
+    ARM64_REG_T0);
+  ABuf.EmitU32(Arm64UbfizW(Dest, Source, AShift, AWidth));
+  Arm64CachedStore(ABuf, ACache, Dest, ADest);
 end;
 
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
@@ -3446,6 +4092,7 @@ procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
 var
   Cond: Byte;
   Wide: Boolean;
+  Left, Right: Byte;
 begin
   Wide := False;
   case ACompare.Op of
@@ -3473,12 +4120,15 @@ begin
   end;
   if ABranch.Op = iroBranchIfNot then
     Cond := Cond xor 1;
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ACompare.A);
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, ACompare.B);
+  Arm64CachedBinarySourceRegs(ABuf, ACache, ACompare.A, ACompare.B,
+    Left, Right);
   if Wide then
-    ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T1))
+    ABuf.EmitU32(Arm64CmpX(Left, Right))
   else
-    ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T1));
+    ABuf.EmitU32(Arm64CmpW(Left, Right));
+  { STR does not alter NZCV, so reconcile live dirty expressions after CMP and
+    before the fused control split without losing the comparison flags. }
+  Arm64FlushDynamicRegCache(ABuf, ACache);
   EmitBCondTo(ABuf, Cond, TWasmJitLabel(ABranch.B));
   Arm64InvalidateRegCache(ACache);
 end;
@@ -3546,6 +4196,16 @@ begin
   Site := ABuf.CurrentOffset;
   ABuf.AddPatch(Site, TWasmJitLabel(ATarget), Integer(Arm64BPlaceholder));
   ABuf.EmitU32(Arm64BPlaceholder);
+end;
+
+procedure Arm64EmitBlTo(const ABuf: TWasmCodeBuffer;
+  const ATarget: TWasmJitLabel);
+var
+  Site: Integer;
+begin
+  Site := ABuf.CurrentOffset;
+  ABuf.AddPatch(Site, ATarget, Integer(Arm64BlPlaceholder));
+  ABuf.EmitU32(Arm64BlPlaceholder);
 end;
 
 procedure EmitBCondTo(const ABuf: TWasmCodeBuffer; const ACond: Byte;
@@ -3955,23 +4615,365 @@ begin
   end;
 end;
 
+{ A one- or two-slot-parameter/one-result static call can publish and retire
+  its logical frame entirely in generated code. Resolution stays
+  instance-relative and position-independent: the caller activation supplies
+  the live function
+  address map, the context supplies an indirection to Store.Funcs, and each
+  function instance supplies prelinked pointers into freshly validated IR.
+  No helper is crossed on the compiled fast path. }
+procedure EmitNativeScalarDirectCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AArgBytes, AStateOffset: UInt32;
+  const AFallback, ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  FuncLayout: TWasmFuncInst;
+  StateLayout: TWasmJitDirectCallState;
+  FuncDirectEntry, FuncInstance: UInt32;
+  MetaFn, MetaIrBase, MetaFuncAddrs, MetaEntryZeroRegs,
+    MetaRefRegBits, MetaRegisterCount, MetaEntryZeroCount,
+    MetaParam0Reg, MetaParam1Reg, MetaResult0Reg: UInt32;
+  StateRegBase, StateIrBase, StateCtx, StateEntry, StateGcFrameSlot,
+    StateResultReg: UInt32;
+  ZeroLoop, ZeroDone, Exhausted: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  FuncDirectEntry := UInt32(PtrUInt(@FuncLayout.CompiledDirectEntry) -
+    PtrUInt(@FuncLayout));
+  FuncInstance := UInt32(PtrUInt(@FuncLayout.Instance) -
+    PtrUInt(@FuncLayout));
+  MetaFn := UInt32(PtrUInt(@FuncLayout.DirectMeta.Fn) - PtrUInt(@FuncLayout));
+  MetaIrBase := UInt32(PtrUInt(@FuncLayout.DirectMeta.IrBase) -
+    PtrUInt(@FuncLayout));
+  MetaFuncAddrs := UInt32(PtrUInt(@FuncLayout.DirectMeta.FuncAddrs) -
+    PtrUInt(@FuncLayout));
+  MetaEntryZeroRegs := UInt32(PtrUInt(@FuncLayout.DirectMeta.EntryZeroRegs) -
+    PtrUInt(@FuncLayout));
+  MetaRefRegBits := UInt32(PtrUInt(@FuncLayout.DirectMeta.RefRegBits) -
+    PtrUInt(@FuncLayout));
+  MetaRegisterCount := UInt32(PtrUInt(@FuncLayout.DirectMeta.RegisterCount) -
+    PtrUInt(@FuncLayout));
+  MetaEntryZeroCount := UInt32(PtrUInt(@FuncLayout.DirectMeta.EntryZeroCount) -
+    PtrUInt(@FuncLayout));
+  MetaParam0Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Param0Reg) -
+    PtrUInt(@FuncLayout));
+  MetaParam1Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Param1Reg) -
+    PtrUInt(@FuncLayout));
+  MetaResult0Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Result0Reg) -
+    PtrUInt(@FuncLayout));
+  StateRegBase := UInt32(PtrUInt(@StateLayout.RegBase) - PtrUInt(@StateLayout));
+  StateIrBase := UInt32(PtrUInt(@StateLayout.IrBase) - PtrUInt(@StateLayout));
+  StateCtx := UInt32(PtrUInt(@StateLayout.Ctx) - PtrUInt(@StateLayout));
+  StateEntry := UInt32(PtrUInt(@StateLayout.Entry) - PtrUInt(@StateLayout));
+  StateGcFrameSlot := UInt32(PtrUInt(@StateLayout.GcFrameSlot) -
+    PtrUInt(@StateLayout));
+  StateResultReg := UInt32(PtrUInt(@StateLayout.ScalarResultReg) -
+    PtrUInt(@StateLayout));
+
+  ZeroLoop := ABuf.NewLabel;
+  ZeroDone := ABuf.NewLabel;
+  Exhausted := ABuf.NewLabel;
+
+  { x25 is the current context for functions without pinned memory. Resolve
+    caller funcidx -> store address -> live function instance. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
+  Arm64EmitLoadImm64(ABuf, 3, FO.ActStride);
+  ABuf.EmitU32(Arm64MulX(2, 2, 3));
+  Arm64EmitLdrX(ABuf, 3, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(2, 3, 2));
+  Arm64EmitLdrX(ABuf, 1, 2, UInt32(FO.ActFuncAddrs));
+  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrW(ABuf, 2, 1, 0);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxFuncsSlot));
+  Arm64EmitLdrX(ABuf, 1, 1, 0);
+  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
+  ABuf.EmitU32(Arm64MulX(2, 2, 8));
+  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+  Arm64EmitLdrX(ABuf, 9, 3, FuncDirectEntry);
+  ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_ZR));
+  EmitBCondTo(ABuf, ARM64_COND_EQ, AFallback);
+
+  { Exhaustion is checked before the first logical-frame mutation. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HS, Exhausted);
+  Arm64EmitLdrX(ABuf, 2, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+  Arm64EmitLdrW(ABuf, 8, 3, MetaRegisterCount);
+  ABuf.EmitU32(Arm64AddX(13, 2, 8));
+  Arm64EmitLdrX(ABuf, 10, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
+  ABuf.EmitU32(Arm64CmpX(13, 10));
+  EmitBCondTo(ABuf, ARM64_COND_HI, Exhausted);
+
+  { x6 := activation[depth], x5 := Values[old ValueTop]. }
+  Arm64EmitLoadImm64(ABuf, 8, FO.ActStride);
+  ABuf.EmitU32(Arm64MulX(8, 1, 8));
+  Arm64EmitLdrX(ABuf, 6, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(6, 6, 8));
+  Arm64EmitLdrX(ABuf, 5, ARM64_REG_MEMORY, UInt32(FO.CtxValues));
+  Arm64EmitLoadImm64(ABuf, 12, 8);
+  ABuf.EmitU32(Arm64MulX(8, 2, 12));
+  ABuf.EmitU32(Arm64AddX(5, 5, 8));
+
+  Arm64EmitLdrX(ABuf, 8, 3, MetaFn);
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActFn));
+  Arm64EmitLdrX(ABuf, 8, 3, FuncInstance);
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActInstance));
+  Arm64EmitLdrX(ABuf, 8, 3, MetaFuncAddrs);
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActFuncAddrs));
+  Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActIP));
+  Arm64EmitStrX(ABuf, 2, 6, UInt32(FO.ActBase));
+  Arm64EmitStrX(ABuf, 13, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+
+  { Sparse entry zeroing precedes parameter publication and GC visibility. }
+  Arm64EmitLdrX(ABuf, 10, 3, MetaEntryZeroRegs);
+  Arm64EmitLdrW(ABuf, 11, 3, MetaEntryZeroCount);
+  ABuf.BindLabel(ZeroLoop);
+  EmitCbzTo(ABuf, 11, UInt32(ZeroDone));
+  Arm64EmitLdrW(ABuf, 8, 10, 0);
+  ABuf.EmitU32(Arm64MulX(8, 8, 12));
+  ABuf.EmitU32(Arm64MemRegOffset($F9000000, ARM64_REG_ZR, 5, 8, True));
+  ABuf.EmitU32(Arm64AddImmX(10, 10, 4));
+  ABuf.EmitU32(Arm64SubImmX(11, 11, 1));
+  EmitBranchTo(ABuf, UInt32(ZeroLoop));
+  ABuf.BindLabel(ZeroDone);
+  Arm64EmitLdrW(ABuf, 8, 3, MetaParam0Reg);
+  ABuf.EmitU32(Arm64MulX(8, 8, 12));
+  Arm64EmitLdrX(ABuf, 10, ARM64_REG_SP, 0);
+  ABuf.EmitU32(Arm64MemRegOffset($F9000000, 10, 5, 8, True));
+  if AArgBytes = 2 * ARM64_SLOT_SIZE then
+  begin
+    Arm64EmitLdrW(ABuf, 8, 3, MetaParam1Reg);
+    ABuf.EmitU32(Arm64MulX(8, 8, 12));
+    Arm64EmitLdrX(ABuf, 10, ARM64_REG_SP, ARM64_SLOT_SIZE);
+    ABuf.EmitU32(Arm64MemRegOffset($F9000000, 10, 5, 8, True));
+  end;
+
+  Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetKind));
+  Arm64EmitStrX(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetDest));
+  Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetCount));
+  Arm64EmitStrX(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetBase));
+  ABuf.EmitU32(Arm64AddImmX(8, ARM64_REG_SP, AArgBytes));
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActEntryResults));
+
+  { Publish the precise frame only after every reference slot is initialized. }
+  Arm64EmitLdrX(ABuf, 7, ARM64_REG_MEMORY, UInt32(FO.CtxGcFrameSlot));
+  ABuf.EmitU32(Arm64AddImmX(8, 6, UInt32(FO.ActGcFrame)));
+  Arm64EmitLdrX(ABuf, 10, 7, 0);
+  Arm64EmitStrX(ABuf, 10, 8, UInt32(FO.GcFramePrev));
+  Arm64EmitStrX(ABuf, 5, 8, UInt32(FO.GcFrameSlots));
+  Arm64EmitLdrX(ABuf, 10, 3, MetaRefRegBits);
+  Arm64EmitStrX(ABuf, 10, 8, UInt32(FO.GcFrameRefRegBits));
+  Arm64EmitLdrW(ABuf, 10, 3, MetaRegisterCount);
+  Arm64EmitStrW(ABuf, 10, 8, UInt32(FO.GcFrameRegisterCount));
+  Arm64EmitLdrX(ABuf, 10, 3, FuncInstance);
+  Arm64EmitStrX(ABuf, 10, 8, UInt32(FO.GcFrameInstance));
+  Arm64EmitStrX(ABuf, 8, 7, 0);
+  ABuf.EmitU32(Arm64AddImmX(1, 1, 1));
+  Arm64EmitStrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+
+  { Preserve the normal-return retirement state across the native callee. }
+  Arm64EmitStrX(ABuf, 5, ARM64_REG_SP, AStateOffset + StateRegBase);
+  Arm64EmitLdrX(ABuf, 2, 3, MetaIrBase);
+  Arm64EmitStrX(ABuf, 2, ARM64_REG_SP, AStateOffset + StateIrBase);
+  Arm64EmitStrX(ABuf, ARM64_REG_MEMORY, ARM64_REG_SP, AStateOffset + StateCtx);
+  Arm64EmitStrX(ABuf, 6, ARM64_REG_SP, AStateOffset + StateEntry);
+  Arm64EmitStrX(ABuf, 7, ARM64_REG_SP, AStateOffset + StateGcFrameSlot);
+  Arm64EmitLdrW(ABuf, 8, 3, MetaResult0Reg);
+  Arm64EmitStrW(ABuf, 8, ARM64_REG_SP, AStateOffset + StateResultReg);
+
+  Arm64EmitLdrX(ABuf, 9, 3, FuncDirectEntry);
+  ABuf.EmitU32(Arm64MovReg(0, 5));
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
+  ABuf.EmitU32(Arm64MovReg(3, ARM64_REG_MEMORY));
+  ABuf.EmitU32(Arm64MovReg(4, 9));
+  ABuf.EmitU32(Arm64Blr(9));
+
+  { Normal return: copy the scalar result, unlink the GC frame, and retire
+    ValueTop/Depth. Abnormal exits longjmp and never execute this block. }
+  Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, AStateOffset + StateCtx);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP, AStateOffset + StateEntry);
+  Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, AStateOffset + StateRegBase);
+  Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP, AStateOffset + StateResultReg);
+  Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP, AStateOffset + StateGcFrameSlot);
+  Arm64EmitLdrX(ABuf, 5, 1, UInt32(FO.ActEntryResults));
+  Arm64EmitLoadImm64(ABuf, 6, 8);
+  ABuf.EmitU32(Arm64MulX(3, 3, 6));
+  ABuf.EmitU32(Arm64MemRegOffset($F9400000, 6, 2, 3, True));
+  Arm64EmitStrX(ABuf, 6, 5, 0);
+  Arm64EmitLdrX(ABuf, 5, 1, UInt32(FO.ActGcFrame + FO.GcFramePrev));
+  Arm64EmitStrX(ABuf, 5, 4, 0);
+  Arm64EmitLdrX(ABuf, 5, 1, UInt32(FO.ActBase));
+  Arm64EmitStrX(ABuf, 5, 0, UInt32(FO.CtxValueTop));
+  Arm64EmitLdrX(ABuf, 5, 0, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(5, 5, 1));
+  Arm64EmitStrX(ABuf, 5, 0, UInt32(FO.CtxDepth));
+  EmitBranchTo(ABuf, UInt32(ADone));
+
+  ABuf.BindLabel(Exhausted);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
+{ Proof-gated self recursion for a closed helper-free numeric function. The
+  callee's register file lives on the native stack. The external wrapper pins
+  the exact remaining logical/value-frame budget in x26, so recursive frames
+  need no observable Depth/ValueTop updates. There are no references,
+  allocations, host calls, interpreted escapes, or throwing instructions in
+  the eligible graph. Consequently each recursive stack map is empty: the
+  wrapper's one fully published logical/GC frame remains the sole root, while
+  lightweight frames contain numeric bits only and cannot reach a collector.
+  Ordinary calls are not epoch safepoints; only IR-marked loop back-edges poll,
+  exactly as in the interpreter. Traps longjmp to the invocation trampoline
+  and discard x26; normal returns restore it after each local call. }
+procedure EmitNativeScalarSelfCallReg(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32;
+  const ACoreLabel, AExhaustedLabel: TWasmJitLabel);
+var
+  FrameBytes: UInt32;
+begin
+  FrameBytes := Arm64Align16(ARegisterCount * ARM64_SLOT_SIZE) + 16;
+
+  { Subtract-and-test the exact budget before native-stack mutation. An
+    exhausted path discards the underflowed callee-saved register while
+    unwinding to the invocation trampoline. A call is not an epoch safepoint;
+    the local core retains ordinary IR back-edge checks emitted below. }
+  ABuf.EmitU32(Arm64SubsImmX(ARM64_REG_NATIVE_BUDGET,
+    ARM64_REG_NATIVE_BUDGET, 1));
+  EmitBCondTo(ABuf, ARM64_COND_LO, AExhaustedLabel);
+  { Allocate the frame and preserve x19/LR in one pre-index pair store. The
+    numeric register file begins 16 bytes above SP and remains aligned. x12
+    carries the parameter directly into the local core. }
+  ABuf.EmitU32(Arm64StpX19LrPre(FrameBytes));
+
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_REGFILE, ARM64_REG_SP, 16));
+  Arm64EmitBlTo(ABuf, ACoreLabel);
+
+  ABuf.EmitU32(Arm64LdpX19LrPost(FrameBytes));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_NATIVE_BUDGET,
+    ARM64_REG_NATIVE_BUDGET, 1));
+end;
+
+procedure EmitNativeScalarSelfCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const ARegisterCount, AParamReg, AResultReg: UInt32;
+  const ACoreLabel, AExhaustedLabel: TWasmJitLabel);
+begin
+  { Canonical fallback retained for callers outside the cached local ABI. }
+  LdX(ABuf, 12, IrAuxBlockItem(AAux, AIns.A, 0));
+  EmitNativeScalarSelfCallReg(ABuf, ARegisterCount, ACoreLabel,
+    AExhaustedLabel);
+  StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
+end;
+
+{ A compiled numeric leaf has no call, allocation, reference, handler,
+  safepoint, or trapping operation that can observe a published activation.
+  Check the exact logical/value caps, then enter its native-stack scalar ABI.
+  A nil entry preserves the generic compiled/interpreted/host fallback. }
+procedure EmitNativeScalarLeafDirectCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AArgN: UInt32; const AFallback, ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  FuncLayout: TWasmFuncInst;
+  FuncNativeEntry, MetaRegisterCount: UInt32;
+  Exhausted: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  FuncNativeEntry := UInt32(
+    PtrUInt(@FuncLayout.CompiledNativeScalarEntry) - PtrUInt(@FuncLayout));
+  MetaRegisterCount := UInt32(
+    PtrUInt(@FuncLayout.DirectMeta.RegisterCount) - PtrUInt(@FuncLayout));
+  Exhausted := ABuf.NewLabel;
+
+  { Resolve caller funcidx -> store address -> live function instance. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
+  Arm64EmitLoadImm64(ABuf, 3, FO.ActStride);
+  ABuf.EmitU32(Arm64MulX(2, 2, 3));
+  Arm64EmitLdrX(ABuf, 3, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(2, 3, 2));
+  Arm64EmitLdrX(ABuf, 1, 2, UInt32(FO.ActFuncAddrs));
+  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrW(ABuf, 2, 1, 0);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxFuncsSlot));
+  Arm64EmitLdrX(ABuf, 1, 1, 0);
+  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
+  ABuf.EmitU32(Arm64MulX(2, 2, 8));
+  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+  Arm64EmitLdrX(ABuf, 9, 3, FuncNativeEntry);
+  ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_ZR));
+  EmitBCondTo(ABuf, ARM64_COND_EQ, AFallback);
+
+  { Match JitEnterResolvedFrame's two exhaustion predicates without mutation. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HS, Exhausted);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+  Arm64EmitLdrW(ABuf, 8, 3, MetaRegisterCount);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HI, Exhausted);
+
+  LdX(ABuf, 12, IrAuxBlockItem(AAux, AIns.A, 0));
+  if AArgN = 2 then
+    LdX(ABuf, 13, IrAuxBlockItem(AAux, AIns.A, 1));
+  ABuf.EmitU32(Arm64MovReg(4, ARM64_REG_ZR));
+  ABuf.EmitU32(Arm64Blr(9));
+  StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
+  EmitBranchTo(ABuf, UInt32(ADone));
+
+  ABuf.BindLabel(Exhausted);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
 { iroCall / iroCallIndirect / iroCallRef. x0 is always the store (pinned in
   x20); the callee selector differs per form (funcidx immediate / packed
   type+table immediate plus the index operand / the funcref operand), and the
   last two arguments are always the arg and result scratch pointers. }
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32);
+  const AAux: TWasmIrAuxU32; const AUsePinnedMemory,
+  ANativeScalarSelf: Boolean; const ANativeRegisterCount,
+  ANativeParamReg, ANativeResultReg: UInt32;
+  const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel);
 var
   ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
-  FallbackLabel, DoneLabel: TWasmJitLabel;
+  FallbackLabel, DoneLabel, NativeFallback, NativeDone: TWasmJitLabel;
+  UseNativeLeaf: Boolean;
 begin
+  if ANativeScalarSelf and (AIns.Op = iroCall) then
+  begin
+    EmitNativeScalarSelfCall(ABuf, AIns, AAux, ANativeRegisterCount,
+      ANativeParamReg, ANativeResultReg, ANativeCoreLabel,
+      ANativeExhaustedLabel);
+    Exit;
+  end;
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
+  UseNativeLeaf := (AIns.Op = iroCall) and (ArgN in [1, 2]) and
+    (ResN = 1) and not AUsePinnedMemory;
+  NativeFallback := -1;
+  NativeDone := -1;
+  if UseNativeLeaf then
+  begin
+    NativeFallback := ABuf.NewLabel;
+    NativeDone := ABuf.NewLabel;
+    EmitNativeScalarLeafDirectCall(ABuf, AIns, AAux, ArgN,
+      NativeFallback, NativeDone);
+    ABuf.BindLabel(NativeFallback);
+  end;
   ArgBytes := ArgN * ARM64_SLOT_SIZE;
   ResBytes := ResN * ARM64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
   if AIns.Op = iroCall then
-    FrameBytes := Arm64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
+    FrameBytes := Arm64Align16(StateOffset +
+      SizeOf(TWasmJitDirectCallState))
   else
     FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
 
@@ -3987,21 +4989,50 @@ begin
           nil return falls back to the existing host/interpreter dispatcher. }
         FallbackLabel := ABuf.NewLabel;
         DoneLabel := ABuf.NewLabel;
-        Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
-        ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
-        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
-        ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
-        Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
-        ABuf.EmitU32(Arm64CmpX(0, 31));
-        EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
-        ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
-        Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, StateOffset);
-        ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
-        Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset + ARM64_SLOT_SIZE);
-        ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
-        ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
-        Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
-        EmitBranchTo(ABuf, UInt32(DoneLabel));
+        if (ArgN in [1, 2]) and (ResN = 1) and not AUsePinnedMemory then
+          EmitNativeScalarDirectCall(ABuf, AIns, ArgBytes, StateOffset,
+            FallbackLabel, DoneLabel)
+        else
+        begin
+          Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
+          ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+          ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+          ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
+          if (ArgN = 1) and (ResN = 1) then
+            Arm64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
+          else
+            Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
+          ABuf.EmitU32(Arm64CmpX(0, 31));
+          EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
+          ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
+          Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, StateOffset);
+          ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
+          Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP,
+            StateOffset + ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 3, ARM64_REG_SP,
+            StateOffset + 2 * ARM64_SLOT_SIZE);
+          ABuf.EmitU32(Arm64MovReg(4, ARM64_REG_T0));
+          ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+          if (ArgN = 1) and (ResN = 1) then
+          begin
+            Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP,
+              StateOffset + 2 * ARM64_SLOT_SIZE);
+            Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP,
+              StateOffset + 3 * ARM64_SLOT_SIZE);
+            Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset);
+            Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP,
+              StateOffset + 5 * ARM64_SLOT_SIZE);
+            Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP,
+              StateOffset + 4 * ARM64_SLOT_SIZE);
+            Arm64EmitCallHelper(ABuf, aohDirectCallFinishScalar)
+          end
+          else
+          begin
+            ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+            Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+          end;
+          EmitBranchTo(ABuf, UInt32(DoneLabel));
+        end;
         ABuf.BindLabel(FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
@@ -4030,6 +5061,8 @@ begin
 
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
   ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  if UseNativeLeaf then
+    ABuf.BindLabel(NativeDone);
 end;
 
 { iroReturnCall / iroReturnCallIndirect / iroReturnCallRef. Same marshal, but
@@ -4396,7 +5429,10 @@ end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32): Boolean;
+  const AInsIndex: UInt32; const AUsePinnedMemory,
+  ANativeScalarSelf: Boolean; const ANativeRegisterCount,
+  ANativeParamReg, ANativeResultReg: UInt32;
+  const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel): Boolean;
 begin
   Result := True;
   case AIns.Op of
@@ -4428,7 +5464,11 @@ begin
         EmitCbzTo(ABuf, ARM64_REG_T0, AIns.B);
       end;
     iroBrTable: EmitBrTable(ABuf, AIns, AAux);
-    iroReturn: Arm64EmitEpilogue(ABuf);
+    iroReturn:
+      if ANativeScalarSelf then
+        Arm64EmitRet(ABuf)
+      else
+        Arm64EmitEpilogue(ABuf);
     iroUnreachable:
       begin
         ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(wtkUnreachable)), 0));
@@ -4436,7 +5476,10 @@ begin
       end;
 
     { --- calls (Wave 3) ------------------------------------------------ }
-    iroCall, iroCallIndirect, iroCallRef: EmitCall(ABuf, AIns, AAux);
+    iroCall, iroCallIndirect, iroCallRef:
+      EmitCall(ABuf, AIns, AAux, AUsePinnedMemory, ANativeScalarSelf,
+        ANativeRegisterCount, ANativeParamReg, ANativeResultReg,
+        ANativeCoreLabel, ANativeExhaustedLabel);
     iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
       EmitReturnCall(ABuf, AIns, AAux);
 
@@ -4668,6 +5711,10 @@ begin
     GArm64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
     GArm64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
     GArm64HelperTable[aohResolveMemory] := @JitResolveMemory;
+    GArm64HelperTable[aohDirectCallFinishScalar] :=
+      @JitFinishDirectCallScalar;
+    GArm64HelperTable[aohDirectCallPrepareScalar] :=
+      @JitPrepareDirectCallScalar;
     GArm64HelperTableFilled := True;
   end;
   Result := @GArm64HelperTable[aohTrapKind];

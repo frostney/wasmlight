@@ -18,9 +18,8 @@
       (JitCanCompile — the scope fence, §10.3), so the JIT is always correct and
       only ever faster where it applies.
 
-  THE HAND-OFF (§5.1, the frame IS the interpreter's frame). Generated code
-  never edits the interpreter context layout itself. JitDispatch builds an
-  entry frame, and a direct compiled call reaches the same logic through
+  THE HAND-OFF (§5.1, the frame IS the interpreter's frame). JitDispatch builds
+  an entry frame, and a generic direct compiled call reaches the same logic through
   JitPrepareDirectCall — exhaustion check, register-file carve,
   zero, param marshal, GC-frame push — which returns @Values[Base], the
   register-file base. It passes that base to the compiled entry in the first
@@ -34,6 +33,18 @@
   entry in x0/x1 (AAPCS64); the Wave-2 prologue pins the base in the callee-
   saved x19 (surviving helper calls) and the store in x20 (for the epoch word),
   and the epilogue restores them before returning to JitLeaveFrame.
+
+  The one narrow exception is the proof-gated AArch64 scalar self-call path:
+  a closed helper-free numeric function uses a native-stack register file for
+  recursion and edits only the shared Depth/ValueTop counters. Its external
+  AAPCS wrapper saves and pins the full callee-saved state once, then calls a
+  local position-independent core; recursion preserves only x19/LR beside the
+  native register file. The wrapper pins the exact remaining depth/value-frame
+  budget in x26; recursion checks and adjusts it without publishing counters.
+  Ordinary calls do not invent epoch safepoints, while IR-marked loop
+  back-edges still poll;
+  references, allocation, handlers, host/interpreted escape, indirect/tail
+  calls, and cross-function calls all retain the full shared-frame path above.
 
   WAVE 3 CHANGES EXACTLY TWO THINGS HERE. (1) JitDispatch delegates to the
   backend's Arm64InvokeCompiled, because a compiled body may end in a
@@ -147,15 +158,14 @@ type
     property Store: TWasmStore read FStore;
   end;
 
-  { The compiled entry's calling convention (§5.2/§5.3, aot-spec §1.3/§4.3).
-    THREE arguments now: the register-file base pointer JitEnterFrame returned
-    (@Values[Base]), the store, and the IR-code base @Fn^.Code[0]. AAPCS64/SysV
-    pass them in x0/x1/x2 (rdi/rsi/rdx); the prologue pins the register-file base
-    (x19/rbx), the store (x20/r12 — from which it pins &Epoch, the snapshot, and
-    the per-process helper-table base), and the IR base (x23/rbp), from which
-    every runtime-op template computes @Fn^.Code[i] position-independently. cdecl
-    selects the platform C convention, matching the backend's hand-emitted
-    prologue/epilogue. }
+  { The x64 / backend-free compiled-entry declaration. It receives the
+    register-file base pointer JitEnterFrame returned (@Values[Base]), the
+    store, and the IR-code base @Fn^.Code[0]. The AArch64 backend extends this
+    private ABI with the interpreter context used by generated direct-call
+    frame setup and an entry pointer retained by the generic direct-call ABI;
+    its local declaration is fingerprinted with the AOT ABI.
+    cdecl selects the platform C convention, matching each backend's
+    hand-emitted prologue/epilogue. }
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
     const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
@@ -173,6 +183,19 @@ function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
   frame, or an unsupported target — the function then runs interpreted. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
+{ A deliberately narrow proof for the AArch64 native self-call ABI: one
+  scalar parameter/result, no default-initialized locals or references, and
+  only helper-free numeric/control ops whose direct calls all target the same
+  function. Other shapes retain the shared logical-frame call path. }
+function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
+  const ASelfFuncIdx: UInt32): Boolean;
+
+{ A bounded cross-function companion: a one/two-parameter, one-result numeric
+  leaf whose body cannot trap, allocate, call, or reach a safepoint. It may use
+  a lightweight native-stack frame because no operation inside it can observe
+  the temporarily unpublished logical frame. }
+function JitCanNativeScalarLeaf(const AFn: PWasmIrFunctionRec): Boolean;
+
 { Convenience wrapper: force-compile AAddr on AJit (delegates to the method). }
 function JitForceCompile(const AJit: TWasmJitContext;
   const AAddr: TWasmFuncAddr): Boolean;
@@ -188,7 +211,11 @@ function JitForceCompile(const AJit: TWasmJitContext;
   the function un-compiled, exactly as the on-hot JIT would decline it. }
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
-  out ARegisterCount: UInt32): TWasmBytes;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AFn: PWasmIrFunctionRec; const AFuncIdx: UInt32;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
 
 implementation
 
@@ -252,7 +279,7 @@ var
 begin
   { No backend on this target, so nothing is ever compiled and this is
     unreachable; kept as the plain single-shot hand-off so the unit still
-    compiles and documents the (3-arg, position-independent) contract. }
+    compiles and documents the x64 (3-arg, position-independent) contract. }
   Ctx := InterpContextFor(AStore);
   Base := JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults,
     ConsumeJitSeamReentry);
@@ -327,6 +354,93 @@ begin
   {$ENDIF}
 end;
 
+function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
+  const ASelfFuncIdx: UInt32): Boolean;
+var
+  I: Integer;
+  Ins: TWasmIrInstr;
+  HasSelfCall: Boolean;
+begin
+  Result := False;
+  {$IFDEF WASM_JIT_ARM64}
+  if (AFn = nil) or (AFn^.ParamCount <> 1) or (AFn^.ResultCount <> 1) or
+    (Length(AFn^.LocalRegs) <> 1) or (Length(AFn^.ResultRegs) <> 1) or
+    (Length(AFn^.EntryZeroRegs) <> 0) or (Length(AFn^.Handlers) <> 0) or
+    (AFn^.RegisterCount = 0) or (AFn^.RegisterCount > 32) then
+    Exit;
+  for I := 0 to High(AFn^.RegTypes) do
+    if AFn^.RegTypes[I].Kind <> wvkNum then
+      Exit;
+  HasSelfCall := False;
+  for I := 0 to High(AFn^.Code) do
+  begin
+    Ins := AFn^.Code[I];
+    case Ins.Op of
+      iroMove, iroJump, iroBranchIf, iroBranchIfNot, iroReturn,
+      iroI32Const, iroI64Const, iroF32Const, iroF64Const,
+      iroI32Eqz, iroI64Eqz,
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+      iroSelect:;
+      iroCall:
+        begin
+          if (UInt32(Ins.Imm) <> ASelfFuncIdx) or
+            (IrAuxBlockCount(AFn^.AuxU32, Ins.A) <> 1) or
+            (IrAuxBlockCount(AFn^.AuxU32, Ins.B) <> 1) then
+            Exit;
+          HasSelfCall := True;
+        end;
+    else
+      Exit;
+    end;
+  end;
+  Result := HasSelfCall;
+  {$ENDIF}
+end;
+
+function JitCanNativeScalarLeaf(const AFn: PWasmIrFunctionRec): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  {$IFDEF WASM_JIT_ARM64}
+  if (AFn = nil) or (AFn^.ParamCount < 1) or (AFn^.ParamCount > 2) or
+    (AFn^.ResultCount <> 1) or
+    (Length(AFn^.LocalRegs) <> Integer(AFn^.ParamCount)) or
+    (Length(AFn^.ResultRegs) <> 1) or
+    (Length(AFn^.EntryZeroRegs) <> 0) or (Length(AFn^.Handlers) <> 0) or
+    (AFn^.RegisterCount = 0) or (AFn^.RegisterCount > 32) then
+    Exit;
+  for I := 0 to High(AFn^.RegTypes) do
+    if AFn^.RegTypes[I].Kind <> wvkNum then
+      Exit;
+  for I := 0 to High(AFn^.Code) do
+    case AFn^.Code[I].Op of
+      iroMove, iroReturn,
+      iroI32Const, iroI64Const,
+      iroI32Eqz, iroI64Eqz,
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+      iroSelect:;
+    else
+      Exit;
+    end;
+  Result := True;
+  {$ENDIF}
+end;
+
 { --- compilation --------------------------------------------------------- }
 
 {$IFDEF WASM_JIT_BACKEND}
@@ -342,6 +456,7 @@ end;
   always balanced by a restore. The Arm64* / X64* calls are the only
   backend-specific part; everything else is shared. }
 function JitCompileToBuffer(const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32;
   const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
   const AFinalize: Boolean = True): TWasmCodeBuffer;
 var
@@ -352,14 +467,31 @@ var
   TargetCount: UInt32;
   AllocatedSlots: array[0..2] of UInt32;
   SlotScores: array of UInt32;
+  SlotUseCounts: array of UInt32;
+  VisibleSlots: array of Boolean;
   Fusion: array of Integer;
   PlannedCode: TWasmIrCode;
   SkipPlanned: array of Boolean;
+  ImmediateFusion: array of Boolean;
+  ImmediateValues: array of UInt32;
+  MaskedShiftSource: array of Integer;
+  MaskedShiftShape: array of UInt32;
   UseStaticCache: Boolean;
   UseThirdStatic: Boolean;
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
+  UseNativeScalarSelf: Boolean;
+  UseNativeScalarLeaf: Boolean;
+  UseNativeScalarCore: Boolean;
+  UseExtendedFrame: Boolean;
+  NativeParamCount: UInt32;
+  NativeParamReg: UInt32;
+  NativeParam1Reg: UInt32;
+  NativeResultReg: UInt32;
+  NativeCoreLabel: TWasmJitLabel;
+  NativeExhaustedLabel: TWasmJitLabel;
+  NativeExternalLabel: TWasmJitLabel;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -480,6 +612,424 @@ var
       end;
   end;
 
+  procedure AnalyzeImmediateFusion;
+  var
+    K: Integer;
+    Value: UInt32;
+  begin
+    SetLength(ImmediateFusion, Length(AFn^.Code));
+    SetLength(ImmediateValues, Length(AFn^.Code));
+    {$IFDEF WASM_JIT_ARM64}
+    { Keep this narrower than general constant folding: only helper-free,
+      base-pinned scalar-memory loops may erase an adjacent single-use
+      i32.const. Broad loop folding previously regressed nonlinear code. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if (PlannedCode[K].Op = iroI32Const) and
+        (PlannedCode[K + 1].B = PlannedCode[K].Dest) and
+        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K] and not Targets[K + 1] then
+      begin
+        Value := UInt32(PlannedCode[K].Imm and $FFFFFFFF);
+        if Arm64CanUseI32Immediate(PlannedCode[K + 1].Op, Value) then
+        begin
+          SkipPlanned[K] := True;
+          ImmediateFusion[K + 1] := True;
+          ImmediateValues[K + 1] := Value;
+        end;
+      end;
+    {$ENDIF}
+  end;
+
+  {$IFDEF WASM_JIT_ARM64}
+  procedure AnalyzeMaskedShiftFusion;
+  var
+    K, Width: Integer;
+    Mask, Shift: UInt32;
+    Source: UInt32;
+  begin
+    SetLength(MaskedShiftSource, Length(PlannedCode));
+    SetLength(MaskedShiftShape, Length(PlannedCode));
+    for K := 0 to High(MaskedShiftSource) do
+      MaskedShiftSource[K] := -1;
+    for K := 0 to High(PlannedCode) - 3 do
+      if (PlannedCode[K].Op = iroI32Const) and
+        (PlannedCode[K + 1].Op = iroI32And) and
+        (PlannedCode[K + 2].Op = iroI32Const) and
+        (PlannedCode[K + 3].Op = iroI32Shl) and
+        not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not SkipPlanned[K + 2] and not SkipPlanned[K + 3] and
+        not Targets[K] and not Targets[K + 1] and
+        not Targets[K + 2] and not Targets[K + 3] and
+        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
+        (SimpleUseCount(PlannedCode[K + 1].Dest) = 1) and
+        (SimpleUseCount(PlannedCode[K + 2].Dest) = 1) and
+        (PlannedCode[K + 1].Dest = PlannedCode[K + 3].A) and
+        (PlannedCode[K + 2].Dest = PlannedCode[K + 3].B) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not IsVisibleFrameReg(PlannedCode[K + 1].Dest) and
+        not IsVisibleFrameReg(PlannedCode[K + 2].Dest) then
+      begin
+        if PlannedCode[K + 1].A = PlannedCode[K].Dest then
+          Source := PlannedCode[K + 1].B
+        else if PlannedCode[K + 1].B = PlannedCode[K].Dest then
+          Source := PlannedCode[K + 1].A
+        else
+          Continue;
+        Mask := UInt32(PlannedCode[K].Imm);
+        if Mask = 0 then
+          Continue;
+        if Mask = High(UInt32) then
+          Width := 32
+        else
+        begin
+          if (Mask and (Mask + 1)) <> 0 then
+            Continue;
+          Width := 0;
+          while Mask <> 0 do
+          begin
+            Inc(Width);
+            Mask := Mask shr 1;
+          end;
+        end;
+        Shift := UInt32(PlannedCode[K + 2].Imm) and 31;
+        if UInt32(Width) + Shift > 32 then
+          Continue;
+        SkipPlanned[K] := True;
+        SkipPlanned[K + 1] := True;
+        SkipPlanned[K + 2] := True;
+        MaskedShiftSource[K + 3] := Integer(Source);
+        MaskedShiftShape[K + 3] := Shift or (UInt32(Width) shl 8);
+      end;
+  end;
+  {$ENDIF}
+
+  procedure AnalyzeMemoryMoves;
+  var
+    K, P, First: Integer;
+    Source, Temp: UInt32;
+
+    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+    begin
+      Result := (ASlot = AllocatedSlots[0]) or
+        (ASlot = AllocatedSlots[1]) or
+        ((AllocatedSlots[2] <> High(UInt32)) and
+          (ASlot = AllocatedSlots[2]));
+    end;
+
+    function ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
+    begin
+      Result := AOp in [
+        iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+        iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+        iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+        iroI64Load32S, iroI64Load32U,
+        iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+        iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+        iroI64Store32];
+    end;
+
+    function MemoryUseCount(const AReg: UInt32): UInt32;
+    var
+      J: Integer;
+    begin
+      Result := 0;
+      for J := 0 to High(AFn^.Code) do
+        if ScalarMemoryOp(AFn^.Code[J].Op) then
+        begin
+          if AFn^.Code[J].A = AReg then Inc(Result);
+          if (AFn^.Code[J].Op in [iroI32Store, iroI64Store, iroF32Store,
+            iroF64Store, iroI32Store8, iroI32Store16, iroI64Store8,
+            iroI64Store16, iroI64Store32]) and
+            (AFn^.Code[J].Dest = AReg) then
+            Inc(Result);
+        end;
+    end;
+
+  begin
+    {$IFDEF WASM_JIT_ARM64}
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) do
+      if ScalarMemoryOp(PlannedCode[K].Op) then
+      begin
+        First := K - 2;
+        if First < 0 then First := 0;
+        for P := K - 1 downto First do
+          if (PlannedCode[P].Op = iroMove) and not SkipPlanned[P] and
+            not Targets[P] and not Targets[K] then
+          begin
+            Source := PlannedCode[P].A;
+            Temp := PlannedCode[P].Dest;
+            if IsAllocatedSlot(Source) and
+              (SimpleUseCount(Temp) + MemoryUseCount(Temp) = 1) then
+            begin
+              if PlannedCode[K].A = Temp then
+              begin
+                PlannedCode[K].A := Source;
+                SkipPlanned[P] := True;
+              end
+              else if (PlannedCode[K].Op in [iroI32Store, iroI64Store,
+                iroF32Store, iroF64Store, iroI32Store8, iroI32Store16,
+                iroI64Store8, iroI64Store16, iroI64Store32]) and
+                (PlannedCode[K].Dest = Temp) then
+              begin
+                PlannedCode[K].Dest := Source;
+                SkipPlanned[P] := True;
+              end;
+            end;
+          end;
+      end;
+    {$ENDIF}
+  end;
+
+  procedure AnalyzeLocalAliases;
+  var
+    K, L, Last: Integer;
+    Source, Alias_: UInt32;
+
+    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+    begin
+      Result := (ASlot = AllocatedSlots[0]) or
+        (ASlot = AllocatedSlots[1]) or
+        ((AllocatedSlots[2] <> High(UInt32)) and
+          (ASlot = AllocatedSlots[2]));
+    end;
+
+    function FullUseCount(const ASlot: UInt32): UInt32;
+    var
+      N: Integer;
+    begin
+      Result := 0;
+      for N := 0 to High(AFn^.Code) do
+        case AFn^.Code[N].Op of
+          iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
+            if AFn^.Code[N].A = ASlot then Inc(Result);
+          iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+          iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+          iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+          iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+          iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+          iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
+            begin
+              if AFn^.Code[N].A = ASlot then Inc(Result);
+              if AFn^.Code[N].B = ASlot then Inc(Result);
+            end;
+          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+          iroI64Load32S, iroI64Load32U:
+            if AFn^.Code[N].A = ASlot then Inc(Result);
+          iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+          iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+          iroI64Store32:
+            begin
+              if AFn^.Code[N].A = ASlot then Inc(Result);
+              if AFn^.Code[N].Dest = ASlot then Inc(Result);
+            end;
+        end;
+    end;
+
+    function RewriteUse(var AIns: TWasmIrInstr; const AOld,
+      ANew: UInt32): Boolean;
+    begin
+      Result := False;
+      case AIns.Op of
+        iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz,
+        iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+        iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+        iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+        iroI64Load32S, iroI64Load32U:
+          if AIns.A = AOld then
+          begin
+            AIns.A := ANew;
+            Result := True;
+          end;
+        iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+        iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+        iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+        iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+        iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+        iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+        iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
+          begin
+            if AIns.A = AOld then
+            begin
+              AIns.A := ANew;
+              Result := True;
+            end;
+            if AIns.B = AOld then
+            begin
+              AIns.B := ANew;
+              Result := True;
+            end;
+          end;
+        iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+        iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+        iroI64Store32:
+          begin
+            if AIns.A = AOld then
+            begin
+              AIns.A := ANew;
+              Result := True;
+            end;
+            if AIns.Dest = AOld then
+            begin
+              AIns.Dest := ANew;
+              Result := True;
+            end;
+          end;
+      end;
+    end;
+
+    function DefinesSlot(const AIns: TWasmIrInstr;
+      const ASlot: UInt32): Boolean;
+    begin
+      Result := (AIns.Dest = ASlot) and
+        (AIns.Op in [iroMove, iroI32Const, iroI64Const, iroF32Const,
+          iroF64Const, iroI32Eqz, iroI64Eqz,
+          iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+          iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+          iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+          iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+          iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+          iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr,
+          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+          iroI64Load32S, iroI64Load32U]);
+    end;
+
+  begin
+    {$IFDEF WASM_JIT_ARM64}
+    { Validation lowers local.get to a move into a one-use expression slot.
+      In the helper-free base-pinned loop shape, forward that exact alias into
+      an already-cached consumer without changing the canonical IR or labels.
+      The four-instruction window covers the bounded lowering shapes while a
+      target, safepoint, or intervening write to the visible source ends the
+      proof. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if (PlannedCode[K].Op = iroMove) and not SkipPlanned[K] and
+        (not Targets[K] or IsAllocatedSlot(PlannedCode[K].A)) and
+        IsVisibleFrameReg(PlannedCode[K].A) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        (FullUseCount(PlannedCode[K].Dest) = 1) then
+      begin
+        Source := PlannedCode[K].A;
+        Alias_ := PlannedCode[K].Dest;
+        Last := K + 4;
+        if Last > High(PlannedCode) then
+          Last := High(PlannedCode);
+        for L := K + 1 to Last do
+        begin
+          if Targets[L] or IrInstrIsSafepoint(PlannedCode[L]) then
+            Break;
+          if SkipPlanned[L] then
+            Continue;
+          if RewriteUse(PlannedCode[L], Alias_, Source) then
+          begin
+            SkipPlanned[K] := True;
+            Break;
+          end;
+          if DefinesSlot(PlannedCode[L], Source) then
+            Break;
+        end;
+      end;
+    {$ENDIF}
+  end;
+
+  procedure AnalyzeStoreLoadForwarding;
+  var
+    K, L, Last: Integer;
+    StoreIns, LoadIns: TWasmIrInstr;
+
+    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+    begin
+      Result := (ASlot = AllocatedSlots[0]) or
+        (ASlot = AllocatedSlots[1]) or
+        ((AllocatedSlots[2] <> High(UInt32)) and
+          (ASlot = AllocatedSlots[2]));
+    end;
+
+  begin
+    {$IFDEF WASM_JIT_ARM64}
+    { This is deliberately not general memory value numbering. In the
+      helper-free, base-pinned shape, forward only across at most two pure
+      lowering moves to an exact same-address i32 load.
+      The store is still emitted and therefore keeps its normal fault/trap and
+      memory side effect; after it succeeds, the store-confined thread cannot
+      change that memory before the immediately following load. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+    begin
+      StoreIns := PlannedCode[K];
+      if SkipPlanned[K] or (StoreIns.Op <> iroI32Store) or
+        not IsAllocatedSlot(StoreIns.A) or
+        not IsAllocatedSlot(StoreIns.Dest) then
+        Continue;
+      Last := K + 3;
+      if Last > High(PlannedCode) then
+        Last := High(PlannedCode);
+      for L := K + 1 to Last do
+      begin
+        if Targets[L] then
+          Break;
+        LoadIns := PlannedCode[L];
+        if LoadIns.Op = iroI32Load then
+        begin
+          if not SkipPlanned[L] and
+            (LoadIns.A = StoreIns.A) and
+            (LoadIns.B = StoreIns.B) and
+            (LoadIns.Imm = StoreIns.Imm) and
+            (LoadIns.Dest <> StoreIns.A) and
+            (LoadIns.Dest <> StoreIns.Dest) and
+            not IsVisibleFrameReg(LoadIns.Dest) and
+            (SimpleUseCount(LoadIns.Dest) = 1) and
+            (L < High(PlannedCode)) and not Targets[L + 1] and
+            not SkipPlanned[L + 1] and
+            (PlannedCode[L + 1].Op = iroI32Add) then
+          begin
+            if PlannedCode[L + 1].A = LoadIns.Dest then
+            begin
+              PlannedCode[L + 1].A := StoreIns.Dest;
+              SkipPlanned[L] := True;
+            end
+            else if PlannedCode[L + 1].B = LoadIns.Dest then
+            begin
+              PlannedCode[L + 1].B := StoreIns.Dest;
+              SkipPlanned[L] := True;
+            end;
+          end;
+          Break;
+        end;
+        { At this analysis point only lowering moves can have been skipped;
+          they emit no code. A surviving move may be crossed only when it
+          cannot redefine the exact address or stored-value slot. Checking the
+          IR safepoint bit explicitly keeps this proof independent of move's
+          current non-safepoint classification. }
+        if (LoadIns.Op <> iroMove) or IrInstrIsSafepoint(LoadIns) then
+          Break;
+        if SkipPlanned[L] then
+          Continue;
+        if (LoadIns.Dest = StoreIns.A) or
+          (LoadIns.Dest = StoreIns.Dest) then
+          Break;
+      end;
+    end;
+    {$ENDIF}
+  end;
+
   function StaticCacheOp(const AOp: TWasmIrOp): Boolean;
   begin
     case AOp of
@@ -552,6 +1102,188 @@ var
           ScoreSlot(AIns.Dest);
         end;
     end;
+  end;
+
+  procedure CountSlotUse(const ASlot: UInt32);
+  begin
+    if ASlot < UInt32(Length(SlotUseCounts)) then
+      Inc(SlotUseCounts[ASlot]);
+  end;
+
+  procedure CountInstructionUses(const AIns: TWasmIrInstr);
+  var
+    N: Integer;
+  begin
+    case AIns.Op of
+      iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
+        CountSlotUse(AIns.A);
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr:
+        begin
+          CountSlotUse(AIns.A);
+          CountSlotUse(AIns.B);
+        end;
+      iroSelect:
+        begin
+          CountSlotUse(AIns.A);
+          CountSlotUse(AIns.B);
+          CountSlotUse(UInt32(AIns.Imm));
+        end;
+      iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+      iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+      iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+      iroI64Load32S, iroI64Load32U:
+        CountSlotUse(AIns.A);
+      iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+      iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+      iroI64Store32:
+        begin
+          CountSlotUse(AIns.A);
+          CountSlotUse(AIns.Dest);
+        end;
+      iroCall:
+        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, AIns.A)) - 1 do
+          CountSlotUse(IrAuxBlockItem(AFn^.AuxU32, AIns.A, UInt32(N)));
+    end;
+  end;
+
+  procedure AnalyzeDynamicWriteBack;
+  var
+    K: Integer;
+
+    procedure MarkLoopCarried(const AFirst, ALast: Integer);
+    var
+      Defined: array of Boolean;
+      Ins: TWasmIrInstr;
+      J, N: Integer;
+
+      procedure MarkUse(const ASlot: UInt32);
+      begin
+        if (ASlot < UInt32(Length(Defined))) and not Defined[ASlot] then
+          VisibleSlots[ASlot] := True;
+      end;
+
+      procedure MarkDefinition(const ASlot: UInt32);
+      begin
+        if ASlot < UInt32(Length(Defined)) then
+          Defined[ASlot] := True;
+      end;
+    begin
+      SetLength(Defined, AFn^.RegisterCount);
+      for N := AFirst to ALast do
+      begin
+        if SkipPlanned[N] or (Fusion[N] = -2) then
+          Continue;
+        Ins := PlannedCode[N];
+        if MaskedShiftSource[N] >= 0 then
+        begin
+          MarkUse(UInt32(MaskedShiftSource[N]));
+          MarkDefinition(Ins.Dest);
+          Continue;
+        end;
+        if Fusion[N] >= 0 then
+          Ins := PlannedCode[Fusion[N]]
+        else
+          Ins := PlannedCode[N];
+        case Ins.Op of
+          iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
+            MarkUse(Ins.A);
+          iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+          iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+          iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+          iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+          iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+          iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr:
+            begin
+              MarkUse(Ins.A);
+              MarkUse(Ins.B);
+            end;
+          iroSelect:
+            begin
+              MarkUse(Ins.A);
+              MarkUse(Ins.B);
+              MarkUse(UInt32(Ins.Imm));
+            end;
+          iroCall:
+            for J := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.A)) - 1 do
+              MarkUse(IrAuxBlockItem(AFn^.AuxU32, Ins.A, UInt32(J)));
+          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+          iroI64Load32S, iroI64Load32U:
+            MarkUse(Ins.A);
+          iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+          iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+          iroI64Store32:
+            begin
+              MarkUse(Ins.A);
+              MarkUse(Ins.Dest);
+            end;
+        end;
+        if Fusion[N] < 0 then
+          case Ins.Op of
+            iroMove, iroI32Const, iroI64Const, iroF32Const, iroF64Const,
+            iroI32Eqz, iroI64Eqz,
+            iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+            iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+            iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+            iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+            iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+            iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+            iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+            iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+            iroSelect,
+            iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+            iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+            iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+            iroI64Load32S, iroI64Load32U:
+              MarkDefinition(Ins.Dest);
+            iroCall:
+              for J := 0 to
+                Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.B)) - 1 do
+                MarkDefinition(IrAuxBlockItem(AFn^.AuxU32, Ins.B,
+                  UInt32(J)));
+          end;
+      end;
+    end;
+  begin
+    SetLength(SlotUseCounts, AFn^.RegisterCount);
+    SetLength(VisibleSlots, AFn^.RegisterCount);
+    for K := 0 to High(AFn^.LocalRegs) do
+      if AFn^.LocalRegs[K] < UInt32(Length(VisibleSlots)) then
+        VisibleSlots[AFn^.LocalRegs[K]] := True;
+    for K := 0 to High(AFn^.ResultRegs) do
+      if AFn^.ResultRegs[K] < UInt32(Length(VisibleSlots)) then
+        VisibleSlots[AFn^.ResultRegs[K]] := True;
+    for K := 0 to High(PlannedCode) do
+      if not SkipPlanned[K] then
+      begin
+        if MaskedShiftSource[K] >= 0 then
+          CountSlotUse(UInt32(MaskedShiftSource[K]))
+        else if Fusion[K] >= 0 then
+          CountInstructionUses(PlannedCode[Fusion[K]])
+        else if Fusion[K] <> -2 then
+          CountInstructionUses(PlannedCode[K]);
+      end;
+    { A finite lexical use count alone cannot see a use reached by a backward
+      edge. Preserve every slot read before it is redefined in each loop
+      region, while still allowing values produced inside the loop to die at
+      the back-edge flush. }
+    for K := 0 to High(PlannedCode) do
+      if (PlannedCode[K].Op = iroJump) and
+        (PlannedCode[K].A <= UInt32(K)) then
+        MarkLoopCarried(Integer(PlannedCode[K].A), K)
+      else if (PlannedCode[K].Op in [iroBranchIf, iroBranchIfNot]) and
+        (PlannedCode[K].B <= UInt32(K)) then
+        MarkLoopCarried(Integer(PlannedCode[K].B), K);
   end;
 
   procedure AnalyzeStaticCache;
@@ -668,14 +1400,41 @@ var
             UsePinnedMemoryBase := False;
       end;
   end;
+
 begin
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
   try
+    UseNativeScalarSelf := JitCanNativeScalarSelf(AFn, AFuncIdx);
+    UseNativeScalarLeaf := JitCanNativeScalarLeaf(AFn);
+    UseNativeScalarCore := UseNativeScalarSelf or UseNativeScalarLeaf;
+    NativeParamCount := 0;
+    NativeParamReg := 0;
+    NativeParam1Reg := 0;
+    NativeResultReg := 0;
+    NativeCoreLabel := -1;
+    NativeExhaustedLabel := -1;
+    NativeExternalLabel := -1;
+    if UseNativeScalarCore then
+    begin
+      NativeParamCount := AFn^.ParamCount;
+      NativeParamReg := AFn^.LocalRegs[0];
+      if NativeParamCount = 2 then
+        NativeParam1Reg := AFn^.LocalRegs[1];
+      NativeResultReg := AFn^.ResultRegs[0];
+    end;
     { One label per IR instruction, created in order so label id = IR index
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
+    if UseNativeScalarCore then
+    begin
+      NativeCoreLabel := Buf.NewLabel;
+      if UseNativeScalarSelf then
+        NativeExhaustedLabel := Buf.NewLabel;
+      if UseNativeScalarLeaf then
+        NativeExternalLabel := Buf.NewLabel;
+    end;
 
     { A cache is valid only along one straight-line predecessor. Mark every IR
       branch destination up front so a join invalidates compile-time cache
@@ -699,23 +1458,78 @@ begin
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
+    if UseNativeScalarCore then
+    begin
+      { x26 is unavailable to the shared native core cache: recursion pins its
+        additional-frame budget there, while a leaf uses the wider x14-x17
+        dynamic set and does not need a third static entry. }
+      AllocatedSlots[2] := High(UInt32);
+      { The native core seeds x12/x13 before any canonical register-file load;
+        use its bounded write-back cache rather than the ordinary entry loads. }
+      UseStaticCache := False;
+    end;
     UseThirdStatic := UseStaticCache and
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
+    AnalyzeMemoryMoves;
+    AnalyzeLocalAliases;
+    AnalyzeStoreLoadForwarding;
+    {$IFDEF WASM_JIT_ARM64}
+    AnalyzeMaskedShiftFusion;
+    {$ENDIF}
+    AnalyzeImmediateFusion;
     AnalyzeFusion;
+    {$IFDEF WASM_JIT_ARM64}
+    AnalyzeDynamicWriteBack;
+    {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
-    if UseThirdStatic then
+    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
+    if UseNativeScalarLeaf then
+    begin
+      Arm64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeCoreLabel,
+        NativeExternalLabel);
+      Buf.BindLabel(NativeExternalLabel);
+    end;
+    if UseExtendedFrame then
       Arm64EmitPrologueExtended(Buf)
     else
       Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if UseNativeScalarSelf then
+      Arm64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
       Arm64EmitPinMemory(Buf, PinnedMemoryIndex, UsePinnedMemoryBase);
+    if UseNativeScalarCore then
+    begin
+      { The external AAPCS entry owns the full callee-saved frame once. The
+        recursive path targets this position-independent local core directly. }
+      Arm64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+      if UseExtendedFrame then
+        Arm64EmitEpilogueExtended(Buf)
+      else
+        Arm64EmitEpilogue(Buf);
+      Buf.BindLabel(NativeCoreLabel);
+    end;
     Arm64InitRegCache(ArmCache);
     if UseStaticCache then
+    begin
       Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
+      if UsePinnedMemoryBase then
+        Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
+          @VisibleSlots[0], AFn^.RegisterCount);
+    end;
+    if UseNativeScalarCore then
+      { The closed helper-free native core may defer block-local numeric
+        stores. Calls flush only values the lexical liveness plan still needs;
+        generic call-bearing functions never enable this mode. }
+      Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
+    if UseNativeScalarCore then
+      Arm64SeedNativeCoreCache(ArmCache, NativeParamCount, NativeParamReg,
+        NativeParam1Reg, UseNativeScalarLeaf and not UseNativeScalarSelf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     X64EmitPrologue(Buf);
@@ -733,6 +1547,7 @@ begin
       if Targets[I] then
       begin
         {$IFDEF WASM_JIT_ARM64}
+        Arm64FlushDynamicRegCache(Buf, ArmCache);
         Arm64InvalidateRegCache(ArmCache);
         {$ENDIF}
         {$IFDEF WASM_JIT_X64}
@@ -747,19 +1562,34 @@ begin
         base (x23/rbp), which the entry receives freshly per invocation — no
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      if Fusion[I] >= 0 then
+      if MaskedShiftSource[I] >= 0 then
+      begin
+        Arm64EmitMaskedShiftCached(Buf, UInt32(MaskedShiftSource[I]),
+          PlannedCode[I].Dest, Byte(MaskedShiftShape[I] and $FF),
+          Byte(MaskedShiftShape[I] shr 8), ArmCache);
+        Emitted := True;
+      end
+      else if Fusion[I] >= 0 then
       begin
         Arm64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
           PlannedCode[I], ArmCache);
         Emitted := True;
       end
       else
-        Emitted := Arm64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
-          UInt32(I),
-          (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
-            (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
+      begin
+        if ImmediateFusion[I] then
+          Emitted := Arm64EmitOpCachedImmediate(Buf, PlannedCode[I],
+            ImmediateValues[I], ArmCache)
+        else
+          Emitted := Arm64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
+            UInt32(I),
+            (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
+              (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
-          UsePinnedMemory, UsePinnedMemoryBase, UseThirdStatic, ArmCache);
+            UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
+            UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
+            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache);
+      end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
       if Fusion[I] >= 0 then
@@ -786,6 +1616,15 @@ begin
     end;
 
     {$IFDEF WASM_JIT_ARM64}
+    if UseNativeScalarSelf then
+    begin
+      { All ordinary native-core paths return through iroReturn. Keep the rare
+        exhaustion helper out of line so successful recursive calls need no
+        branch around a per-call trap block. }
+      Buf.BindLabel(NativeExhaustedLabel);
+      Arm64EmitLoadImm32(Buf, 0, UInt32(Ord(wtkStackExhausted)));
+      Arm64EmitCallHelper(Buf, aohTrapKind);
+    end;
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
@@ -830,6 +1669,7 @@ begin
       begin
         FStore.Funcs[FCompiledAddrs[I]].CompiledEntry := nil;
         FStore.Funcs[FCompiledAddrs[I]].CompiledDirectEntry := nil;
+        FStore.Funcs[FCompiledAddrs[I]].CompiledNativeScalarEntry := nil;
       end;
     { We installed the hook (RegisterJit); clear it so a later call finds no
       dispatcher and runs interpreted. Normal use is one JIT context per store,
@@ -902,7 +1742,10 @@ begin
     then stays interpreted, which is always correct (jit-spec §4.3). Any other
     exception is a genuine internal fault and propagates. }
   try
-    FBuffers[N] := JitCompileToBuffer(Fn, WasmJitOffsets(FStore).StoreEpoch,
+    FBuffers[N] := JitCompileToBuffer(Fn,
+      FStore.Funcs[AAddr].Instance.Ir.FuncImportCount +
+        FStore.Funcs[AAddr].FuncIrIndex,
+      WasmJitOffsets(FStore).StoreEpoch,
       WasmJitOffsets(FStore).StoreEpochSnapshot,
       WasmJitOffsets(FStore).StoreJitHelperTable);
   except
@@ -918,6 +1761,8 @@ begin
   FStore.Funcs[AAddr].CompiledEntry := FBuffers[N].EntryPoint;
   if JitCanDirectCall(Fn) then
     FStore.Funcs[AAddr].CompiledDirectEntry := FBuffers[N].EntryPoint;
+  if JitCanNativeScalarLeaf(Fn) then
+    FStore.Funcs[AAddr].CompiledNativeScalarEntry := FBuffers[N].EntryPoint;
 
   N := Length(FCompiledAddrs);
   SetLength(FCompiledAddrs, N + 1);
@@ -976,6 +1821,9 @@ begin
   if JitCanDirectCall(IrFunctionFor(AAddr)) then
     FStore.Funcs[AAddr].CompiledDirectEntry :=
       FStore.Funcs[AAddr].CompiledEntry;
+  if JitCanNativeScalarLeaf(IrFunctionFor(AAddr)) then
+    FStore.Funcs[AAddr].CompiledNativeScalarEntry :=
+      FStore.Funcs[AAddr].CompiledEntry;
 
   N := Length(FCompiledAddrs);
   SetLength(FCompiledAddrs, N + 1);
@@ -992,6 +1840,18 @@ end;
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes;
+begin
+  { Preserve the pre-native staging surface for code-shape tests and callers
+    that do not have a module function index. High(UInt32) cannot match a
+    validated call target, so the proof-gated self-call ABI stays disabled. }
+  Result := JitStageFunctionBytes(AStore, AFn, High(UInt32), AEntryOffset,
+    ARegisterCount);
+end;
+
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AFn: PWasmIrFunctionRec; const AFuncIdx: UInt32;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
 {$IFDEF WASM_JIT_BACKEND}
 var
   Buf: TWasmCodeBuffer;
@@ -1005,7 +1865,8 @@ begin
   ARegisterCount := AFn^.RegisterCount;
   {$IFDEF WASM_JIT_BACKEND}
   try
-    Buf := JitCompileToBuffer(AFn, WasmJitOffsets(AStore).StoreEpoch,
+    Buf := JitCompileToBuffer(AFn, AFuncIdx,
+      WasmJitOffsets(AStore).StoreEpoch,
       WasmJitOffsets(AStore).StoreEpochSnapshot,
       WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
   except

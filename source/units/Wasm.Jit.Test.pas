@@ -276,6 +276,37 @@ begin
   ]);
 end;
 
+{ Acyclic non-tail self recursion entered after a host bumps the invocation
+  epoch. Ordinary calls are not safepoints: only IR-marked loop back-edges
+  poll. Therefore both tiers must finish rec(n), even though the shared epoch
+  now differs from the outer invocation snapshot. The native scalar self-call
+  path must not invent an extra poll merely because it lowers the call to BL.
+
+    import "e"."bump" (func)                    ; func 0
+    (func $rec (param i32) (result i32) ...)      ; func 1
+    (func $run (param i32) (result i32)
+      call 0  local.get 0  call 1)                ; func 2 }
+function EpochAcyclicRecModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(2, VecOf([BLit([$01, $65, $04, $62, $75, $6D, $70, $00, $00])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$01])])),
+    Sect(7, VecOf([
+      BLit([$03, $72, $65, $63, $00, $01]),
+      BLit([$03, $72, $75, $6E, $00, $02])])),
+    Sect(10, VecOf([
+      CodeEntry([$00,
+        $20, $00, $45, $04, $40, $41, $00, $0F, $0B,
+        $20, $00, $41, $01, $6B, $10, $01, $41, $01, $6A,
+        $0B]),
+      CodeEntry([$00, $10, $00, $20, $00, $10, $01, $0B])]))
+  ]);
+end;
+
 { --- Wave-3 modules: the call family (jit-spec §12.3 Wave 3) ------------
 
   Each is a complete module built from literal bytes so the shape under test is
@@ -312,6 +343,24 @@ begin
     Sect(10, VecOf([
       CodeEntry([$00, $20, $00, $20, $01, $6B, $0B]),
       CodeEntry([$00, $20, $00, $41, $07, $10, $00, $41, $01, $6A, $0B])]))
+  ]);
+end;
+
+{ A compiled caller enters a native-eligible leaf which overwrites its incoming
+  parameter before returning it. The seeded x12 cache entry must be updated;
+  retaining a second stale mapping returns the caller's original argument. }
+function LeafLocalSetModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00])])),
+    Sect(7, VecOf([
+      ExportEntry('helper', $00, 0),
+      ExportEntry('run', $00, 1)])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $41, $02, $21, $00, $20, $00, $0B]),
+      CodeEntry([$00, $20, $00, $10, $00, $0B])]))
   ]);
 end;
 
@@ -448,6 +497,39 @@ begin
       CodeEntry([$00,
         $20, $00, $45, $04, $40, $41, $00, $0F, $0B,
         $20, $00, $41, $01, $6B, $10, $00, $41, $01, $6A,
+        $0B])]))
+  ]);
+end;
+
+{ Two recursive results feed a select after both calls. The first result must
+  remain live across the second local-core BL even though it is not a visible
+  local/result slot and the condition selects it only afterward. Before the
+  native write-back liveness fix, analysis did not account for any of the
+  select's three source slots, allowing a dirty call result to be discarded
+  before the generic select reloaded the canonical register file.
+
+    (func $rec (param i32) (result i32)
+      (if (i32.lt_u (local.get 0) (i32.const 2))
+        (then (return (local.get 0))))
+      (select
+        (call $rec (i32.sub (local.get 0) (i32.const 1)))
+        (call $rec (i32.sub (local.get 0) (i32.const 2)))
+        (local.tee 0 (i32.const 1)))) }
+function NativeSelfSelectModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([ExportEntry('rec', $00, 0)])),
+    Sect(10, VecOf([
+      CodeEntry([$00,
+        $20, $00, $41, $02, $49, $04, $40,
+          $20, $00, $0F,
+        $0B,
+        $20, $00, $41, $01, $6B, $10, $00,
+        $20, $00, $41, $02, $6B, $10, $00,
+        $41, $01, $22, $00, $1B,
         $0B])]))
   ]);
 end;
@@ -654,6 +736,61 @@ begin
       $20, $01, $41, $01, $6A, $22, $01, { ++i }
       $20, $00, $49, $0D, $00,        { while i < n }
       $0B, $20, $02, $0B])]))
+  ]);
+end;
+
+{ The varying-address store/load pair used by the narrow aarch64 forwarding
+  plan. The store's memory effect is observable independently at address 4
+  after run(2), so reusing its value for the following load cannot accidentally
+  turn into deleting the store. }
+function MemForwardModuleBytes(const AMemoryPages: Byte = 1): TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, AMemoryPages])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $01, $03, $7F,                  { locals: i, acc, addr }
+      $03, $40,                       { loop }
+      $20, $01, $41, $FF, $FF, $00, $71, $41, $02, $74, $21, $03,
+      $20, $03, $20, $01, $36, $02, $00, { memory[addr] := i }
+      $20, $02, $20, $03, $28, $02, $00, $6A, $21, $02,
+      $20, $01, $41, $01, $6A, $21, $01,
+      $20, $01, $20, $00, $49, $0D, $00,
+      $0B, $20, $02, $0B])]))
+  ]);
+end;
+
+{ A loop parameter is a dynamic IR slot whose next use is reached through the
+  back edge rather than later in lexical order. The cached Arm64 path must
+  reconcile it at the jump even though ordinary remaining-use counting has
+  reached zero. The varying-address memory body keeps this on the optimized
+  helper-free path; after 100 iterations the last observed value is 106. }
+function MemLoopCarriedModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, $01])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $01, $06, $7F,                  { locals: i, acc, addr, seen, hot1, hot2 }
+      $41, $07,                       { loop-carried value = 7 }
+      $03, $00,                       { loop (param i32) (result i32) }
+      $22, $04, $41, $01, $6A,       { seen = carried; carried += 1 }
+      $20, $05, $41, $01, $6A, $21, $05,
+      $20, $05, $41, $01, $6A, $21, $05, { keep hot1 statically allocated }
+      $20, $06, $41, $01, $6A, $21, $06,
+      $20, $06, $41, $01, $6A, $21, $06, { keep hot2 statically allocated }
+      $20, $01, $41, $FF, $FF, $00, $71, $41, $02, $74, $21, $03,
+      $20, $03, $20, $01, $36, $02, $00, { memory[addr] := i }
+      $20, $02, $20, $03, $28, $02, $00, $6A, $21, $02,
+      $20, $01, $41, $01, $6A, $21, $01, { ++i }
+      $20, $01, $20, $00, $49, $0D, $00, { while i < n }
+      $0B, $1A, $20, $04, $0B])]))
   ]);
 end;
 
@@ -1101,6 +1238,15 @@ begin
     BLit([$00, $20, $00, $20, $01, $6A, $0B]), 'add');
 end;
 
+function MaskedShiftModuleBytes: TWasmBytes;
+begin
+  { (func (export "maskshift") (param i32) (result i32)
+      (i32.shl (i32.and (local.get 0) (i32.const 16383)) (i32.const 2))) }
+  Result := OneFunc(BLit([$60, $01, $7F, $01, $7F]),
+    BLit([$00, $20, $00, $41, $FF, $FF, $00, $71, $41, $02, $74, $0B]),
+    'maskshift');
+end;
+
 type
   TInputPair = record
     A, B: Int32;
@@ -1179,6 +1325,7 @@ type
     procedure TestForceCompileSetsEntry;
 
     procedure TestI32Arith;
+    procedure TestMaskedShiftFusion;
     procedure TestI64Arith;
     procedure TestI32Compare;
     procedure TestF64Ops;
@@ -1192,6 +1339,7 @@ type
     procedure TestUnreachable;
     procedure TestEpochInterruptDifferential;
     procedure TestEpochInterruptAcrossSeamToInterpCallee;
+    procedure TestEpochBumpBeforeAcyclicNativeRecursion;
 
     { --- Wave 3: the call family ------------------------------------- }
     procedure TestCallCompiledToCompiled;
@@ -1207,12 +1355,19 @@ type
     procedure TestTailCallMutual;
     procedure TestTailCallCrossTierBounded;
     procedure TestTailCallToHost;
+    procedure TestNativeScalarSelfProofGate;
+    procedure TestNativeScalarSelfSelectLiveness;
+    procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
+    procedure TestForwardedMemoryLoadKeepsStoreEffect;
+    procedure TestForwardedMemoryLoadKeepsStoreOobTrap;
+    procedure TestMemoryLocalAliasCodeShape;
     procedure TestMemoryLoopCache;
+    procedure TestMemoryLoopCarriedCache;
     procedure TestMemoryOobTraps;
     procedure TestMemory64MaxOffset;
     procedure TestMemorySizeGrow;
@@ -1595,6 +1750,10 @@ begin
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(True);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry =
     FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
+  {$IFDEF WASM_JIT_ARM64}
+  Expect<Boolean>(FStore.Funcs[AddAddr].CompiledNativeScalarEntry =
+    FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
+  {$ENDIF}
   Expect<Boolean>(FJit.ForceCompile(AddAddr)).ToBe(True);
   {$ELSE}
   Expect<Boolean>(Compiled).ToBe(False);
@@ -1697,6 +1856,13 @@ begin
       Expect<Boolean>(Compiled).ToBe(False);
       {$ENDIF}
     end;
+end;
+
+procedure TJitTests.TestMaskedShiftFusion;
+begin
+  Expect<Boolean>(DiffFresh(MaskedShiftModuleBytes, 'maskshift',
+    [MakeValueI32(Integer($DEADBEEF))])).ToBe(
+      {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
 procedure TJitTests.TestI64Arith;
@@ -2350,6 +2516,18 @@ begin
 end;
 
 
+procedure TJitTests.TestEpochBumpBeforeAcyclicNativeRecursion;
+begin
+  { The interpreted wrapper bumps Epoch after the outer invocation captured
+    its snapshot, then enters a proof-gated compiled recursive function whose
+    control flow has no loop back-edge. Calls are not epoch safepoints, so rec
+    must return normally under both tiers. }
+  FDiffHost := @JitBumpEpochCallback;
+  CompileExports(['rec']);
+  Expect<Boolean>(DiffModule(EpochAcyclicRecModuleBytes, 'run',
+    [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 { --- Wave 3: the call family (jit-spec §12.3 Wave 3) --------------------
 
   Every one of these is the same differential contract as the rest of the
@@ -2520,9 +2698,163 @@ begin
     [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestNativeScalarSelfProofGate;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+begin
+  { The native recursive ABI is intentionally a closed one-node proof, not a
+    general call optimization. This shape has one numeric parameter/result,
+    no locals, references, helpers, memory, or cross-function escape. }
+  Bytes := RecurseModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe({$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  { A one-slot numeric leaf has no internal call to accelerate and must not pay
+    the extended native frame merely because all of its operations are safe. }
+  Bytes := OneFunc(BLit([$60, $01, $7F, $01, $7F]),
+    BLit([$00, $20, $00, $0B]), 'id');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  { Two parameters remains outside the one-slot self-recursive ABI. The
+    separate native-leaf proof is exercised below. }
+  Bytes := AddModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+end;
+
+procedure TJitTests.TestNativeScalarSelfSelectLiveness;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+begin
+  Bytes := NativeSelfSelectModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe(
+      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  CompileExports(['rec']);
+  Expect<Boolean>(DiffModule(Bytes, 'rec',
+    [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestNativeScalarLeafProofAndExhaustion;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RunRegisterCount: UInt32;
+begin
+  { The optimized cross-function target is exactly the two-parameter numeric
+    helper in CallPairModuleBytes. Its caller is not a leaf because it calls;
+    a trapping division body is also refused. }
+  Bytes := CallPairModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[0])).ToBe(
+      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+    Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[1])).ToBe(False);
+    RunRegisterCount := Ir.Functions[1].RegisterCount;
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  Bytes := I32BinModule($6D, 'divs');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[0])).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  CompileExports(['helper', 'run']);
+  Expect<Boolean>(DiffModule(LeafLocalSetModuleBytes, 'run',
+    [MakeValueI32(1)])).ToBe(JIT_BACKEND_AVAILABLE);
+
+  { The lightweight call must enforce the same logical depth boundary as the
+    interpreter before touching native stack state. DiffModule also asserts
+    that the trapped invocation leaves Depth, ValueTop, and the GC frame clean. }
+  WasmInterpMaxDepth := 1;
+  try
+    CompileExports(['helper', 'run']);
+    Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
+      [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(CallPairModuleBytes, 'run',
+      [MakeValueI32(10)])).ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+
+  { Repeat with value capacity as the sole limiting resource. The outer run
+    frame fits exactly; entering the leaf would exceed the shared slot cap. }
+  WasmInterpValueSlots := RunRegisterCount;
+  try
+    CompileExports(['helper', 'run']);
+    Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
+      [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RegisterCount: UInt32;
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  Param, Res: TWasmValue;
+  Trapped: Boolean;
+  Msg: string;
 begin
   { NON-tail recursion must exhaust at the same LOGICAL depth under both tiers
     (jit-spec §13 item 2), because both carve their frames through the same
@@ -2544,6 +2876,82 @@ begin
       shrunk cap, which is read when each store's context is first created. }
     Expect<string>(TrapMessageOf(RecurseModuleBytes, 'rec',
       [MakeValueI32(4000)])).ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+
+  { Repeat the same exact-boundary sweep with VALUE capacity as the sole
+    limiting resource. The validated rec function's register count determines
+    the cap, so this remains exact if lowering changes its slot allocation. }
+  Bytes := RecurseModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    RegisterCount := Ir.Functions[0].RegisterCount;
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  WasmInterpMaxDepth := 256;
+  WasmInterpValueSlots := NativeUInt(RegisterCount) * 64;
+  try
+    for N := 58 to 70 do
+    begin
+      CompileExports(['rec']);
+      Expect<Boolean>(DiffModule(Bytes, 'rec', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    Expect<string>(TrapMessageOf(Bytes, 'rec', [MakeValueI32(4000)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+
+  { A native exhaustion longjmps before changing the published outer logical
+    frame. The invocation trampoline must retire that outer frame, after which
+    the same store and compiled entry are immediately reusable. }
+  WasmInterpMaxDepth := 64;
+  try
+    FBytes := RecurseModuleBytes;
+    DecodeModule(FBytes, FModule);
+    FIr := ValidateModule(FModule, FBytes);
+    FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+      NativeUInt(Length(FBytes)), FImports);
+    RegisterInterpreter(FStore);
+    Expect<Boolean>(FInstance.FindExport('rec', Kind, Addr)).ToBe(True);
+    FJit := RegisterJit(FStore);
+    Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+
+    Param := MakeValueI32(4000);
+    Res.Bits := 0;
+    Trapped := False;
+    Msg := '';
+    try
+      InterpInvoke(FStore, Addr, @Param, @Res);
+    except
+      on E: EWasmTrap do
+      begin
+        Trapped := True;
+        Msg := E.Message;
+      end;
+    end;
+    Expect<Boolean>(Trapped).ToBe(True);
+    Expect<string>(Msg).ToBe('call stack exhausted');
+    Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+    Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
+
+    Param := MakeValueI32(4);
+    Res.Bits := High(UInt64);
+    InterpInvoke(FStore, Addr, @Param, @Res);
+    Expect<Integer>(Res.I32).ToBe(4);
+    Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+    Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
   finally
     WasmInterpMaxDepth := 256;
   end;
@@ -2580,10 +2988,82 @@ begin
     [MakeValueI32(0)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+procedure TJitTests.TestForwardedMemoryLoadKeepsStoreEffect;
+var
+  Addr: UInt32;
+  Kind: TWasmExternKind;
+  Params, Results: array[0 .. 0] of TWasmValue;
+  Stored: UInt32;
+begin
+  FBytes := MemForwardModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    NativeUInt(Length(FBytes)), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  if not FInstance.FindExport('run', Kind, Addr) then
+    raise EWasmError.Create('no export named run');
+  Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+  Params[0] := MakeValueI32(2);
+  Results[0].Bits := High(UInt64);
+  InterpInvoke(FStore, Addr, @Params[0], @Results[0]);
+  Expect<UInt64>(Results[0].Bits).ToBe(1);
+  Move(FStore.MemAddressAt(FInstance.MemAddrs[0], 4, 0, 4)^,
+    Stored, SizeOf(Stored));
+  Expect<UInt32>(Stored).ToBe(1);
+end;
+
+procedure TJitTests.TestForwardedMemoryLoadKeepsStoreOobTrap;
+var
+  Bytes: TWasmBytes;
+begin
+  { With a zero-page memory, run(1)'s first exact store/load pair is out of
+    bounds. The forwarding plan skips only the load and must leave the original
+    store in place as the trapping access. }
+  Bytes := MemForwardModuleBytes(0);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(1)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(1)]))
+    .ToBe('out of bounds memory access');
+end;
+
+procedure TJitTests.TestMemoryLocalAliasCodeShape;
+{$IFDEF WASM_JIT_ARM64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_ARM64}
+  FBytes := MemForwardModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, @FIr.Functions[0], EntryOffset,
+    RegisterCount);
+  { The bounded local aliases remove seven loop-body copies while every
+    original IR label remains represented. Pin the resulting A64 shape so the
+    transform cannot silently stop applying while differential behavior stays
+    correct. }
+  Expect<Integer>(Length(Code)).ToBe(196);
+  Expect<NativeUInt>(EntryOffset).ToBe(0);
+  Expect<UInt32>(RegisterCount).ToBe(FIr.Functions[0].RegisterCount);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestMemoryLoopCache;
 begin
   Expect<Boolean>(DiffFresh(MemLoopModuleBytes, 'run', [MakeValueI32(100)]))
     .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
+procedure TJitTests.TestMemoryLoopCarriedCache;
+begin
+  Expect<Boolean>(DiffFresh(MemLoopCarriedModuleBytes, 'run',
+    [MakeValueI32(100)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
 procedure TJitTests.TestMemoryOobTraps;
@@ -2872,6 +3352,8 @@ begin
   Test('JIT i32.add is bitwise identical to the interpreter',
     TestMilestoneAddIdentical);
   Test('i32 arithmetic/logic/shift match the interpreter', TestI32Arith);
+  Test('a bounded masked shift matches the interpreter',
+    TestMaskedShiftFusion);
   Test('i64 arithmetic/logic/shift match the interpreter', TestI64Arith);
   Test('i32 compares and eqz match the interpreter', TestI32Compare);
   Test('f64 ops (incl. NaN) match the interpreter bitwise', TestF64Ops);
@@ -2890,6 +3372,8 @@ begin
     TestEpochInterruptDifferential);
   Test('a compiled caller''s interrupt reaches an interpreted callee across the seam',
     TestEpochInterruptAcrossSeamToInterpCallee);
+  Test('an epoch bump before acyclic native recursion does not invent a safepoint',
+    TestEpochBumpBeforeAcyclicNativeRecursion);
 
   Test('a compiled function calling a compiled function matches',
     TestCallCompiledToCompiled);
@@ -2911,14 +3395,28 @@ begin
   Test('1e6 alternating compiled<->interpreted return_calls run in bounded stack',
     TestTailCallCrossTierBounded);
   Test('return_call to a host function matches', TestTailCallToHost);
+  Test('native scalar self-call proof accepts only its closed one-slot subset',
+    TestNativeScalarSelfProofGate);
+  Test('native scalar self-call keeps both select inputs live',
+    TestNativeScalarSelfSelectLiveness);
+  Test('native scalar leaf calls preserve proof and exhaustion boundaries',
+    TestNativeScalarLeafProofAndExhaustion);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',
     TestThrowAcrossCompiledFrameCaught);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
+  Test('a forwarded memory load keeps the store memory effect',
+    TestForwardedMemoryLoadKeepsStoreEffect);
+  Test('a forwarded memory load keeps the store out-of-bounds trap',
+    TestForwardedMemoryLoadKeepsStoreOobTrap);
+  Test('a scalar memory loop forwards bounded local aliases',
+    TestMemoryLocalAliasCodeShape);
   Test('a scalar memory loop retains cached values identically',
     TestMemoryLoopCache);
+  Test('a scalar memory loop reconciles dynamic loop-carried values',
+    TestMemoryLoopCarriedCache);
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);
   Test('memory64 maximum offset compiles and traps identically',
     TestMemory64MaxOffset);

@@ -101,6 +101,7 @@ type
   TWasmActivation = record
     Fn: PWasmIrFunction;             { the code being run; borrowed, stable }
     Instance: TWasmModuleInstance;   { borrowed; owns index spaces + ids }
+    FuncAddrs: PUInt32;              { stable instance-owned direct-call map }
     IP: UInt32;                      { index into Fn^.Code }
     Base: NativeUInt;                { register 0 = Values[Base] }
     GcFrame: TWasmGcFrame;           { the collector's view of this frame }
@@ -133,6 +134,8 @@ type
     Acts: PWasmActivation;           { GetMem(DepthCap * SizeOf activation) }
     DepthCap: NativeUInt;
     Depth: NativeUInt;               { number of live activations }
+    FuncsSlot: PWasmFuncInsts;       { stable address of Store.Funcs }
+    GcFrameSlot: PPWasmGcFrame;      { stable address of Heap.FFrames }
   end;
 
   { O-J5: the register-file / frame offsets the JIT's generated code reads
@@ -146,21 +149,42 @@ type
     CtxValues: NativeUInt;           { TWasmInterpContext.Values }
     CtxValueTop: NativeUInt;         { TWasmInterpContext.ValueTop }
     CtxValueCap: NativeUInt;         { TWasmInterpContext.ValueCap }
+    CtxActs: NativeUInt;             { TWasmInterpContext.Acts }
+    CtxDepthCap: NativeUInt;         { TWasmInterpContext.DepthCap }
     CtxDepth: NativeUInt;            { TWasmInterpContext.Depth }
+    CtxFuncsSlot: NativeUInt;        { TWasmInterpContext.FuncsSlot }
+    CtxGcFrameSlot: NativeUInt;      { TWasmInterpContext.GcFrameSlot }
     ActStride: NativeUInt;           { SizeOf(TWasmActivation) }
     ActBase: NativeUInt;             { TWasmActivation.Base }
+    ActFn: NativeUInt;               { TWasmActivation.Fn }
+    ActInstance: NativeUInt;         { TWasmActivation.Instance }
+    ActFuncAddrs: NativeUInt;        { TWasmActivation.FuncAddrs }
+    ActIP: NativeUInt;               { TWasmActivation.IP }
+    ActGcFrame: NativeUInt;          { TWasmActivation.GcFrame }
+    ActRetKind: NativeUInt;          { TWasmActivation.RetKind }
+    ActRetDest: NativeUInt;          { TWasmActivation.RetDest }
+    ActRetCount: NativeUInt;         { TWasmActivation.RetCount }
+    ActRetBase: NativeUInt;          { TWasmActivation.RetBase }
+    ActEntryResults: NativeUInt;     { TWasmActivation.EntryResults }
+    GcFramePrev: NativeUInt;         { TWasmGcFrame.Prev }
     GcFrameSlots: NativeUInt;        { TWasmGcFrame.Slots }
     GcFrameRefRegBits: NativeUInt;   { TWasmGcFrame.RefRegBits }
     GcFrameRegisterCount: NativeUInt;{ TWasmGcFrame.RegisterCount }
+    GcFrameInstance: NativeUInt;     { TWasmGcFrame.Instance }
   end;
 
-  { The two live values a generated direct-call site needs after the shared
-    frame helper has resolved and entered a compiled callee. Kept pointer-only
-    so both native backends use the same 16-byte stack layout. }
+  { The live values a generated direct-call site needs after the shared frame
+    helper has resolved and entered a compiled callee. The scalar-result leaf
+    also receives the already-resolved context, activation and GC-chain slot,
+    so it can retire the frame without re-walking Pascal object graphs. }
   PWasmJitDirectCallState = ^TWasmJitDirectCallState;
   TWasmJitDirectCallState = record
     RegBase: PWasmValue;
     IrBase: PWasmIrInstr;
+    Ctx: PWasmInterpContext;
+    Entry: PWasmActivation;
+    GcFrameSlot: PPWasmGcFrame;
+    ScalarResultReg: UInt32;
   end;
 
 var
@@ -295,7 +319,13 @@ procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
 function JitPrepareDirectCall(const AStore: TWasmStore;
   const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
   const AState: PWasmJitDirectCallState): Pointer; cdecl;
+function JitPrepareDirectCallScalar(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
+  const AState: PWasmJitDirectCallState): Pointer; cdecl;
 procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
+procedure JitFinishDirectCallScalar(const ACtx: PWasmInterpContext;
+  const AEntry: PWasmActivation; const AFrameBase: PWasmValue;
+  const AResultReg: UInt32; const AGcFrameSlot: PPWasmGcFrame); cdecl;
 
 { O-J5: the register-file / frame offsets the JIT hard-codes (see the record
   above). Layout-only; the co-located test asserts them. }
@@ -307,7 +337,7 @@ const
     template's byte layout, a pinned-register reassignment, the entry-ABI shape.
     Bump it whenever position-independent codegen changes in a way that would
     make an existing artifact's bytes wrong. }
-  AOT_ABI_REVISION = 4;
+  AOT_ABI_REVISION = 12;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -615,6 +645,7 @@ begin
   Callee := @ACtx^.Acts[ACtx^.Depth];
   Callee^.Fn := CalleeFn;
   Callee^.Instance := CalleeInst;
+  Callee^.FuncAddrs := @CalleeInst.FuncAddrs[0];
   Callee^.Base := NewBase;
   Callee^.IP := 0;
   ACtx^.ValueTop := NewBase + CalleeFn^.RegisterCount;
@@ -690,6 +721,7 @@ begin
   ACtx^.Store.Heap.PopFrame;
   ATop^.Fn := CalleeFn;
   ATop^.Instance := CalleeInst;
+  ATop^.FuncAddrs := @CalleeInst.FuncAddrs[0];
   ATop^.IP := 0;
   ACtx^.ValueTop := ATop^.Base + CalleeFn^.RegisterCount;
 
@@ -3040,6 +3072,8 @@ begin
   Result^.Values := PWasmValue((NativeUInt(Result^.ValuesRaw) + 15)
     and not NativeUInt(15));
   Result^.Acts := GetMem(Result^.DepthCap * SizeOf(TWasmActivation));
+  Result^.FuncsSlot := @AStore.Funcs;
+  Result^.GcFrameSlot := AStore.Heap.FrameSlot;
 end;
 
 { The store's TierContextFree hook: releases the two reservations and the
@@ -3136,6 +3170,7 @@ begin
   Entry := @ACtx^.Acts[ACtx^.Depth];
   Entry^.Fn := AFn;
   Entry^.Instance := AInst;
+  Entry^.FuncAddrs := @AInst.FuncAddrs[0];
   Entry^.Base := ACtx^.ValueTop;
   Entry^.IP := 0;
   ACtx^.ValueTop := Entry^.Base + AFn^.RegisterCount;
@@ -3230,6 +3265,70 @@ begin
     AState^.IrBase := @Fn^.Code[0]
   else
     AState^.IrBase := nil;
+  AState^.Ctx := Ctx;
+  Result := FuncInst^.CompiledDirectEntry;
+end;
+
+function JitPrepareDirectCallScalar(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
+  const AState: PWasmJitDirectCallState): Pointer; cdecl;
+var
+  Ctx: PWasmInterpContext;
+  Inst: TWasmModuleInstance;
+  Addr: TWasmFuncAddr;
+  FuncInst: ^TWasmFuncInst;
+  Fn: PWasmIrFunction;
+  Entry: PWasmActivation;
+  Slots: PWasmValue;
+  I: Integer;
+begin
+  Result := nil;
+  Ctx := PWasmInterpContext(AStore.TierContext);
+  Inst := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+  Addr := Inst.FuncAddrs[UInt32(AFuncIdx)];
+  FuncInst := @AStore.Funcs[Addr];
+  if (FuncInst^.Kind <> wfkWasm) or
+    (FuncInst^.CompiledDirectEntry = nil) then
+    Exit;
+
+  Fn := @FuncInst^.Instance.Ir.Functions[FuncInst^.FuncIrIndex];
+  if (Ctx^.Depth >= Ctx^.DepthCap) or
+    (Ctx^.ValueTop + Fn^.RegisterCount > Ctx^.ValueCap) then
+    TrapNow(wtkStackExhausted);
+
+  Entry := @Ctx^.Acts[Ctx^.Depth];
+  Entry^.Fn := Fn;
+  Entry^.Instance := FuncInst^.Instance;
+  Entry^.FuncAddrs := FuncInst^.DirectMeta.FuncAddrs;
+  Entry^.Base := Ctx^.ValueTop;
+  Entry^.IP := 0;
+  Ctx^.ValueTop := Entry^.Base + Fn^.RegisterCount;
+  Slots := Frame(Ctx^.Values, Entry^.Base);
+  I := 0;
+  while I < Length(Fn^.EntryZeroRegs) do
+  begin
+    Slots[Fn^.EntryZeroRegs[I]].Bits := 0;
+    Inc(I);
+  end;
+  Slots[Fn^.LocalRegs[0]] := AArgs[0];
+
+  Entry^.RetKind := rtCaller;
+  Entry^.RetCount := 0;
+  Entry^.RetDest := nil;
+  Entry^.RetBase := 0;
+  Entry^.EntryResults := AResults;
+  PushGcFrame(Ctx, Entry, Fn, Entry^.Base);
+  Inc(Ctx^.Depth);
+
+  AState^.RegBase := Slots;
+  if Length(Fn^.Code) > 0 then
+    AState^.IrBase := @Fn^.Code[0]
+  else
+    AState^.IrBase := nil;
+  AState^.Ctx := Ctx;
+  AState^.Entry := Entry;
+  AState^.GcFrameSlot := Ctx^.Store.Heap.FrameSlot;
+  AState^.ScalarResultReg := Fn^.ResultRegs[0];
   Result := FuncInst^.CompiledDirectEntry;
 end;
 
@@ -3270,6 +3369,42 @@ begin
   Dec(Ctx^.Depth);
 end;
 
+{$IFDEF CPUAARCH64}
+procedure JitFinishDirectCallScalar(const ACtx: PWasmInterpContext;
+  const AEntry: PWasmActivation; const AFrameBase: PWasmValue;
+  const AResultReg: UInt32; const AGcFrameSlot: PPWasmGcFrame); cdecl;
+  assembler; nostackframe;
+asm
+  { AAPCS64: x0=Ctx, x1=Entry, x2=FrameBase, w3=ResultReg,
+    x4=&Heap.FFrames. These layout constants are asserted by
+    TestJitFrameOffsetsMatchLayout. }
+  ldr x5, [x1, #112]       { EntryResults }
+  ldr x6, [x2, x3, lsl #3]
+  str x6, [x5]
+  ldr x5, [x1, #40]        { GcFrame.Prev }
+  str x5, [x4]
+  ldr x5, [x1, #32]        { Base }
+  str x5, [x0, #32]        { ValueTop }
+  ldr x5, [x0, #56]        { Depth }
+  sub x5, x5, #1
+  str x5, [x0, #56]
+end;
+{$ELSE}
+procedure JitFinishDirectCallScalar(const ACtx: PWasmInterpContext;
+  const AEntry: PWasmActivation; const AFrameBase: PWasmValue;
+  const AResultReg: UInt32; const AGcFrameSlot: PPWasmGcFrame); cdecl;
+begin
+  { A one-slot result cannot be v128, whose flat ABI width is two slots. The
+    validated call-site result arity therefore makes this a complete scalar
+    specialization of JitFinishDirectCall, without inspecting a run-time type
+    tag or walking the generic result-shape loop. }
+  AEntry^.EntryResults[0] := AFrameBase[AResultReg];
+  AGcFrameSlot^ := AEntry^.GcFrame.Prev;
+  ACtx^.ValueTop := AEntry^.Base;
+  Dec(ACtx^.Depth);
+end;
+{$ENDIF}
+
 function WasmJitFrameOffsets: TWasmJitFrameOffsets;
 var
   C: TWasmInterpContext;
@@ -3281,12 +3416,28 @@ begin
   Result.CtxValues := PtrUInt(@C.Values) - PtrUInt(@C);
   Result.CtxValueTop := PtrUInt(@C.ValueTop) - PtrUInt(@C);
   Result.CtxValueCap := PtrUInt(@C.ValueCap) - PtrUInt(@C);
+  Result.CtxActs := PtrUInt(@C.Acts) - PtrUInt(@C);
+  Result.CtxDepthCap := PtrUInt(@C.DepthCap) - PtrUInt(@C);
   Result.CtxDepth := PtrUInt(@C.Depth) - PtrUInt(@C);
+  Result.CtxFuncsSlot := PtrUInt(@C.FuncsSlot) - PtrUInt(@C);
+  Result.CtxGcFrameSlot := PtrUInt(@C.GcFrameSlot) - PtrUInt(@C);
   Result.ActStride := SizeOf(TWasmActivation);
   Result.ActBase := PtrUInt(@A.Base) - PtrUInt(@A);
+  Result.ActFn := PtrUInt(@A.Fn) - PtrUInt(@A);
+  Result.ActInstance := PtrUInt(@A.Instance) - PtrUInt(@A);
+  Result.ActFuncAddrs := PtrUInt(@A.FuncAddrs) - PtrUInt(@A);
+  Result.ActIP := PtrUInt(@A.IP) - PtrUInt(@A);
+  Result.ActGcFrame := PtrUInt(@A.GcFrame) - PtrUInt(@A);
+  Result.ActRetKind := PtrUInt(@A.RetKind) - PtrUInt(@A);
+  Result.ActRetDest := PtrUInt(@A.RetDest) - PtrUInt(@A);
+  Result.ActRetCount := PtrUInt(@A.RetCount) - PtrUInt(@A);
+  Result.ActRetBase := PtrUInt(@A.RetBase) - PtrUInt(@A);
+  Result.ActEntryResults := PtrUInt(@A.EntryResults) - PtrUInt(@A);
+  Result.GcFramePrev := PtrUInt(@G.Prev) - PtrUInt(@G);
   Result.GcFrameSlots := PtrUInt(@G.Slots) - PtrUInt(@G);
   Result.GcFrameRefRegBits := PtrUInt(@G.RefRegBits) - PtrUInt(@G);
   Result.GcFrameRegisterCount := PtrUInt(@G.RegisterCount) - PtrUInt(@G);
+  Result.GcFrameInstance := PtrUInt(@G.Instance) - PtrUInt(@G);
 end;
 
 { FNV-1a hashing wraps modulo 2^64 by design, so overflow/range checks must be
@@ -3327,6 +3478,18 @@ begin
   Fold(JO.FuncKind);
   Fold(JO.FuncCompiledEntry);
   Fold(JO.FuncCompiledDirectEntry);
+  Fold(JO.FuncCompiledNativeScalarEntry);
+  Fold(JO.FuncDirectMeta);
+  Fold(JO.DirectMetaFn);
+  Fold(JO.DirectMetaIrBase);
+  Fold(JO.DirectMetaFuncAddrs);
+  Fold(JO.DirectMetaEntryZeroRegs);
+  Fold(JO.DirectMetaRefRegBits);
+  Fold(JO.DirectMetaRegisterCount);
+  Fold(JO.DirectMetaEntryZeroCount);
+  Fold(JO.DirectMetaParam0Reg);
+  Fold(JO.DirectMetaParam1Reg);
+  Fold(JO.DirectMetaResult0Reg);
   Fold(JO.FuncCallCount);
   Fold(JO.MemInstStride);
   Fold(JO.MemBase);
@@ -3336,12 +3499,28 @@ begin
   Fold(FO.CtxValues);
   Fold(FO.CtxValueTop);
   Fold(FO.CtxValueCap);
+  Fold(FO.CtxActs);
+  Fold(FO.CtxDepthCap);
   Fold(FO.CtxDepth);
+  Fold(FO.CtxFuncsSlot);
+  Fold(FO.CtxGcFrameSlot);
   Fold(FO.ActStride);
   Fold(FO.ActBase);
+  Fold(FO.ActFn);
+  Fold(FO.ActInstance);
+  Fold(FO.ActFuncAddrs);
+  Fold(FO.ActIP);
+  Fold(FO.ActGcFrame);
+  Fold(FO.ActRetKind);
+  Fold(FO.ActRetDest);
+  Fold(FO.ActRetCount);
+  Fold(FO.ActRetBase);
+  Fold(FO.ActEntryResults);
+  Fold(FO.GcFramePrev);
   Fold(FO.GcFrameSlots);
   Fold(FO.GcFrameRefRegBits);
   Fold(FO.GcFrameRegisterCount);
+  Fold(FO.GcFrameInstance);
 
   Fold(SizeOf(TWasmIrInstr));
   Fold(SizeOf(TWasmValue));

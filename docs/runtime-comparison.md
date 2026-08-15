@@ -88,9 +88,9 @@ so they are absent rather than relabelled as one.
 ## Method
 
 The reusable harness is in
-[`tools/runtime-comparison/`](../tools/runtime-comparison/README.md). It:
+[`tools/runtime-comparison/`](../tools/runtime-comparison/README.md). It now:
 
-1. assembles four checked WAT fixtures and validates the resulting binaries;
+1. assembles eleven checked WAT fixtures and validates the resulting binaries;
 2. precompiles all available artifacts and populates wazero's native cache;
 3. verifies every command exits successfully before accepting a timing;
 4. holds `/tmp/wasmlight-perf-gate.lock` for the complete measurement;
@@ -119,6 +119,15 @@ instantiation, a 2,000-iteration loop, and one host call. The heavy workloads
 use the same boundary but are long enough to be dominated by guest execution.
 They are not in-process call microbenchmarks.
 
+The expanded suite keeps materially different runtime costs separate: paired
+memory traffic, load-only traffic, store-only traffic, generic cross-function
+calls, repeated `memory.grow`, GC allocation with a bounded live root set,
+dependent SIMD arithmetic, and repeated WASI host calls. Every fixture checks
+its final value or invariant before a successful `proc_exit`. Workloads are
+capability-scoped rather than weakened to the least capable peer: unsupported
+runtime cells are recorded as unavailable. See the harness README for the
+current capability matrix.
+
 The substantive compiled-workload spreads were 0.38–4.24%, except wazero's
 memory result at 29.69%; treat that cell as directional. Startup spreads were
 3.48–16.02%, expected for 2–9 ms process measurements. wasmlight's interpreter
@@ -127,16 +136,14 @@ loop spread was 17.08%; other heavy interpreter cells were below 10%.
 ## What this does not establish
 
 - It is one Apple Silicon host, not a cross-platform ranking.
-- It does not measure compilation time, peak RSS, host-call throughput,
-  multi-instance density, or concurrent stores.
-- Four small kernels do not predict a full application mix.
+- It does not measure compilation time, peak RSS, repeated instantiation
+  throughput, multi-instance density, or concurrent stores.
+- Eleven focused kernels do not predict a full application mix.
 - No security or correctness ranking follows from speed. Conformance claims
   require each project's own pinned corpus and exact feature configuration.
 - WAMR AOT/JIT still needs a native arm64 `wamrc` build before its performance
   ceiling can be compared fairly.
 
-The next useful benchmark expansion is host-call and instantiation throughput,
-followed by one real toolchain-compiled WASI application. For runtime
-optimization, the current evidence says to profile recursive call/return first,
-then the memory chokepoint, while protecting wasmlight's startup and artifact
-size advantages.
+The next useful benchmark expansion is repeated instantiation throughput and
+one real toolchain-compiled WASI application. The focused kernels should remain
+diagnostic inputs rather than be treated as an application-level ranking.

@@ -3465,7 +3465,10 @@ begin
         X64EmitLea(ABuf, X64_ARG2, X64_RSP, 0);                  { args }
         X64EmitLea(ABuf, X64_ARG3, X64_RSP, Int32(ArgBytes));    { results }
         X64EmitLea(ABuf, X64_ARG4, X64_RSP, Int32(StateOffset)); { state }
-        X64EmitCallHelper(ABuf, aohDirectCallPrepare);
+        if (ArgN = 1) and (ResN = 1) then
+          X64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
+        else
+          X64EmitCallHelper(ABuf, aohDirectCallPrepare);
         X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);     { test rax,rax }
         X64EmitJccTo(ABuf, X64_CC_E, UInt32(FallbackLabel));
         X64EmitMovRegReg(ABuf, X64_R11, X64_RAX);                { entry }
@@ -3474,8 +3477,24 @@ begin
         X64EmitLoadMem64(ABuf, X64_ARG2, X64_RSP,
           Int32(StateOffset + X64_SLOT_SIZE));
         X64EmitCallReg(ABuf, X64_R11);
-        X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
-        X64EmitCallHelper(ABuf, aohDirectCallFinish);
+        if (ArgN = 1) and (ResN = 1) then
+        begin
+          X64EmitLoadMem64(ABuf, X64_ARG0, X64_RSP,
+            Int32(StateOffset + 2 * X64_SLOT_SIZE));
+          X64EmitLoadMem64(ABuf, X64_ARG1, X64_RSP,
+            Int32(StateOffset + 3 * X64_SLOT_SIZE));
+          X64EmitLoadMem64(ABuf, X64_ARG2, X64_RSP, Int32(StateOffset));
+          X64EmitLoadMem32(ABuf, X64_ARG3, X64_RSP,
+            Int32(StateOffset + 5 * X64_SLOT_SIZE));
+          X64EmitLoadMem64(ABuf, X64_ARG4, X64_RSP,
+            Int32(StateOffset + 4 * X64_SLOT_SIZE));
+          X64EmitCallHelper(ABuf, aohDirectCallFinishScalar)
+        end
+        else
+        begin
+          X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+          X64EmitCallHelper(ABuf, aohDirectCallFinish);
+        end;
         X64EmitJmpTo(ABuf, UInt32(DoneLabel));
         ABuf.BindLabel(FallbackLabel);
         X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
@@ -3899,6 +3918,10 @@ begin
     GX64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
     GX64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
     GX64HelperTable[aohResolveMemory] := @X64ResolveMemory;
+    GX64HelperTable[aohDirectCallFinishScalar] :=
+      @JitFinishDirectCallScalar;
+    GX64HelperTable[aohDirectCallPrepareScalar] :=
+      @JitPrepareDirectCallScalar;
     GX64HelperTableFilled := True;
   end;
   Result := @GX64HelperTable[aohTrapKind];

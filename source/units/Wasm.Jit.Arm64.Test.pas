@@ -51,6 +51,7 @@ type
     procedure TestWordBuilderBits;
     procedure TestFrameWordBits;
     procedure TestBranchPlaceholderBits;
+    procedure TestLocalCallPatch;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWave2;
     procedure TestCallArityFence;
@@ -58,8 +59,13 @@ type
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
     procedure TestStaticCacheKeepsShiftResult;
+    procedure TestStaticCacheUsesHostRegsForAlu;
+    procedure TestStaticAndMissingSourcesUseHostRegs;
+    procedure TestDynamicDestReservation;
+    procedure TestExtendedCachedEmitterEntry;
     procedure TestThirdStaticAllocation;
     procedure TestExtendedFrameWords;
+    procedure TestDynamicWriteBackSpillsOnlyLiveValues;
 
     procedure TestExecAddTemplate;
     procedure TestExecAddWraps;
@@ -112,8 +118,12 @@ begin
   Expect<UInt32>(Arm64UdivX(9, 9, 10)).ToBe($9ACA0929);
   Expect<UInt32>(Arm64MsubW(9, 11, 10, 9)).ToBe($1B0AA569);
   Expect<UInt32>(Arm64AndW(0, 1, 2)).ToBe($0A020020);
+  Expect<UInt32>(Arm64AndLowMaskImmW(9, 12, 14)).ToBe($12003589);
+  Expect<UInt32>(Arm64LslImmW(9, 16, 2)).ToBe($531E7609);
+  Expect<UInt32>(Arm64AddImmW(9, 15, 1)).ToBe($110005E9);
   Expect<UInt32>(Arm64OrrW(0, 1, 2)).ToBe($2A020020);
   Expect<UInt32>(Arm64EorW(0, 1, 2)).ToBe($4A020020);
+  Expect<UInt32>(Arm64UbfizW(9, 14, 2, 14)).ToBe($531E35C9);
   Expect<UInt32>(Arm64LslvW(0, 1, 2)).ToBe($1AC22020);
   Expect<UInt32>(Arm64LsrvW(0, 1, 2)).ToBe($1AC22420);
   Expect<UInt32>(Arm64AsrvW(0, 1, 2)).ToBe($1AC22820);
@@ -164,6 +174,7 @@ begin
     its marshaling buffer. These four are the load-bearing words. }
   Expect<UInt32>(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 32))
     .ToBe($D10083FF);                                    { sub sp,sp,#32 }
+  Expect<UInt32>(Arm64SubsImmX(26, 26, 1)).ToBe($F100075A);
   Expect<UInt32>(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 32))
     .ToBe($910083FF);                                    { add sp,sp,#32 }
   Expect<UInt32>(Arm64AddImmX(2, ARM64_REG_SP, 0)).ToBe($910003E2); { mov x2,sp }
@@ -181,6 +192,13 @@ begin
   Expect<UInt32>(Arm64LdpX23X24Off32).ToBe($A94263F7);
   Expect<UInt32>(Arm64LdpX21X22Off16).ToBe($A9415BF5);
   Expect<UInt32>(Arm64LdpX19X20PostIndex64).ToBe($A8C453F3);
+  { The lightweight recursive core preserves only x19 and its incoming link. }
+  Expect<UInt32>(Arm64StpX19Lr(64)).ToBe($A9047BF3);
+  Expect<UInt32>(Arm64LdpX19Lr(64)).ToBe($A9447BF3);
+  { The budgeted core combines a 112-byte frame allocation/retirement with
+    that pair save/restore using signed pre/post-index forms. }
+  Expect<UInt32>(Arm64StpX19LrPre(112)).ToBe($A9B97BF3);
+  Expect<UInt32>(Arm64LdpX19LrPost(112)).ToBe($A8C77BF3);
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
@@ -240,6 +258,110 @@ begin
   end;
 end;
 
+procedure TArm64Tests.TestStaticCacheUsesHostRegsForAlu;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..1] of UInt32;
+  Visible: array[0..1] of Boolean;
+begin
+  UseCounts[0] := 1;
+  UseCounts[1] := 1;
+  Visible[0] := True;
+  Visible[1] := True;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 2);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 0, 0, 1, 0), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    { Two initial static loads followed directly by add w12,w12,w13: cached
+      sources still consume their planned uses and the destination stays dirty. }
+    Expect<Integer>(Buf.Size).ToBe(3 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 2)).ToBe(
+      Arm64AddW(ARM64_REG_CACHE0, ARM64_REG_CACHE0, ARM64_REG_CACHE1));
+    Expect<UInt32>(UseCounts[0]).ToBe(0);
+    Expect<UInt32>(UseCounts[1]).ToBe(0);
+    Expect<Boolean>(Cache.Entries[0].Dirty).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestStaticAndMissingSourcesUseHostRegs;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..3] of UInt32;
+  Visible: array[0..3] of Boolean;
+begin
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[0] := 1;
+  UseCounts[2] := 1;
+  Visible[0] := True;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 4);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 3, 0, 2, 0), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    { The static left source stays in x12. The missing right source is loaded
+      directly into x14, and the result is reserved in x15. }
+    Expect<Integer>(Buf.Size).ToBe(4 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 2)).ToBe(
+      Arm64LdrX(ARM64_REG_CACHE2, ARM64_REG_REGFILE, 2 * ARM64_SLOT_SIZE));
+    Expect<UInt32>(EmittedWord(Buf, 3)).ToBe(
+      Arm64AddW(ARM64_REG_CACHE3, ARM64_REG_CACHE0, ARM64_REG_CACHE2));
+    Expect<UInt32>(UseCounts[0]).ToBe(0);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestDynamicDestReservation;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..3] of UInt32;
+  Visible: array[0..3] of Boolean;
+begin
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[0] := 2;
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 4);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroMove, 2, 0, 0, 0), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 3, 0, 2, 0), Aux,
+      1, False, False, False, False, Cache)).ToBe(True);
+    { The move writes x14 directly from x12; the add then reserves non-source
+      x15 and consumes x12/x14 without scratch shuffles. }
+    Expect<Integer>(Buf.Size).ToBe(4 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 2)).ToBe(
+      Arm64MovReg(ARM64_REG_CACHE2, ARM64_REG_CACHE0));
+    Expect<UInt32>(EmittedWord(Buf, 3)).ToBe(
+      Arm64AddW(ARM64_REG_CACHE3, ARM64_REG_CACHE0, ARM64_REG_CACHE2));
+    Expect<UInt32>(UseCounts[0]).ToBe(0);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+    Expect<Boolean>(Cache.Entries[3].Dirty).ToBe(True);
+    Expect<Boolean>(Cache.Entries[4].Dirty).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TArm64Tests.TestThirdStaticAllocation;
 var
   Buf: TWasmCodeBuffer;
@@ -256,6 +378,24 @@ begin
   end;
 end;
 
+procedure TArm64Tests.TestExtendedCachedEmitterEntry;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64InitRegCache(Cache);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 0, 0, 0, 7), Aux,
+      0, False, False, False, False, True, 1, 0, 0, 0, 0, Cache)).ToBe(True);
+    Expect<Boolean>(Buf.Size > 0).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TArm64Tests.TestExtendedFrameWords;
 var
   Buf: TWasmCodeBuffer;
@@ -263,10 +403,10 @@ begin
   Buf := TWasmCodeBuffer.Create;
   try
     Arm64EmitPrologueExtended(Buf);
-    Expect<Integer>(Buf.Size).ToBe(10 * SizeOf(UInt32));
+    Expect<Integer>(Buf.Size).ToBe(11 * SizeOf(UInt32));
     Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
       Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
-    Expect<UInt32>(EmittedWord(Buf, 9)).ToBe(
+    Expect<UInt32>(EmittedWord(Buf, 10)).ToBe(
       Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
   finally
     Buf.Free;
@@ -286,12 +426,81 @@ begin
   end;
 end;
 
+procedure TArm64Tests.TestDynamicWriteBackSpillsOnlyLiveValues;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..9] of UInt32;
+  Visible: array[0..9] of Boolean;
+  I: Integer;
+begin
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0],
+      Length(UseCounts));
+    for I := 0 to 4 do
+      Expect<Boolean>(Arm64EmitOpCached(Buf,
+        MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
+        UInt32(I), False, False, False, False, Cache)).ToBe(True);
+    { The fifth value evicts the first after its last use count reached zero.
+      Two static loads plus two words per constant: no canonical spill. }
+    Expect<Integer>(Buf.Size).ToBe(12 * SizeOf(UInt32));
+  finally
+    Buf.Free;
+  end;
+
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0],
+      Length(UseCounts));
+    for I := 0 to 4 do
+      Expect<Boolean>(Arm64EmitOpCached(Buf,
+        MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
+        UInt32(I), False, False, False, False, Cache)).ToBe(True);
+    { Slot 2 still has a future use, so its eviction writes one canonical
+      value before x14 is reassigned. }
+    Expect<Integer>(Buf.Size).ToBe(13 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 11)).ToBe(
+      Arm64StrX(ARM64_REG_CACHE2, ARM64_REG_REGFILE,
+        Arm64SlotByteOffset(2)));
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TArm64Tests.TestBranchPlaceholderBits;
 begin
   Expect<UInt32>(Arm64BPlaceholder).ToBe($14000000);
+  Expect<UInt32>(Arm64BlPlaceholder).ToBe($94000000);
   Expect<UInt32>(Arm64BCondPlaceholder(ARM64_COND_EQ)).ToBe($54000000);
   Expect<UInt32>(Arm64CbzWPlaceholder(9)).ToBe($34000009);
   Expect<UInt32>(Arm64CbnzWPlaceholder(9)).ToBe($35000009);
+end;
+
+procedure TArm64Tests.TestLocalCallPatch;
+var
+  Buf: TWasmCodeBuffer;
+  Target: TWasmJitLabel;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Target := Buf.NewLabel;
+    Arm64EmitBlTo(Buf, Target);
+    Buf.EmitU32(Arm64Ret);
+    Buf.BindLabel(Target);
+    Arm64ResolvePatches(Buf);
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe($94000002);
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TArm64Tests.TestSlotOffset;
@@ -677,6 +886,7 @@ begin
   Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
   Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
+  Test('local BL patches stay position-independent', TestLocalCallPatch);
   Test('slot byte offset is register*8', TestSlotOffset);
   Test('predicate covers waves 2-6 (only EH is declined)',
     TestPredicateCoversWave2);
@@ -690,10 +900,20 @@ begin
     TestStaticCacheKeepsFourTemporaries);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
+  Test('static allocation feeds ALU host registers directly',
+    TestStaticCacheUsesHostRegsForAlu);
+  Test('static and missing ALU sources stay in host registers',
+    TestStaticAndMissingSourcesUseHostRegs);
+  Test('dynamic destinations reserve a non-source cache register',
+    TestDynamicDestReservation);
+  Test('cached emission keeps compatibility and explicit native entries',
+    TestExtendedCachedEmitterEntry);
   Test('static allocation can retain a third long-lived slot',
     TestThirdStaticAllocation);
   Test('the extended frame preserves its third static register',
     TestExtendedFrameWords);
+  Test('dynamic write-back spills live values and discards dead values',
+    TestDynamicWriteBackSpillsOnlyLiveValues);
   Test('executes the i32.add template over a register file', TestExecAddTemplate);
   Test('i32.add template wraps at 2^32 and clears the high half',
     TestExecAddWraps);

@@ -1,5 +1,165 @@
 # Handoff
 
+Updated: 2026-08-15 (generic scalar direct-call specialization)
+
+## Two-argument cross-function call path
+
+- Started `codex/optimize-generic-direct-calls` from exact delivery head
+  `cda57e8a762cffebf91f5482988d88e128cbae33`. The untouched release baseline
+  and its AOT artifact remain under `/tmp/wasmlight-call-generic-base.ThFhCN`.
+- The accepted Arm64 specialization covers direct calls to proof-gated numeric
+  leaves with one or two parameters and one result. Eligible callees contain
+  no calls, memory operations, references, allocation/GC, handlers,
+  safepoints, or trapping operations. All other targets retain the existing
+  direct-frame or generic/interpreted/host path.
+- A lightweight caller checks the exact shared depth and value-slot limits
+  before native-stack mutation, transfers scalar arguments in x12/x13, and
+  receives the result in x12. The leaf uses a bounded numeric-only native
+  register file and a wider x12-x17 write-back cache. Canonical external entry,
+  live Store.Funcs indirection, AOT PIC, trampoline unwinding, and tier fallback
+  remain intact. AOT ABI revision 12 rejects older incompatible artifacts.
+- Serialized command-level A/B for 50 million checked two-argument calls,
+  compilation excluded, one warm-up and seven paired samples under
+  `/tmp/wasmlight-perf-gate.lock`: forward baseline/candidate medians
+  722.307/143.581 ms; reverse candidate/baseline 145.594/728.319 ms. This is
+  about 80% faster (roughly 5x). Same-schedule Wasmtime 47.0.3 was 63.861 ms,
+  leaving Wasmlight at about 2.25x on this deliberately call-dominated test.
+- Final seven-sample both-order guard medians (baseline/candidate forward,
+  candidate/baseline reverse) were: scalar loop 390.123/390.195 and
+  390.891/390.848 ms; varying memory 26.398/24.239 and 19.204/22.298; loads
+  48.602/47.657 and 47.244/42.051; stores 42.620/38.538 and 38.862/42.209;
+  memory growth 13.926/14.066 and 13.887/13.861; GC allocation
+  131.028/130.549 and 131.248/131.043; SIMD 24.304/24.324 and
+  24.301/24.153; host calls 35.626/35.525 and 35.852/35.398; startup
+  2.710/2.641 and 2.466/2.592 ms. Short memory/startup rows show reversing
+  process noise, not an order-independent regression.
+- The first pinned-core run exposed three `local.set` divergences: redefining a
+  native leaf parameter could create a dynamic duplicate of its seeded cache
+  entry and later read the stale input. Marking x12/x13 as fixed cache entries
+  corrected it; a focused compiled-to-compiled local.set regression now pins
+  the failure, along with explicit leaf proof rejection and exact depth/value
+  exhaustion cleanup tests.
+- Final macOS/aarch64 gates: frozen install, format, agents, diff check, clean
+  release and development builds, and all 44 suites pass. The pinned 257-file
+  core corpus is exactly 65,188 pass and zero fail/skip/staged/errors in
+  interpreter/JIT/AOT; JIT and AOT compile 8,703 functions. Linux/x86-64 in
+  OrbStack (`wasmx64`, FPC 3.2.2, LWPT 0.6.0) also passes clean release/dev
+  builds, all 44 suites, and the same corpus identity with 8,704 compiled
+  functions in JIT/AOT. The x64 native backend remains on its generic path.
+- Rejected and reverted: a per-instance native call table was slower and added
+  mutable metadata; pinning the caller's FuncAddrs map removed eleven lookup
+  instructions but regressed final medians to 149-163 ms. Neither experiment
+  remains in the tree. Delivery is tracked by PR #6
+  (`https://github.com/frostney/wasmlight/pull/6`); no rebase or force operation
+  was performed.
+
+Updated: 2026-08-15 (runtime comparison expanded)
+
+## Diagnostic runtime workloads
+
+- The default runtime-comparison suite now has eleven self-checking workloads.
+  Seven new fixtures separate cache-resident linear-memory loads, stores,
+  generic two-parameter cross-function calls, 4,096 one-page `memory.grow`
+  operations, bounded-live-set GC allocation, dependent i32x4 SIMD, and one
+  million WASI monotonic-clock host calls.
+- `bench.py` owns a workload registry with descriptions, assembler selection,
+  and verified runtime support. Capability-heavy workloads are not weakened to
+  fit old peers: GC runs on wasmlight and Wasmtime, SIMD on wasmlight,
+  Wasmtime, Wasmer, WasmEdge, and wazero, and host-call everywhere except
+  wasm3. Missing cells render as unavailable in Markdown and the existing PR
+  comment renderer. GC uses `wasm-tools parse` because WABT 1.0.41 does not
+  accept the current Core 3.0 GC text forms.
+- A seven-sample rotated best-profile run passed for all new applicable
+  configurations. Apple M5 Max wasmlight/Wasmtime medians in ms were:
+  load 46.702/33.111, store 39.013/28.915, generic call 725.350/64.599,
+  memory-grow 14.584/16.173, GC 131.539/29.696, SIMD 24.063/5.959, and host
+  call 36.040/39.732. These are diagnostic observations, not CI thresholds.
+- A separate interpreter smoke run passed every applicable runtime/workload
+  combination. All eleven modules also prepared and validated together from
+  the final release build. Generated modules, artifacts, and reports remain
+  under ignored `build/runtime-comparison/`.
+- Added four Python harness tests covering registry/source completeness, GC
+  parser and capability scope, unsupported-config omission, and unavailable
+  table cells; the four existing PR-comment tests remain green.
+- Gates: frozen install, clean dev and release builds (3/3 each), full unit
+  suite 44/44, Python tests 8/8, format 90/90, generated-agent check,
+  Markdown lint 42 files, Python byte-compilation, and diff whitespace all
+  pass. No runtime implementation or conformance behavior changed, so the
+  pinned external corpus was not rerun for this benchmark-only patch.
+
+Updated: 2026-08-15 (runtime optimization goal reached)
+
+## Within 1.5x of Wasmtime
+
+- Fetched the remote default and started the clean
+  `codex/optimize-within-1-5x-wasmtime` branch from exact
+  `origin/main@c20a7d1c6c8312996b8c8d910b577fd1215f46e9`. No rebase,
+  force-push, PR, or remote push was used.
+- Retained exact-main release binaries under
+  `/tmp/wasmlight-c20a7d1-baseline.ZSMAeO/`. The initial Apple M5 Max
+  best-profile medians were startup 2.859 ms (0.63x Wasmtime), loop
+  538.488 ms (1.54x), fib(35) 369.757 ms (10.45x), and varying-address
+  memory 87.262 ms (4.50x).
+- The final measured runtime source head is
+  `68bc95303ee5617028233cfc0cd5747af6c1a7e3`. The full command-level
+  `best` profile used precompiled artifacts, compilation outside the timer,
+  self-checking modules, one warm-up, seven samples, rotated runtime order,
+  and `/tmp/wasmlight-perf-gate.lock`. Final medians versus same-schedule
+  Wasmtime 47.0.3 were:
+  - startup: 2.147 vs 3.480 ms = 0.617x;
+  - loop: 364.166 vs 333.697 ms = 1.091x;
+  - fib: 31.522 vs 32.001 ms = 0.985x;
+  - memory: 21.625 vs 16.891 ms = 1.280x.
+  Every workload is below the agreed 1.5x ceiling. Raw samples and metadata
+  are retained at `/tmp/wasmlight-final-68bc953/results.json`.
+- The accepted aarch64 memory waves defer loop write-back, fold bounded
+  immediate/local/memory operands, combine low-mask shifts with `UBFIZ`, use
+  cached sources and destinations, forward exact store-load pairs, and
+  propagate bounded local aliases. Every optimization is restricted to the
+  existing helper-free, zero-offset, i32 guard-page/static-cache proof shape;
+  stores and first OOB traps remain observable, CFG joins/backedges reconcile
+  live state, and x64 analysis remains unchanged. The final memory workload is
+  1.28x Wasmtime, down from 4.50x.
+- The accepted call waves progressively specialized scalar compiled frames,
+  emitted proof-gated native self-recursion, factored one external AAPCS
+  wrapper from a PIC local core, pinned an exact depth/value-frame budget in
+  x26, and use x12 as a one-slot local-core parameter/result ABI with bounded
+  lexical write-back. The native subset excludes references, helpers, memory,
+  handlers, host/interpreted/cross-function/indirect/tail escape, and retains
+  generic fallback for every other call. Cap checks precede mutation; longjmp
+  owns abnormal cleanup; actual IR backedge epoch polls remain unchanged.
+- Independent review caught two tier-identity defects before closure. Commit
+  `8f6849724f1c641cb5e5b94838b7375b94a0670c` removed an invented epoch poll
+  from ordinary native self-calls and added host-epoch-bump JIT/AOT
+  regressions. Commit `28eb4d5c1cfd17ba696dfcfa5b60eeab3ab3aa54`
+  completed lexical and loop-carried liveness accounting for rotate, select,
+  and call operands/results; its two-self-call select fixture fails without
+  the correction. A final independent re-review found no remaining concrete
+  cache, budget, AAPCS/PIC/AOT, epoch, longjmp, GC, or tier-divergence issue.
+  AOT ABI revision 11 rejects artifacts generated by the superseded layouts
+  and faulty liveness analysis.
+- Rejected and reverted candidates include direct cached memory operands
+  before deferred write-back (0.4%), several local-slot/cache/immediate loop
+  experiments that regressed or overlapped noise, a bounded MADD fusion
+  (0.77-1.53%, below the materiality gate), and broad call-bearing static
+  caching (fib regressed from about 63 to 71 ms). A narrow write-back prototype
+  missing a return flush produced a wrong AOT result and was fixed before any
+  acceptance measurement.
+- Final macOS/aarch64 gates on the exact final runtime tree: frozen install,
+  clean release and development builds, format, generated-agent reference,
+  diff check, Markdown lint, and all 44 suites pass. The pinned 257-script core
+  corpus is byte-identical across interpreter/JIT/AOT at 65,188 pass and zero
+  fail/skip/staged/errors; JIT/AOT compile 8,703 functions.
+- Final Linux/x86-64 proof used OrbStack's native amd64 VM, FPC 3.2.2, the
+  checksum-verified LWPT 0.6.0 release, and an exact `git archive` of
+  `68bc953`. Clean release and development builds plus all 44 suites pass. The
+  same pinned core corpus is byte-identical at 65,188/0/0/0 in all tiers;
+  x64 JIT/AOT compile 8,704 functions. VM evidence remains under
+  `/tmp/wasmlight-x64-final.XCWobI/` inside `wasmx64`.
+- The delivery branch is intentionally local and unpushed. The measured source
+  head is followed only by this handoff update; no runtime code or generated
+  artifact changes after `68bc953`.
+
 Updated: 2026-08-15 (PR runtime-comparison gate and sticky report)
 
 ## PR runtime-comparison gate
