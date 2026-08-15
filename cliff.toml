@@ -23,12 +23,15 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim }}
 {% for commit in commits %}
-  - {{ commit.message | split(pat="\n") | first | trim }}
+- {{ commit.message | split(pat="\n") | first | trim }}
 {%- endfor %}
-{% endfor %}\n
+{% endfor %}
 """
 footer = ""
-trim = true
+trim = false
+postprocessors = [
+  { pattern = "\\n+$", replace = "" },
+]
 
 [git]
 conventional_commits = true
@@ -40,6 +43,11 @@ sort_commits = "newest"
 
 commit_parsers = [
   { message = "^chore\\(release\\)", skip = true },
+  { message = "^Initial commit$", skip = true },
+  { message = "^(Complete section body decoding|Validation and IR|Interpreter|Runner|SIMD|Embedding|JIT part 1|More JIT|Even more JIT|AOT)", group = "New Features" },
+  { message = "^Bugfixes$", group = "Bug Fixes" },
+  { message = "^Doc updates$", group = "Documentation" },
+  { message = "^bench", group = "Performance" },
   { message = "^feat",     group = "New Features" },
   { message = "^fix",      group = "Bug Fixes" },
   { message = "^perf",     group = "Performance" },

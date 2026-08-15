@@ -1,5 +1,39 @@
 # Handoff
 
+Updated: 2026-08-15 (post-v1 roadmap and 0.1.0 release)
+
+## Durable roadmap and release decisions
+
+- `ROADMAP-260815.md` is the source-verified comparison against Wasmtime,
+  Wasmer, WasmEdge, WAMR, wazero, and wasm3 at recorded source heads. It
+  classifies feature gaps and records the accepted post-v1 sequence.
+- Release the completed pinned-Core-3 runtime as `0.1.0` before feature
+  expansion. The user separately authorized publication through the official
+  project-local `create-release` workflow on 2026-08-15.
+- `0.2.0` completes and governs embedding: table/tag coverage, instance
+  composition, resource policy, epoch configuration, and ordinary JIT policy.
+- `0.3.0` wires `wasi-testsuite` and completes the 19 missing non-network WASI
+  Preview 1 functions. Sockets remain a later, separately approved capability
+  slice over pre-granted handles in `wasi_snapshot_preview1`.
+- `0.4.0` adds operational observability. Async hosting is deferred to the
+  Component Model re-entry so the runtime designs one suspension mechanism
+  against the selected Component Model and WASI async ABI.
+- After the re-entry gate is met, the Component Model and current WASI
+  generation become the next strategic standards programme. Threads remain a
+  separate demand-led programme because they reverse ADR-0008.
+- Exact-main CI run 31899074165 passed all six configured targets. The four
+  64-bit UNIX legs proved interpreter/JIT/AOT tally identity; the Windows legs
+  proved the interpreter.
+- The first-release publisher is unambiguous: no workflow owns a tag or GitHub
+  release, so `create-release` owns one unprefixed `0.1.0` tag and one GitHub
+  release from the committed changelog. There is no binary or registry publish.
+- The local release gate passed on the prepared diff: frozen install, format,
+  generated-agent check, all three builds, all 44 unit suites, all Markdown,
+  and `git diff --check`.
+- Milestone, issue, Component Model, threads, and socket implementation remain
+  separately confirmation-gated. Live PR, CI, tag, and release state must be
+  verified from GitHub rather than inferred from this handoff.
+
 Updated: 2026-08-15 (x64 scalar-call specialization)
 
 ## x64 scalar leaf calls and self-recursion
