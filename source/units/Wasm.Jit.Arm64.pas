@@ -237,6 +237,11 @@ function Arm64OrrX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64EorW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64EorX(const ARd, ARn, ARm: Byte): UInt32;
 
+{ UBFIZ Wd,Wn,lsb,width: retain the low width bits and shift them left by
+  lsb. The bounded (x & low_mask) << shift address idiom maps to this one
+  instruction when width + shift <= 32. }
+function Arm64UbfizW(const ARd, ARn, ALsb, AWidth: Byte): UInt32;
+
 { Variable shifts/rotates (LSLV/LSRV/ASRV/RORV); the shift amount is taken
   modulo the register width by the hardware, exactly wasm's `count and (N-1)`. }
 function Arm64LslvW(const ARd, ARn, ARm: Byte): UInt32;
@@ -490,6 +495,9 @@ function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
 function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AValue: UInt32;
   var ACache: TArm64RegCache): Boolean;
+procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
+  const ASource, ADest: UInt32; const AShift, AWidth: Byte;
+  var ACache: TArm64RegCache);
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
 
@@ -2725,6 +2733,12 @@ begin
   Result := $CA000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
 end;
 
+function Arm64UbfizW(const ARd, ARn, ALsb, AWidth: Byte): UInt32;
+begin
+  Result := $53000000 or (UInt32((32 - ALsb) and 31) shl 16) or
+    (UInt32(AWidth - 1) shl 10) or (UInt32(ARn) shl 5) or ARd;
+end;
+
 function Arm64LslvW(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $1AC02000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
@@ -3628,6 +3642,15 @@ begin
         Byte(AValue and 31)));
   end;
   Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+end;
+
+procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
+  const ASource, ADest: UInt32; const AShift, AWidth: Byte;
+  var ACache: TArm64RegCache);
+begin
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ASource);
+  ABuf.EmitU32(Arm64UbfizW(ARM64_REG_T0, ARM64_REG_T0, AShift, AWidth));
+  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, ADest);
 end;
 
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;

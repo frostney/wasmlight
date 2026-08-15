@@ -357,6 +357,8 @@ var
   SkipPlanned: array of Boolean;
   ImmediateFusion: array of Boolean;
   ImmediateValues: array of UInt32;
+  MaskedShiftSource: array of Integer;
+  MaskedShiftShape: array of UInt32;
   UseStaticCache: Boolean;
   UseThirdStatic: Boolean;
   UsePinnedMemory: Boolean;
@@ -513,6 +515,69 @@ var
       end;
     {$ENDIF}
   end;
+
+  {$IFDEF WASM_JIT_ARM64}
+  procedure AnalyzeMaskedShiftFusion;
+  var
+    K, Width: Integer;
+    Mask, Shift: UInt32;
+    Source: UInt32;
+  begin
+    SetLength(MaskedShiftSource, Length(PlannedCode));
+    SetLength(MaskedShiftShape, Length(PlannedCode));
+    for K := 0 to High(MaskedShiftSource) do
+      MaskedShiftSource[K] := -1;
+    for K := 0 to High(PlannedCode) - 3 do
+      if (PlannedCode[K].Op = iroI32Const) and
+        (PlannedCode[K + 1].Op = iroI32And) and
+        (PlannedCode[K + 2].Op = iroI32Const) and
+        (PlannedCode[K + 3].Op = iroI32Shl) and
+        not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not SkipPlanned[K + 2] and not SkipPlanned[K + 3] and
+        not Targets[K] and not Targets[K + 1] and
+        not Targets[K + 2] and not Targets[K + 3] and
+        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
+        (SimpleUseCount(PlannedCode[K + 1].Dest) = 1) and
+        (SimpleUseCount(PlannedCode[K + 2].Dest) = 1) and
+        (PlannedCode[K + 1].Dest = PlannedCode[K + 3].A) and
+        (PlannedCode[K + 2].Dest = PlannedCode[K + 3].B) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not IsVisibleFrameReg(PlannedCode[K + 1].Dest) and
+        not IsVisibleFrameReg(PlannedCode[K + 2].Dest) then
+      begin
+        if PlannedCode[K + 1].A = PlannedCode[K].Dest then
+          Source := PlannedCode[K + 1].B
+        else if PlannedCode[K + 1].B = PlannedCode[K].Dest then
+          Source := PlannedCode[K + 1].A
+        else
+          Continue;
+        Mask := UInt32(PlannedCode[K].Imm);
+        if Mask = 0 then
+          Continue;
+        if Mask = High(UInt32) then
+          Width := 32
+        else
+        begin
+          if (Mask and (Mask + 1)) <> 0 then
+            Continue;
+          Width := 0;
+          while Mask <> 0 do
+          begin
+            Inc(Width);
+            Mask := Mask shr 1;
+          end;
+        end;
+        Shift := UInt32(PlannedCode[K + 2].Imm) and 31;
+        if UInt32(Width) + Shift > 32 then
+          Continue;
+        SkipPlanned[K] := True;
+        SkipPlanned[K + 1] := True;
+        SkipPlanned[K + 2] := True;
+        MaskedShiftSource[K + 3] := Integer(Source);
+        MaskedShiftShape[K + 3] := Shift or (UInt32(Width) shl 8);
+      end;
+  end;
+  {$ENDIF}
 
   procedure AnalyzeMemoryMoves;
   var
@@ -732,6 +797,13 @@ var
       begin
         if SkipPlanned[N] or (Fusion[N] = -2) then
           Continue;
+        Ins := PlannedCode[N];
+        if MaskedShiftSource[N] >= 0 then
+        begin
+          MarkUse(UInt32(MaskedShiftSource[N]));
+          MarkDefinition(Ins.Dest);
+          Continue;
+        end;
         if Fusion[N] >= 0 then
           Ins := PlannedCode[Fusion[N]]
         else
@@ -796,7 +868,9 @@ var
     for K := 0 to High(PlannedCode) do
       if not SkipPlanned[K] then
       begin
-        if Fusion[K] >= 0 then
+        if MaskedShiftSource[K] >= 0 then
+          CountSlotUse(UInt32(MaskedShiftSource[K]))
+        else if Fusion[K] >= 0 then
           CountInstructionUses(PlannedCode[Fusion[K]])
         else if Fusion[K] <> -2 then
           CountInstructionUses(PlannedCode[K]);
@@ -963,6 +1037,9 @@ begin
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
+    {$IFDEF WASM_JIT_ARM64}
+    AnalyzeMaskedShiftFusion;
+    {$ENDIF}
     AnalyzeImmediateFusion;
     AnalyzeFusion;
     {$IFDEF WASM_JIT_ARM64}
@@ -1018,7 +1095,14 @@ begin
         base (x23/rbp), which the entry receives freshly per invocation — no
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      if Fusion[I] >= 0 then
+      if MaskedShiftSource[I] >= 0 then
+      begin
+        Arm64EmitMaskedShiftCached(Buf, UInt32(MaskedShiftSource[I]),
+          PlannedCode[I].Dest, Byte(MaskedShiftShape[I] and $FF),
+          Byte(MaskedShiftShape[I] shr 8), ArmCache);
+        Emitted := True;
+      end
+      else if Fusion[I] >= 0 then
       begin
         Arm64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
           PlannedCode[I], ArmCache);

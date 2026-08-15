@@ -1132,6 +1132,15 @@ begin
     BLit([$00, $20, $00, $20, $01, $6A, $0B]), 'add');
 end;
 
+function MaskedShiftModuleBytes: TWasmBytes;
+begin
+  { (func (export "maskshift") (param i32) (result i32)
+      (i32.shl (i32.and (local.get 0) (i32.const 16383)) (i32.const 2))) }
+  Result := OneFunc(BLit([$60, $01, $7F, $01, $7F]),
+    BLit([$00, $20, $00, $41, $FF, $FF, $00, $71, $41, $02, $74, $0B]),
+    'maskshift');
+end;
+
 type
   TInputPair = record
     A, B: Int32;
@@ -1210,6 +1219,7 @@ type
     procedure TestForceCompileSetsEntry;
 
     procedure TestI32Arith;
+    procedure TestMaskedShiftFusion;
     procedure TestI64Arith;
     procedure TestI32Compare;
     procedure TestF64Ops;
@@ -1729,6 +1739,13 @@ begin
       Expect<Boolean>(Compiled).ToBe(False);
       {$ENDIF}
     end;
+end;
+
+procedure TJitTests.TestMaskedShiftFusion;
+begin
+  Expect<Boolean>(DiffFresh(MaskedShiftModuleBytes, 'maskshift',
+    [MakeValueI32(Integer($DEADBEEF))])).ToBe(
+      {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
 procedure TJitTests.TestI64Arith;
@@ -2910,6 +2927,8 @@ begin
   Test('JIT i32.add is bitwise identical to the interpreter',
     TestMilestoneAddIdentical);
   Test('i32 arithmetic/logic/shift match the interpreter', TestI32Arith);
+  Test('a bounded masked shift matches the interpreter',
+    TestMaskedShiftFusion);
   Test('i64 arithmetic/logic/shift match the interpreter', TestI64Arith);
   Test('i32 compares and eqz match the interpreter', TestI32Compare);
   Test('f64 ops (incl. NaN) match the interpreter bitwise', TestF64Ops);
