@@ -2,9 +2,9 @@
 
 ## Executive Summary
 
-- Nothing is released yet. wasmlight is pre-0.1; this file records the
-  intended release mechanics so the first release follows them rather
-  than inventing them.
+- `0.1.0` is wasmlight's first release: the completed pinned-Core-3 runtime,
+  its three execution tiers on 64-bit UNIX, the interpreter on every supported
+  target, and the current deny-by-default WASI Preview 1 subset.
 - Releases go through the `create-release` skill: changelog first, then
   an unprefixed SemVer tag matching `[package].version` in `lwpt.toml`.
 - wasmlight is consumed as an lwpt dependency, not as a distributed
@@ -31,8 +31,8 @@ The gates are in [DEFINITION_OF_DONE.md](../DEFINITION_OF_DONE.md); the
 mechanics are:
 
 1. `ci.yml` is green on the release commit — the full platform matrix.
-2. Bump `[package].version` in `lwpt.toml`. That is the single source of
-   truth: the `prebuild` hook restamps `source/units/Version.inc`, so
+2. Set and verify `[package].version` in `lwpt.toml`. That is the single source
+   of truth: the `prebuild` hook restamps `source/units/Version.inc`, so
    `wasmlight --version` follows automatically.
 3. Regenerate the changelog with git-cliff and land it **before** the tag,
    so the tag's notes are published from a committed section.
