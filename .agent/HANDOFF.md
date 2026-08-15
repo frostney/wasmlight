@@ -49,7 +49,9 @@ Updated: 2026-08-15 (generic scalar direct-call specialization)
 - Rejected and reverted: a per-instance native call table was slower and added
   mutable metadata; pinning the caller's FuncAddrs map removed eleven lookup
   instructions but regressed final medians to 149-163 ms. Neither experiment
-  remains in the tree. No push, rebase, or force operation was performed.
+  remains in the tree. Delivery is tracked by PR #6
+  (`https://github.com/frostney/wasmlight/pull/6`); no rebase or force operation
+  was performed.
 
 Updated: 2026-08-15 (runtime comparison expanded)
 
