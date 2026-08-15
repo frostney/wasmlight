@@ -460,7 +460,7 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
 function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32): Boolean;
+  const AInsIndex: UInt32; const AUsePinnedMemory: Boolean = False): Boolean;
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
 procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASlots: array of UInt32);
@@ -915,7 +915,7 @@ begin
     { Helpers, safepoints, complex control and currently uncached templates all
       observe/write the canonical memory register file. }
     Arm64InvalidateRegCache(ACache);
-    Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+    Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex, AUsePinnedMemory);
   end;
 end;
 
@@ -1015,16 +1015,15 @@ end;
   observationally identical (§13). }
 
 type
-  { The compiled entry's ABI, mirroring Wasm.Jit.TWasmJitCompiledEntry (kept
-    local so this unit stays below the driver). THREE arguments now
-    (aot-spec §1.3/§4.3): the register-file base (x0 -> pinned x19), the store
-    (x1 -> pinned x20, from which the prologue pins &Epoch, the snapshot, and
-    the helper-table base), and the IR-code base @Fn^.Code[0] (x2 -> pinned x23),
-    from which every runtime-op template computes @Fn^.Code[i]. The IR base is a
-    live per-invocation value, never baked, which is what makes the code
+  { The AArch64 compiled-entry ABI (kept local so this unit stays below the
+    driver): the register-file base (x0 -> pinned x19), the store (x1 -> pinned
+    x20), the IR-code base @Fn^.Code[0] (x2 -> pinned x23), and the interpreter
+    context (x3 -> x25 unless the function pins memory there). IR and context
+    are live per-invocation values, never baked, which keeps code
     position-independent. }
   TArm64CompiledEntry = procedure(const ARegBase: PWasmValue;
-    const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
+    const AStore: TWasmStore; const AIrBase: PWasmIrInstr;
+    const ACtx: PWasmInterpContext); cdecl;
 
 { Fix A: the pending tail-call channel is now the SHARED Wasm.Interp.GTierTail
   (TierTailSlot), written by BOTH a compiled body's return_call* helper AND the
@@ -1294,7 +1293,7 @@ begin
       UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
       Exit;
     end;
-    Entry(Base, AStore, IrBase);
+    Entry(Base, AStore, IrBase, Ctx);
     CurrentSeamCatch := Seam.Prev;
 
     { Pop (reuses ONE frame-teardown path; on a tail the body wrote no results,
@@ -3095,6 +3094,7 @@ begin
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_REGFILE, 0));  { mov x19,x0 (regbase) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_STORE, 1));    { mov x20,x1 (store) }
   ABuf.EmitU32(Arm64MovReg(ARM64_REG_IRBASE, 2));   { mov x23,x2 (IR base) }
+  ABuf.EmitU32(Arm64MovReg(ARM64_REG_MEMORY, 3));   { mov x25,x3 (context) }
 end;
 
 procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer);
@@ -3955,12 +3955,203 @@ begin
   end;
 end;
 
+{ A one-parameter/one-result static call can publish and retire its logical
+  frame entirely in generated code. Resolution stays instance-relative and
+  position-independent: the caller activation supplies the live function
+  address map, the context supplies an indirection to Store.Funcs, and each
+  function instance supplies prelinked pointers into freshly validated IR.
+  No helper is crossed on the compiled fast path. }
+procedure EmitNativeScalarDirectCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AArgBytes, AStateOffset: UInt32;
+  const AFallback, ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  FuncLayout: TWasmFuncInst;
+  StateLayout: TWasmJitDirectCallState;
+  FuncDirectEntry, FuncInstance: UInt32;
+  MetaFn, MetaIrBase, MetaFuncAddrs, MetaEntryZeroRegs,
+    MetaRefRegBits, MetaRegisterCount, MetaEntryZeroCount,
+    MetaParam0Reg, MetaResult0Reg: UInt32;
+  StateRegBase, StateIrBase, StateCtx, StateEntry, StateGcFrameSlot,
+    StateResultReg: UInt32;
+  ZeroLoop, ZeroDone, Exhausted: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  FuncDirectEntry := UInt32(PtrUInt(@FuncLayout.CompiledDirectEntry) -
+    PtrUInt(@FuncLayout));
+  FuncInstance := UInt32(PtrUInt(@FuncLayout.Instance) -
+    PtrUInt(@FuncLayout));
+  MetaFn := UInt32(PtrUInt(@FuncLayout.DirectMeta.Fn) - PtrUInt(@FuncLayout));
+  MetaIrBase := UInt32(PtrUInt(@FuncLayout.DirectMeta.IrBase) -
+    PtrUInt(@FuncLayout));
+  MetaFuncAddrs := UInt32(PtrUInt(@FuncLayout.DirectMeta.FuncAddrs) -
+    PtrUInt(@FuncLayout));
+  MetaEntryZeroRegs := UInt32(PtrUInt(@FuncLayout.DirectMeta.EntryZeroRegs) -
+    PtrUInt(@FuncLayout));
+  MetaRefRegBits := UInt32(PtrUInt(@FuncLayout.DirectMeta.RefRegBits) -
+    PtrUInt(@FuncLayout));
+  MetaRegisterCount := UInt32(PtrUInt(@FuncLayout.DirectMeta.RegisterCount) -
+    PtrUInt(@FuncLayout));
+  MetaEntryZeroCount := UInt32(PtrUInt(@FuncLayout.DirectMeta.EntryZeroCount) -
+    PtrUInt(@FuncLayout));
+  MetaParam0Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Param0Reg) -
+    PtrUInt(@FuncLayout));
+  MetaResult0Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Result0Reg) -
+    PtrUInt(@FuncLayout));
+  StateRegBase := UInt32(PtrUInt(@StateLayout.RegBase) - PtrUInt(@StateLayout));
+  StateIrBase := UInt32(PtrUInt(@StateLayout.IrBase) - PtrUInt(@StateLayout));
+  StateCtx := UInt32(PtrUInt(@StateLayout.Ctx) - PtrUInt(@StateLayout));
+  StateEntry := UInt32(PtrUInt(@StateLayout.Entry) - PtrUInt(@StateLayout));
+  StateGcFrameSlot := UInt32(PtrUInt(@StateLayout.GcFrameSlot) -
+    PtrUInt(@StateLayout));
+  StateResultReg := UInt32(PtrUInt(@StateLayout.ScalarResultReg) -
+    PtrUInt(@StateLayout));
+
+  ZeroLoop := ABuf.NewLabel;
+  ZeroDone := ABuf.NewLabel;
+  Exhausted := ABuf.NewLabel;
+
+  { x25 is the current context for functions without pinned memory. Resolve
+    caller funcidx -> store address -> live function instance. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
+  Arm64EmitLoadImm64(ABuf, 3, FO.ActStride);
+  ABuf.EmitU32(Arm64MulX(2, 2, 3));
+  Arm64EmitLdrX(ABuf, 3, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(2, 3, 2));
+  Arm64EmitLdrX(ABuf, 1, 2, UInt32(FO.ActFuncAddrs));
+  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrW(ABuf, 2, 1, 0);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxFuncsSlot));
+  Arm64EmitLdrX(ABuf, 1, 1, 0);
+  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
+  ABuf.EmitU32(Arm64MulX(2, 2, 8));
+  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+  Arm64EmitLdrX(ABuf, 9, 3, FuncDirectEntry);
+  ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_ZR));
+  EmitBCondTo(ABuf, ARM64_COND_EQ, AFallback);
+
+  { Exhaustion is checked before the first logical-frame mutation. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HS, Exhausted);
+  Arm64EmitLdrX(ABuf, 2, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+  Arm64EmitLdrW(ABuf, 8, 3, MetaRegisterCount);
+  ABuf.EmitU32(Arm64AddX(13, 2, 8));
+  Arm64EmitLdrX(ABuf, 10, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
+  ABuf.EmitU32(Arm64CmpX(13, 10));
+  EmitBCondTo(ABuf, ARM64_COND_HI, Exhausted);
+
+  { x6 := activation[depth], x5 := Values[old ValueTop]. }
+  Arm64EmitLoadImm64(ABuf, 8, FO.ActStride);
+  ABuf.EmitU32(Arm64MulX(8, 1, 8));
+  Arm64EmitLdrX(ABuf, 6, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(6, 6, 8));
+  Arm64EmitLdrX(ABuf, 5, ARM64_REG_MEMORY, UInt32(FO.CtxValues));
+  Arm64EmitLoadImm64(ABuf, 12, 8);
+  ABuf.EmitU32(Arm64MulX(8, 2, 12));
+  ABuf.EmitU32(Arm64AddX(5, 5, 8));
+
+  Arm64EmitLdrX(ABuf, 8, 3, MetaFn);
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActFn));
+  Arm64EmitLdrX(ABuf, 8, 3, FuncInstance);
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActInstance));
+  Arm64EmitLdrX(ABuf, 8, 3, MetaFuncAddrs);
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActFuncAddrs));
+  Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActIP));
+  Arm64EmitStrX(ABuf, 2, 6, UInt32(FO.ActBase));
+  Arm64EmitStrX(ABuf, 13, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+
+  { Sparse entry zeroing precedes parameter publication and GC visibility. }
+  Arm64EmitLdrX(ABuf, 10, 3, MetaEntryZeroRegs);
+  Arm64EmitLdrW(ABuf, 11, 3, MetaEntryZeroCount);
+  ABuf.BindLabel(ZeroLoop);
+  EmitCbzTo(ABuf, 11, UInt32(ZeroDone));
+  Arm64EmitLdrW(ABuf, 8, 10, 0);
+  ABuf.EmitU32(Arm64MulX(8, 8, 12));
+  ABuf.EmitU32(Arm64MemRegOffset($F9000000, ARM64_REG_ZR, 5, 8, True));
+  ABuf.EmitU32(Arm64AddImmX(10, 10, 4));
+  ABuf.EmitU32(Arm64SubImmX(11, 11, 1));
+  EmitBranchTo(ABuf, UInt32(ZeroLoop));
+  ABuf.BindLabel(ZeroDone);
+  Arm64EmitLdrW(ABuf, 8, 3, MetaParam0Reg);
+  ABuf.EmitU32(Arm64MulX(8, 8, 12));
+  Arm64EmitLdrX(ABuf, 10, ARM64_REG_SP, 0);
+  ABuf.EmitU32(Arm64MemRegOffset($F9000000, 10, 5, 8, True));
+
+  Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetKind));
+  Arm64EmitStrX(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetDest));
+  Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetCount));
+  Arm64EmitStrX(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetBase));
+  ABuf.EmitU32(Arm64AddImmX(8, ARM64_REG_SP, AArgBytes));
+  Arm64EmitStrX(ABuf, 8, 6, UInt32(FO.ActEntryResults));
+
+  { Publish the precise frame only after every reference slot is initialized. }
+  Arm64EmitLdrX(ABuf, 7, ARM64_REG_MEMORY, UInt32(FO.CtxGcFrameSlot));
+  ABuf.EmitU32(Arm64AddImmX(8, 6, UInt32(FO.ActGcFrame)));
+  Arm64EmitLdrX(ABuf, 10, 7, 0);
+  Arm64EmitStrX(ABuf, 10, 8, UInt32(FO.GcFramePrev));
+  Arm64EmitStrX(ABuf, 5, 8, UInt32(FO.GcFrameSlots));
+  Arm64EmitLdrX(ABuf, 10, 3, MetaRefRegBits);
+  Arm64EmitStrX(ABuf, 10, 8, UInt32(FO.GcFrameRefRegBits));
+  Arm64EmitLdrW(ABuf, 10, 3, MetaRegisterCount);
+  Arm64EmitStrW(ABuf, 10, 8, UInt32(FO.GcFrameRegisterCount));
+  Arm64EmitLdrX(ABuf, 10, 3, FuncInstance);
+  Arm64EmitStrX(ABuf, 10, 8, UInt32(FO.GcFrameInstance));
+  Arm64EmitStrX(ABuf, 8, 7, 0);
+  ABuf.EmitU32(Arm64AddImmX(1, 1, 1));
+  Arm64EmitStrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+
+  { Preserve the normal-return retirement state across the native callee. }
+  Arm64EmitStrX(ABuf, 5, ARM64_REG_SP, AStateOffset + StateRegBase);
+  Arm64EmitLdrX(ABuf, 2, 3, MetaIrBase);
+  Arm64EmitStrX(ABuf, 2, ARM64_REG_SP, AStateOffset + StateIrBase);
+  Arm64EmitStrX(ABuf, ARM64_REG_MEMORY, ARM64_REG_SP, AStateOffset + StateCtx);
+  Arm64EmitStrX(ABuf, 6, ARM64_REG_SP, AStateOffset + StateEntry);
+  Arm64EmitStrX(ABuf, 7, ARM64_REG_SP, AStateOffset + StateGcFrameSlot);
+  Arm64EmitLdrW(ABuf, 8, 3, MetaResult0Reg);
+  Arm64EmitStrW(ABuf, 8, ARM64_REG_SP, AStateOffset + StateResultReg);
+
+  Arm64EmitLdrX(ABuf, 9, 3, FuncDirectEntry);
+  ABuf.EmitU32(Arm64MovReg(0, 5));
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
+  ABuf.EmitU32(Arm64MovReg(3, ARM64_REG_MEMORY));
+  ABuf.EmitU32(Arm64Blr(9));
+
+  { Normal return: copy the scalar result, unlink the GC frame, and retire
+    ValueTop/Depth. Abnormal exits longjmp and never execute this block. }
+  Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, AStateOffset + StateCtx);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP, AStateOffset + StateEntry);
+  Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, AStateOffset + StateRegBase);
+  Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP, AStateOffset + StateResultReg);
+  Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP, AStateOffset + StateGcFrameSlot);
+  Arm64EmitLdrX(ABuf, 5, 1, UInt32(FO.ActEntryResults));
+  Arm64EmitLoadImm64(ABuf, 6, 8);
+  ABuf.EmitU32(Arm64MulX(3, 3, 6));
+  ABuf.EmitU32(Arm64MemRegOffset($F9400000, 6, 2, 3, True));
+  Arm64EmitStrX(ABuf, 6, 5, 0);
+  Arm64EmitLdrX(ABuf, 5, 1, UInt32(FO.ActGcFrame + FO.GcFramePrev));
+  Arm64EmitStrX(ABuf, 5, 4, 0);
+  Arm64EmitLdrX(ABuf, 5, 1, UInt32(FO.ActBase));
+  Arm64EmitStrX(ABuf, 5, 0, UInt32(FO.CtxValueTop));
+  Arm64EmitLdrX(ABuf, 5, 0, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(5, 5, 1));
+  Arm64EmitStrX(ABuf, 5, 0, UInt32(FO.CtxDepth));
+  EmitBranchTo(ABuf, UInt32(ADone));
+
+  ABuf.BindLabel(Exhausted);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
 { iroCall / iroCallIndirect / iroCallRef. x0 is always the store (pinned in
   x20); the callee selector differs per form (funcidx immediate / packed
   type+table immediate plus the index operand / the funcref operand), and the
   last two arguments are always the arg and result scratch pointers. }
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32);
+  const AAux: TWasmIrAuxU32; const AUsePinnedMemory: Boolean);
 var
   ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
   FallbackLabel, DoneLabel: TWasmJitLabel;
@@ -3971,13 +4162,8 @@ begin
   ResBytes := ResN * ARM64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
   if AIns.Op = iroCall then
-  begin
-    if (ArgN = 1) and (ResN = 1) then
-      FrameBytes := Arm64Align16(StateOffset +
-        SizeOf(TWasmJitDirectCallState))
-    else
-      FrameBytes := Arm64Align16(StateOffset + 2 * ARM64_SLOT_SIZE)
-  end
+    FrameBytes := Arm64Align16(StateOffset +
+      SizeOf(TWasmJitDirectCallState))
   else
     FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
 
@@ -3993,40 +4179,49 @@ begin
           nil return falls back to the existing host/interpreter dispatcher. }
         FallbackLabel := ABuf.NewLabel;
         DoneLabel := ABuf.NewLabel;
-        Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
-        ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
-        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
-        ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
-        if (ArgN = 1) and (ResN = 1) then
-          Arm64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
+        if (ArgN = 1) and (ResN = 1) and not AUsePinnedMemory then
+          EmitNativeScalarDirectCall(ABuf, AIns, ArgBytes, StateOffset,
+            FallbackLabel, DoneLabel)
         else
-          Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
-        ABuf.EmitU32(Arm64CmpX(0, 31));
-        EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
-        ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
-        Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, StateOffset);
-        ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
-        Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset + ARM64_SLOT_SIZE);
-        ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
-        if (ArgN = 1) and (ResN = 1) then
         begin
-          Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP,
+          Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
+          ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+          ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+          ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
+          if (ArgN = 1) and (ResN = 1) then
+            Arm64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
+          else
+            Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
+          ABuf.EmitU32(Arm64CmpX(0, 31));
+          EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
+          ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
+          Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP, StateOffset);
+          ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
+          Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP,
+            StateOffset + ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 3, ARM64_REG_SP,
             StateOffset + 2 * ARM64_SLOT_SIZE);
-          Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP,
-            StateOffset + 3 * ARM64_SLOT_SIZE);
-          Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset);
-          Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP,
-            StateOffset + 5 * ARM64_SLOT_SIZE);
-          Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP,
-            StateOffset + 4 * ARM64_SLOT_SIZE);
-          Arm64EmitCallHelper(ABuf, aohDirectCallFinishScalar)
-        end
-        else
-        begin
-          ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
-          Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+          ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
+          if (ArgN = 1) and (ResN = 1) then
+          begin
+            Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP,
+              StateOffset + 2 * ARM64_SLOT_SIZE);
+            Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP,
+              StateOffset + 3 * ARM64_SLOT_SIZE);
+            Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset);
+            Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP,
+              StateOffset + 5 * ARM64_SLOT_SIZE);
+            Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP,
+              StateOffset + 4 * ARM64_SLOT_SIZE);
+            Arm64EmitCallHelper(ABuf, aohDirectCallFinishScalar)
+          end
+          else
+          begin
+            ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+            Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+          end;
+          EmitBranchTo(ABuf, UInt32(DoneLabel));
         end;
-        EmitBranchTo(ABuf, UInt32(DoneLabel));
         ABuf.BindLabel(FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
@@ -4421,7 +4616,7 @@ end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32): Boolean;
+  const AInsIndex: UInt32; const AUsePinnedMemory: Boolean): Boolean;
 begin
   Result := True;
   case AIns.Op of
@@ -4461,7 +4656,8 @@ begin
       end;
 
     { --- calls (Wave 3) ------------------------------------------------ }
-    iroCall, iroCallIndirect, iroCallRef: EmitCall(ABuf, AIns, AAux);
+    iroCall, iroCallIndirect, iroCallRef:
+      EmitCall(ABuf, AIns, AAux, AUsePinnedMemory);
     iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
       EmitReturnCall(ABuf, AIns, AAux);
 

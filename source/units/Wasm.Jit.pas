@@ -147,15 +147,13 @@ type
     property Store: TWasmStore read FStore;
   end;
 
-  { The compiled entry's calling convention (§5.2/§5.3, aot-spec §1.3/§4.3).
-    THREE arguments now: the register-file base pointer JitEnterFrame returned
-    (@Values[Base]), the store, and the IR-code base @Fn^.Code[0]. AAPCS64/SysV
-    pass them in x0/x1/x2 (rdi/rsi/rdx); the prologue pins the register-file base
-    (x19/rbx), the store (x20/r12 — from which it pins &Epoch, the snapshot, and
-    the per-process helper-table base), and the IR base (x23/rbp), from which
-    every runtime-op template computes @Fn^.Code[i] position-independently. cdecl
-    selects the platform C convention, matching the backend's hand-emitted
-    prologue/epilogue. }
+  { The x64 / backend-free compiled-entry declaration. It receives the
+    register-file base pointer JitEnterFrame returned (@Values[Base]), the
+    store, and the IR-code base @Fn^.Code[0]. The AArch64 backend extends this
+    private ABI with the interpreter context used by generated direct-call
+    frame setup; its local declaration is fingerprinted with the AOT ABI.
+    cdecl selects the platform C convention, matching each backend's
+    hand-emitted prologue/epilogue. }
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
     const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
@@ -252,7 +250,7 @@ var
 begin
   { No backend on this target, so nothing is ever compiled and this is
     unreachable; kept as the plain single-shot hand-off so the unit still
-    compiles and documents the (3-arg, position-independent) contract. }
+    compiles and documents the x64 (3-arg, position-independent) contract. }
   Ctx := InterpContextFor(AStore);
   Base := JitEnterFrame(Ctx, AStore, AFuncAddr, AParams, AResults,
     ConsumeJitSeamReentry);

@@ -263,10 +263,10 @@ begin
   Buf := TWasmCodeBuffer.Create;
   try
     Arm64EmitPrologueExtended(Buf);
-    Expect<Integer>(Buf.Size).ToBe(10 * SizeOf(UInt32));
+    Expect<Integer>(Buf.Size).ToBe(11 * SizeOf(UInt32));
     Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
       Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
-    Expect<UInt32>(EmittedWord(Buf, 9)).ToBe(
+    Expect<UInt32>(EmittedWord(Buf, 10)).ToBe(
       Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
   finally
     Buf.Free;

@@ -226,6 +226,22 @@ type
 
   TWasmFuncKind = (wfkWasm, wfkHost);
 
+  { Per-instance links consumed by the generated scalar direct-call path.
+    Every pointer names validated IR or an instance-owned address map whose
+    storage is fixed after instantiation. CompiledDirectEntry deliberately
+    remains on TWasmFuncInst: JIT/AOT wiring may publish it later. }
+  TWasmDirectCallMeta = record
+    Fn: Pointer;
+    IrBase: Pointer;
+    FuncAddrs: PUInt32;
+    EntryZeroRegs: PUInt32;
+    RefRegBits: PUInt32;
+    RegisterCount: UInt32;
+    EntryZeroCount: UInt32;
+    Param0Reg: UInt32;
+    Result0Reg: UInt32;
+  end;
+
   TWasmStore = class;
 
   { A host function. Params and Results are frame slices the caller owns;
@@ -285,12 +301,14 @@ type
       and re-dispatches its pending target. }
     CompiledDirectEntry: Pointer;
     CallCount: UInt32;
+    DirectMeta: TWasmDirectCallMeta;
     { wfkHost }
     Callback: TWasmHostFunc;
     HostData: Pointer;               { opaque to the runtime }
   end;
 
   TWasmFuncInsts = array of TWasmFuncInst;
+  PWasmFuncInsts = ^TWasmFuncInsts;
 
   { "A table instance … records its type and holds a sequence of reference
     values … It is an invariant of the semantics that all table elements
@@ -934,6 +952,16 @@ type
     FuncKind: NativeUInt;            { TWasmFuncInst.Kind }
     FuncCompiledEntry: NativeUInt;   { TWasmFuncInst.CompiledEntry }
     FuncCompiledDirectEntry: NativeUInt; { TWasmFuncInst.CompiledDirectEntry }
+    FuncDirectMeta: NativeUInt;        { TWasmFuncInst.DirectMeta }
+    DirectMetaFn: NativeUInt;
+    DirectMetaIrBase: NativeUInt;
+    DirectMetaFuncAddrs: NativeUInt;
+    DirectMetaEntryZeroRegs: NativeUInt;
+    DirectMetaRefRegBits: NativeUInt;
+    DirectMetaRegisterCount: NativeUInt;
+    DirectMetaEntryZeroCount: NativeUInt;
+    DirectMetaParam0Reg: NativeUInt;
+    DirectMetaResult0Reg: NativeUInt;
     FuncCallCount: NativeUInt;       { TWasmFuncInst.CallCount }
     MemInstStride: NativeUInt;       { SizeOf(TWasmMemoryInst) }
     MemBase: NativeUInt;             { TWasmMemoryInst.Base }
@@ -2270,6 +2298,24 @@ begin
   Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);
   Result.FuncCompiledDirectEntry :=
     PtrUInt(@F.CompiledDirectEntry) - PtrUInt(@F);
+  Result.FuncDirectMeta := PtrUInt(@F.DirectMeta) - PtrUInt(@F);
+  Result.DirectMetaFn := PtrUInt(@F.DirectMeta.Fn) - PtrUInt(@F.DirectMeta);
+  Result.DirectMetaIrBase := PtrUInt(@F.DirectMeta.IrBase) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaFuncAddrs := PtrUInt(@F.DirectMeta.FuncAddrs) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaEntryZeroRegs := PtrUInt(@F.DirectMeta.EntryZeroRegs) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaRefRegBits := PtrUInt(@F.DirectMeta.RefRegBits) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaRegisterCount := PtrUInt(@F.DirectMeta.RegisterCount) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaEntryZeroCount := PtrUInt(@F.DirectMeta.EntryZeroCount) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaParam0Reg := PtrUInt(@F.DirectMeta.Param0Reg) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaResult0Reg := PtrUInt(@F.DirectMeta.Result0Reg) -
+    PtrUInt(@F.DirectMeta);
   Result.FuncCallCount := PtrUInt(@F.CallCount) - PtrUInt(@F);
   Result.MemInstStride := SizeOf(TWasmMemoryInst);
   Result.MemBase := PtrUInt(@M.Base) - PtrUInt(@M);

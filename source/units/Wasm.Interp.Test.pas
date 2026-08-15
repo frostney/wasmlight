@@ -2379,9 +2379,9 @@ begin
     Keep its immediates pinned to the live record layout. }
   Expect<Int32>(Integer(Off.CtxValueTop)).ToBe(32);
   Expect<Int32>(Integer(Off.CtxDepth)).ToBe(56);
-  Expect<Int32>(Integer(Off.ActBase)).ToBe(24);
-  Expect<Int32>(Integer(Off.ActGcFrame + Off.GcFramePrev)).ToBe(32);
-  Expect<Int32>(Integer(Off.ActEntryResults)).ToBe(104);
+  Expect<Int32>(Integer(Off.ActBase)).ToBe(32);
+  Expect<Int32>(Integer(Off.ActGcFrame + Off.GcFramePrev)).ToBe(40);
+  Expect<Int32>(Integer(Off.ActEntryResults)).ToBe(112);
   {$ENDIF}
 end;
 

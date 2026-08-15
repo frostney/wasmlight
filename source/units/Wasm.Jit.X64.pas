@@ -3448,12 +3448,7 @@ begin
   ResBytes := ResN * X64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
   if AIns.Op = iroCall then
-  begin
-    if (ArgN = 1) and (ResN = 1) then
-      FrameBytes := X64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
-    else
-      FrameBytes := X64Align16(StateOffset + 2 * X64_SLOT_SIZE)
-  end
+    FrameBytes := X64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
   else
     FrameBytes := X64CallFrameBytes(ArgN, ResN);
 
