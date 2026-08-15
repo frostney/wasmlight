@@ -24,9 +24,11 @@
     r13 = &Store.Epoch        (r12 + StoreEpoch offset)
     r14 = the epoch captured at entry (Store.EpochSnapshot, §6)
   Scratch is rax/rcx/rdx (caller-saved, dead at op boundaries); the SysV arg
-  registers marshal helper arguments. The prologue pushes rbx/r12/r13/r14 and a
-  single 8-byte pad (keeping rsp 16-aligned for calls); the epilogue reverses
-  it. A trap unwinds through LongJmp to the per-invocation trampoline
+  registers marshal helper arguments. The prologue pushes rbx/r12/r13/r14 and
+  reserves one 8-byte alignment/memory slot; scalar-call-bearing functions use
+  three slots so the live interpreter context can be retained. The epilogue
+  reverses the selected shape. A trap unwinds through LongJmp
+  to the per-invocation trampoline
   (ADR-0009), which restores the caller's callee-saved set from its setjmp, so a
   skipped epilogue on the trap path is correct.
 
@@ -110,6 +112,7 @@ type
     Entries: array[0..3] of TX64RegCacheEntry;
     Next: Byte;
     StaticAllocation: Boolean;
+    FixedWriteThrough: Boolean;
   end;
 
 const
@@ -292,6 +295,9 @@ procedure X64EmitAddRsp(const ABuf: TWasmCodeBuffer; const AImm: Int32);
 procedure X64EmitSubRsp(const ABuf: TWasmCodeBuffer; const AImm: Int32);
 { call reg (FF /2). }
 procedure X64EmitCallReg(const ABuf: TWasmCodeBuffer; const AReg: Byte);
+{ call rel32 to a code-buffer label. }
+procedure X64EmitCallTo(const ABuf: TWasmCodeBuffer;
+  const ATarget: TWasmJitLabel);
 
 { jmp rel32 / jcc rel32 placeholders (rel32 = 0), recording a patch against the
   target label (= the target IR-instruction index; the driver binds one label
@@ -301,20 +307,28 @@ procedure X64EmitJccTo(const ABuf: TWasmCodeBuffer; const ACc: Byte;
   const ATarget: UInt32);
 
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
-procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer);
+procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer;
+  const ARetainContext: Boolean = False);
+procedure X64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount, AParamCount, AParam0Reg, AParam1Reg: UInt32;
+  const ACoreLabel, AExternalLabel: TWasmJitLabel);
+procedure X64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
+  const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
+  const ACoreLabel: TWasmJitLabel);
 { Pin the per-process helper-table base in r15 (aot-spec §1.2/§4.3): loads it
   from the store field (r12 + AHelperTableOffset) ONCE. Emitted by the driver
   right after the prologue; the exec-only encoder tests skip it. }
 procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
 { Resolve a single function memory once and keep its stable instance pointer in
-  the prologue's otherwise-unused alignment slot at [rsp]. Scalar accesses
+  the prologue's memory slot at [rsp]. Scalar accesses
   still reload live Base/ByteSize fields, so memory.grow semantics are unchanged. }
 procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
   const AMemoryIndex: UInt32);
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
-procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer);
+procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer;
+  const ARetainContext: Boolean = False);
 
 { Emit an indirect call to helper slot AHelper through the pinned helper table:
   `call qword [r15 + Ord(AHelper)*8]` (aot-spec §1.2) — position-independent. }
@@ -343,8 +357,12 @@ function X64CanEmitOp(const AOp: TWasmIrOp): Boolean;
   AInsIndex*SizeOf(TWasmIrInstr), so nothing is baked. }
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32): Boolean;
+  const AInsIndex: UInt32;
+  const ARetainContext: Boolean = False;
+  const AUseNativeScalarCall: Boolean = False): Boolean;
 procedure X64InitRegCache(out ACache: TX64RegCache);
+procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
+  const AParamCount, AParam0Slot, AParam1Slot: UInt32);
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlots: array of UInt32);
 procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
@@ -353,7 +371,13 @@ procedure X64InvalidateRegCache(var ACache: TX64RegCache);
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
-  var ACache: TX64RegCache): Boolean;
+  var ACache: TX64RegCache): Boolean; overload;
+function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  ANativeScalarLeaf: Boolean; const ANativeResultReg: UInt32;
+  const ARetainContext, AUseNativeScalarCall: Boolean;
+  var ACache: TX64RegCache): Boolean; overload;
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
@@ -395,6 +419,8 @@ procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
 procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
   var ACache: TX64RegCache); forward;
+procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; var ACache: TX64RegCache); forward;
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
   var ACache: TX64RegCache); forward;
@@ -484,6 +510,17 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory: Boolean;
   var ACache: TX64RegCache): Boolean;
 begin
+  Result := X64EmitOpCached(ABuf, AIns, AAux, AInsIndex, AAddr64,
+    AUsePinnedMemory, False, 0, False, False, ACache);
+end;
+
+function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
+  ANativeScalarLeaf: Boolean; const ANativeResultReg: UInt32;
+  const ARetainContext, AUseNativeScalarCall: Boolean;
+  var ACache: TX64RegCache): Boolean;
+begin
   Result := True;
   if X64ScalarMemoryOp(AIns.Op) then
   begin
@@ -523,12 +560,27 @@ begin
           The epoch-only back-edge cannot collect on its fallthrough and the
           mismatch path traps without returning, so numeric slots need no
           canonical writeback here. Observable exits still flush below. }
-        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+          AUseNativeScalarCall);
       end;
-    iroReturn, iroUnreachable:
+    iroReturn:
+      begin
+        if ANativeScalarLeaf then
+        begin
+          X64CachedLoad(ABuf, ACache, X64_R8, ANativeResultReg);
+          X64EmitRet(ABuf);
+        end
+        else
+        begin
+          X64FlushRegCache(ABuf, ACache);
+          X64EmitEpilogue(ABuf, ARetainContext);
+        end;
+      end;
+    iroUnreachable:
       begin
         X64FlushRegCache(ABuf, ACache);
-        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+          AUseNativeScalarCall);
       end;
     iroI32Eqz, iroI64Eqz:
       begin
@@ -567,6 +619,7 @@ begin
     iroI32Shl: X64CachedShift(ABuf, AIns, 4, False, ACache);
     iroI32ShrS: X64CachedShift(ABuf, AIns, 7, False, ACache);
     iroI32ShrU: X64CachedShift(ABuf, AIns, 5, False, ACache);
+    iroI32Rotl: X64CachedShift(ABuf, AIns, 0, False, ACache);
     iroI32Rotr: X64CachedShift(ABuf, AIns, 1, False, ACache);
     iroI64Add: X64CachedAlu(ABuf, AIns, $01, True, False, ACache);
     iroI64Sub: X64CachedAlu(ABuf, AIns, $29, True, False, ACache);
@@ -577,10 +630,13 @@ begin
     iroI64Shl: X64CachedShift(ABuf, AIns, 4, True, ACache);
     iroI64ShrS: X64CachedShift(ABuf, AIns, 7, True, ACache);
     iroI64ShrU: X64CachedShift(ABuf, AIns, 5, True, ACache);
+    iroI64Rotl: X64CachedShift(ABuf, AIns, 0, True, ACache);
     iroI64Rotr: X64CachedShift(ABuf, AIns, 1, True, ACache);
+    iroSelect: X64CachedSelect(ABuf, AIns, ACache);
   else
     X64InvalidateRegCache(ACache);
-    Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex);
+    Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+      AUseNativeScalarCall);
   end;
 end;
 
@@ -598,6 +654,21 @@ end;
 procedure X64InitRegCache(out ACache: TX64RegCache);
 begin
   FillChar(ACache, SizeOf(ACache), 0);
+end;
+
+procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
+  const AParamCount, AParam0Slot, AParam1Slot: UInt32);
+begin
+  X64InitRegCache(ACache);
+  ACache.StaticAllocation := True;
+  ACache.FixedWriteThrough := True;
+  ACache.Entries[0].Valid := True;
+  ACache.Entries[0].Slot := AParam0Slot;
+  if AParamCount = 2 then
+  begin
+    ACache.Entries[1].Valid := True;
+    ACache.Entries[1].Slot := AParam1Slot;
+  end;
 end;
 
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
@@ -691,6 +762,8 @@ begin
       Host := X64CacheHostReg(Victim);
       if ASrc <> Host then
         X64EmitMovRegReg(ABuf, Host, ASrc);
+      if ACache.FixedWriteThrough then
+        X64EmitStoreSlot64(ABuf, Host, ASlot);
       Exit;
     end;
     X64EmitStoreSlot64(ABuf, ASrc, ASlot);
@@ -739,6 +812,17 @@ begin
   X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
   X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
   X64EmitShiftCl(ABuf, ASubop, AWide, X64_RAX);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
+procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; var ACache: TX64RegCache);
+begin
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+  X64CachedLoad(ABuf, ACache, X64_RDX, UInt32(AIns.Imm));
+  X64EmitAluRegReg(ABuf, $85, False, X64_RDX, X64_RDX);
+  X64EmitCmovcc(ABuf, X64_CC_E, True, X64_RAX, X64_RCX);
   X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
 end;
 
@@ -882,10 +966,13 @@ end;
 
 type
   { The compiled entry's ABI (aot-spec §1.3/§4.3): regbase in rdi, store in rsi,
-    IR-code base @Fn^.Code[0] in rdx; cdecl = SysV. The prologue pins them in
-    rbx / r12 / rbp, and pins the helper-table base (r15) off the store. }
+    IR-code base @Fn^.Code[0] in rdx, interpreter context in rcx; cdecl = SysV.
+    The prologue pins the first three in rbx / r12 / rbp and pins the helper-
+    table base (r15) off the store. Scalar-call-bearing bodies retain rcx in
+    their extended frame. }
   TX64CompiledEntry = procedure(const ARegBase: PWasmValue;
-    const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
+    const AStore: TWasmStore; const AIrBase: PWasmIrInstr;
+    const ACtx: PWasmInterpContext); cdecl;
 
 { Fix A: the pending tail channel is the SHARED Wasm.Interp.GTierTail
   (TierTailSlot), written by both a compiled body's return_call* helper and the
@@ -1120,7 +1207,7 @@ begin
       UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
       Exit;
     end;
-    Entry(Base, AStore, IrBase);
+    Entry(Base, AStore, IrBase, Ctx);
     CurrentSeamCatch := Seam.Prev;
 
     JitLeaveFrame(Ctx);
@@ -2763,6 +2850,17 @@ begin
   ABuf.EmitByte($D0 or (AReg and 7));
 end;
 
+procedure X64EmitCallTo(const ABuf: TWasmCodeBuffer;
+  const ATarget: TWasmJitLabel);
+var
+  Site: Integer;
+begin
+  Site := ABuf.CurrentOffset;
+  ABuf.EmitByte($E8);
+  ABuf.EmitU32(0);
+  ABuf.AddPatch(Site, ATarget, X64_PATCH_JMP32);
+end;
+
 procedure X64EmitCallHelper(const ABuf: TWasmCodeBuffer;
   const AHelper: TWasmAotHelper);
 begin
@@ -2810,7 +2908,8 @@ end;
 {  the Wave-2 frame + branch patching                                    }
 { ===================================================================== }
 
-procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer);
+procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer;
+  const ARetainContext: Boolean);
 begin
   X64EmitPushReg(ABuf, X64_RBX);
   X64EmitPushReg(ABuf, X64_R12);
@@ -2818,12 +2917,54 @@ begin
   X64EmitPushReg(ABuf, X64_R14);
   X64EmitPushReg(ABuf, X64_R15);
   X64EmitPushReg(ABuf, X64_RBP);
-  { Six 8-byte pushes leave rsp 8 mod 16 (entry is 8 mod 16); the pad restores
-    16-alignment so every CALL below sees an aligned stack (SysV §3.2.2). }
-  X64EmitSubRsp(ABuf, 8);
+  { Six pushes leave rsp 8 mod 16. One slot restores call alignment and may
+    retain a pinned memory. Scalar-call-bearing functions reserve two further
+    slots so the second can retain their live interpreter context. }
+  if ARetainContext then
+    X64EmitSubRsp(ABuf, 24)
+  else
+    X64EmitSubRsp(ABuf, 8);
   X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RDI);   { rbx := regbase (arg0) }
   X64EmitMovRegReg(ABuf, X64_REG_STORE, X64_RSI);     { r12 := store (arg1) }
   X64EmitMovRegReg(ABuf, X64_REG_IRBASE, X64_RDX);    { rbp := IR base (arg2) }
+  if ARetainContext then
+    X64EmitStoreMem64(ABuf, X64_RCX, X64_RSP, 8);     { context (arg3) }
+end;
+
+procedure X64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount, AParamCount, AParam0Reg, AParam1Reg: UInt32;
+  const ACoreLabel, AExternalLabel: TWasmJitLabel);
+var
+  FrameBytes: UInt32;
+begin
+  { Canonical entries carry their non-nil context in rcx. A lightweight leaf
+    caller passes nil with scalar arguments in r8/r9 and receives r8. }
+  X64EmitAluRegReg(ABuf, $85, True, X64_RCX, X64_RCX);
+  X64EmitJccTo(ABuf, X64_CC_NE, UInt32(AExternalLabel));
+  FrameBytes := (ARegisterCount * X64_SLOT_SIZE + 15) and not UInt32(15);
+  X64EmitPushReg(ABuf, X64_RBX);
+  X64EmitSubRsp(ABuf, Int32(FrameBytes));
+  X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RSP);
+  { Keep the native frame canonical as well as register-cached. This makes the
+    bridge safe if an eligible operation uses a memory-backed template. }
+  X64EmitStoreSlot64(ABuf, X64_R8, AParam0Reg);
+  if AParamCount = 2 then
+    X64EmitStoreSlot64(ABuf, X64_R9, AParam1Reg);
+  X64EmitCallTo(ABuf, ACoreLabel);
+  X64EmitAddRsp(ABuf, Int32(FrameBytes));
+  X64EmitPopReg(ABuf, X64_RBX);
+  X64EmitRet(ABuf);
+end;
+
+procedure X64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
+  const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
+  const ACoreLabel: TWasmJitLabel);
+begin
+  X64EmitLoadSlot64(ABuf, X64_R8, AParam0Reg);
+  if AParamCount = 2 then
+    X64EmitLoadSlot64(ABuf, X64_R9, AParam1Reg);
+  X64EmitCallTo(ABuf, ACoreLabel);
+  X64EmitStoreSlot64(ABuf, X64_R8, AResultReg);
 end;
 
 procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
@@ -2855,9 +2996,13 @@ begin
   X64EmitLoadMem64(ABuf, X64_REG_EPOCH, X64_REG_STORE, Int32(ASnapshotOffset));
 end;
 
-procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer);
+procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer;
+  const ARetainContext: Boolean);
 begin
-  X64EmitAddRsp(ABuf, 8);            { undo the alignment pad }
+  if ARetainContext then
+    X64EmitAddRsp(ABuf, 24)
+  else
+    X64EmitAddRsp(ABuf, 8);
   X64EmitPopReg(ABuf, X64_RBP);
   X64EmitPopReg(ABuf, X64_R15);
   X64EmitPopReg(ABuf, X64_R14);
@@ -3436,14 +3581,94 @@ begin
   end;
 end;
 
+procedure EmitNativeScalarLeafDirectCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AArgN: UInt32; const AFallback, ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  FuncLayout: TWasmFuncInst;
+  FuncNativeEntry, MetaRegisterCount: UInt32;
+  Exhausted: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  FuncNativeEntry := UInt32(
+    PtrUInt(@FuncLayout.CompiledNativeScalarEntry) - PtrUInt(@FuncLayout));
+  MetaRegisterCount := UInt32(
+    PtrUInt(@FuncLayout.DirectMeta.RegisterCount) - PtrUInt(@FuncLayout));
+  Exhausted := ABuf.NewLabel;
+
+  { Resolve caller funcidx through the live activation address map. }
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_RSP, 8);       { context }
+  X64EmitLoadMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
+  X64EmitMovRegImm32(ABuf, X64_RSI, 1);
+  X64EmitAluRegReg(ABuf, $29, True, X64_RCX, X64_RSI);
+  X64EmitMovRegImm64(ABuf, X64_RSI, FO.ActStride);
+  X64EmitImul(ABuf, True, X64_RCX, X64_RSI);
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX, Int32(FO.CtxActs));
+  X64EmitAluRegReg(ABuf, $01, True, X64_RDX, X64_RCX);
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RDX, Int32(FO.ActFuncAddrs));
+  X64EmitLoadMem32(ABuf, X64_RCX, X64_RDX,
+    Int32(UInt32(AIns.Imm) * 4));
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX, Int32(FO.CtxFuncsSlot));
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RDX, 0);
+  X64EmitMovRegImm64(ABuf, X64_RSI, SizeOf(TWasmFuncInst));
+  X64EmitImul(ABuf, True, X64_RCX, X64_RSI);
+  X64EmitAluRegReg(ABuf, $01, True, X64_RDX, X64_RCX);
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_RDX, Int32(FuncNativeEntry));
+  X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);
+  X64EmitJccTo(ABuf, X64_CC_E, UInt32(AFallback));
+
+  { Match JitEnterResolvedFrame's depth and value-slot predicates before the
+    lightweight call mutates native stack state. }
+  X64EmitLoadMem64(ABuf, X64_RCX, X64_RSP, 8);
+  X64EmitLoadMem64(ABuf, X64_RSI, X64_RCX, Int32(FO.CtxDepth));
+  X64EmitLoadMem64(ABuf, X64_RDI, X64_RCX, Int32(FO.CtxDepthCap));
+  X64EmitAluRegReg(ABuf, $39, True, X64_RSI, X64_RDI);
+  X64EmitJccTo(ABuf, X64_CC_AE, UInt32(Exhausted));
+  X64EmitLoadMem64(ABuf, X64_RSI, X64_RCX, Int32(FO.CtxValueTop));
+  X64EmitLoadMem32(ABuf, X64_RDI, X64_RDX, Int32(MetaRegisterCount));
+  X64EmitAluRegReg(ABuf, $01, True, X64_RSI, X64_RDI);
+  X64EmitLoadMem64(ABuf, X64_RDI, X64_RCX, Int32(FO.CtxValueCap));
+  X64EmitAluRegReg(ABuf, $39, True, X64_RSI, X64_RDI);
+  X64EmitJccTo(ABuf, X64_CC_A, UInt32(Exhausted));
+
+  X64EmitLoadSlot64(ABuf, X64_R8,
+    IrAuxBlockItem(AAux, AIns.A, 0));
+  if AArgN = 2 then
+    X64EmitLoadSlot64(ABuf, X64_R9,
+      IrAuxBlockItem(AAux, AIns.A, 1));
+  X64EmitMovRegImm32(ABuf, X64_RCX, 0);              { native-leaf selector }
+  X64EmitCallReg(ABuf, X64_RAX);
+  X64EmitStoreSlot64(ABuf, X64_R8,
+    IrAuxBlockItem(AAux, AIns.B, 0));
+  X64EmitJmpTo(ABuf, UInt32(ADone));
+
+  ABuf.BindLabel(Exhausted);
+  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32);
+  const AAux: TWasmIrAuxU32; const AUseNativeScalarCall: Boolean);
 var
   ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
-  FallbackLabel, DoneLabel: TWasmJitLabel;
+  FallbackLabel, DoneLabel, NativeFallback, NativeDone: TWasmJitLabel;
+  UseNativeLeaf: Boolean;
 begin
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
+  UseNativeLeaf := AUseNativeScalarCall and (AIns.Op = iroCall) and
+    (ArgN in [1, 2]) and (ResN = 1);
+  NativeFallback := -1;
+  NativeDone := -1;
+  if UseNativeLeaf then
+  begin
+    NativeFallback := ABuf.NewLabel;
+    NativeDone := ABuf.NewLabel;
+    EmitNativeScalarLeafDirectCall(ABuf, AIns, AAux, ArgN,
+      NativeFallback, NativeDone);
+    ABuf.BindLabel(NativeFallback);
+  end;
   ArgBytes := ArgN * X64_SLOT_SIZE;
   ResBytes := ResN * X64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
@@ -3476,6 +3701,8 @@ begin
         X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_STORE);
         X64EmitLoadMem64(ABuf, X64_ARG2, X64_RSP,
           Int32(StateOffset + X64_SLOT_SIZE));
+        X64EmitLoadMem64(ABuf, X64_ARG3, X64_RSP,
+          Int32(StateOffset + 2 * X64_SLOT_SIZE));
         X64EmitCallReg(ABuf, X64_R11);
         if (ArgN = 1) and (ResN = 1) then
         begin
@@ -3522,10 +3749,12 @@ begin
 
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
+  if UseNativeLeaf then
+    ABuf.BindLabel(NativeDone);
 end;
 
 procedure EmitReturnCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32);
+  const AAux: TWasmIrAuxU32; const ARetainContext: Boolean);
 var
   ArgN, FrameBytes: UInt32;
 begin
@@ -3561,7 +3790,7 @@ begin
   end;
 
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
-  X64EmitEpilogue(ABuf);
+  X64EmitEpilogue(ABuf, ARetainContext);
 end;
 
 { ===================================================================== }
@@ -3718,7 +3947,8 @@ end;
 
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const AInsIndex: UInt32): Boolean;
+  const AInsIndex: UInt32; const ARetainContext,
+  AUseNativeScalarCall: Boolean): Boolean;
 begin
   Result := True;
   case AIns.Op of
@@ -3750,12 +3980,13 @@ begin
         X64EmitJccTo(ABuf, X64_CC_E, AIns.B);
       end;
     iroBrTable: EmitBrTable(ABuf, AIns, AAux);
-    iroReturn: X64EmitEpilogue(ABuf);
+    iroReturn: X64EmitEpilogue(ABuf, ARetainContext);
     iroUnreachable: EmitTrapCall(ABuf, wtkUnreachable);
 
-    iroCall, iroCallIndirect, iroCallRef: EmitCall(ABuf, AIns, AAux);
+    iroCall, iroCallIndirect, iroCallRef:
+      EmitCall(ABuf, AIns, AAux, AUseNativeScalarCall);
     iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
-      EmitReturnCall(ABuf, AIns, AAux);
+      EmitReturnCall(ABuf, AIns, AAux, ARetainContext);
 
     iroSelect: EmitSelect(ABuf, AIns);
 
