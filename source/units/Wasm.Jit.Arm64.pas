@@ -3971,7 +3971,13 @@ begin
   ResBytes := ResN * ARM64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
   if AIns.Op = iroCall then
-    FrameBytes := Arm64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
+  begin
+    if (ArgN = 1) and (ResN = 1) then
+      FrameBytes := Arm64Align16(StateOffset +
+        SizeOf(TWasmJitDirectCallState))
+    else
+      FrameBytes := Arm64Align16(StateOffset + 2 * ARM64_SLOT_SIZE)
+  end
   else
     FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
 
@@ -3991,7 +3997,10 @@ begin
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
         ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
-        Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
+        if (ArgN = 1) and (ResN = 1) then
+          Arm64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
+        else
+          Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
         ABuf.EmitU32(Arm64CmpX(0, 31));
         EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
@@ -3999,8 +4008,24 @@ begin
         ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
         Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset + ARM64_SLOT_SIZE);
         ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
-        ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
-        Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+        if (ArgN = 1) and (ResN = 1) then
+        begin
+          Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP,
+            StateOffset + 2 * ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP,
+            StateOffset + 3 * ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset);
+          Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP,
+            StateOffset + 5 * ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP,
+            StateOffset + 4 * ARM64_SLOT_SIZE);
+          Arm64EmitCallHelper(ABuf, aohDirectCallFinishScalar)
+        end
+        else
+        begin
+          ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+          Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+        end;
         EmitBranchTo(ABuf, UInt32(DoneLabel));
         ABuf.BindLabel(FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
@@ -4668,6 +4693,10 @@ begin
     GArm64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
     GArm64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
     GArm64HelperTable[aohResolveMemory] := @JitResolveMemory;
+    GArm64HelperTable[aohDirectCallFinishScalar] :=
+      @JitFinishDirectCallScalar;
+    GArm64HelperTable[aohDirectCallPrepareScalar] :=
+      @JitPrepareDirectCallScalar;
     GArm64HelperTableFilled := True;
   end;
   Result := @GArm64HelperTable[aohTrapKind];

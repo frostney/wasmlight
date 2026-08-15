@@ -915,7 +915,9 @@ type
     aohReturnCallRef,          { 11 return_call_ref }
     aohDirectCallPrepare,      { 12 compiled direct-call frame entry }
     aohDirectCallFinish,       { 13 compiled direct-call frame exit }
-    aohResolveMemory           { 14 scalar-memory instance resolution }
+    aohResolveMemory,          { 14 scalar-memory instance resolution }
+    aohDirectCallFinishScalar, { 15 scalar compiled direct-call frame exit }
+    aohDirectCallPrepareScalar { 16 scalar compiled direct-call frame entry }
   );
 
 const
