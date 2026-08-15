@@ -483,6 +483,39 @@ begin
   ]);
 end;
 
+{ Two recursive results feed a select after both calls. The first result must
+  remain live across the second local-core BL even though it is not a visible
+  local/result slot and the condition selects it only afterward. Before the
+  native write-back liveness fix, analysis did not account for any of the
+  select's three source slots, allowing a dirty call result to be discarded
+  before the generic select reloaded the canonical register file.
+
+    (func $rec (param i32) (result i32)
+      (if (i32.lt_u (local.get 0) (i32.const 2))
+        (then (return (local.get 0))))
+      (select
+        (call $rec (i32.sub (local.get 0) (i32.const 1)))
+        (call $rec (i32.sub (local.get 0) (i32.const 2)))
+        (local.tee 0 (i32.const 1)))) }
+function NativeSelfSelectModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([ExportEntry('rec', $00, 0)])),
+    Sect(10, VecOf([
+      CodeEntry([$00,
+        $20, $00, $41, $02, $49, $04, $40,
+          $20, $00, $0F,
+        $0B,
+        $20, $00, $41, $01, $6B, $10, $00,
+        $20, $00, $41, $02, $6B, $10, $00,
+        $41, $01, $22, $00, $1B,
+        $0B])]))
+  ]);
+end;
+
 { A TWO-result call, so the result unmarshal loop is exercised beyond one slot:
 
     (func $pair (result i32 i64) (i32.const 3) (i64.const 4))
@@ -1305,6 +1338,7 @@ type
     procedure TestTailCallCrossTierBounded;
     procedure TestTailCallToHost;
     procedure TestNativeScalarSelfProofGate;
+    procedure TestNativeScalarSelfSelectLiveness;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
 
@@ -2695,6 +2729,30 @@ begin
   end;
 end;
 
+procedure TJitTests.TestNativeScalarSelfSelectLiveness;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+begin
+  Bytes := NativeSelfSelectModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe(
+      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  CompileExports(['rec']);
+  Expect<Boolean>(DiffModule(Bytes, 'rec',
+    [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
@@ -3249,6 +3307,8 @@ begin
   Test('return_call to a host function matches', TestTailCallToHost);
   Test('native scalar self-call proof accepts only its closed one-slot subset',
     TestNativeScalarSelfProofGate);
+  Test('native scalar self-call keeps both select inputs live',
+    TestNativeScalarSelfSelectLiveness);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',
