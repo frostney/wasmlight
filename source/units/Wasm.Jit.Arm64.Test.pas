@@ -174,6 +174,7 @@ begin
     its marshaling buffer. These four are the load-bearing words. }
   Expect<UInt32>(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 32))
     .ToBe($D10083FF);                                    { sub sp,sp,#32 }
+  Expect<UInt32>(Arm64SubsImmX(26, 26, 1)).ToBe($F100075A);
   Expect<UInt32>(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, 32))
     .ToBe($910083FF);                                    { add sp,sp,#32 }
   Expect<UInt32>(Arm64AddImmX(2, ARM64_REG_SP, 0)).ToBe($910003E2); { mov x2,sp }
@@ -194,6 +195,10 @@ begin
   { The lightweight recursive core preserves only x19 and its incoming link. }
   Expect<UInt32>(Arm64StpX19Lr(64)).ToBe($A9047BF3);
   Expect<UInt32>(Arm64LdpX19Lr(64)).ToBe($A9447BF3);
+  { The budgeted core combines a 112-byte frame allocation/retirement with
+    that pair save/restore using signed pre/post-index forms. }
+  Expect<UInt32>(Arm64StpX19LrPre(112)).ToBe($A9B97BF3);
+  Expect<UInt32>(Arm64LdpX19LrPost(112)).ToBe($A8C77BF3);
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
@@ -384,7 +389,7 @@ begin
     Arm64InitRegCache(Cache);
     Expect<Boolean>(Arm64EmitOpCached(Buf,
       MakeIrInstr(iroI32Const, 0, 0, 0, 7), Aux,
-      0, False, False, False, False, True, 1, 0, 0, 0, Cache)).ToBe(True);
+      0, False, False, False, False, True, 1, 0, 0, 0, 0, Cache)).ToBe(True);
     Expect<Boolean>(Buf.Size > 0).ToBe(True);
   finally
     Buf.Free;

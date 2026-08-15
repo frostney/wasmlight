@@ -2698,6 +2698,15 @@ end;
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RegisterCount: UInt32;
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  Param, Res: TWasmValue;
+  Trapped: Boolean;
+  Msg: string;
 begin
   { NON-tail recursion must exhaust at the same LOGICAL depth under both tiers
     (jit-spec §13 item 2), because both carve their frames through the same
@@ -2719,6 +2728,82 @@ begin
       shrunk cap, which is read when each store's context is first created. }
     Expect<string>(TrapMessageOf(RecurseModuleBytes, 'rec',
       [MakeValueI32(4000)])).ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+
+  { Repeat the same exact-boundary sweep with VALUE capacity as the sole
+    limiting resource. The validated rec function's register count determines
+    the cap, so this remains exact if lowering changes its slot allocation. }
+  Bytes := RecurseModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    RegisterCount := Ir.Functions[0].RegisterCount;
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  WasmInterpMaxDepth := 256;
+  WasmInterpValueSlots := NativeUInt(RegisterCount) * 64;
+  try
+    for N := 58 to 70 do
+    begin
+      CompileExports(['rec']);
+      Expect<Boolean>(DiffModule(Bytes, 'rec', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    Expect<string>(TrapMessageOf(Bytes, 'rec', [MakeValueI32(4000)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+
+  { A native exhaustion longjmps before changing the published outer logical
+    frame. The invocation trampoline must retire that outer frame, after which
+    the same store and compiled entry are immediately reusable. }
+  WasmInterpMaxDepth := 64;
+  try
+    FBytes := RecurseModuleBytes;
+    DecodeModule(FBytes, FModule);
+    FIr := ValidateModule(FModule, FBytes);
+    FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+      NativeUInt(Length(FBytes)), FImports);
+    RegisterInterpreter(FStore);
+    Expect<Boolean>(FInstance.FindExport('rec', Kind, Addr)).ToBe(True);
+    FJit := RegisterJit(FStore);
+    Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+
+    Param := MakeValueI32(4000);
+    Res.Bits := 0;
+    Trapped := False;
+    Msg := '';
+    try
+      InterpInvoke(FStore, Addr, @Param, @Res);
+    except
+      on E: EWasmTrap do
+      begin
+        Trapped := True;
+        Msg := E.Message;
+      end;
+    end;
+    Expect<Boolean>(Trapped).ToBe(True);
+    Expect<string>(Msg).ToBe('call stack exhausted');
+    Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+    Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
+
+    Param := MakeValueI32(4);
+    Res.Bits := High(UInt64);
+    InterpInvoke(FStore, Addr, @Param, @Res);
+    Expect<Integer>(Res.I32).ToBe(4);
+    Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+    Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
   finally
     WasmInterpMaxDepth := 256;
   end;
