@@ -1,6 +1,7 @@
 # Changelog
 
 All notable changes to wasmlight are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
+
 ## [0.1.0] - 2026-08-15
 
 ### Bug Fixes
