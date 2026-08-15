@@ -1074,12 +1074,18 @@ var
       iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
       iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
       iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
       iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
-      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr:
         begin
           CountSlotUse(AIns.A);
           CountSlotUse(AIns.B);
+        end;
+      iroSelect:
+        begin
+          CountSlotUse(AIns.A);
+          CountSlotUse(AIns.B);
+          CountSlotUse(UInt32(AIns.Imm));
         end;
       iroI32Load, iroI64Load, iroF32Load, iroF64Load,
       iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
@@ -1107,7 +1113,7 @@ var
     var
       Defined: array of Boolean;
       Ins: TWasmIrInstr;
-      N: Integer;
+      J, N: Integer;
 
       procedure MarkUse(const ASlot: UInt32);
       begin
@@ -1145,13 +1151,22 @@ var
           iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
           iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
           iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
           iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
-          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
+          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr:
             begin
               MarkUse(Ins.A);
               MarkUse(Ins.B);
             end;
+          iroSelect:
+            begin
+              MarkUse(Ins.A);
+              MarkUse(Ins.B);
+              MarkUse(UInt32(Ins.Imm));
+            end;
+          iroCall:
+            for J := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.A)) - 1 do
+              MarkUse(IrAuxBlockItem(AFn^.AuxU32, Ins.A, UInt32(J)));
           iroI32Load, iroI64Load, iroF32Load, iroF64Load,
           iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
           iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
@@ -1174,14 +1189,20 @@ var
             iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
             iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
             iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-            iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+            iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
             iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
-            iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr,
+            iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+            iroSelect,
             iroI32Load, iroI64Load, iroF32Load, iroF64Load,
             iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
             iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
             iroI64Load32S, iroI64Load32U:
               MarkDefinition(Ins.Dest);
+            iroCall:
+              for J := 0 to
+                Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.B)) - 1 do
+                MarkDefinition(IrAuxBlockItem(AFn^.AuxU32, Ins.B,
+                  UInt32(J)));
           end;
       end;
     end;
