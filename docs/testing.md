@@ -284,13 +284,13 @@ is byte-identical to the interpreter's (a codegen bug would break the
 identity invariant). `errors=0` and a pass floor guard against a silent
 corpus vanishing.
 
-**Honest cross-platform status.** The three-tier identity is proven so far
-on **aarch64-darwin** (native) and **amd64-linux** (a Rosetta-accelerated
-OrbStack VM). The remaining CI legs — Windows x64/x86, 32-bit, and native
-(non-emulated) x86-64 — are **now wired but have not yet had their first
-run on the full matrix**. Read the byte-identity claim as measured on those
-two environments and CI-enforced going forward, not as universal proof
-across every target. [roadmap.md](roadmap.md) tracks that gap.
+**Honest cross-platform status.** Exact-main
+[CI run 31899074165](https://github.com/frostney/wasmlight/actions/runs/31899074165)
+passed the full configured matrix: x86-64 and i386 Windows, AArch64 and x86-64
+macOS, and AArch64 and x86-64 Linux. The four 64-bit UNIX legs proved
+interpreter/JIT/AOT tally identity; the Windows legs proved the interpreter,
+which is the only tier shipped there. This closes the earlier first-run gap;
+it does not claim compiled-tier support on platforms where no backend ships.
 
 ### The WASI conformance corpus is a future wave
 

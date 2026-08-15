@@ -72,7 +72,7 @@
   re-validates the module: the artifact is a per-module perf cache bound
   by hash, never a trust bypass. **There is no remaining roadmap track** —
   the critical path *and* the performance tiers are complete.
-- **What honestly remains is not a track.** Three things. First, broader
+- **What honestly remains is not a v1 track.** Three things. First, broader
   optimizing-compiler work beyond the shipped, measured fast paths: more
   general register allocation and native lowering, plus optimizations such as
   inlining, loop-invariant code motion, and global value numbering. The
@@ -84,28 +84,32 @@
   direct-call frame entry/exit, and pin eligible single-memory state in the
   aarch64 backend. Second, the 368 recursively measured failures, all confined
   to proposals or the out-of-scope legacy encoding (see Track C). Third,
-  cross-platform CI validation on the legs never yet run on real hardware:
-  the three-tier identity is proven locally on **aarch64-darwin** (native)
-  and **amd64-linux** (a Rosetta VM), and the corpus is **now wired into
-  CI** on every platform — but that matrix (Windows, 32-bit, native
-  x86-64) has not yet had its first run.
-- **No dates.** There is no delivery history to anchor them to (see
-  Confidence). Tracks are sized against counted spec surface and ordered
-  by dependency.
+  operational runtime facilities and post-Core-3 standards work. Exact-main
+  CI has now passed all six configured targets; the four 64-bit UNIX legs
+  proved interpreter/JIT/AOT tally identity and the Windows legs proved the
+  interpreter.
+- **Next sequence:** release `0.1.0`, then complete and govern the embedding
+  surface (`0.2.0`), independently judge and finish non-network WASI Preview 1
+  (`0.3.0`), and add operational observability (`0.4.0`). The source-verified
+  comparison, accepted decisions, and sizing evidence are in the
+  [2026-08-15 roadmap review](../ROADMAP-260815.md).
+- **No dates.** Seven merged pull requests provide an initial delivery sample,
+  but the observed rate varies too widely to support a calendar commitment.
+  Releases remain ordered by dependency and exit criteria.
 
 ## Confidence
 
-Sizing here is anchored on the **counted specification surface**, not on
-measured throughput, because there is nothing to measure yet: the
-repository has no closed issues, no merged pull requests, and no releases.
-A throughput-anchored plan needs merged-PR history and issue-to-merge lead
-time; neither exists. Tracks A, B, C, D, and E landing does not change
-that: tracks landing outside a pull-request workflow are not a rate.
+The original A-J plan was anchored on counted specification surface because
+the repository had no pull-request delivery history. It now has seven merged
+pull requests, but still no issue-created-to-merge sample and no release
+cadence. The observed rates range from 0.54 pull requests per week over 90 days
+to 17.3 during the short active burst; PR-open-to-merge time omits most
+investigation and implementation. Those data support bounded sequencing, not
+dates. Re-anchor after four issue-linked roadmap pull requests have merged.
 
-That is a real limitation, not a formality. Counts tell you how much
-surface there is, not how fast this project crosses it. **Re-anchor this
-roadmap once there is merged-PR history**, and treat any calendar estimate
-made before then as invented.
+The current throughput calculations, source-level peer comparison, and
+confidence limits are recorded in the
+[2026-08-15 roadmap review](../ROADMAP-260815.md).
 
 Spec counts below come from `wasm-mcp` at pinned `spec/main`
 `d7b37e4170d8315f2f1283aed4e8076591a9a333`; testsuite counts from
@@ -664,6 +668,27 @@ has landed and is covered by the reference WAST suite in
 `WebAssembly/component-model/test`. That suite exists now — updating
 the older observation that nothing exercised the proposal — but it is
 Wasmtime-anchored rather than a neutral conformance bar.
+
+## Post-v1 version plan
+
+- **`0.1.0`: pinned-Core-3 baseline.** Changelog-first release of the shipped
+  runtime; no new runtime behavior.
+- **`0.2.0`: complete and governable embedding.** Public table/tag coverage,
+  instance composition, resource policy, epoch configuration, and ordinary
+  JIT policy.
+- **`0.3.0`: independently judged WASI Preview 1.** Wire `wasi-testsuite`, then
+  complete the 19 missing non-network functions. Sockets remain a later,
+  separately approved capability slice over pre-granted handles.
+- **`0.4.0`: operational runtime.** Name-aware guest stacks, profiler maps,
+  and structured statistics. Async hosting remains deferred to the Component
+  Model re-entry so the runtime designs one suspension mechanism.
+- **After `0.4.0`: Components and current WASI.** Re-enter only after a fresh
+  ADR proves a reproducible target, independent enough oracle, stable Canonical
+  ABI, and deny-by-default capability model. Threads remain a separate,
+  demand-led programme because they reverse ADR-0008.
+
+The detailed source evidence, dependency graph, sizing, and accepted decisions
+are in the [2026-08-15 roadmap review](../ROADMAP-260815.md).
 
 ## Not planned
 
