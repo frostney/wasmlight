@@ -243,3 +243,198 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@v19
         with:
           globs: "**/*.md"
+
+  # Same-runner base-vs-PR measurement, following GocciaScript's benchmark
+  # reporting shape. The job is a correctness/executability gate: timing
+  # deltas are reported, never asserted (VISION.md, "Honest measurement").
+  runtime-comparison:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout main base
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore pinned runtime executables
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.tool_cache }}/wasmlight-runtime-comparison
+          key: runtime-comparison-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/runtime-comparison/install-ci-tools.sh') }}
+
+      - name: Install pinned runtime executables
+        run: |
+          RUNTIME_TOOL_ROOT="$RUNNER_TOOL_CACHE/wasmlight-runtime-comparison"
+          bash tools/runtime-comparison/install-ci-tools.sh "$RUNTIME_TOOL_ROOT"
+          echo "$RUNTIME_TOOL_ROOT/bin" >> "$GITHUB_PATH"
+
+      - name: Verify runtime executables
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          wasmer --version
+          wasmedge --version
+          iwasm --version
+          wamrc --version
+          wazero version
+          wasm3 2>&1 | head -1 || true
+          wasm-tools --version
+          wat2wasm --version
+
+      - name: Install FPC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ASSET="lwpt-${LWPT_VERSION}-linux-x64"
+          BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
+          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          sha256sum -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          tar xzf "${ASSET}.tar.gz"
+          echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
+
+      - name: Build release binaries for main and PR
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/wasmlight-binaries"
+
+          (
+            cd baseline-source
+            lwpt install --frozen
+            lwpt build --mode release
+          )
+          install -m 755 baseline-source/build/wasmlight \
+            "$RUNNER_TEMP/wasmlight-binaries/main"
+
+          lwpt install --frozen
+          lwpt build --mode release
+          install -m 755 build/wasmlight \
+            "$RUNNER_TEMP/wasmlight-binaries/pr"
+
+      - name: Measure main base
+        run: |
+          set -euo pipefail
+          python3 tools/runtime-comparison/bench.py \
+            --profile best \
+            --samples 7 \
+            --wasmlight "$RUNNER_TEMP/wasmlight-binaries/main" \
+            --source-commit "${{ github.event.pull_request.base.sha }}"
+          mkdir -p build/runtime-comparison-ci
+          cp build/runtime-comparison/results.json \
+            build/runtime-comparison-ci/main.json
+
+      - name: Measure PR
+        run: |
+          set -euo pipefail
+          python3 tools/runtime-comparison/bench.py \
+            --profile best \
+            --samples 7 \
+            --wasmlight "$RUNNER_TEMP/wasmlight-binaries/pr" \
+            --source-commit "${{ github.event.pull_request.head.sha }}"
+          mkdir -p build/runtime-comparison-ci
+          cp build/runtime-comparison/results.json \
+            build/runtime-comparison-ci/pr.json
+
+      - name: Upload raw runtime comparison
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-comparison-results
+          retention-days: 7
+          if-no-files-found: ignore
+          path: build/runtime-comparison-ci/*.json
+
+  runtime-comparison-comment:
+    needs: runtime-comparison
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Download raw runtime comparison
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: runtime-comparison-results
+          path: runtime-comparison-results
+
+      - name: Render runtime comparison comment
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 tools/runtime-comparison/render_comment.py \
+            --baseline runtime-comparison-results/main.json \
+            --current runtime-comparison-results/pr.json \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --run-url "$RUN_URL" \
+            --output runtime-comparison-comment.md
+
+      - name: Upsert runtime comparison comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v9
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- wasmlight-runtime-comparison -->';
+            const body = fs.readFileSync('runtime-comparison-comment.md', 'utf8');
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            if (pull.head.sha !== process.env.EXPECTED_HEAD) {
+              core.notice(`Skipping stale comparison for ${process.env.EXPECTED_HEAD}`);
+              return;
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(
+              comment => comment.body && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

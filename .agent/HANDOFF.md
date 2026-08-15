@@ -1,5 +1,100 @@
 # Handoff
 
+Updated: 2026-08-15 (PR runtime-comparison gate and sticky report)
+
+## PR runtime-comparison gate
+
+- Extended `.github/workflows/pr.yml` with a Linux x86-64
+  `runtime-comparison` job and an always-running
+  `runtime-comparison-comment` reporter, following GocciaScript's same-runner
+  base-vs-PR artifact/comment shape.
+- The gate builds release binaries for the PR base and head, runs the four
+  self-checking workloads against both on the same runner, uploads raw JSON,
+  and upserts one comment identified by
+  `<!-- wasmlight-runtime-comparison -->`. A stale-run guard refuses to let an
+  older workflow overwrite a newer head's comment.
+- This is deliberately an executable gate, not a numeric threshold: build,
+  fixture validation, precompilation, result verification, or runtime-command
+  failure makes the job red. Timing deltas and range-overlap classifications
+  are informational and cannot fail a PR, preserving the project's honest
+  measurement rule.
+- Added `tools/runtime-comparison/install-ci-tools.sh`: Wasmtime 47.0.3,
+  Wasmer 7.2.1, WasmEdge 0.17.1, WAMR/wamrc 2.4.5, wazero 1.12.0, wasm3 0.5.0,
+  wasm-tools 1.256.0, and WABT 1.0.41 are pinned to exact release assets and
+  SHA-256 digests. The extracted executable tree is cached with a key derived
+  from the installer, so any version/digest edit invalidates it.
+- The Linux best-profile WAMR row now uses precompiled AOT. The harness passes
+  an explicit `--target=x86_64`/`aarch64` to `wamrc`; this was required after a
+  clean Ubuntu x86-64-emulation smoke exposed host-target misdetection. Hosts
+  without a runnable `wamrc` still fall back to a clearly labelled interpreter.
+- Added and unit-tested `render_comment.py`: the comment shows main vs PR,
+  overlap-aware deltas, every peer, the peer ratio, method, non-gating policy,
+  workflow link, and raw-artifact pointer. Missing candidate output renders a
+  failure comment rather than throwing away the reporting path.
+- Local verification: frozen install, formatting, generated-agent validation,
+  release build, and all 44 unit suites pass. Actionlint passes for the new
+  workflow (the existing SC2005 at pr.yml:91 is ignored), shellcheck passes,
+  renderer 4/4 tests pass, Python byte-compilation passes, Markdown lint passes,
+  YAML parsing and diff whitespace pass, and a clean Ubuntu container verified
+  every cached executable plus WAMR AOT compile and execution.
+- PR #5's first runtime-comparison run exposed the published wasm3 0.5.0
+  x86-64 ELF exiting on GitHub's runner with SIGILL before measurement. The
+  installer now builds wasm3 once from the checksum-verified archive for pinned
+  commit `6b8bcb1e07bf26ebef09a7211b0a37a446eafd52`; the installer-derived cache
+  retains that executable for later runs. The source-root lookup is constrained
+  to the archive's top-level directory: an unconstrained `find CMakeLists.txt`
+  selected wasm3's Android JNI subproject on one hosted filesystem traversal.
+- Live forge check found no branch protection or repository ruleset. The new
+  job makes the PR workflow red on failure, but it cannot become a mechanically
+  required merge check until a ruleset is added after the workflow exists on
+  the default branch.
+
+Updated: 2026-08-14 (reproducible seven-runtime comparison delivered)
+
+## Runtime comparison and performance scorecard
+
+- Fetched `origin/main@a7d9565304ee1138b4e76763810559e7ba1112d1` and created
+  `codex/compare-runtimes` without a rebase, force-push, or upstream tracking
+  branch. The prior handoff-only change was retained in commit `3e25018`.
+- Added the reusable comparison harness and four self-checking WASI workloads
+  under `tools/runtime-comparison/`. Commit `83c132b9d52a` is the exact clean
+  measured head. Compilation happens outside the timer; the run uses one
+  warm-up, seven measured samples, a rotated round-robin schedule, and the
+  shared `/tmp/wasmlight-perf-gate.lock`. Raw samples are generated under
+  `build/runtime-comparison/` and are not committed.
+- Added `docs/runtime-comparison.md` with a current product-shape comparison of
+  Wasmtime 47.0.3, Wasmer 7.2.1, WasmEdge 0.17.1, WAMR 2.4.5, wazero 1.12.0,
+  and wasm3 0.5.0, plus the full performance snapshot and limitations.
+- Wasmlight's defensible position is a native Object Pascal runtime with an
+  unusually complete pinned core-3.0 implementation, strict phase/error
+  boundaries, deny-by-default capabilities, and observational identity across
+  selected execution modes. Do not position it as a general Wasmtime
+  replacement: Component Model/WASI p2, threads/shared memory, host-surface
+  breadth, mature bindings/tooling, external security assurance, and peak
+  native performance are material gaps.
+- "Complete in every tier" is an observable-behaviour claim. The JIT and AOT
+  share native backends and conservatively fall back per function when
+  `JitCanCompile` declines a shape (including handler-table cases); it is not a
+  claim that every core-3.0 operation is natively lowered.
+- Clean-head Apple M5 Max medians: wasmlight AOT startup 2.191 ms (fastest);
+  nonlinear 300M loop 503.042 ms (Wasmtime/Wasmer/WasmEdge/wazero compiled
+  configurations are 1.48-1.51x faster); fib(35) 353.371 ms (compiled peers
+  7.96-15.64x faster); varying-address 50M memory 82.054 ms (compiled peers
+  2.66-4.66x faster). WAMR and wasm3 were interpreter-only in the installed
+  best-profile configurations.
+- Wasmlight's interpreter starts fastest and beats the explicit WasmEdge and
+  wazero interpreters on all three heavy workloads, but WAMR and wasm3 are
+  4.62-9.32x faster. The strongest optimization targets are recursive
+  call/return first, then the memory chokepoint; preserve startup and artifact
+  size while changing either.
+- WAMR AOT/JIT remains unmeasured: WAMR supports both, but its official 2.4.5
+  macOS `wamrc` asset is x86-64-only and this arm64 host has no Rosetta. Build a
+  native arm64 compiler before claiming WAMR's performance ceiling.
+- Next scorecard extensions are host-call and repeated-instantiation throughput,
+  peak RSS/multi-instance density, then one real toolchain-compiled WASI app.
+  Keep Component Model and threads as explicit product-direction decisions,
+  not assumed roadmap additions.
+
 Updated: 2026-08-14 (optimization skill PR refreshed on current main)
 
 ## Runtime optimization skill
