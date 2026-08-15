@@ -658,6 +658,88 @@ var
     {$ENDIF}
   end;
 
+  procedure AnalyzeStoreLoadForwarding;
+  var
+    K, L, Last: Integer;
+    StoreIns, LoadIns: TWasmIrInstr;
+
+    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+    begin
+      Result := (ASlot = AllocatedSlots[0]) or
+        (ASlot = AllocatedSlots[1]) or
+        ((AllocatedSlots[2] <> High(UInt32)) and
+          (ASlot = AllocatedSlots[2]));
+    end;
+
+  begin
+    {$IFDEF WASM_JIT_ARM64}
+    { This is deliberately not general memory value numbering. In the
+      helper-free, base-pinned shape, forward only across at most two pure
+      lowering moves to an exact same-address i32 load.
+      The store is still emitted and therefore keeps its normal fault/trap and
+      memory side effect; after it succeeds, the store-confined thread cannot
+      change that memory before the immediately following load. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+    begin
+      StoreIns := PlannedCode[K];
+      if SkipPlanned[K] or (StoreIns.Op <> iroI32Store) or
+        not IsAllocatedSlot(StoreIns.A) or
+        not IsAllocatedSlot(StoreIns.Dest) then
+        Continue;
+      Last := K + 3;
+      if Last > High(PlannedCode) then
+        Last := High(PlannedCode);
+      for L := K + 1 to Last do
+      begin
+        if Targets[L] then
+          Break;
+        LoadIns := PlannedCode[L];
+        if LoadIns.Op = iroI32Load then
+        begin
+          if not SkipPlanned[L] and
+            (LoadIns.A = StoreIns.A) and
+            (LoadIns.B = StoreIns.B) and
+            (LoadIns.Imm = StoreIns.Imm) and
+            (LoadIns.Dest <> StoreIns.A) and
+            (LoadIns.Dest <> StoreIns.Dest) and
+            not IsVisibleFrameReg(LoadIns.Dest) and
+            (SimpleUseCount(LoadIns.Dest) = 1) and
+            (L < High(PlannedCode)) and not Targets[L + 1] and
+            not SkipPlanned[L + 1] and
+            (PlannedCode[L + 1].Op = iroI32Add) then
+          begin
+            if PlannedCode[L + 1].A = LoadIns.Dest then
+            begin
+              PlannedCode[L + 1].A := StoreIns.Dest;
+              SkipPlanned[L] := True;
+            end
+            else if PlannedCode[L + 1].B = LoadIns.Dest then
+            begin
+              PlannedCode[L + 1].B := StoreIns.Dest;
+              SkipPlanned[L] := True;
+            end;
+          end;
+          Break;
+        end;
+        { At this analysis point only lowering moves can have been skipped;
+          they emit no code. A surviving move may be crossed only when it
+          cannot redefine the exact address or stored-value slot. Checking the
+          IR safepoint bit explicitly keeps this proof independent of move's
+          current non-safepoint classification. }
+        if (LoadIns.Op <> iroMove) or IrInstrIsSafepoint(LoadIns) then
+          Break;
+        if SkipPlanned[L] then
+          Continue;
+        if (LoadIns.Dest = StoreIns.A) or
+          (LoadIns.Dest = StoreIns.Dest) then
+          Break;
+      end;
+    end;
+    {$ENDIF}
+  end;
+
   function StaticCacheOp(const AOp: TWasmIrOp): Boolean;
   begin
     case AOp of
@@ -1037,6 +1119,7 @@ begin
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
+    AnalyzeStoreLoadForwarding;
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeMaskedShiftFusion;
     {$ENDIF}

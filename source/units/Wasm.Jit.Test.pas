@@ -657,6 +657,30 @@ begin
   ]);
 end;
 
+{ The varying-address store/load pair used by the narrow aarch64 forwarding
+  plan. The store's memory effect is observable independently at address 4
+  after run(2), so reusing its value for the following load cannot accidentally
+  turn into deleting the store. }
+function MemForwardModuleBytes(const AMemoryPages: Byte = 1): TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, AMemoryPages])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $01, $03, $7F,                  { locals: i, acc, addr }
+      $03, $40,                       { loop }
+      $20, $01, $41, $FF, $FF, $00, $71, $41, $02, $74, $21, $03,
+      $20, $03, $20, $01, $36, $02, $00, { memory[addr] := i }
+      $20, $02, $20, $03, $28, $02, $00, $6A, $21, $02,
+      $20, $01, $41, $01, $6A, $21, $01,
+      $20, $01, $20, $00, $49, $0D, $00,
+      $0B, $20, $02, $0B])]))
+  ]);
+end;
+
 { A loop parameter is a dynamic IR slot whose next use is reached through the
   back edge rather than later in lexical order. The cached Arm64 path must
   reconcile it at the jump even though ordinary remaining-use counting has
@@ -1253,6 +1277,8 @@ type
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
+    procedure TestForwardedMemoryLoadKeepsStoreEffect;
+    procedure TestForwardedMemoryLoadKeepsStoreOobTrap;
     procedure TestMemoryLoopCache;
     procedure TestMemoryLoopCarriedCache;
     procedure TestMemoryOobTraps;
@@ -2629,6 +2655,46 @@ begin
     [MakeValueI32(0)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+procedure TJitTests.TestForwardedMemoryLoadKeepsStoreEffect;
+var
+  Addr: UInt32;
+  Kind: TWasmExternKind;
+  Params, Results: array[0 .. 0] of TWasmValue;
+  Stored: UInt32;
+begin
+  FBytes := MemForwardModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    NativeUInt(Length(FBytes)), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  if not FInstance.FindExport('run', Kind, Addr) then
+    raise EWasmError.Create('no export named run');
+  Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+  Params[0] := MakeValueI32(2);
+  Results[0].Bits := High(UInt64);
+  InterpInvoke(FStore, Addr, @Params[0], @Results[0]);
+  Expect<UInt64>(Results[0].Bits).ToBe(1);
+  Move(FStore.MemAddressAt(FInstance.MemAddrs[0], 4, 0, 4)^,
+    Stored, SizeOf(Stored));
+  Expect<UInt32>(Stored).ToBe(1);
+end;
+
+procedure TJitTests.TestForwardedMemoryLoadKeepsStoreOobTrap;
+var
+  Bytes: TWasmBytes;
+begin
+  { With a zero-page memory, run(1)'s first exact store/load pair is out of
+    bounds. The forwarding plan skips only the load and must leave the original
+    store in place as the trapping access. }
+  Bytes := MemForwardModuleBytes(0);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(1)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(1)]))
+    .ToBe('out of bounds memory access');
+end;
+
 procedure TJitTests.TestMemoryLoopCache;
 begin
   Expect<Boolean>(DiffFresh(MemLoopModuleBytes, 'run', [MakeValueI32(100)]))
@@ -2974,6 +3040,10 @@ begin
     TestThrowAcrossCompiledFrameCaught);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
+  Test('a forwarded memory load keeps the store memory effect',
+    TestForwardedMemoryLoadKeepsStoreEffect);
+  Test('a forwarded memory load keeps the store out-of-bounds trap',
+    TestForwardedMemoryLoadKeepsStoreOobTrap);
   Test('a scalar memory loop retains cached values identically',
     TestMemoryLoopCache);
   Test('a scalar memory loop reconciles dynamic loop-carried values',
