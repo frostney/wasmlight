@@ -59,6 +59,7 @@ type
     procedure TestStaticCacheKeepsFourTemporaries;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheUsesHostRegsForAlu;
+    procedure TestStaticAndMissingSourcesUseHostRegs;
     procedure TestDynamicDestReservation;
     procedure TestThirdStaticAllocation;
     procedure TestExtendedFrameWords;
@@ -274,6 +275,40 @@ begin
     Expect<UInt32>(UseCounts[0]).ToBe(0);
     Expect<UInt32>(UseCounts[1]).ToBe(0);
     Expect<Boolean>(Cache.Entries[0].Dirty).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestStaticAndMissingSourcesUseHostRegs;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..3] of UInt32;
+  Visible: array[0..3] of Boolean;
+begin
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[0] := 1;
+  UseCounts[2] := 1;
+  Visible[0] := True;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 4);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 3, 0, 2, 0), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    { The static left source stays in x12. The missing right source is loaded
+      directly into x14, and the result is reserved in x15. }
+    Expect<Integer>(Buf.Size).ToBe(4 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 2)).ToBe(
+      Arm64LdrX(ARM64_REG_CACHE2, ARM64_REG_REGFILE, 2 * ARM64_SLOT_SIZE));
+    Expect<UInt32>(EmittedWord(Buf, 3)).ToBe(
+      Arm64AddW(ARM64_REG_CACHE3, ARM64_REG_CACHE0, ARM64_REG_CACHE2));
+    Expect<UInt32>(UseCounts[0]).ToBe(0);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
   finally
     Buf.Free;
   end;
@@ -819,6 +854,8 @@ begin
     TestStaticCacheKeepsShiftResult);
   Test('static allocation feeds ALU host registers directly',
     TestStaticCacheUsesHostRegsForAlu);
+  Test('static and missing ALU sources stay in host registers',
+    TestStaticAndMissingSourcesUseHostRegs);
   Test('dynamic destinations reserve a non-source cache register',
     TestDynamicDestReservation);
   Test('static allocation can retain a third long-lived slot',

@@ -658,6 +658,168 @@ var
     {$ENDIF}
   end;
 
+  procedure AnalyzeLocalAliases;
+  var
+    K, L, Last: Integer;
+    Source, Alias_: UInt32;
+
+    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+    begin
+      Result := (ASlot = AllocatedSlots[0]) or
+        (ASlot = AllocatedSlots[1]) or
+        ((AllocatedSlots[2] <> High(UInt32)) and
+          (ASlot = AllocatedSlots[2]));
+    end;
+
+    function FullUseCount(const ASlot: UInt32): UInt32;
+    var
+      N: Integer;
+    begin
+      Result := 0;
+      for N := 0 to High(AFn^.Code) do
+        case AFn^.Code[N].Op of
+          iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
+            if AFn^.Code[N].A = ASlot then Inc(Result);
+          iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+          iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+          iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+          iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+          iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+          iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
+            begin
+              if AFn^.Code[N].A = ASlot then Inc(Result);
+              if AFn^.Code[N].B = ASlot then Inc(Result);
+            end;
+          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+          iroI64Load32S, iroI64Load32U:
+            if AFn^.Code[N].A = ASlot then Inc(Result);
+          iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+          iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+          iroI64Store32:
+            begin
+              if AFn^.Code[N].A = ASlot then Inc(Result);
+              if AFn^.Code[N].Dest = ASlot then Inc(Result);
+            end;
+        end;
+    end;
+
+    function RewriteUse(var AIns: TWasmIrInstr; const AOld,
+      ANew: UInt32): Boolean;
+    begin
+      Result := False;
+      case AIns.Op of
+        iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz,
+        iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+        iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+        iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+        iroI64Load32S, iroI64Load32U:
+          if AIns.A = AOld then
+          begin
+            AIns.A := ANew;
+            Result := True;
+          end;
+        iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+        iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+        iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+        iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+        iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+        iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+        iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
+          begin
+            if AIns.A = AOld then
+            begin
+              AIns.A := ANew;
+              Result := True;
+            end;
+            if AIns.B = AOld then
+            begin
+              AIns.B := ANew;
+              Result := True;
+            end;
+          end;
+        iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+        iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+        iroI64Store32:
+          begin
+            if AIns.A = AOld then
+            begin
+              AIns.A := ANew;
+              Result := True;
+            end;
+            if AIns.Dest = AOld then
+            begin
+              AIns.Dest := ANew;
+              Result := True;
+            end;
+          end;
+      end;
+    end;
+
+    function DefinesSlot(const AIns: TWasmIrInstr;
+      const ASlot: UInt32): Boolean;
+    begin
+      Result := (AIns.Dest = ASlot) and
+        (AIns.Op in [iroMove, iroI32Const, iroI64Const, iroF32Const,
+          iroF64Const, iroI32Eqz, iroI64Eqz,
+          iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+          iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+          iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+          iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+          iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
+          iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr,
+          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+          iroI64Load32S, iroI64Load32U]);
+    end;
+
+  begin
+    {$IFDEF WASM_JIT_ARM64}
+    { Validation lowers local.get to a move into a one-use expression slot.
+      In the helper-free base-pinned loop shape, forward that exact alias into
+      an already-cached consumer without changing the canonical IR or labels.
+      The four-instruction window covers the bounded lowering shapes while a
+      target, safepoint, or intervening write to the visible source ends the
+      proof. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if (PlannedCode[K].Op = iroMove) and not SkipPlanned[K] and
+        (not Targets[K] or IsAllocatedSlot(PlannedCode[K].A)) and
+        IsVisibleFrameReg(PlannedCode[K].A) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        (FullUseCount(PlannedCode[K].Dest) = 1) then
+      begin
+        Source := PlannedCode[K].A;
+        Alias_ := PlannedCode[K].Dest;
+        Last := K + 4;
+        if Last > High(PlannedCode) then
+          Last := High(PlannedCode);
+        for L := K + 1 to Last do
+        begin
+          if Targets[L] or IrInstrIsSafepoint(PlannedCode[L]) then
+            Break;
+          if SkipPlanned[L] then
+            Continue;
+          if RewriteUse(PlannedCode[L], Alias_, Source) then
+          begin
+            SkipPlanned[K] := True;
+            Break;
+          end;
+          if DefinesSlot(PlannedCode[L], Source) then
+            Break;
+        end;
+      end;
+    {$ENDIF}
+  end;
+
   procedure AnalyzeStoreLoadForwarding;
   var
     K, L, Last: Integer;
@@ -1119,6 +1281,7 @@ begin
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
+    AnalyzeLocalAliases;
     AnalyzeStoreLoadForwarding;
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeMaskedShiftFusion;

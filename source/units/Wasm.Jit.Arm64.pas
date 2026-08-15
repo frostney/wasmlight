@@ -3555,12 +3555,53 @@ end;
 function Arm64CachedSourceReg(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASlot: UInt32;
   const ADefault: Byte): Byte;
+var
+  Victim: Integer;
 begin
-  if not Arm64CachedHostForSlot(ACache, ASlot, Result) then
-    Result := ADefault;
+  if Arm64CachedHostForSlot(ACache, ASlot, Result) then
+  begin
+    { Keep the existing load path as the one place that consumes the planned
+      use count. The established host emits no move. }
+    Arm64CachedLoad(ABuf, ACache, Result, ASlot);
+    Exit;
+  end;
+  if ACache.StaticAllocation then
+  begin
+    { A one-source cached operation can load a missing expression directly
+      into its selected dynamic entry. This is the same round-robin victim and
+      liveness spill used by CachedLoad, without an unnecessary scratch copy. }
+    Victim := 3 + ACache.Next;
+    ACache.Next := Byte((ACache.Next + 1) and 3);
+    if ACache.WriteBackDynamics then
+      Arm64SpillCacheEntry(ABuf, ACache, Victim);
+    Result := Arm64CacheHostReg(Victim);
+    LdX(ABuf, Result, ASlot);
+    ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Dirty := False;
+    ACache.Entries[Victim].Slot := ASlot;
+    if ACache.WriteBackDynamics and (ASlot < ACache.SlotCount) and
+      (ACache.UseCounts[ASlot] > 0) then
+      Dec(ACache.UseCounts[ASlot]);
+    Exit;
+  end;
+  Result := ADefault;
   { Keep the existing load path as the one place that consumes the planned use
-    count. When Result already owns the slot this emits no move. }
+    count in the original write-through cache. }
   Arm64CachedLoad(ABuf, ACache, Result, ASlot);
+end;
+
+function Arm64CachedStaticHostForSlot(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to ACache.StaticCount - 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := Arm64CacheHostReg(I);
+      Exit(True);
+    end;
+  Result := False;
 end;
 
 procedure Arm64CachedBinarySourceRegs(const ABuf: TWasmCodeBuffer;
@@ -3574,6 +3615,23 @@ begin
     Arm64CachedHostForSlot(ACache, ARightSlot, ARight) then
   begin
     Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+    Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
+    Exit;
+  end;
+  { A static allocation cannot be evicted by resolving the other operand into
+    x14..x17. Keep that side in its host register and load the missing side
+    directly into a dynamic entry. }
+  if Arm64CachedStaticHostForSlot(ACache, ALeftSlot, ALeft) then
+  begin
+    Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+    ARight := Arm64CachedSourceReg(ABuf, ACache, ARightSlot,
+      ARM64_REG_T1);
+    Exit;
+  end;
+  if Arm64CachedStaticHostForSlot(ACache, ARightSlot, ARight) then
+  begin
+    ALeft := Arm64CachedSourceReg(ABuf, ACache, ALeftSlot,
+      ARM64_REG_T0);
     Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
     Exit;
   end;
