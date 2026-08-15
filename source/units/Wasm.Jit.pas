@@ -36,10 +36,12 @@
 
   The one narrow exception is the proof-gated AArch64 scalar self-call path:
   a closed helper-free numeric function uses a native-stack register file for
-  recursion and edits only the shared Depth/ValueTop counters. It checks both
-  caps and the entry epoch before mutation; references, allocation, handlers,
-  host/interpreted escape, indirect/tail calls, and cross-function calls all
-  retain the full shared-frame path above.
+  recursion and edits only the shared Depth/ValueTop counters. Its external
+  AAPCS wrapper saves and pins the full callee-saved state once, then calls a
+  local position-independent core; recursion preserves only x19/LR beside the
+  native register file. It checks both caps and the entry epoch before mutation;
+  references, allocation, handlers, host/interpreted escape, indirect/tail
+  calls, and cross-function calls all retain the full shared-frame path above.
 
   WAVE 3 CHANGES EXACTLY TWO THINGS HERE. (1) JitDispatch delegates to the
   backend's Arm64InvokeCompiled, because a compiled body may end in a
@@ -157,8 +159,8 @@ type
     register-file base pointer JitEnterFrame returned (@Values[Base]), the
     store, and the IR-code base @Fn^.Code[0]. The AArch64 backend extends this
     private ABI with the interpreter context used by generated direct-call
-    frame setup and the live entry pointer used by proof-gated self calls; its
-    local declaration is fingerprinted with the AOT ABI.
+    frame setup and an entry pointer retained by the generic direct-call ABI;
+    its local declaration is fingerprinted with the AOT ABI.
     cdecl selects the platform C convention, matching each backend's
     hand-emitted prologue/epilogue. }
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
@@ -434,6 +436,7 @@ var
   UseExtendedFrame: Boolean;
   NativeParamReg: UInt32;
   NativeResultReg: UInt32;
+  NativeCoreLabel: TWasmJitLabel;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -1161,6 +1164,7 @@ begin
     UseNativeScalarSelf := JitCanNativeScalarSelf(AFn, AFuncIdx);
     NativeParamReg := 0;
     NativeResultReg := 0;
+    NativeCoreLabel := -1;
     if UseNativeScalarSelf then
     begin
       NativeParamReg := AFn^.LocalRegs[0];
@@ -1170,6 +1174,8 @@ begin
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
+    if UseNativeScalarSelf then
+      NativeCoreLabel := Buf.NewLabel;
 
     { A cache is valid only along one straight-line predecessor. Mark every IR
       branch destination up front so a join invalidates compile-time cache
@@ -1193,11 +1199,6 @@ begin
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
-    { x26 pins the live entry for the native self-call ABI. Keep the static
-      allocator from assigning that register even if its eligibility widens in
-      a later wave to admit call-bearing functions. }
-    if UseNativeScalarSelf then
-      AllocatedSlots[2] := High(UInt32);
     UseThirdStatic := UseStaticCache and
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
@@ -1213,17 +1214,26 @@ begin
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
-    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
+    UseExtendedFrame := UseThirdStatic;
     if UseExtendedFrame then
       Arm64EmitPrologueExtended(Buf)
     else
       Arm64EmitPrologue(Buf);
-    if UseNativeScalarSelf then
-      Arm64EmitPinSelfEntry(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     if UsePinnedMemory then
       Arm64EmitPinMemory(Buf, PinnedMemoryIndex, UsePinnedMemoryBase);
+    if UseNativeScalarSelf then
+    begin
+      { The external AAPCS entry owns the full callee-saved frame once. The
+        recursive path targets this position-independent local core directly. }
+      Arm64EmitBlTo(Buf, NativeCoreLabel);
+      if UseExtendedFrame then
+        Arm64EmitEpilogueExtended(Buf)
+      else
+        Arm64EmitEpilogue(Buf);
+      Buf.BindLabel(NativeCoreLabel);
+    end;
     Arm64InitRegCache(ArmCache);
     if UseStaticCache then
     begin
@@ -1290,7 +1300,7 @@ begin
               (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarSelf, AFn^.RegisterCount, NativeParamReg,
-            NativeResultReg, ArmCache);
+            NativeResultReg, NativeCoreLabel, ArmCache);
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}

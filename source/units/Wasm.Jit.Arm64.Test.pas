@@ -51,6 +51,7 @@ type
     procedure TestWordBuilderBits;
     procedure TestFrameWordBits;
     procedure TestBranchPlaceholderBits;
+    procedure TestLocalCallPatch;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWave2;
     procedure TestCallArityFence;
@@ -189,6 +190,9 @@ begin
   Expect<UInt32>(Arm64LdpX23X24Off32).ToBe($A94263F7);
   Expect<UInt32>(Arm64LdpX21X22Off16).ToBe($A9415BF5);
   Expect<UInt32>(Arm64LdpX19X20PostIndex64).ToBe($A8C453F3);
+  { The lightweight recursive core preserves only x19 and its incoming link. }
+  Expect<UInt32>(Arm64StpX19Lr(64)).ToBe($A9047BF3);
+  Expect<UInt32>(Arm64LdpX19Lr(64)).ToBe($A9447BF3);
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
@@ -345,7 +349,7 @@ begin
     Arm64InitRegCache(Cache);
     Expect<Boolean>(Arm64EmitOpCached(Buf,
       MakeIrInstr(iroI32Const, 0, 0, 0, 7), Aux,
-      0, False, False, False, False, True, 1, 0, 0, Cache)).ToBe(True);
+      0, False, False, False, False, True, 1, 0, 0, 0, Cache)).ToBe(True);
     Expect<Boolean>(Buf.Size > 0).ToBe(True);
   finally
     Buf.Free;
@@ -435,9 +439,28 @@ end;
 procedure TArm64Tests.TestBranchPlaceholderBits;
 begin
   Expect<UInt32>(Arm64BPlaceholder).ToBe($14000000);
+  Expect<UInt32>(Arm64BlPlaceholder).ToBe($94000000);
   Expect<UInt32>(Arm64BCondPlaceholder(ARM64_COND_EQ)).ToBe($54000000);
   Expect<UInt32>(Arm64CbzWPlaceholder(9)).ToBe($34000009);
   Expect<UInt32>(Arm64CbnzWPlaceholder(9)).ToBe($35000009);
+end;
+
+procedure TArm64Tests.TestLocalCallPatch;
+var
+  Buf: TWasmCodeBuffer;
+  Target: TWasmJitLabel;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Target := Buf.NewLabel;
+    Arm64EmitBlTo(Buf, Target);
+    Buf.EmitU32(Arm64Ret);
+    Buf.BindLabel(Target);
+    Arm64ResolvePatches(Buf);
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe($94000002);
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TArm64Tests.TestSlotOffset;
@@ -823,6 +846,7 @@ begin
   Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
   Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
+  Test('local BL patches stay position-independent', TestLocalCallPatch);
   Test('slot byte offset is register*8', TestSlotOffset);
   Test('predicate covers waves 2-6 (only EH is declined)',
     TestPredicateCoversWave2);
