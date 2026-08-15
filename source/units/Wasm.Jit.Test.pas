@@ -346,6 +346,24 @@ begin
   ]);
 end;
 
+{ A compiled caller enters a native-eligible leaf which overwrites its incoming
+  parameter before returning it. The seeded x12 cache entry must be updated;
+  retaining a second stale mapping returns the caller's original argument. }
+function LeafLocalSetModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00])])),
+    Sect(7, VecOf([
+      ExportEntry('helper', $00, 0),
+      ExportEntry('run', $00, 1)])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $41, $02, $21, $00, $20, $00, $0B]),
+      CodeEntry([$00, $20, $00, $10, $00, $0B])]))
+  ]);
+end;
+
 { call_indirect over a 4-entry table holding [$double, $other, null, null]:
 
     (func $double (param i32) (result i32) (i32.mul (local.get 0) 2))  ; type 0
@@ -1339,6 +1357,7 @@ type
     procedure TestTailCallToHost;
     procedure TestNativeScalarSelfProofGate;
     procedure TestNativeScalarSelfSelectLiveness;
+    procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
 
@@ -1731,6 +1750,10 @@ begin
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledEntry <> nil).ToBe(True);
   Expect<Boolean>(FStore.Funcs[AddAddr].CompiledDirectEntry =
     FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
+  {$IFDEF WASM_JIT_ARM64}
+  Expect<Boolean>(FStore.Funcs[AddAddr].CompiledNativeScalarEntry =
+    FStore.Funcs[AddAddr].CompiledEntry).ToBe(True);
+  {$ENDIF}
   Expect<Boolean>(FJit.ForceCompile(AddAddr)).ToBe(True);
   {$ELSE}
   Expect<Boolean>(Compiled).ToBe(False);
@@ -2713,8 +2736,8 @@ begin
     Module.Free;
   end;
 
-  { Two parameters is also outside the one-slot ABI and must retain the generic
-    logical/value/GC-frame path on every backend. }
+  { Two parameters remains outside the one-slot self-recursive ABI. The
+    separate native-leaf proof is exercised below. }
   Bytes := AddModuleBytes;
   Module := TWasmModule.Create;
   Ir := nil;
@@ -2751,6 +2774,73 @@ begin
   CompileExports(['rec']);
   Expect<Boolean>(DiffModule(Bytes, 'rec',
     [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestNativeScalarLeafProofAndExhaustion;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RunRegisterCount: UInt32;
+begin
+  { The optimized cross-function target is exactly the two-parameter numeric
+    helper in CallPairModuleBytes. Its caller is not a leaf because it calls;
+    a trapping division body is also refused. }
+  Bytes := CallPairModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[0])).ToBe(
+      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+    Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[1])).ToBe(False);
+    RunRegisterCount := Ir.Functions[1].RegisterCount;
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  Bytes := I32BinModule($6D, 'divs');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[0])).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  CompileExports(['helper', 'run']);
+  Expect<Boolean>(DiffModule(LeafLocalSetModuleBytes, 'run',
+    [MakeValueI32(1)])).ToBe(JIT_BACKEND_AVAILABLE);
+
+  { The lightweight call must enforce the same logical depth boundary as the
+    interpreter before touching native stack state. DiffModule also asserts
+    that the trapped invocation leaves Depth, ValueTop, and the GC frame clean. }
+  WasmInterpMaxDepth := 1;
+  try
+    CompileExports(['helper', 'run']);
+    Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
+      [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(CallPairModuleBytes, 'run',
+      [MakeValueI32(10)])).ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+
+  { Repeat with value capacity as the sole limiting resource. The outer run
+    frame fits exactly; entering the leaf would exceed the shared slot cap. }
+  WasmInterpValueSlots := RunRegisterCount;
+  try
+    CompileExports(['helper', 'run']);
+    Expect<Boolean>(DiffModule(CallPairModuleBytes, 'run',
+      [MakeValueI32(10)])).ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
 end;
 
 procedure TJitTests.TestDeepRecursionExhausts;
@@ -3309,6 +3399,8 @@ begin
     TestNativeScalarSelfProofGate);
   Test('native scalar self-call keeps both select inputs live',
     TestNativeScalarSelfSelectLiveness);
+  Test('native scalar leaf calls preserve proof and exhaustion boundaries',
+    TestNativeScalarLeafProofAndExhaustion);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',

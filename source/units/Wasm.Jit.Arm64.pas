@@ -440,7 +440,11 @@ procedure Arm64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
 procedure Arm64EmitNativeSelfBudget(const ABuf: TWasmCodeBuffer;
   const ARegisterCount: UInt32);
 procedure Arm64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
-  const AParamReg, AResultReg: UInt32; const ACoreLabel: TWasmJitLabel);
+  const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
+  const ACoreLabel: TWasmJitLabel);
+procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32; const ACoreLabel,
+  AExternalLabel: TWasmJitLabel);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
 
@@ -504,7 +508,8 @@ procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
   const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
   const ASlotCount: UInt32);
 procedure Arm64SeedNativeCoreCache(var ACache: TArm64RegCache;
-  const AParamSlot: UInt32);
+  const AParamCount, AParam0Slot, AParam1Slot: UInt32;
+  const AUseLeafCapacity: Boolean);
 procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache);
 procedure Arm64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
@@ -674,13 +679,35 @@ procedure EmitBCondTo(const ABuf: TWasmCodeBuffer; const ACond: Byte;
   const ATarget: TWasmJitLabel); forward;
 
 procedure Arm64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
-  const AParamReg, AResultReg: UInt32; const ACoreLabel: TWasmJitLabel);
+  const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
+  const ACoreLabel: TWasmJitLabel);
 begin
   { The external AAPCS wrapper bridges the canonical register file to the
-    local one-slot core ABI once. Recursive calls keep both transfers in x12. }
-  LdX(ABuf, 12, AParamReg);
+    local scalar core ABI once. Recursive calls use x12; two-parameter leaves
+    additionally receive their second scalar in x13. }
+  LdX(ABuf, 12, AParam0Reg);
+  if AParamCount = 2 then
+    LdX(ABuf, 13, AParam1Reg);
   Arm64EmitBlTo(ABuf, ACoreLabel);
   StX(ABuf, 12, AResultReg);
+end;
+
+procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
+  const ARegisterCount: UInt32; const ACoreLabel,
+  AExternalLabel: TWasmJitLabel);
+var
+  FrameBytes: UInt32;
+begin
+  { Canonical entries pass their non-zero entry address in x4. A lightweight
+    caller passes zero with the scalar arguments already in x12/x13. }
+  EmitCbnzTo(ABuf, 4, UInt32(AExternalLabel));
+  FrameBytes := ((ARegisterCount * ARM64_SLOT_SIZE + 15) and not UInt32(15))
+    + 16;
+  ABuf.EmitU32(Arm64StpX19LrPre(FrameBytes));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_REGFILE, ARM64_REG_SP, 16));
+  Arm64EmitBlTo(ABuf, ACoreLabel);
+  ABuf.EmitU32(Arm64LdpX19LrPost(FrameBytes));
+  Arm64EmitRet(ABuf);
 end;
 
 function Arm64MemoryAccessSize(const AOp: TWasmIrOp): UInt32;
@@ -3599,15 +3626,34 @@ begin
 end;
 
 procedure Arm64SeedNativeCoreCache(var ACache: TArm64RegCache;
-  const AParamSlot: UInt32);
+  const AParamCount, AParam0Slot, AParam1Slot: UInt32;
+  const AUseLeafCapacity: Boolean);
 begin
-  { x12 is populated by both the external wrapper and each local recursive
-    caller. The callee slot stays absent until a control-flow flush proves it
-    must be materialized. }
+  { x12/x13 are populated by the external wrapper or lightweight caller. The
+    callee slots stay absent until a flush proves they must be materialized.
+    A non-recursive leaf may also use x14-x17: unlike the self-recursive ABI it
+    does not reserve x26 for a frame budget, and it has no nested call whose
+    register boundary would require the deliberately smaller two-entry cache. }
+  if AUseLeafCapacity then
+  begin
+    ACache.StaticAllocation := True;
+    { Keep the incoming slots fixed in x12/x13. A later local.set must update
+      that exact mapping rather than create a duplicate dynamic entry whose
+      older fixed mapping would win the next lookup. }
+    ACache.StaticCount := Byte(AParamCount);
+  end;
   ACache.Entries[0].Valid := True;
   ACache.Entries[0].Dirty := True;
-  ACache.Entries[0].Slot := AParamSlot;
-  ACache.Next := 1;
+  ACache.Entries[0].Slot := AParam0Slot;
+  if AParamCount = 2 then
+  begin
+    ACache.Entries[1].Valid := True;
+    ACache.Entries[1].Dirty := True;
+    ACache.Entries[1].Slot := AParam1Slot;
+    ACache.Next := 0;
+  end
+  else
+    ACache.Next := 1;
 end;
 
 function Arm64EntryNeedsWriteBack(const ACache: TArm64RegCache;
@@ -4569,9 +4615,10 @@ begin
   end;
 end;
 
-{ A one-parameter/one-result static call can publish and retire its logical
-  frame entirely in generated code. Resolution stays instance-relative and
-  position-independent: the caller activation supplies the live function
+{ A one- or two-slot-parameter/one-result static call can publish and retire
+  its logical frame entirely in generated code. Resolution stays
+  instance-relative and position-independent: the caller activation supplies
+  the live function
   address map, the context supplies an indirection to Store.Funcs, and each
   function instance supplies prelinked pointers into freshly validated IR.
   No helper is crossed on the compiled fast path. }
@@ -4585,7 +4632,7 @@ var
   FuncDirectEntry, FuncInstance: UInt32;
   MetaFn, MetaIrBase, MetaFuncAddrs, MetaEntryZeroRegs,
     MetaRefRegBits, MetaRegisterCount, MetaEntryZeroCount,
-    MetaParam0Reg, MetaResult0Reg: UInt32;
+    MetaParam0Reg, MetaParam1Reg, MetaResult0Reg: UInt32;
   StateRegBase, StateIrBase, StateCtx, StateEntry, StateGcFrameSlot,
     StateResultReg: UInt32;
   ZeroLoop, ZeroDone, Exhausted: TWasmJitLabel;
@@ -4609,6 +4656,8 @@ begin
   MetaEntryZeroCount := UInt32(PtrUInt(@FuncLayout.DirectMeta.EntryZeroCount) -
     PtrUInt(@FuncLayout));
   MetaParam0Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Param0Reg) -
+    PtrUInt(@FuncLayout));
+  MetaParam1Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Param1Reg) -
     PtrUInt(@FuncLayout));
   MetaResult0Reg := UInt32(PtrUInt(@FuncLayout.DirectMeta.Result0Reg) -
     PtrUInt(@FuncLayout));
@@ -4694,6 +4743,13 @@ begin
   ABuf.EmitU32(Arm64MulX(8, 8, 12));
   Arm64EmitLdrX(ABuf, 10, ARM64_REG_SP, 0);
   ABuf.EmitU32(Arm64MemRegOffset($F9000000, 10, 5, 8, True));
+  if AArgBytes = 2 * ARM64_SLOT_SIZE then
+  begin
+    Arm64EmitLdrW(ABuf, 8, 3, MetaParam1Reg);
+    ABuf.EmitU32(Arm64MulX(8, 8, 12));
+    Arm64EmitLdrX(ABuf, 10, ARM64_REG_SP, ARM64_SLOT_SIZE);
+    ABuf.EmitU32(Arm64MemRegOffset($F9000000, 10, 5, 8, True));
+  end;
 
   Arm64EmitStrW(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetKind));
   Arm64EmitStrX(ABuf, ARM64_REG_ZR, 6, UInt32(FO.ActRetDest));
@@ -4812,6 +4868,71 @@ begin
   StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
 end;
 
+{ A compiled numeric leaf has no call, allocation, reference, handler,
+  safepoint, or trapping operation that can observe a published activation.
+  Check the exact logical/value caps, then enter its native-stack scalar ABI.
+  A nil entry preserves the generic compiled/interpreted/host fallback. }
+procedure EmitNativeScalarLeafDirectCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AArgN: UInt32; const AFallback, ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  FuncLayout: TWasmFuncInst;
+  FuncNativeEntry, MetaRegisterCount: UInt32;
+  Exhausted: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  FuncNativeEntry := UInt32(
+    PtrUInt(@FuncLayout.CompiledNativeScalarEntry) - PtrUInt(@FuncLayout));
+  MetaRegisterCount := UInt32(
+    PtrUInt(@FuncLayout.DirectMeta.RegisterCount) - PtrUInt(@FuncLayout));
+  Exhausted := ABuf.NewLabel;
+
+  { Resolve caller funcidx -> store address -> live function instance. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
+  Arm64EmitLoadImm64(ABuf, 3, FO.ActStride);
+  ABuf.EmitU32(Arm64MulX(2, 2, 3));
+  Arm64EmitLdrX(ABuf, 3, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(2, 3, 2));
+  Arm64EmitLdrX(ABuf, 1, 2, UInt32(FO.ActFuncAddrs));
+  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrW(ABuf, 2, 1, 0);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxFuncsSlot));
+  Arm64EmitLdrX(ABuf, 1, 1, 0);
+  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
+  ABuf.EmitU32(Arm64MulX(2, 2, 8));
+  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+  Arm64EmitLdrX(ABuf, 9, 3, FuncNativeEntry);
+  ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_ZR));
+  EmitBCondTo(ABuf, ARM64_COND_EQ, AFallback);
+
+  { Match JitEnterResolvedFrame's two exhaustion predicates without mutation. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HS, Exhausted);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+  Arm64EmitLdrW(ABuf, 8, 3, MetaRegisterCount);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HI, Exhausted);
+
+  LdX(ABuf, 12, IrAuxBlockItem(AAux, AIns.A, 0));
+  if AArgN = 2 then
+    LdX(ABuf, 13, IrAuxBlockItem(AAux, AIns.A, 1));
+  ABuf.EmitU32(Arm64MovReg(4, ARM64_REG_ZR));
+  ABuf.EmitU32(Arm64Blr(9));
+  StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
+  EmitBranchTo(ABuf, UInt32(ADone));
+
+  ABuf.BindLabel(Exhausted);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
 { iroCall / iroCallIndirect / iroCallRef. x0 is always the store (pinned in
   x20); the callee selector differs per form (funcidx immediate / packed
   type+table immediate plus the index operand / the funcref operand), and the
@@ -4823,7 +4944,8 @@ procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel);
 var
   ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
-  FallbackLabel, DoneLabel: TWasmJitLabel;
+  FallbackLabel, DoneLabel, NativeFallback, NativeDone: TWasmJitLabel;
+  UseNativeLeaf: Boolean;
 begin
   if ANativeScalarSelf and (AIns.Op = iroCall) then
   begin
@@ -4834,6 +4956,18 @@ begin
   end;
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
+  UseNativeLeaf := (AIns.Op = iroCall) and (ArgN in [1, 2]) and
+    (ResN = 1) and not AUsePinnedMemory;
+  NativeFallback := -1;
+  NativeDone := -1;
+  if UseNativeLeaf then
+  begin
+    NativeFallback := ABuf.NewLabel;
+    NativeDone := ABuf.NewLabel;
+    EmitNativeScalarLeafDirectCall(ABuf, AIns, AAux, ArgN,
+      NativeFallback, NativeDone);
+    ABuf.BindLabel(NativeFallback);
+  end;
   ArgBytes := ArgN * ARM64_SLOT_SIZE;
   ResBytes := ResN * ARM64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
@@ -4855,7 +4989,7 @@ begin
           nil return falls back to the existing host/interpreter dispatcher. }
         FallbackLabel := ABuf.NewLabel;
         DoneLabel := ABuf.NewLabel;
-        if (ArgN = 1) and (ResN = 1) and not AUsePinnedMemory then
+        if (ArgN in [1, 2]) and (ResN = 1) and not AUsePinnedMemory then
           EmitNativeScalarDirectCall(ABuf, AIns, ArgBytes, StateOffset,
             FallbackLabel, DoneLabel)
         else
@@ -4927,6 +5061,8 @@ begin
 
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
   ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  if UseNativeLeaf then
+    ABuf.BindLabel(NativeDone);
 end;
 
 { iroReturnCall / iroReturnCallIndirect / iroReturnCallRef. Same marshal, but

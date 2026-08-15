@@ -1038,6 +1038,14 @@ begin
     if Length(AIr.Functions[Index].LocalRegs) > 0 then
       AStore.Funcs[Addr].DirectMeta.Param0Reg :=
         AIr.Functions[Index].LocalRegs[0];
+    if Length(AIr.Functions[Index].LocalRegs) > 1 then
+      AStore.Funcs[Addr].DirectMeta.Param1Reg :=
+        AIr.Functions[Index].LocalRegs[1]
+    else if (Length(AIr.Functions[Index].LocalRegs) = 1) and
+      (AIr.Functions[Index].RegTypes[
+        AIr.Functions[Index].LocalRegs[0]].Kind = wvkVec) then
+      AStore.Funcs[Addr].DirectMeta.Param1Reg :=
+        AIr.Functions[Index].LocalRegs[0] + 1;
     if Length(AIr.Functions[Index].ResultRegs) > 0 then
       AStore.Funcs[Addr].DirectMeta.Result0Reg :=
         AIr.Functions[Index].ResultRegs[0];

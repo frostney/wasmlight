@@ -606,6 +606,10 @@ begin
     { The compiled functions are AOT-wired; the declined one is left nil, so it
       runs interpreted (aot-spec §4.2 step 6). }
     Expect<Boolean>(Store.Funcs[AddAddr].CompiledEntry <> nil).ToBe(True);
+    {$IFDEF WASM_JIT_ARM64}
+    Expect<Boolean>(Store.Funcs[AddAddr].CompiledNativeScalarEntry =
+      Store.Funcs[AddAddr].CompiledEntry).ToBe(True);
+    {$ENDIF}
     Expect<Boolean>(Store.Funcs[AddCaller].CompiledEntry <> nil).ToBe(True);
     Expect<Boolean>(Store.Funcs[DeclinedCaller].CompiledEntry <> nil).ToBe(True);
     Expect<Boolean>(Store.Funcs[Declined].CompiledEntry = nil).ToBe(True);

@@ -190,6 +190,12 @@ function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
   const ASelfFuncIdx: UInt32): Boolean;
 
+{ A bounded cross-function companion: a one/two-parameter, one-result numeric
+  leaf whose body cannot trap, allocate, call, or reach a safepoint. It may use
+  a lightweight native-stack frame because no operation inside it can observe
+  the temporarily unpublished logical frame. }
+function JitCanNativeScalarLeaf(const AFn: PWasmIrFunctionRec): Boolean;
+
 { Convenience wrapper: force-compile AAddr on AJit (delegates to the method). }
 function JitForceCompile(const AJit: TWasmJitContext;
   const AAddr: TWasmFuncAddr): Boolean;
@@ -398,6 +404,43 @@ begin
   {$ENDIF}
 end;
 
+function JitCanNativeScalarLeaf(const AFn: PWasmIrFunctionRec): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  {$IFDEF WASM_JIT_ARM64}
+  if (AFn = nil) or (AFn^.ParamCount < 1) or (AFn^.ParamCount > 2) or
+    (AFn^.ResultCount <> 1) or
+    (Length(AFn^.LocalRegs) <> Integer(AFn^.ParamCount)) or
+    (Length(AFn^.ResultRegs) <> 1) or
+    (Length(AFn^.EntryZeroRegs) <> 0) or (Length(AFn^.Handlers) <> 0) or
+    (AFn^.RegisterCount = 0) or (AFn^.RegisterCount > 32) then
+    Exit;
+  for I := 0 to High(AFn^.RegTypes) do
+    if AFn^.RegTypes[I].Kind <> wvkNum then
+      Exit;
+  for I := 0 to High(AFn^.Code) do
+    case AFn^.Code[I].Op of
+      iroMove, iroReturn,
+      iroI32Const, iroI64Const,
+      iroI32Eqz, iroI64Eqz,
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+      iroSelect:;
+    else
+      Exit;
+    end;
+  Result := True;
+  {$ENDIF}
+end;
+
 { --- compilation --------------------------------------------------------- }
 
 {$IFDEF WASM_JIT_BACKEND}
@@ -439,11 +482,16 @@ var
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
   UseNativeScalarSelf: Boolean;
+  UseNativeScalarLeaf: Boolean;
+  UseNativeScalarCore: Boolean;
   UseExtendedFrame: Boolean;
+  NativeParamCount: UInt32;
   NativeParamReg: UInt32;
+  NativeParam1Reg: UInt32;
   NativeResultReg: UInt32;
   NativeCoreLabel: TWasmJitLabel;
   NativeExhaustedLabel: TWasmJitLabel;
+  NativeExternalLabel: TWasmJitLabel;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -1352,28 +1400,40 @@ var
             UsePinnedMemoryBase := False;
       end;
   end;
+
 begin
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
   try
     UseNativeScalarSelf := JitCanNativeScalarSelf(AFn, AFuncIdx);
+    UseNativeScalarLeaf := JitCanNativeScalarLeaf(AFn);
+    UseNativeScalarCore := UseNativeScalarSelf or UseNativeScalarLeaf;
+    NativeParamCount := 0;
     NativeParamReg := 0;
+    NativeParam1Reg := 0;
     NativeResultReg := 0;
     NativeCoreLabel := -1;
     NativeExhaustedLabel := -1;
-    if UseNativeScalarSelf then
+    NativeExternalLabel := -1;
+    if UseNativeScalarCore then
     begin
+      NativeParamCount := AFn^.ParamCount;
       NativeParamReg := AFn^.LocalRegs[0];
+      if NativeParamCount = 2 then
+        NativeParam1Reg := AFn^.LocalRegs[1];
       NativeResultReg := AFn^.ResultRegs[0];
     end;
     { One label per IR instruction, created in order so label id = IR index
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
-    if UseNativeScalarSelf then
+    if UseNativeScalarCore then
     begin
       NativeCoreLabel := Buf.NewLabel;
-      NativeExhaustedLabel := Buf.NewLabel;
+      if UseNativeScalarSelf then
+        NativeExhaustedLabel := Buf.NewLabel;
+      if UseNativeScalarLeaf then
+        NativeExternalLabel := Buf.NewLabel;
     end;
 
     { A cache is valid only along one straight-line predecessor. Mark every IR
@@ -1398,10 +1458,16 @@ begin
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
-    if UseNativeScalarSelf then
-      { x26 is the wrapper-pinned additional-frame budget, never a cached
-        wasm slot, for the lifetime of the local recursive core. }
+    if UseNativeScalarCore then
+    begin
+      { x26 is unavailable to the shared native core cache: recursion pins its
+        additional-frame budget there, while a leaf uses the wider x14-x17
+        dynamic set and does not need a third static entry. }
       AllocatedSlots[2] := High(UInt32);
+      { The native core seeds x12/x13 before any canonical register-file load;
+        use its bounded write-back cache rather than the ordinary entry loads. }
+      UseStaticCache := False;
+    end;
     UseThirdStatic := UseStaticCache and
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
@@ -1419,6 +1485,12 @@ begin
 
     {$IFDEF WASM_JIT_ARM64}
     UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
+    if UseNativeScalarLeaf then
+    begin
+      Arm64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeCoreLabel,
+        NativeExternalLabel);
+      Buf.BindLabel(NativeExternalLabel);
+    end;
     if UseExtendedFrame then
       Arm64EmitPrologueExtended(Buf)
     else
@@ -1429,12 +1501,12 @@ begin
       Arm64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
       Arm64EmitPinMemory(Buf, PinnedMemoryIndex, UsePinnedMemoryBase);
-    if UseNativeScalarSelf then
+    if UseNativeScalarCore then
     begin
       { The external AAPCS entry owns the full callee-saved frame once. The
         recursive path targets this position-independent local core directly. }
-      Arm64EmitNativeCoreWrapperCall(Buf, NativeParamReg, NativeResultReg,
-        NativeCoreLabel);
+      Arm64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
       if UseExtendedFrame then
         Arm64EmitEpilogueExtended(Buf)
       else
@@ -1449,14 +1521,15 @@ begin
         Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
           @VisibleSlots[0], AFn^.RegisterCount);
     end;
-    if UseNativeScalarSelf then
+    if UseNativeScalarCore then
       { The closed helper-free native core may defer block-local numeric
         stores. Calls flush only values the lexical liveness plan still needs;
         generic call-bearing functions never enable this mode. }
       Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
         @VisibleSlots[0], AFn^.RegisterCount);
-    if UseNativeScalarSelf then
-      Arm64SeedNativeCoreCache(ArmCache, NativeParamReg);
+    if UseNativeScalarCore then
+      Arm64SeedNativeCoreCache(ArmCache, NativeParamCount, NativeParamReg,
+        NativeParam1Reg, UseNativeScalarLeaf and not UseNativeScalarSelf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     X64EmitPrologue(Buf);
@@ -1512,9 +1585,9 @@ begin
             UInt32(I),
             (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
               (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
-              (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
+            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
-            UseNativeScalarSelf, AFn^.RegisterCount, NativeParamReg,
+            UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
             NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache);
       end;
       {$ENDIF}
@@ -1596,6 +1669,7 @@ begin
       begin
         FStore.Funcs[FCompiledAddrs[I]].CompiledEntry := nil;
         FStore.Funcs[FCompiledAddrs[I]].CompiledDirectEntry := nil;
+        FStore.Funcs[FCompiledAddrs[I]].CompiledNativeScalarEntry := nil;
       end;
     { We installed the hook (RegisterJit); clear it so a later call finds no
       dispatcher and runs interpreted. Normal use is one JIT context per store,
@@ -1687,6 +1761,8 @@ begin
   FStore.Funcs[AAddr].CompiledEntry := FBuffers[N].EntryPoint;
   if JitCanDirectCall(Fn) then
     FStore.Funcs[AAddr].CompiledDirectEntry := FBuffers[N].EntryPoint;
+  if JitCanNativeScalarLeaf(Fn) then
+    FStore.Funcs[AAddr].CompiledNativeScalarEntry := FBuffers[N].EntryPoint;
 
   N := Length(FCompiledAddrs);
   SetLength(FCompiledAddrs, N + 1);
@@ -1744,6 +1820,9 @@ begin
     Pointer(PtrUInt(Buf.EntryPoint) + AEntryOffset);
   if JitCanDirectCall(IrFunctionFor(AAddr)) then
     FStore.Funcs[AAddr].CompiledDirectEntry :=
+      FStore.Funcs[AAddr].CompiledEntry;
+  if JitCanNativeScalarLeaf(IrFunctionFor(AAddr)) then
+    FStore.Funcs[AAddr].CompiledNativeScalarEntry :=
       FStore.Funcs[AAddr].CompiledEntry;
 
   N := Length(FCompiledAddrs);

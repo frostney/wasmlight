@@ -1,5 +1,56 @@
 # Handoff
 
+Updated: 2026-08-15 (generic scalar direct-call specialization)
+
+## Two-argument cross-function call path
+
+- Started `codex/optimize-generic-direct-calls` from exact delivery head
+  `cda57e8a762cffebf91f5482988d88e128cbae33`. The untouched release baseline
+  and its AOT artifact remain under `/tmp/wasmlight-call-generic-base.ThFhCN`.
+- The accepted Arm64 specialization covers direct calls to proof-gated numeric
+  leaves with one or two parameters and one result. Eligible callees contain
+  no calls, memory operations, references, allocation/GC, handlers,
+  safepoints, or trapping operations. All other targets retain the existing
+  direct-frame or generic/interpreted/host path.
+- A lightweight caller checks the exact shared depth and value-slot limits
+  before native-stack mutation, transfers scalar arguments in x12/x13, and
+  receives the result in x12. The leaf uses a bounded numeric-only native
+  register file and a wider x12-x17 write-back cache. Canonical external entry,
+  live Store.Funcs indirection, AOT PIC, trampoline unwinding, and tier fallback
+  remain intact. AOT ABI revision 12 rejects older incompatible artifacts.
+- Serialized command-level A/B for 50 million checked two-argument calls,
+  compilation excluded, one warm-up and seven paired samples under
+  `/tmp/wasmlight-perf-gate.lock`: forward baseline/candidate medians
+  722.307/143.581 ms; reverse candidate/baseline 145.594/728.319 ms. This is
+  about 80% faster (roughly 5x). Same-schedule Wasmtime 47.0.3 was 63.861 ms,
+  leaving Wasmlight at about 2.25x on this deliberately call-dominated test.
+- Final seven-sample both-order guard medians (baseline/candidate forward,
+  candidate/baseline reverse) were: scalar loop 390.123/390.195 and
+  390.891/390.848 ms; varying memory 26.398/24.239 and 19.204/22.298; loads
+  48.602/47.657 and 47.244/42.051; stores 42.620/38.538 and 38.862/42.209;
+  memory growth 13.926/14.066 and 13.887/13.861; GC allocation
+  131.028/130.549 and 131.248/131.043; SIMD 24.304/24.324 and
+  24.301/24.153; host calls 35.626/35.525 and 35.852/35.398; startup
+  2.710/2.641 and 2.466/2.592 ms. Short memory/startup rows show reversing
+  process noise, not an order-independent regression.
+- The first pinned-core run exposed three `local.set` divergences: redefining a
+  native leaf parameter could create a dynamic duplicate of its seeded cache
+  entry and later read the stale input. Marking x12/x13 as fixed cache entries
+  corrected it; a focused compiled-to-compiled local.set regression now pins
+  the failure, along with explicit leaf proof rejection and exact depth/value
+  exhaustion cleanup tests.
+- Final macOS/aarch64 gates: frozen install, format, agents, diff check, clean
+  release and development builds, and all 44 suites pass. The pinned 257-file
+  core corpus is exactly 65,188 pass and zero fail/skip/staged/errors in
+  interpreter/JIT/AOT; JIT and AOT compile 8,703 functions. Linux/x86-64 in
+  OrbStack (`wasmx64`, FPC 3.2.2, LWPT 0.6.0) also passes clean release/dev
+  builds, all 44 suites, and the same corpus identity with 8,704 compiled
+  functions in JIT/AOT. The x64 native backend remains on its generic path.
+- Rejected and reverted: a per-instance native call table was slower and added
+  mutable metadata; pinning the caller's FuncAddrs map removed eleven lookup
+  instructions but regressed final medians to 149-163 ms. Neither experiment
+  remains in the tree. No push, rebase, or force operation was performed.
+
 Updated: 2026-08-15 (runtime comparison expanded)
 
 ## Diagnostic runtime workloads

@@ -337,7 +337,7 @@ const
     template's byte layout, a pinned-register reassignment, the entry-ABI shape.
     Bump it whenever position-independent codegen changes in a way that would
     make an existing artifact's bytes wrong. }
-  AOT_ABI_REVISION = 11;
+  AOT_ABI_REVISION = 12;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -3478,6 +3478,7 @@ begin
   Fold(JO.FuncKind);
   Fold(JO.FuncCompiledEntry);
   Fold(JO.FuncCompiledDirectEntry);
+  Fold(JO.FuncCompiledNativeScalarEntry);
   Fold(JO.FuncDirectMeta);
   Fold(JO.DirectMetaFn);
   Fold(JO.DirectMetaIrBase);
@@ -3487,6 +3488,7 @@ begin
   Fold(JO.DirectMetaRegisterCount);
   Fold(JO.DirectMetaEntryZeroCount);
   Fold(JO.DirectMetaParam0Reg);
+  Fold(JO.DirectMetaParam1Reg);
   Fold(JO.DirectMetaResult0Reg);
   Fold(JO.FuncCallCount);
   Fold(JO.MemInstStride);

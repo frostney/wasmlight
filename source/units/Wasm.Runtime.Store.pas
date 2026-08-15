@@ -239,6 +239,7 @@ type
     RegisterCount: UInt32;
     EntryZeroCount: UInt32;
     Param0Reg: UInt32;
+    Param1Reg: UInt32;
     Result0Reg: UInt32;
   end;
 
@@ -300,6 +301,10 @@ type
       tail-calling body always stays on the invocation trampoline that consumes
       and re-dispatches its pending target. }
     CompiledDirectEntry: Pointer;
+    { Same entry address for a proof-gated one/two-parameter numeric leaf. A
+      zero x4 selects its lightweight native-stack ABI; ordinary entries pass
+      the non-zero canonical address and retain the published logical frame. }
+    CompiledNativeScalarEntry: Pointer;
     CallCount: UInt32;
     DirectMeta: TWasmDirectCallMeta;
     { wfkHost }
@@ -952,6 +957,7 @@ type
     FuncKind: NativeUInt;            { TWasmFuncInst.Kind }
     FuncCompiledEntry: NativeUInt;   { TWasmFuncInst.CompiledEntry }
     FuncCompiledDirectEntry: NativeUInt; { TWasmFuncInst.CompiledDirectEntry }
+    FuncCompiledNativeScalarEntry: NativeUInt;
     FuncDirectMeta: NativeUInt;        { TWasmFuncInst.DirectMeta }
     DirectMetaFn: NativeUInt;
     DirectMetaIrBase: NativeUInt;
@@ -961,6 +967,7 @@ type
     DirectMetaRegisterCount: NativeUInt;
     DirectMetaEntryZeroCount: NativeUInt;
     DirectMetaParam0Reg: NativeUInt;
+    DirectMetaParam1Reg: NativeUInt;
     DirectMetaResult0Reg: NativeUInt;
     FuncCallCount: NativeUInt;       { TWasmFuncInst.CallCount }
     MemInstStride: NativeUInt;       { SizeOf(TWasmMemoryInst) }
@@ -2298,6 +2305,8 @@ begin
   Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);
   Result.FuncCompiledDirectEntry :=
     PtrUInt(@F.CompiledDirectEntry) - PtrUInt(@F);
+  Result.FuncCompiledNativeScalarEntry :=
+    PtrUInt(@F.CompiledNativeScalarEntry) - PtrUInt(@F);
   Result.FuncDirectMeta := PtrUInt(@F.DirectMeta) - PtrUInt(@F);
   Result.DirectMetaFn := PtrUInt(@F.DirectMeta.Fn) - PtrUInt(@F.DirectMeta);
   Result.DirectMetaIrBase := PtrUInt(@F.DirectMeta.IrBase) -
@@ -2313,6 +2322,8 @@ begin
   Result.DirectMetaEntryZeroCount := PtrUInt(@F.DirectMeta.EntryZeroCount) -
     PtrUInt(@F.DirectMeta);
   Result.DirectMetaParam0Reg := PtrUInt(@F.DirectMeta.Param0Reg) -
+    PtrUInt(@F.DirectMeta);
+  Result.DirectMetaParam1Reg := PtrUInt(@F.DirectMeta.Param1Reg) -
     PtrUInt(@F.DirectMeta);
   Result.DirectMetaResult0Reg := PtrUInt(@F.DirectMeta.Result0Reg) -
     PtrUInt(@F.DirectMeta);
