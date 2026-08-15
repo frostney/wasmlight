@@ -365,7 +365,7 @@ var
   HasSelfCall: Boolean;
 begin
   Result := False;
-  {$IFDEF WASM_JIT_ARM64}
+  {$IFDEF WASM_JIT_BACKEND}
   if (AFn = nil) or (AFn^.ParamCount <> 1) or (AFn^.ResultCount <> 1) or
     (Length(AFn^.LocalRegs) <> 1) or (Length(AFn^.ResultRegs) <> 1) or
     (Length(AFn^.EntryZeroRegs) <> 0) or (Length(AFn^.Handlers) <> 0) or
@@ -489,6 +489,7 @@ var
   UseNativeScalarLeaf: Boolean;
   UseNativeScalarCore: Boolean;
   UseNativeScalarCall: Boolean;
+  UseX64ExtendedFrame: Boolean;
   NativeScalarCall: Boolean;
   UseExtendedFrame: Boolean;
   NativeParamCount: UInt32;
@@ -1557,6 +1558,7 @@ begin
         NativeParam1Reg, UseNativeScalarLeaf and not UseNativeScalarSelf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
+    UseX64ExtendedFrame := UseNativeScalarCall or UseNativeScalarSelf;
     if UseNativeScalarLeaf then
     begin
       X64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeParamCount,
@@ -1564,22 +1566,24 @@ begin
         NativeExternalLabel);
       Buf.BindLabel(NativeExternalLabel);
     end;
-    X64EmitPrologue(Buf, UseNativeScalarCall);
+    X64EmitPrologue(Buf, UseX64ExtendedFrame);
     X64EmitPinHelperTable(Buf, AHelperTableOffset);
     X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if UseNativeScalarSelf then
+      X64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
       X64EmitPinMemory(Buf, PinnedMemoryIndex);
     X64InitRegCache(X64Cache);
-    if UseNativeScalarLeaf then
+    if UseNativeScalarCore then
       X64SeedNativeCoreCache(X64Cache, NativeParamCount, NativeParamReg,
-        NativeParam1Reg)
+        NativeParam1Reg, UseNativeScalarLeaf)
     else if UseStaticCache then
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
-    if UseNativeScalarLeaf then
+    if UseNativeScalarCore then
     begin
       X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
         NativeParam1Reg, NativeResultReg, NativeCoreLabel);
-      X64EmitEpilogue(Buf, UseNativeScalarCall);
+      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
       Buf.BindLabel(NativeCoreLabel);
     end;
     {$ENDIF}
@@ -1648,8 +1652,10 @@ begin
           (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
-          UsePinnedMemory, UseNativeScalarLeaf, NativeResultReg,
-          UseNativeScalarCall, NativeScalarCall,
+          UsePinnedMemory, UseNativeScalarCore, UseNativeScalarSelf,
+          AFn^.RegisterCount, NativeParamReg, NativeResultReg,
+          NativeCoreLabel, NativeExhaustedLabel, UseX64ExtendedFrame,
+          NativeScalarCall,
           X64Cache);
       {$ENDIF}
       if not Emitted then
@@ -1673,6 +1679,12 @@ begin
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
+    if UseNativeScalarSelf then
+    begin
+      Buf.BindLabel(NativeExhaustedLabel);
+      X64EmitMovRegImm32(Buf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
+      X64EmitCallHelper(Buf, aohTrapKind);
+    end;
     X64ResolvePatches(Buf);
     {$ENDIF}
     { AOT staging (aot-spec §3.2) stops HERE, before MakeExecutable: the caller

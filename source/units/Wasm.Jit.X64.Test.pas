@@ -57,6 +57,7 @@ type
     procedure TestEpilogueBytes;
     procedure TestEpochCaptureBytes;
     procedure TestEpochCheckCoreBytes;
+    procedure TestNativeSelfCallBytes;
     procedure TestRuntimeCallMarshalBytes;
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
@@ -513,6 +514,29 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestNativeSelfCallBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { test r12; je exhausted; r12--; push rbx; 16-byte regfile; rbx:=rsp;
+    store r8 parameter; call core; restore; r12++. Both branches are rel32
+    placeholders resolved after the complete function is emitted. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    Buf.NewLabel;
+    X64EmitNativeSelfCall(Buf, 2, 0, 0, 1);
+    CheckSeq(Buf, [$4D, $85, $E4, $0F, $84, $00, $00, $00, $00,
+      $B8, $01, $00, $00, $00, $49, $29, $C4, $53,
+      $48, $83, $EC, $10, $48, $89, $E3, $4C, $89, $03,
+      $E8, $00, $00, $00, $00, $48, $83, $C4, $10, $5B,
+      $B8, $01, $00, $00, $00, $49, $01, $C4]);
+    Expect<Integer>(Buf.PatchCount).ToBe(2);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestRuntimeCallMarshalBytes;
 var
   Buf: TWasmCodeBuffer;
@@ -689,6 +713,8 @@ begin
   Test('the epoch capture emits the asserted bytes', TestEpochCaptureBytes);
   Test('the epoch-check load+compare core emits the asserted bytes',
     TestEpochCheckCoreBytes);
+  Test('the native self-call frame emits the asserted bytes',
+    TestNativeSelfCallBytes);
   Test('the runtime/vec helper-call marshaling emits the asserted bytes',
     TestRuntimeCallMarshalBytes);
   Test('helper calls and the IR pointer are position-independent',

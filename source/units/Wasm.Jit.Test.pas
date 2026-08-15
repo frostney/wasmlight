@@ -2753,7 +2753,7 @@ begin
     DecodeModule(Bytes, Module);
     Ir := ValidateModule(Module, Bytes);
     Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
-      Ir.FuncImportCount)).ToBe({$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+      Ir.FuncImportCount)).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   finally
     Ir.Free;
     Module.Free;
@@ -2805,7 +2805,7 @@ begin
     Ir := ValidateModule(Module, Bytes);
     Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
       Ir.FuncImportCount)).ToBe(
-      {$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+      {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   finally
     Ir.Free;
     Module.Free;
