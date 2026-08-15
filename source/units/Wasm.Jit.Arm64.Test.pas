@@ -58,6 +58,7 @@ type
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
     procedure TestStaticCacheKeepsShiftResult;
+    procedure TestStaticCacheUsesHostRegsForAlu;
     procedure TestThirdStaticAllocation;
     procedure TestExtendedFrameWords;
     procedure TestDynamicWriteBackSpillsOnlyLiveValues;
@@ -240,6 +241,38 @@ begin
       Found := Found or (Cache.Entries[I].Valid and
         (Cache.Entries[I].Slot = 4));
     Expect<Boolean>(Found).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestStaticCacheUsesHostRegsForAlu;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  UseCounts: array[0..1] of UInt32;
+  Visible: array[0..1] of Boolean;
+begin
+  UseCounts[0] := 1;
+  UseCounts[1] := 1;
+  Visible[0] := True;
+  Visible[1] := True;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Arm64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 2);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 0, 0, 1, 0), Aux,
+      0, False, False, False, False, Cache)).ToBe(True);
+    { Two initial static loads followed directly by add w12,w12,w13: cached
+      sources still consume their planned uses and the destination stays dirty. }
+    Expect<Integer>(Buf.Size).ToBe(3 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 2)).ToBe(
+      Arm64AddW(ARM64_REG_CACHE0, ARM64_REG_CACHE0, ARM64_REG_CACHE1));
+    Expect<UInt32>(UseCounts[0]).ToBe(0);
+    Expect<UInt32>(UseCounts[1]).ToBe(0);
+    Expect<Boolean>(Cache.Entries[0].Dirty).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -745,6 +778,8 @@ begin
     TestStaticCacheKeepsFourTemporaries);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
+  Test('static allocation feeds ALU host registers directly',
+    TestStaticCacheUsesHostRegsForAlu);
   Test('static allocation can retain a third long-lived slot',
     TestThirdStaticAllocation);
   Test('the extended frame preserves its third static register',

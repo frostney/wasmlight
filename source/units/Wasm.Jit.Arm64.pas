@@ -547,6 +547,14 @@ procedure Arm64CachedRel(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache); forward;
 function Arm64CachedHostForSlot(const ACache: TArm64RegCache;
   const ASlot: UInt32; out AHost: Byte): Boolean; forward;
+function Arm64CachedSourceReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const ADefault: Byte): Byte; forward;
+procedure Arm64CachedBinarySourceRegs(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ALeftSlot, ARightSlot: UInt32;
+  out ALeft, ARight: Byte); forward;
+function Arm64CachedStaticDestReg(const ACache: TArm64RegCache;
+  const ASlot: UInt32; const ADefault: Byte): Byte; forward;
 procedure EmitCbnzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
 procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
@@ -3536,6 +3544,48 @@ begin
   Result := False;
 end;
 
+function Arm64CachedSourceReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlot: UInt32;
+  const ADefault: Byte): Byte;
+begin
+  if not Arm64CachedHostForSlot(ACache, ASlot, Result) then
+    Result := ADefault;
+  { Keep the existing load path as the one place that consumes the planned use
+    count. When Result already owns the slot this emits no move. }
+  Arm64CachedLoad(ABuf, ACache, Result, ASlot);
+end;
+
+procedure Arm64CachedBinarySourceRegs(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ALeftSlot, ARightSlot: UInt32;
+  out ALeft, ARight: Byte);
+begin
+  { A missing right operand can evict a dynamic entry holding the left one.
+    Use host registers directly only when both lookups are already stable;
+    otherwise preserve both values in the established scratch pair. }
+  if Arm64CachedHostForSlot(ACache, ALeftSlot, ALeft) and
+    Arm64CachedHostForSlot(ACache, ARightSlot, ARight) then
+  begin
+    Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+    Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
+    Exit;
+  end;
+  ALeft := ARM64_REG_T0;
+  ARight := ARM64_REG_T1;
+  Arm64CachedLoad(ABuf, ACache, ALeft, ALeftSlot);
+  Arm64CachedLoad(ABuf, ACache, ARight, ARightSlot);
+end;
+
+function Arm64CachedStaticDestReg(const ACache: TArm64RegCache;
+  const ASlot: UInt32; const ADefault: Byte): Byte;
+var
+  I: Integer;
+begin
+  Result := ADefault;
+  for I := 0 to ACache.StaticCount - 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Exit(Arm64CacheHostReg(I));
+end;
+
 procedure Arm64CachedStore(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASrc: Byte; const ASlot: UInt32);
 var
@@ -3591,11 +3641,13 @@ end;
 procedure Arm64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AWb: TArm64WordBin;
   var ACache: TArm64RegCache);
+var
+  Left, Right, Dest: Byte;
 begin
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, AIns.B);
-  ABuf.EmitU32(AWb(ARM64_REG_T0, ARM64_REG_T0, ARM64_REG_T1));
-  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+  Arm64CachedBinarySourceRegs(ABuf, ACache, AIns.A, AIns.B, Left, Right);
+  Dest := Arm64CachedStaticDestReg(ACache, AIns.Dest, ARM64_REG_T0);
+  ABuf.EmitU32(AWb(Dest, Left, Right));
+  Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
 end;
 
 function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
@@ -3618,14 +3670,16 @@ function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
 var
   Mask: UInt32;
   Ones: Byte;
+  Source, Dest: Byte;
 begin
   Result := Arm64CanUseI32Immediate(AIns.Op, AValue);
   if not Result then
     Exit;
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+  Source := Arm64CachedSourceReg(ABuf, ACache, AIns.A, ARM64_REG_T0);
+  Dest := Arm64CachedStaticDestReg(ACache, AIns.Dest, ARM64_REG_T0);
   case AIns.Op of
     iroI32Add:
-      ABuf.EmitU32(Arm64AddImmW(ARM64_REG_T0, ARM64_REG_T0, AValue));
+      ABuf.EmitU32(Arm64AddImmW(Dest, Source, AValue));
     iroI32And:
       begin
         Mask := AValue;
@@ -3635,22 +3689,25 @@ begin
           Inc(Ones);
           Mask := Mask shr 1;
         end;
-        ABuf.EmitU32(Arm64AndLowMaskImmW(ARM64_REG_T0, ARM64_REG_T0, Ones));
+        ABuf.EmitU32(Arm64AndLowMaskImmW(Dest, Source, Ones));
       end;
     iroI32Shl:
-      ABuf.EmitU32(Arm64LslImmW(ARM64_REG_T0, ARM64_REG_T0,
+      ABuf.EmitU32(Arm64LslImmW(Dest, Source,
         Byte(AValue and 31)));
   end;
-  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+  Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
 end;
 
 procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
   const ASource, ADest: UInt32; const AShift, AWidth: Byte;
   var ACache: TArm64RegCache);
+var
+  Source, Dest: Byte;
 begin
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ASource);
-  ABuf.EmitU32(Arm64UbfizW(ARM64_REG_T0, ARM64_REG_T0, AShift, AWidth));
-  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, ADest);
+  Source := Arm64CachedSourceReg(ABuf, ACache, ASource, ARM64_REG_T0);
+  Dest := Arm64CachedStaticDestReg(ACache, ADest, ARM64_REG_T0);
+  ABuf.EmitU32(Arm64UbfizW(Dest, Source, AShift, AWidth));
+  Arm64CachedStore(ABuf, ACache, Dest, ADest);
 end;
 
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
@@ -3658,6 +3715,7 @@ procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
 var
   Cond: Byte;
   Wide: Boolean;
+  Left, Right: Byte;
 begin
   Wide := False;
   case ACompare.Op of
@@ -3685,12 +3743,12 @@ begin
   end;
   if ABranch.Op = iroBranchIfNot then
     Cond := Cond xor 1;
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ACompare.A);
-  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, ACompare.B);
+  Arm64CachedBinarySourceRegs(ABuf, ACache, ACompare.A, ACompare.B,
+    Left, Right);
   if Wide then
-    ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T1))
+    ABuf.EmitU32(Arm64CmpX(Left, Right))
   else
-    ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T1));
+    ABuf.EmitU32(Arm64CmpW(Left, Right));
   { STR does not alter NZCV, so reconcile live dirty expressions after CMP and
     before the fused control split without losing the comparison flags. }
   Arm64FlushDynamicRegCache(ABuf, ACache);
