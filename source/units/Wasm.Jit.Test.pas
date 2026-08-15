@@ -1272,6 +1272,7 @@ type
     procedure TestTailCallMutual;
     procedure TestTailCallCrossTierBounded;
     procedure TestTailCallToHost;
+    procedure TestNativeScalarSelfProofGate;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
 
@@ -2596,6 +2597,60 @@ begin
     [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestNativeScalarSelfProofGate;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+begin
+  { The native recursive ABI is intentionally a closed one-node proof, not a
+    general call optimization. This shape has one numeric parameter/result,
+    no locals, references, helpers, memory, or cross-function escape. }
+  Bytes := RecurseModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe({$IFDEF WASM_JIT_ARM64}True{$ELSE}False{$ENDIF});
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  { A one-slot numeric leaf has no internal call to accelerate and must not pay
+    the extended native frame merely because all of its operations are safe. }
+  Bytes := OneFunc(BLit([$60, $01, $7F, $01, $7F]),
+    BLit([$00, $20, $00, $0B]), 'id');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  { Two parameters is also outside the one-slot ABI and must retain the generic
+    logical/value/GC-frame path on every backend. }
+  Bytes := AddModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0],
+      Ir.FuncImportCount)).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
@@ -3061,6 +3116,8 @@ begin
   Test('1e6 alternating compiled<->interpreted return_calls run in bounded stack',
     TestTailCallCrossTierBounded);
   Test('return_call to a host function matches', TestTailCallToHost);
+  Test('native scalar self-call proof accepts only its closed one-slot subset',
+    TestNativeScalarSelfProofGate);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',

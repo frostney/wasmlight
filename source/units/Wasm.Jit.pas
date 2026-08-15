@@ -18,9 +18,8 @@
       (JitCanCompile — the scope fence, §10.3), so the JIT is always correct and
       only ever faster where it applies.
 
-  THE HAND-OFF (§5.1, the frame IS the interpreter's frame). Generated code
-  never edits the interpreter context layout itself. JitDispatch builds an
-  entry frame, and a direct compiled call reaches the same logic through
+  THE HAND-OFF (§5.1, the frame IS the interpreter's frame). JitDispatch builds
+  an entry frame, and a generic direct compiled call reaches the same logic through
   JitPrepareDirectCall — exhaustion check, register-file carve,
   zero, param marshal, GC-frame push — which returns @Values[Base], the
   register-file base. It passes that base to the compiled entry in the first
@@ -34,6 +33,13 @@
   entry in x0/x1 (AAPCS64); the Wave-2 prologue pins the base in the callee-
   saved x19 (surviving helper calls) and the store in x20 (for the epoch word),
   and the epilogue restores them before returning to JitLeaveFrame.
+
+  The one narrow exception is the proof-gated AArch64 scalar self-call path:
+  a closed helper-free numeric function uses a native-stack register file for
+  recursion and edits only the shared Depth/ValueTop counters. It checks both
+  caps and the entry epoch before mutation; references, allocation, handlers,
+  host/interpreted escape, indirect/tail calls, and cross-function calls all
+  retain the full shared-frame path above.
 
   WAVE 3 CHANGES EXACTLY TWO THINGS HERE. (1) JitDispatch delegates to the
   backend's Arm64InvokeCompiled, because a compiled body may end in a
@@ -151,7 +157,8 @@ type
     register-file base pointer JitEnterFrame returned (@Values[Base]), the
     store, and the IR-code base @Fn^.Code[0]. The AArch64 backend extends this
     private ABI with the interpreter context used by generated direct-call
-    frame setup; its local declaration is fingerprinted with the AOT ABI.
+    frame setup and the live entry pointer used by proof-gated self calls; its
+    local declaration is fingerprinted with the AOT ABI.
     cdecl selects the platform C convention, matching each backend's
     hand-emitted prologue/epilogue. }
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
@@ -171,6 +178,13 @@ function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
   frame, or an unsupported target — the function then runs interpreted. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
+{ A deliberately narrow proof for the AArch64 native self-call ABI: one
+  scalar parameter/result, no default-initialized locals or references, and
+  only helper-free numeric/control ops whose direct calls all target the same
+  function. Other shapes retain the shared logical-frame call path. }
+function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
+  const ASelfFuncIdx: UInt32): Boolean;
+
 { Convenience wrapper: force-compile AAddr on AJit (delegates to the method). }
 function JitForceCompile(const AJit: TWasmJitContext;
   const AAddr: TWasmFuncAddr): Boolean;
@@ -185,7 +199,8 @@ function JitForceCompile(const AJit: TWasmJitContext;
   or when the emitter cannot fit the branch displacements — the caller records
   the function un-compiled, exactly as the on-hot JIT would decline it. }
 function JitStageFunctionBytes(const AStore: TWasmStore;
-  const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
+  const AFn: PWasmIrFunctionRec; const AFuncIdx: UInt32;
+  out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes;
 
 implementation
@@ -325,6 +340,56 @@ begin
   {$ENDIF}
 end;
 
+function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
+  const ASelfFuncIdx: UInt32): Boolean;
+var
+  I: Integer;
+  Ins: TWasmIrInstr;
+  HasSelfCall: Boolean;
+begin
+  Result := False;
+  {$IFDEF WASM_JIT_ARM64}
+  if (AFn = nil) or (AFn^.ParamCount <> 1) or (AFn^.ResultCount <> 1) or
+    (Length(AFn^.LocalRegs) <> 1) or (Length(AFn^.ResultRegs) <> 1) or
+    (Length(AFn^.EntryZeroRegs) <> 0) or (Length(AFn^.Handlers) <> 0) or
+    (AFn^.RegisterCount = 0) or (AFn^.RegisterCount > 32) then
+    Exit;
+  for I := 0 to High(AFn^.RegTypes) do
+    if AFn^.RegTypes[I].Kind <> wvkNum then
+      Exit;
+  HasSelfCall := False;
+  for I := 0 to High(AFn^.Code) do
+  begin
+    Ins := AFn^.Code[I];
+    case Ins.Op of
+      iroMove, iroJump, iroBranchIf, iroBranchIfNot, iroReturn,
+      iroI32Const, iroI64Const, iroF32Const, iroF64Const,
+      iroI32Eqz, iroI64Eqz,
+      iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+      iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+      iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+      iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
+      iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+      iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+      iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+      iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr,
+      iroSelect:;
+      iroCall:
+        begin
+          if (UInt32(Ins.Imm) <> ASelfFuncIdx) or
+            (IrAuxBlockCount(AFn^.AuxU32, Ins.A) <> 1) or
+            (IrAuxBlockCount(AFn^.AuxU32, Ins.B) <> 1) then
+            Exit;
+          HasSelfCall := True;
+        end;
+    else
+      Exit;
+    end;
+  end;
+  Result := HasSelfCall;
+  {$ENDIF}
+end;
+
 { --- compilation --------------------------------------------------------- }
 
 {$IFDEF WASM_JIT_BACKEND}
@@ -340,6 +405,7 @@ end;
   always balanced by a restore. The Arm64* / X64* calls are the only
   backend-specific part; everything else is shared. }
 function JitCompileToBuffer(const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32;
   const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
   const AFinalize: Boolean = True): TWasmCodeBuffer;
 var
@@ -364,6 +430,10 @@ var
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
+  UseNativeScalarSelf: Boolean;
+  UseExtendedFrame: Boolean;
+  NativeParamReg: UInt32;
+  NativeResultReg: UInt32;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -1250,6 +1320,14 @@ begin
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
   try
+    UseNativeScalarSelf := JitCanNativeScalarSelf(AFn, AFuncIdx);
+    NativeParamReg := 0;
+    NativeResultReg := 0;
+    if UseNativeScalarSelf then
+    begin
+      NativeParamReg := AFn^.LocalRegs[0];
+      NativeResultReg := AFn^.ResultRegs[0];
+    end;
     { One label per IR instruction, created in order so label id = IR index
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
@@ -1277,6 +1355,11 @@ begin
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
+    { x26 pins the live entry for the native self-call ABI. Keep the static
+      allocator from assigning that register even if its eligibility widens in
+      a later wave to admit call-bearing functions. }
+    if UseNativeScalarSelf then
+      AllocatedSlots[2] := High(UInt32);
     UseThirdStatic := UseStaticCache and
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
@@ -1293,10 +1376,13 @@ begin
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
-    if UseThirdStatic then
+    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
+    if UseExtendedFrame then
       Arm64EmitPrologueExtended(Buf)
     else
       Arm64EmitPrologue(Buf);
+    if UseNativeScalarSelf then
+      Arm64EmitPinSelfEntry(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
     Arm64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
     if UsePinnedMemory then
@@ -1365,7 +1451,9 @@ begin
             (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
               (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
               (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
-            UsePinnedMemory, UsePinnedMemoryBase, UseThirdStatic, ArmCache);
+            UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
+            UseNativeScalarSelf, AFn^.RegisterCount, NativeParamReg,
+            NativeResultReg, ArmCache);
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
@@ -1509,7 +1597,10 @@ begin
     then stays interpreted, which is always correct (jit-spec §4.3). Any other
     exception is a genuine internal fault and propagates. }
   try
-    FBuffers[N] := JitCompileToBuffer(Fn, WasmJitOffsets(FStore).StoreEpoch,
+    FBuffers[N] := JitCompileToBuffer(Fn,
+      FStore.Funcs[AAddr].Instance.Ir.FuncImportCount +
+        FStore.Funcs[AAddr].FuncIrIndex,
+      WasmJitOffsets(FStore).StoreEpoch,
       WasmJitOffsets(FStore).StoreEpochSnapshot,
       WasmJitOffsets(FStore).StoreJitHelperTable);
   except
@@ -1597,7 +1688,8 @@ end;
 { --- registration -------------------------------------------------------- }
 
 function JitStageFunctionBytes(const AStore: TWasmStore;
-  const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
+  const AFn: PWasmIrFunctionRec; const AFuncIdx: UInt32;
+  out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes;
 {$IFDEF WASM_JIT_BACKEND}
 var
@@ -1612,7 +1704,8 @@ begin
   ARegisterCount := AFn^.RegisterCount;
   {$IFDEF WASM_JIT_BACKEND}
   try
-    Buf := JitCompileToBuffer(AFn, WasmJitOffsets(AStore).StoreEpoch,
+    Buf := JitCompileToBuffer(AFn, AFuncIdx,
+      WasmJitOffsets(AStore).StoreEpoch,
       WasmJitOffsets(AStore).StoreEpochSnapshot,
       WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
   except
