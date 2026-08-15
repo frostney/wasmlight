@@ -657,6 +657,37 @@ begin
   ]);
 end;
 
+{ A loop parameter is a dynamic IR slot whose next use is reached through the
+  back edge rather than later in lexical order. The cached Arm64 path must
+  reconcile it at the jump even though ordinary remaining-use counting has
+  reached zero. The varying-address memory body keeps this on the optimized
+  helper-free path; after 100 iterations the last observed value is 106. }
+function MemLoopCarriedModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(5, VecOf([BLit([$00, $01])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $01, $06, $7F,                  { locals: i, acc, addr, seen, hot1, hot2 }
+      $41, $07,                       { loop-carried value = 7 }
+      $03, $00,                       { loop (param i32) (result i32) }
+      $22, $04, $41, $01, $6A,       { seen = carried; carried += 1 }
+      $20, $05, $41, $01, $6A, $21, $05,
+      $20, $05, $41, $01, $6A, $21, $05, { keep hot1 statically allocated }
+      $20, $06, $41, $01, $6A, $21, $06,
+      $20, $06, $41, $01, $6A, $21, $06, { keep hot2 statically allocated }
+      $20, $01, $41, $FF, $FF, $00, $71, $41, $02, $74, $21, $03,
+      $20, $03, $20, $01, $36, $02, $00, { memory[addr] := i }
+      $20, $02, $20, $03, $28, $02, $00, $6A, $21, $02,
+      $20, $01, $41, $01, $6A, $21, $01, { ++i }
+      $20, $01, $20, $00, $49, $0D, $00, { while i < n }
+      $0B, $1A, $20, $04, $0B])]))
+  ]);
+end;
+
 { memory.init / data.drop over a PASSIVE data segment (needs the datacount
   section). init copies [srcoff..) of the segment to [arg0..); dropinit drops
   the segment then inits a non-empty range, which must trap. }
@@ -1213,6 +1244,7 @@ type
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
     procedure TestMemoryLoopCache;
+    procedure TestMemoryLoopCarriedCache;
     procedure TestMemoryOobTraps;
     procedure TestMemory64MaxOffset;
     procedure TestMemorySizeGrow;
@@ -2586,6 +2618,12 @@ begin
     .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+procedure TJitTests.TestMemoryLoopCarriedCache;
+begin
+  Expect<Boolean>(DiffFresh(MemLoopCarriedModuleBytes, 'run',
+    [MakeValueI32(100)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
 procedure TJitTests.TestMemoryOobTraps;
 begin
   { an out-of-bounds load and store both trap 'out of bounds memory access'
@@ -2919,6 +2957,8 @@ begin
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
   Test('a scalar memory loop retains cached values identically',
     TestMemoryLoopCache);
+  Test('a scalar memory loop reconciles dynamic loop-carried values',
+    TestMemoryLoopCarriedCache);
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);
   Test('memory64 maximum offset compiles and traps identically',
     TestMemory64MaxOffset);

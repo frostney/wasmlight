@@ -109,6 +109,7 @@ type
 
   TArm64RegCacheEntry = record
     Valid: Boolean;
+    Dirty: Boolean;
     Slot: UInt32;
   end;
 
@@ -123,6 +124,10 @@ type
     Next: Byte;
     StaticCount: Byte;
     StaticAllocation: Boolean;
+    WriteBackDynamics: Boolean;
+    UseCounts: PUInt32;
+    VisibleSlots: PBoolean;
+    SlotCount: UInt32;
   end;
 
   TArm64WordBin = function(const ARd, ARn, ARm: Byte): UInt32;
@@ -467,7 +472,12 @@ function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
 procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASlots: array of UInt32);
+procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
+  const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
+  const ASlotCount: UInt32);
 procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+procedure Arm64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache);
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
@@ -861,6 +871,10 @@ begin
     iroBranchIf, iroBranchIfNot:
       begin
         Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+        { Taken and fallthrough successors must see the same canonical frame.
+          The condition itself is already safe in x9 while dirty expression
+          values that remain live are reconciled before control splits. }
+        Arm64FlushDynamicRegCache(ABuf, ACache);
         if AIns.Op = iroBranchIf then
           EmitCbnzTo(ABuf, ARM64_REG_T0, AIns.B)
         else
@@ -875,6 +889,7 @@ begin
           on the one-thread-per-store fallthrough, and none of the allocated
           slots is a reference. Keep numeric values in registers here; exits
           still flush the canonical logical frame below. }
+        Arm64FlushDynamicRegCache(ABuf, ACache);
         Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
     iroReturn:
@@ -3369,7 +3384,51 @@ begin
       ACache.Entries[ACache.StaticCount].Slot := ASlots[I];
       LdX(ABuf, Arm64CacheHostReg(ACache.StaticCount), ASlots[I]);
       Inc(ACache.StaticCount);
-    end;
+  end;
+end;
+
+procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
+  const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
+  const ASlotCount: UInt32);
+begin
+  ACache.WriteBackDynamics := True;
+  ACache.UseCounts := AUseCounts;
+  ACache.VisibleSlots := AVisibleSlots;
+  ACache.SlotCount := ASlotCount;
+end;
+
+function Arm64EntryNeedsWriteBack(const ACache: TArm64RegCache;
+  const AIndex: Integer): Boolean;
+var
+  Slot: UInt32;
+begin
+  Result := False;
+  if not ACache.Entries[AIndex].Valid or
+    not ACache.Entries[AIndex].Dirty then
+    Exit;
+  Slot := ACache.Entries[AIndex].Slot;
+  if Slot >= ACache.SlotCount then
+    Exit(True);
+  Result := ACache.VisibleSlots[Slot] or (ACache.UseCounts[Slot] > 0);
+end;
+
+procedure Arm64SpillCacheEntry(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const AIndex: Integer);
+begin
+  if Arm64EntryNeedsWriteBack(ACache, AIndex) then
+    StX(ABuf, Arm64CacheHostReg(AIndex), ACache.Entries[AIndex].Slot);
+  ACache.Entries[AIndex].Dirty := False;
+end;
+
+procedure Arm64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.WriteBackDynamics then
+    Exit;
+  for I := ACache.StaticCount to High(ACache.Entries) do
+    Arm64SpillCacheEntry(ABuf, ACache, I);
 end;
 
 procedure Arm64FlushRegCache(const ABuf: TWasmCodeBuffer;
@@ -3386,6 +3445,7 @@ begin
   for I := 0 to ACache.StaticCount - 1 do
     if ACache.Entries[I].Valid then
       StX(ABuf, Arm64CacheHostReg(I), ACache.Entries[I].Slot);
+  Arm64FlushDynamicRegCache(ABuf, ACache);
 end;
 
 procedure Arm64InvalidateRegCache(var ACache: TArm64RegCache);
@@ -3409,6 +3469,13 @@ procedure Arm64CachedLoad(const ABuf: TWasmCodeBuffer;
 var
   I, Victim: Integer;
   Host: Byte;
+
+  procedure ConsumeUse;
+  begin
+    if ACache.WriteBackDynamics and (ASlot < ACache.SlotCount) and
+      (ACache.UseCounts[ASlot] > 0) then
+      Dec(ACache.UseCounts[ASlot]);
+  end;
 begin
   for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
@@ -3416,6 +3483,7 @@ begin
       Host := Arm64CacheHostReg(I);
       if ADest <> Host then
         ABuf.EmitU32(Arm64MovReg(ADest, Host));
+      ConsumeUse;
       Exit;
     end;
   if ACache.StaticAllocation then
@@ -3428,12 +3496,16 @@ begin
     Victim := ACache.Next;
     ACache.Next := Byte(1 - ACache.Next);
   end;
+  if ACache.WriteBackDynamics then
+    Arm64SpillCacheEntry(ABuf, ACache, Victim);
   Host := Arm64CacheHostReg(Victim);
   LdX(ABuf, Host, ASlot);
   ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Dirty := False;
   ACache.Entries[Victim].Slot := ASlot;
   if ADest <> Host then
     ABuf.EmitU32(Arm64MovReg(ADest, Host));
+  ConsumeUse;
 end;
 
 function Arm64CachedHostForSlot(const ACache: TArm64RegCache;
@@ -3467,20 +3539,25 @@ begin
       Host := Arm64CacheHostReg(Victim);
       if ASrc <> Host then
         ABuf.EmitU32(Arm64MovReg(Host, ASrc));
+      ACache.Entries[Victim].Dirty := True;
       Exit;
     end;
     { Unallocated expression values retain the write-through cache in
       x14..x17, so static locals do not evict producer/consumer temporaries. }
-    StX(ABuf, ASrc, ASlot);
+    if not ACache.WriteBackDynamics then
+      StX(ABuf, ASrc, ASlot);
     if Victim < ACache.StaticCount then
     begin
       Victim := 3 + ACache.Next;
       ACache.Next := Byte((ACache.Next + 1) and 3);
     end;
+    if ACache.WriteBackDynamics then
+      Arm64SpillCacheEntry(ABuf, ACache, Victim);
     Host := Arm64CacheHostReg(Victim);
     if ASrc <> Host then
       ABuf.EmitU32(Arm64MovReg(Host, ASrc));
     ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Dirty := ACache.WriteBackDynamics;
     ACache.Entries[Victim].Slot := ASlot;
     Exit;
   end;
@@ -3591,6 +3668,9 @@ begin
     ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_T1))
   else
     ABuf.EmitU32(Arm64CmpW(ARM64_REG_T0, ARM64_REG_T1));
+  { STR does not alter NZCV, so reconcile live dirty expressions after CMP and
+    before the fused control split without losing the comparison flags. }
+  Arm64FlushDynamicRegCache(ABuf, ACache);
   EmitBCondTo(ABuf, Cond, TWasmJitLabel(ABranch.B));
   Arm64InvalidateRegCache(ACache);
 end;
@@ -4083,7 +4163,13 @@ begin
   ResBytes := ResN * ARM64_SLOT_SIZE;
   StateOffset := ArgBytes + ResBytes;
   if AIns.Op = iroCall then
-    FrameBytes := Arm64Align16(StateOffset + SizeOf(TWasmJitDirectCallState))
+  begin
+    if (ArgN = 1) and (ResN = 1) then
+      FrameBytes := Arm64Align16(StateOffset +
+        SizeOf(TWasmJitDirectCallState))
+    else
+      FrameBytes := Arm64Align16(StateOffset + 2 * ARM64_SLOT_SIZE)
+  end
   else
     FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
 
@@ -4103,7 +4189,10 @@ begin
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
         ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
-        Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
+        if (ArgN = 1) and (ResN = 1) then
+          Arm64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
+        else
+          Arm64EmitCallHelper(ABuf, aohDirectCallPrepare);
         ABuf.EmitU32(Arm64CmpX(0, 31));
         EmitBCondTo(ABuf, ARM64_COND_EQ, FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(ARM64_REG_T0, 0));
@@ -4111,8 +4200,24 @@ begin
         ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_STORE));
         Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset + ARM64_SLOT_SIZE);
         ABuf.EmitU32(Arm64Blr(ARM64_REG_T0));
-        ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
-        Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+        if (ArgN = 1) and (ResN = 1) then
+        begin
+          Arm64EmitLdrX(ABuf, 0, ARM64_REG_SP,
+            StateOffset + 2 * ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 1, ARM64_REG_SP,
+            StateOffset + 3 * ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 2, ARM64_REG_SP, StateOffset);
+          Arm64EmitLdrW(ABuf, 3, ARM64_REG_SP,
+            StateOffset + 5 * ARM64_SLOT_SIZE);
+          Arm64EmitLdrX(ABuf, 4, ARM64_REG_SP,
+            StateOffset + 4 * ARM64_SLOT_SIZE);
+          Arm64EmitCallHelper(ABuf, aohDirectCallFinishScalar)
+        end
+        else
+        begin
+          ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+          Arm64EmitCallHelper(ABuf, aohDirectCallFinish);
+        end;
         EmitBranchTo(ABuf, UInt32(DoneLabel));
         ABuf.BindLabel(FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
@@ -4780,6 +4885,10 @@ begin
     GArm64HelperTable[aohDirectCallPrepare] := @JitPrepareDirectCall;
     GArm64HelperTable[aohDirectCallFinish] := @JitFinishDirectCall;
     GArm64HelperTable[aohResolveMemory] := @JitResolveMemory;
+    GArm64HelperTable[aohDirectCallFinishScalar] :=
+      @JitFinishDirectCallScalar;
+    GArm64HelperTable[aohDirectCallPrepareScalar] :=
+      @JitPrepareDirectCallScalar;
     GArm64HelperTableFilled := True;
   end;
   Result := @GArm64HelperTable[aohTrapKind];
