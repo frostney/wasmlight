@@ -355,6 +355,8 @@ var
   Fusion: array of Integer;
   PlannedCode: TWasmIrCode;
   SkipPlanned: array of Boolean;
+  ImmediateFusion: array of Boolean;
+  ImmediateValues: array of UInt32;
   UseStaticCache: Boolean;
   UseThirdStatic: Boolean;
   UsePinnedMemory: Boolean;
@@ -478,6 +480,117 @@ var
         Fusion[K] := -2;
         Fusion[K + 1] := K;
       end;
+  end;
+
+  procedure AnalyzeImmediateFusion;
+  var
+    K: Integer;
+    Value: UInt32;
+  begin
+    SetLength(ImmediateFusion, Length(AFn^.Code));
+    SetLength(ImmediateValues, Length(AFn^.Code));
+    {$IFDEF WASM_JIT_ARM64}
+    { Keep this narrower than general constant folding: only helper-free,
+      base-pinned scalar-memory loops may erase an adjacent single-use
+      i32.const. Broad loop folding previously regressed nonlinear code. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if (PlannedCode[K].Op = iroI32Const) and
+        (PlannedCode[K + 1].B = PlannedCode[K].Dest) and
+        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K] and not Targets[K + 1] then
+      begin
+        Value := UInt32(PlannedCode[K].Imm and $FFFFFFFF);
+        if Arm64CanUseI32Immediate(PlannedCode[K + 1].Op, Value) then
+        begin
+          SkipPlanned[K] := True;
+          ImmediateFusion[K + 1] := True;
+          ImmediateValues[K + 1] := Value;
+        end;
+      end;
+    {$ENDIF}
+  end;
+
+  procedure AnalyzeMemoryMoves;
+  var
+    K, P, First: Integer;
+    Source, Temp: UInt32;
+
+    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+    begin
+      Result := (ASlot = AllocatedSlots[0]) or
+        (ASlot = AllocatedSlots[1]) or
+        ((AllocatedSlots[2] <> High(UInt32)) and
+          (ASlot = AllocatedSlots[2]));
+    end;
+
+    function ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
+    begin
+      Result := AOp in [
+        iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+        iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+        iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+        iroI64Load32S, iroI64Load32U,
+        iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+        iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+        iroI64Store32];
+    end;
+
+    function MemoryUseCount(const AReg: UInt32): UInt32;
+    var
+      J: Integer;
+    begin
+      Result := 0;
+      for J := 0 to High(AFn^.Code) do
+        if ScalarMemoryOp(AFn^.Code[J].Op) then
+        begin
+          if AFn^.Code[J].A = AReg then Inc(Result);
+          if (AFn^.Code[J].Op in [iroI32Store, iroI64Store, iroF32Store,
+            iroF64Store, iroI32Store8, iroI32Store16, iroI64Store8,
+            iroI64Store16, iroI64Store32]) and
+            (AFn^.Code[J].Dest = AReg) then
+            Inc(Result);
+        end;
+    end;
+
+  begin
+    {$IFDEF WASM_JIT_ARM64}
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) do
+      if ScalarMemoryOp(PlannedCode[K].Op) then
+      begin
+        First := K - 2;
+        if First < 0 then First := 0;
+        for P := K - 1 downto First do
+          if (PlannedCode[P].Op = iroMove) and not SkipPlanned[P] and
+            not Targets[P] and not Targets[K] then
+          begin
+            Source := PlannedCode[P].A;
+            Temp := PlannedCode[P].Dest;
+            if IsAllocatedSlot(Source) and
+              (SimpleUseCount(Temp) + MemoryUseCount(Temp) = 1) then
+            begin
+              if PlannedCode[K].A = Temp then
+              begin
+                PlannedCode[K].A := Source;
+                SkipPlanned[P] := True;
+              end
+              else if (PlannedCode[K].Op in [iroI32Store, iroI64Store,
+                iroF32Store, iroF64Store, iroI32Store8, iroI32Store16,
+                iroI64Store8, iroI64Store16, iroI64Store32]) and
+                (PlannedCode[K].Dest = Temp) then
+              begin
+                PlannedCode[K].Dest := Source;
+                SkipPlanned[P] := True;
+              end;
+            end;
+          end;
+      end;
+    {$ENDIF}
   end;
 
   function StaticCacheOp(const AOp: TWasmIrOp): Boolean;
@@ -702,6 +815,8 @@ begin
     UseThirdStatic := UseStaticCache and
       (AllocatedSlots[2] <> High(UInt32));
     AnalyzeAdjacentMoves;
+    AnalyzeMemoryMoves;
+    AnalyzeImmediateFusion;
     AnalyzeFusion;
 
     {$IFDEF WASM_JIT_ARM64}
@@ -754,12 +869,18 @@ begin
         Emitted := True;
       end
       else
-        Emitted := Arm64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
-          UInt32(I),
-          (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
-            (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
-            (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
-          UsePinnedMemory, UsePinnedMemoryBase, UseThirdStatic, ArmCache);
+      begin
+        if ImmediateFusion[I] then
+          Emitted := Arm64EmitOpCachedImmediate(Buf, PlannedCode[I],
+            ImmediateValues[I], ArmCache)
+        else
+          Emitted := Arm64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
+            UInt32(I),
+            (AFn^.Code[I].A < UInt32(Length(AFn^.RegTypes))) and
+              (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
+              (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
+            UsePinnedMemory, UsePinnedMemoryBase, UseThirdStatic, ArmCache);
+      end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
       if Fusion[I] >= 0 then

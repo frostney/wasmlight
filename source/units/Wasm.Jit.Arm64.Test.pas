@@ -112,6 +112,9 @@ begin
   Expect<UInt32>(Arm64UdivX(9, 9, 10)).ToBe($9ACA0929);
   Expect<UInt32>(Arm64MsubW(9, 11, 10, 9)).ToBe($1B0AA569);
   Expect<UInt32>(Arm64AndW(0, 1, 2)).ToBe($0A020020);
+  Expect<UInt32>(Arm64AndLowMaskImmW(9, 12, 14)).ToBe($12003589);
+  Expect<UInt32>(Arm64LslImmW(9, 16, 2)).ToBe($531E7609);
+  Expect<UInt32>(Arm64AddImmW(9, 15, 1)).ToBe($110005E9);
   Expect<UInt32>(Arm64OrrW(0, 1, 2)).ToBe($2A020020);
   Expect<UInt32>(Arm64EorW(0, 1, 2)).ToBe($4A020020);
   Expect<UInt32>(Arm64LslvW(0, 1, 2)).ToBe($1AC22020);

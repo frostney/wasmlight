@@ -223,6 +223,9 @@ function Arm64UdivX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64MsubW(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64MsubX(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64AndW(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64AndLowMaskImmW(const ARd, ARn, AOnes: Byte): UInt32;
+function Arm64LslImmW(const ARd, ARn, AShift: Byte): UInt32;
+function Arm64AddImmW(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 function Arm64AndX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64OrrW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64OrrX(const ARd, ARn, ARm: Byte): UInt32;
@@ -472,6 +475,11 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
   AUsePinnedMemoryBase, AExtendedFrame: Boolean;
   var ACache: TArm64RegCache): Boolean;
+function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
+  const AValue: UInt32): Boolean;
+function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AValue: UInt32;
+  var ACache: TArm64RegCache): Boolean;
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
 
@@ -519,6 +527,8 @@ procedure Arm64CachedAlu(const ABuf: TWasmCodeBuffer;
 procedure Arm64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACond: Byte; const AWide: Boolean;
   var ACache: TArm64RegCache); forward;
+function Arm64CachedHostForSlot(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean; forward;
 procedure EmitCbnzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
 procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
@@ -650,6 +660,22 @@ var
   Folded: Boolean;
   LoadOp: UInt32;
   UseRegOffset: Boolean;
+  AddrReg: Byte;
+  ValueReg: Byte;
+
+  procedure ResolveOperandReg(const ASlot: UInt32; const ADefault: Byte;
+    out AReg: Byte);
+  var
+    Host: Byte;
+  begin
+    AReg := ADefault;
+    if AUsePinnedMemoryBase and ACache.StaticAllocation and
+      Arm64CachedHostForSlot(ACache, ASlot, Host) then
+      AReg := Host
+    else
+      Arm64CachedLoad(ABuf, ACache, AReg, ASlot);
+  end;
+
 begin
   AccessSize := Arm64MemoryAccessSize(AIns.Op);
   { Imm stores the memarg's u64 bit pattern in the IR's signed immediate slot.
@@ -693,17 +719,17 @@ begin
       Arm64EmitLdrX(ABuf, 15, MemoryReg,
         UInt32(PtrUInt(@Layout.ByteSize) - PtrUInt(@Layout)));
   end;
-  if AAddr64 then
-    Arm64CachedLoad(ABuf, ACache, 10, AIns.A)
-  else
-    Arm64CachedLoad(ABuf, ACache, 10, AIns.A);      { canonical i32 is zero-extended }
+  { A helper-free base-pinned access may consume a statically allocated local
+    directly as the register-offset index. Other shapes retain x10 because
+    they reuse cache registers for the live memory instance fields. }
+  ResolveOperandReg(AIns.A, 10, AddrReg);
 
   if AAddr64 and Folded then
   begin
     { Guard-assisted memory64: index > ByteSize can escape the reservation;
       index <= ByteSize is safe because the static offset plus access width is
       wholly absorbed by the reserved guard. }
-    ABuf.EmitU32(Arm64CmpX(10, 15));
+    ABuf.EmitU32(Arm64CmpX(AddrReg, 15));
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
   end
   else if (not AAddr64) and Folded then
@@ -713,9 +739,9 @@ begin
   begin
     { Exact MemInBounds subtraction form: index <= size; offset <= size-index;
       access width <= size-index-offset. No addition can wrap. }
-    ABuf.EmitU32(Arm64CmpX(10, 15));
+    ABuf.EmitU32(Arm64CmpX(AddrReg, 15));
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
-    ABuf.EmitU32(Arm64SubX(15, 15, 10));
+    ABuf.EmitU32(Arm64SubX(15, 15, AddrReg));
     Arm64EmitLoadImm64(ABuf, 11, Offset);
     ABuf.EmitU32(Arm64CmpX(11, 15));
     Arm64EmitTrapUnless(ABuf, ARM64_COND_LS);
@@ -732,7 +758,7 @@ begin
       ABuf.EmitU32(Arm64MovReg(14, BaseReg));
       BaseReg := 14;
     end;
-    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 10));
+    ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, AddrReg));
     Arm64EmitLoadImm64(ABuf, 11, Offset);
     ABuf.EmitU32(Arm64AddX(BaseReg, BaseReg, 11));
   end;
@@ -749,45 +775,49 @@ begin
     iroI64Load, iroF64Load: LoadOp := $F9400000;
     iroI32Store8, iroI64Store8:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($39000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($39000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($39000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($39000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
     iroI32Store16, iroI64Store16:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($79000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($79000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($79000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($79000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
     iroI32Store, iroF32Store, iroI64Store32:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($B9000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($B9000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($B9000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($B9000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
     iroI64Store, iroF64Store:
       begin
-        Arm64CachedLoad(ABuf, ACache, 11, AIns.Dest);
+        ResolveOperandReg(AIns.Dest, 11, ValueReg);
         if UseRegOffset then
-          ABuf.EmitU32(Arm64MemRegOffset($F9000000, 11, BaseReg, 10, AAddr64))
+          ABuf.EmitU32(Arm64MemRegOffset($F9000000, ValueReg, BaseReg,
+            AddrReg, AAddr64))
         else
-          ABuf.EmitU32($F9000000 or (UInt32(BaseReg) shl 5) or 11);
+          ABuf.EmitU32($F9000000 or (UInt32(BaseReg) shl 5) or ValueReg);
         Exit;
       end;
   else
     Exit;
   end;
   if UseRegOffset then
-    ABuf.EmitU32(Arm64MemRegOffset(LoadOp, 11, BaseReg, 10, AAddr64))
+    ABuf.EmitU32(Arm64MemRegOffset(LoadOp, 11, BaseReg, AddrReg, AAddr64))
   else
     ABuf.EmitU32(LoadOp or (UInt32(BaseReg) shl 5) or 11);
   Arm64CachedStore(ABuf, ACache, 11, AIns.Dest);
@@ -2634,6 +2664,28 @@ begin
   Result := $0A000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
 end;
 
+function Arm64AndLowMaskImmW(const ARd, ARn, AOnes: Byte): UInt32;
+begin
+  Result := $12000000 or (UInt32(AOnes - 1) shl 10) or
+    (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64LslImmW(const ARd, ARn, AShift: Byte): UInt32;
+var
+  Shift: Byte;
+begin
+  Shift := AShift and 31;
+  Result := $53000000 or (UInt32((32 - Shift) and 31) shl 16) or
+    (UInt32(31 - Shift) shl 10) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64AddImmW(const ARd, ARn: Byte;
+  const AImm12: UInt32): UInt32;
+begin
+  Result := $11000000 or ((AImm12 and $FFF) shl 10) or
+    (UInt32(ARn) shl 5) or ARd;
+end;
+
 function Arm64AndX(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $8A000000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
@@ -3384,6 +3436,20 @@ begin
     ABuf.EmitU32(Arm64MovReg(ADest, Host));
 end;
 
+function Arm64CachedHostForSlot(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := Arm64CacheHostReg(I);
+      Exit(True);
+    end;
+  Result := False;
+end;
+
 procedure Arm64CachedStore(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASrc: Byte; const ASlot: UInt32);
 var
@@ -3438,6 +3504,52 @@ begin
   Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
   Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, AIns.B);
   ABuf.EmitU32(AWb(ARM64_REG_T0, ARM64_REG_T0, ARM64_REG_T1));
+  Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+end;
+
+function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
+  const AValue: UInt32): Boolean;
+begin
+  case AOp of
+    iroI32Add: Result := AValue <= $FFF;
+    iroI32And:
+      Result := (AValue <> 0) and (AValue <> High(UInt32)) and
+        ((AValue and (AValue + 1)) = 0);
+    iroI32Shl: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AValue: UInt32;
+  var ACache: TArm64RegCache): Boolean;
+var
+  Mask: UInt32;
+  Ones: Byte;
+begin
+  Result := Arm64CanUseI32Immediate(AIns.Op, AValue);
+  if not Result then
+    Exit;
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+  case AIns.Op of
+    iroI32Add:
+      ABuf.EmitU32(Arm64AddImmW(ARM64_REG_T0, ARM64_REG_T0, AValue));
+    iroI32And:
+      begin
+        Mask := AValue;
+        Ones := 0;
+        while Mask <> 0 do
+        begin
+          Inc(Ones);
+          Mask := Mask shr 1;
+        end;
+        ABuf.EmitU32(Arm64AndLowMaskImmW(ARM64_REG_T0, ARM64_REG_T0, Ones));
+      end;
+    iroI32Shl:
+      ABuf.EmitU32(Arm64LslImmW(ARM64_REG_T0, ARM64_REG_T0,
+        Byte(AValue and 31)));
+  end;
   Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
 end;
 
