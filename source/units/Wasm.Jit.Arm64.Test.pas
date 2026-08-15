@@ -60,6 +60,7 @@ type
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheUsesHostRegsForAlu;
     procedure TestDynamicDestReservation;
+    procedure TestExtendedCachedEmitterEntry;
     procedure TestThirdStaticAllocation;
     procedure TestExtendedFrameWords;
     procedure TestDynamicWriteBackSpillsOnlyLiveValues;
@@ -328,6 +329,24 @@ begin
     Expect<Byte>(Cache.StaticCount).ToBe(3);
     Expect<Boolean>(Cache.Entries[2].Valid).ToBe(True);
     Expect<UInt32>(Cache.Entries[2].Slot).ToBe(7);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestExtendedCachedEmitterEntry;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64InitRegCache(Cache);
+    Expect<Boolean>(Arm64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 0, 0, 0, 7), Aux,
+      0, False, False, False, False, True, 1, 0, 0, Cache)).ToBe(True);
+    Expect<Boolean>(Buf.Size > 0).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -821,6 +840,8 @@ begin
     TestStaticCacheUsesHostRegsForAlu);
   Test('dynamic destinations reserve a non-source cache register',
     TestDynamicDestReservation);
+  Test('cached emission keeps compatibility and explicit native entries',
+    TestExtendedCachedEmitterEntry);
   Test('static allocation can retain a third long-lived slot',
     TestThirdStaticAllocation);
   Test('the extended frame preserves its third static register',

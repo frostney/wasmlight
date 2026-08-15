@@ -483,7 +483,7 @@ begin
     { The artifact's code is byte-identical to a FRESH JIT staging of the same
       function — the unified emitter emits the same position-independent bytes
       whether it finalizes to executable memory (JIT) or to bytes (AOT). }
-    Fresh := JitStageFunctionBytes(Store, @Loaded.Ir.Functions[0],
+    Fresh := JitStageFunctionBytes(Store, @Loaded.Ir.Functions[0], 0,
       EntryOffset, RegCount);
     Expect<Integer>(Length(Fresh)).ToBe(Length(Parsed.Funcs[0].Code));
     BytesEqual := Length(Fresh) > 0;
@@ -671,7 +671,7 @@ begin
 
     { The code length, via a stage of the same function (the same finalized
       bytes the JIT mapped). }
-    Staged := JitStageFunctionBytes(JitStore, @JitLoaded.Ir.Functions[0],
+    Staged := JitStageFunctionBytes(JitStore, @JitLoaded.Ir.Functions[0], 0,
       EntryOffset, RegCount);
     Len := Length(Staged);
     Expect<Boolean>(Len > 0).ToBe(True);

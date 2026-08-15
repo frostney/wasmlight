@@ -181,7 +181,8 @@ begin
     Funcs[I].Compiled := False;
     if JitCanCompile(Fn) then
     begin
-      Code := JitStageFunctionBytes(AStore, Fn, EntryOffset, RegCount);
+      Code := JitStageFunctionBytes(AStore, Fn,
+        Ir.FuncImportCount + UInt32(I), EntryOffset, RegCount);
       if Length(Code) > 0 then
       begin
         Funcs[I].Compiled := True;
