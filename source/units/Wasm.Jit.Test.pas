@@ -276,6 +276,37 @@ begin
   ]);
 end;
 
+{ Acyclic non-tail self recursion entered after a host bumps the invocation
+  epoch. Ordinary calls are not safepoints: only IR-marked loop back-edges
+  poll. Therefore both tiers must finish rec(n), even though the shared epoch
+  now differs from the outer invocation snapshot. The native scalar self-call
+  path must not invent an extra poll merely because it lowers the call to BL.
+
+    import "e"."bump" (func)                    ; func 0
+    (func $rec (param i32) (result i32) ...)      ; func 1
+    (func $run (param i32) (result i32)
+      call 0  local.get 0  call 1)                ; func 2 }
+function EpochAcyclicRecModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(2, VecOf([BLit([$01, $65, $04, $62, $75, $6D, $70, $00, $00])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$01])])),
+    Sect(7, VecOf([
+      BLit([$03, $72, $65, $63, $00, $01]),
+      BLit([$03, $72, $75, $6E, $00, $02])])),
+    Sect(10, VecOf([
+      CodeEntry([$00,
+        $20, $00, $45, $04, $40, $41, $00, $0F, $0B,
+        $20, $00, $41, $01, $6B, $10, $01, $41, $01, $6A,
+        $0B]),
+      CodeEntry([$00, $10, $00, $20, $00, $10, $01, $0B])]))
+  ]);
+end;
+
 { --- Wave-3 modules: the call family (jit-spec §12.3 Wave 3) ------------
 
   Each is a complete module built from literal bytes so the shape under test is
@@ -1257,6 +1288,7 @@ type
     procedure TestUnreachable;
     procedure TestEpochInterruptDifferential;
     procedure TestEpochInterruptAcrossSeamToInterpCallee;
+    procedure TestEpochBumpBeforeAcyclicNativeRecursion;
 
     { --- Wave 3: the call family ------------------------------------- }
     procedure TestCallCompiledToCompiled;
@@ -2427,6 +2459,18 @@ begin
 end;
 
 
+procedure TJitTests.TestEpochBumpBeforeAcyclicNativeRecursion;
+begin
+  { The interpreted wrapper bumps Epoch after the outer invocation captured
+    its snapshot, then enters a proof-gated compiled recursive function whose
+    control flow has no loop back-edge. Calls are not epoch safepoints, so rec
+    must return normally under both tiers. }
+  FDiffHost := @JitBumpEpochCallback;
+  CompileExports(['rec']);
+  Expect<Boolean>(DiffModule(EpochAcyclicRecModuleBytes, 'run',
+    [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 { --- Wave 3: the call family (jit-spec §12.3 Wave 3) --------------------
 
   Every one of these is the same differential contract as the rest of the
@@ -3095,6 +3139,8 @@ begin
     TestEpochInterruptDifferential);
   Test('a compiled caller''s interrupt reaches an interpreted callee across the seam',
     TestEpochInterruptAcrossSeamToInterpCallee);
+  Test('an epoch bump before acyclic native recursion does not invent a safepoint',
+    TestEpochBumpBeforeAcyclicNativeRecursion);
 
   Test('a compiled function calling a compiled function matches',
     TestCallCompiledToCompiled);

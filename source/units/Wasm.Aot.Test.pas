@@ -178,6 +178,37 @@ begin
     BLit([$00, $20, $00, $20, $01, $6B, $0B]), 'sub');
 end;
 
+procedure AotBumpEpochCallback(const AStore: TWasmStore;
+  const AData: Pointer; const AParams: PWasmValue;
+  const AResults: PWasmValue);
+begin
+  AStore.Epoch := AStore.Epoch + 1;
+end;
+
+{ Host bump followed by acyclic non-tail self recursion. Calls are not epoch
+  safepoints, so an AOT-loaded native self-call must not trap merely because
+  Epoch differs from the invocation snapshot. }
+function EpochAcyclicRecModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(2, VecOf([BLit([$01, $65, $04, $62, $75, $6D, $70, $00, $00])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$01])])),
+    Sect(7, VecOf([
+      BLit([$03, $72, $65, $63, $00, $01]),
+      BLit([$03, $72, $75, $6E, $00, $02])])),
+    Sect(10, VecOf([
+      CodeEntry([$00,
+        $20, $00, $45, $04, $40, $41, $00, $0F, $0B,
+        $20, $00, $41, $01, $6B, $10, $01, $41, $01, $6A,
+        $0B]),
+      CodeEntry([$00, $10, $00, $20, $00, $10, $01, $0B])]))
+  ]);
+end;
+
 { One export descriptor: name, kind byte $00 (func), function index. }
 function FuncExport(const AName: string; const AIndex: UInt32): TWasmBytes;
 begin
@@ -243,6 +274,7 @@ type
     procedure TestArtifactCodeIsPositionIndependent;
     procedure TestMultiFunctionWithDeclined;
     procedure TestJitAndAotCodeAreByteIdentical;
+    procedure TestEpochBumpBeforeAcyclicNativeRecursion;
     procedure TestGuardRejectsWrongIrVersion;
     procedure TestGuardRejectsWrongArch;
     procedure TestGuardRejectsCorruptChecksum;
@@ -724,6 +756,76 @@ begin
 end;
 {$ENDIF}
 
+procedure TAotTests.TestEpochBumpBeforeAcyclicNativeRecursion;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_, Artifact: TWasmBytes;
+  CompileEngine, Engine: TWasmEngine;
+  CompileStore, Store: TWasmStore;
+  CompileLoaded, Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Canon, TypeIds: TWasmEngineTypeIds;
+  Jit: TWasmJitContext;
+  LoadRes: TWasmAotLoadResult;
+  Param, Res: TWasmValue;
+begin
+  Bytes_ := EpochAcyclicRecModuleBytes;
+  CompileEngine := TWasmEngine.Create;
+  CompileStore := nil;
+  CompileLoaded := nil;
+  Engine := nil;
+  Store := nil;
+  Loaded := nil;
+  Jit := nil;
+  try
+    CompileLoaded := LoadModule(Bytes_);
+    CompileStore := TWasmStore.Create(CompileEngine);
+    Artifact := AotCompileModule(CompileStore, CompileLoaded);
+
+    Engine := TWasmEngine.Create;
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Engine.InternModule(Loaded.Ir, Canon, TypeIds);
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    SetLength(Imports.Funcs, 1);
+    Imports.Funcs[0] := Store.AddHostFunc(TypeIds[0],
+      @AotBumpEpochCallback, nil);
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, LoadRes);
+    Expect<Integer>(Ord(LoadRes)).ToBe(Ord(alrLoaded));
+    Expect<Boolean>(Store.Funcs[ExportAddr(Instance, 'rec')].CompiledEntry <>
+      nil).ToBe(True);
+
+    Store.Epoch := 0;
+    Store.EpochSnapshot := 0;
+    Param := MakeValueI32(8);
+    Res.Bits := High(UInt64);
+    InterpInvoke(Store, ExportAddr(Instance, 'run'), @Param, @Res);
+    Expect<Integer>(Res.I32).ToBe(8);
+    Expect<UInt64>(Store.Epoch).ToBe(1);
+  finally
+    FreeAndNil(Jit);
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+    FreeAndNil(CompileStore);
+    FreeAndNil(CompileLoaded);
+    FreeAndNil(CompileEngine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
 { --- guard tests: build the artifact, mutate/misuse, assert the reason --- }
 
 {$IFDEF WASM_JIT_BACKEND}
@@ -935,6 +1037,8 @@ begin
     TestMultiFunctionWithDeclined);
   Test('AOT-loaded code is byte-identical to a fresh JIT compilation',
     TestJitAndAotCodeAreByteIdentical);
+  Test('an epoch bump before acyclic AOT recursion does not invent a safepoint',
+    TestEpochBumpBeforeAcyclicNativeRecursion);
   Test('a wrong IR-version artifact is rejected (interpret fall-back)',
     TestGuardRejectsWrongIrVersion);
   Test('a wrong-arch artifact is rejected (interpret fall-back)',

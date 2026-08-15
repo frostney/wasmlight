@@ -39,7 +39,8 @@
   recursion and edits only the shared Depth/ValueTop counters. Its external
   AAPCS wrapper saves and pins the full callee-saved state once, then calls a
   local position-independent core; recursion preserves only x19/LR beside the
-  native register file. It checks both caps and the entry epoch before mutation;
+  native register file. It checks both caps before mutation; ordinary calls do
+  not invent epoch safepoints, while IR-marked loop back-edges still poll;
   references, allocation, handlers, host/interpreted escape, indirect/tail
   calls, and cross-function calls all retain the full shared-frame path above.
 

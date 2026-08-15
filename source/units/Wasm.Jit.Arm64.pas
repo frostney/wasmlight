@@ -4593,8 +4593,10 @@ end;
   Depth/ValueTop counters still enforce exactly the same resource limits.
   There are no references, allocations, host calls, interpreted escapes, or
   throwing instructions in the eligible graph, so no per-call activation or
-  GC frame can become observable. Traps longjmp to the invocation trampoline;
-  normal return alone retires the lightweight counters here. }
+  GC frame can become observable. Ordinary calls are not epoch safepoints;
+  only IR-marked loop back-edges poll, exactly as in the interpreter. Traps
+  longjmp to the invocation trampoline; normal return alone retires the
+  lightweight counters here. }
 procedure EmitNativeScalarSelfCall(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const ARegisterCount, AParamReg, AResultReg: UInt32;
@@ -4602,17 +4604,17 @@ procedure EmitNativeScalarSelfCall(const ABuf: TWasmCodeBuffer;
 var
   FO: TWasmJitFrameOffsets;
   FrameBytes, SaveOffset: UInt32;
-  Done, Exhausted, Interrupted: TWasmJitLabel;
+  Done, Exhausted: TWasmJitLabel;
 begin
   FO := WasmJitFrameOffsets;
   SaveOffset := Arm64Align16(ARegisterCount * ARM64_SLOT_SIZE);
   FrameBytes := SaveOffset + 16;
   Done := ABuf.NewLabel;
   Exhausted := ABuf.NewLabel;
-  Interrupted := ABuf.NewLabel;
 
-  { Both exhaustion conditions and the function-entry epoch poll precede the
-    first logical or native-stack mutation. }
+  { Both exhaustion conditions precede the first logical or native-stack
+    mutation. A call is not an epoch safepoint; the local core retains the
+    ordinary IR back-edge checks emitted below. }
   Arm64EmitLdrX(ABuf, 9, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
   Arm64EmitLdrX(ABuf, 10, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
   ABuf.EmitU32(Arm64CmpX(9, 10));
@@ -4622,10 +4624,6 @@ begin
   Arm64EmitLdrX(ABuf, 12, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
   ABuf.EmitU32(Arm64CmpX(11, 12));
   EmitBCondTo(ABuf, ARM64_COND_HI, Exhausted);
-  Arm64EmitLdrX(ABuf, 12, ARM64_REG_EPOCHADDR, 0);
-  ABuf.EmitU32(Arm64CmpX(12, ARM64_REG_EPOCH));
-  EmitBCondTo(ABuf, ARM64_COND_NE, Interrupted);
-
   LdX(ABuf, 12, IrAuxBlockItem(AAux, AIns.A, 0));
   ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
   Arm64EmitStrX(ABuf, 12, ARM64_REG_SP, AParamReg * ARM64_SLOT_SIZE);
@@ -4653,9 +4651,6 @@ begin
 
   ABuf.BindLabel(Exhausted);
   Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
-  Arm64EmitCallHelper(ABuf, aohTrapKind);
-  ABuf.BindLabel(Interrupted);
-  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkEpochInterrupt)));
   Arm64EmitCallHelper(ABuf, aohTrapKind);
   ABuf.BindLabel(Done);
 end;
