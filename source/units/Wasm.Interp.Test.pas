@@ -2374,6 +2374,15 @@ begin
   Expect<Boolean>(Off.CtxValues < Off.CtxValueTop).ToBe(True);
   Expect<Boolean>((Off.CtxValueTop and (SizeOf(Pointer) - 1)) = 0).ToBe(True);
   Expect<Boolean>(Off.ActBase < Off.ActStride).ToBe(True);
+  {$IFDEF CPUAARCH64}
+  { JitFinishDirectCallScalar is a naked AAPCS64 leaf over these exact fields.
+    Keep its immediates pinned to the live record layout. }
+  Expect<Int32>(Integer(Off.CtxValueTop)).ToBe(32);
+  Expect<Int32>(Integer(Off.CtxDepth)).ToBe(56);
+  Expect<Int32>(Integer(Off.ActBase)).ToBe(24);
+  Expect<Int32>(Integer(Off.ActGcFrame + Off.GcFramePrev)).ToBe(32);
+  Expect<Int32>(Integer(Off.ActEntryResults)).ToBe(104);
+  {$ENDIF}
 end;
 
 procedure TInterpTests.TestJitEntryClearsSemanticSlots;

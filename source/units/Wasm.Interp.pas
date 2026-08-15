@@ -149,18 +149,26 @@ type
     CtxDepth: NativeUInt;            { TWasmInterpContext.Depth }
     ActStride: NativeUInt;           { SizeOf(TWasmActivation) }
     ActBase: NativeUInt;             { TWasmActivation.Base }
+    ActGcFrame: NativeUInt;          { TWasmActivation.GcFrame }
+    ActEntryResults: NativeUInt;     { TWasmActivation.EntryResults }
+    GcFramePrev: NativeUInt;         { TWasmGcFrame.Prev }
     GcFrameSlots: NativeUInt;        { TWasmGcFrame.Slots }
     GcFrameRefRegBits: NativeUInt;   { TWasmGcFrame.RefRegBits }
     GcFrameRegisterCount: NativeUInt;{ TWasmGcFrame.RegisterCount }
   end;
 
-  { The two live values a generated direct-call site needs after the shared
-    frame helper has resolved and entered a compiled callee. Kept pointer-only
-    so both native backends use the same 16-byte stack layout. }
+  { The live values a generated direct-call site needs after the shared frame
+    helper has resolved and entered a compiled callee. The scalar-result leaf
+    also receives the already-resolved context, activation and GC-chain slot,
+    so it can retire the frame without re-walking Pascal object graphs. }
   PWasmJitDirectCallState = ^TWasmJitDirectCallState;
   TWasmJitDirectCallState = record
     RegBase: PWasmValue;
     IrBase: PWasmIrInstr;
+    Ctx: PWasmInterpContext;
+    Entry: PWasmActivation;
+    GcFrameSlot: PPWasmGcFrame;
+    ScalarResultReg: UInt32;
   end;
 
 var
@@ -295,7 +303,13 @@ procedure JitLeaveFrame(const ACtx: PWasmInterpContext);
 function JitPrepareDirectCall(const AStore: TWasmStore;
   const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
   const AState: PWasmJitDirectCallState): Pointer; cdecl;
+function JitPrepareDirectCallScalar(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
+  const AState: PWasmJitDirectCallState): Pointer; cdecl;
 procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
+procedure JitFinishDirectCallScalar(const ACtx: PWasmInterpContext;
+  const AEntry: PWasmActivation; const AFrameBase: PWasmValue;
+  const AResultReg: UInt32; const AGcFrameSlot: PPWasmGcFrame); cdecl;
 
 { O-J5: the register-file / frame offsets the JIT hard-codes (see the record
   above). Layout-only; the co-located test asserts them. }
@@ -307,7 +321,7 @@ const
     template's byte layout, a pinned-register reassignment, the entry-ABI shape.
     Bump it whenever position-independent codegen changes in a way that would
     make an existing artifact's bytes wrong. }
-  AOT_ABI_REVISION = 4;
+  AOT_ABI_REVISION = 5;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -3233,6 +3247,68 @@ begin
   Result := FuncInst^.CompiledDirectEntry;
 end;
 
+function JitPrepareDirectCallScalar(const AStore: TWasmStore;
+  const AFuncIdx: PtrUInt; const AArgs, AResults: PWasmValue;
+  const AState: PWasmJitDirectCallState): Pointer; cdecl;
+var
+  Ctx: PWasmInterpContext;
+  Inst: TWasmModuleInstance;
+  Addr: TWasmFuncAddr;
+  FuncInst: ^TWasmFuncInst;
+  Fn: PWasmIrFunction;
+  Entry: PWasmActivation;
+  Slots: PWasmValue;
+  I: Integer;
+begin
+  Result := nil;
+  Ctx := PWasmInterpContext(AStore.TierContext);
+  Inst := Ctx^.Acts[Ctx^.Depth - 1].Instance;
+  Addr := Inst.FuncAddrs[UInt32(AFuncIdx)];
+  FuncInst := @AStore.Funcs[Addr];
+  if (FuncInst^.Kind <> wfkWasm) or
+    (FuncInst^.CompiledDirectEntry = nil) then
+    Exit;
+
+  Fn := @FuncInst^.Instance.Ir.Functions[FuncInst^.FuncIrIndex];
+  if (Ctx^.Depth >= Ctx^.DepthCap) or
+    (Ctx^.ValueTop + Fn^.RegisterCount > Ctx^.ValueCap) then
+    TrapNow(wtkStackExhausted);
+
+  Entry := @Ctx^.Acts[Ctx^.Depth];
+  Entry^.Fn := Fn;
+  Entry^.Instance := FuncInst^.Instance;
+  Entry^.Base := Ctx^.ValueTop;
+  Entry^.IP := 0;
+  Ctx^.ValueTop := Entry^.Base + Fn^.RegisterCount;
+  Slots := Frame(Ctx^.Values, Entry^.Base);
+  I := 0;
+  while I < Length(Fn^.EntryZeroRegs) do
+  begin
+    Slots[Fn^.EntryZeroRegs[I]].Bits := 0;
+    Inc(I);
+  end;
+  Slots[Fn^.LocalRegs[0]] := AArgs[0];
+
+  Entry^.RetKind := rtCaller;
+  Entry^.RetCount := 0;
+  Entry^.RetDest := nil;
+  Entry^.RetBase := 0;
+  Entry^.EntryResults := AResults;
+  PushGcFrame(Ctx, Entry, Fn, Entry^.Base);
+  Inc(Ctx^.Depth);
+
+  AState^.RegBase := Slots;
+  if Length(Fn^.Code) > 0 then
+    AState^.IrBase := @Fn^.Code[0]
+  else
+    AState^.IrBase := nil;
+  AState^.Ctx := Ctx;
+  AState^.Entry := Entry;
+  AState^.GcFrameSlot := Ctx^.Store.Heap.FrameSlot;
+  AState^.ScalarResultReg := Fn^.ResultRegs[0];
+  Result := FuncInst^.CompiledDirectEntry;
+end;
+
 procedure JitFinishDirectCall(const AStore: TWasmStore); cdecl;
 var
   Ctx: PWasmInterpContext;
@@ -3270,6 +3346,42 @@ begin
   Dec(Ctx^.Depth);
 end;
 
+{$IFDEF CPUAARCH64}
+procedure JitFinishDirectCallScalar(const ACtx: PWasmInterpContext;
+  const AEntry: PWasmActivation; const AFrameBase: PWasmValue;
+  const AResultReg: UInt32; const AGcFrameSlot: PPWasmGcFrame); cdecl;
+  assembler; nostackframe;
+asm
+  { AAPCS64: x0=Ctx, x1=Entry, x2=FrameBase, w3=ResultReg,
+    x4=&Heap.FFrames. These layout constants are asserted by
+    TestJitFrameOffsetsMatchLayout. }
+  ldr x5, [x1, #104]       { EntryResults }
+  ldr x6, [x2, x3, lsl #3]
+  str x6, [x5]
+  ldr x5, [x1, #32]        { GcFrame.Prev }
+  str x5, [x4]
+  ldr x5, [x1, #24]        { Base }
+  str x5, [x0, #32]        { ValueTop }
+  ldr x5, [x0, #56]        { Depth }
+  sub x5, x5, #1
+  str x5, [x0, #56]
+end;
+{$ELSE}
+procedure JitFinishDirectCallScalar(const ACtx: PWasmInterpContext;
+  const AEntry: PWasmActivation; const AFrameBase: PWasmValue;
+  const AResultReg: UInt32; const AGcFrameSlot: PPWasmGcFrame); cdecl;
+begin
+  { A one-slot result cannot be v128, whose flat ABI width is two slots. The
+    validated call-site result arity therefore makes this a complete scalar
+    specialization of JitFinishDirectCall, without inspecting a run-time type
+    tag or walking the generic result-shape loop. }
+  AEntry^.EntryResults[0] := AFrameBase[AResultReg];
+  AGcFrameSlot^ := AEntry^.GcFrame.Prev;
+  ACtx^.ValueTop := AEntry^.Base;
+  Dec(ACtx^.Depth);
+end;
+{$ENDIF}
+
 function WasmJitFrameOffsets: TWasmJitFrameOffsets;
 var
   C: TWasmInterpContext;
@@ -3284,6 +3396,9 @@ begin
   Result.CtxDepth := PtrUInt(@C.Depth) - PtrUInt(@C);
   Result.ActStride := SizeOf(TWasmActivation);
   Result.ActBase := PtrUInt(@A.Base) - PtrUInt(@A);
+  Result.ActGcFrame := PtrUInt(@A.GcFrame) - PtrUInt(@A);
+  Result.ActEntryResults := PtrUInt(@A.EntryResults) - PtrUInt(@A);
+  Result.GcFramePrev := PtrUInt(@G.Prev) - PtrUInt(@G);
   Result.GcFrameSlots := PtrUInt(@G.Slots) - PtrUInt(@G);
   Result.GcFrameRefRegBits := PtrUInt(@G.RefRegBits) - PtrUInt(@G);
   Result.GcFrameRegisterCount := PtrUInt(@G.RegisterCount) - PtrUInt(@G);
@@ -3339,6 +3454,9 @@ begin
   Fold(FO.CtxDepth);
   Fold(FO.ActStride);
   Fold(FO.ActBase);
+  Fold(FO.ActGcFrame);
+  Fold(FO.ActEntryResults);
+  Fold(FO.GcFramePrev);
   Fold(FO.GcFrameSlots);
   Fold(FO.GcFrameRefRegBits);
   Fold(FO.GcFrameRegisterCount);
