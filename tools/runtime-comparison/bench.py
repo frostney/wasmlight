@@ -27,7 +27,59 @@ MODULE_DIR = BUILD_DIR / "modules"
 ARTIFACT_DIR = BUILD_DIR / "artifacts"
 WAZERO_CACHE = BUILD_DIR / "wazero-cache"
 LOCK_PATH = Path("/tmp/wasmlight-perf-gate.lock")
-DEFAULT_WORKLOADS = ("startup", "loop", "fib", "memory")
+ALL_RUNTIME_KEYS = frozenset(
+    ("wasmlight", "wasmtime", "wasmer", "wasmedge", "wamr", "wazero", "wasm3")
+)
+GC_RUNTIME_KEYS = frozenset(("wasmlight", "wasmtime"))
+SIMD_RUNTIME_KEYS = frozenset(
+    ("wasmlight", "wasmtime", "wasmer", "wasmedge", "wazero")
+)
+HOST_CALL_RUNTIME_KEYS = frozenset(
+    ("wasmlight", "wasmtime", "wasmer", "wasmedge", "wamr", "wazero")
+)
+PROFILE_RUNTIME_ORDER = {
+    "best": (
+        "wasmlight",
+        "Wasmtime",
+        "Wasmer",
+        "WasmEdge",
+        "WAMR",
+        "wazero",
+        "wasm3",
+    ),
+    "interpreter": ("wasmlight", "WasmEdge", "WAMR", "wazero", "wasm3"),
+}
+
+
+@dataclass(frozen=True)
+class WorkloadSpec:
+    description: str
+    assembler: str = "wat2wasm"
+    runtime_keys: frozenset[str] = ALL_RUNTIME_KEYS
+
+
+WORKLOAD_SPECS = {
+    "startup": WorkloadSpec("process, artifact load, instantiation, and tiny loop"),
+    "loop": WorkloadSpec("300M dependent scalar integer loop iterations"),
+    "fib": WorkloadSpec("recursive fib(35) direct calls"),
+    "memory": WorkloadSpec("50M paired varying-address i32 stores and loads"),
+    "memory-load": WorkloadSpec("100M cache-resident varying-address i32 loads"),
+    "memory-store": WorkloadSpec("100M cache-resident varying-address i32 stores"),
+    "call": WorkloadSpec("50M cross-function direct calls"),
+    "memory-grow": WorkloadSpec("4,096 one-page linear-memory growth operations"),
+    "gc": WorkloadSpec(
+        "2M bounded-live-set GC struct allocations",
+        assembler="wasm-tools",
+        runtime_keys=GC_RUNTIME_KEYS,
+    ),
+    "simd": WorkloadSpec(
+        "1M dependent i32x4 SIMD iterations", runtime_keys=SIMD_RUNTIME_KEYS
+    ),
+    "host-call": WorkloadSpec(
+        "1M WASI monotonic-clock host calls", runtime_keys=HOST_CALL_RUNTIME_KEYS
+    ),
+}
+DEFAULT_WORKLOADS = tuple(WORKLOAD_SPECS)
 
 
 @dataclass(frozen=True)
@@ -91,7 +143,11 @@ def require_commands(wasmlight: Path) -> None:
 def assemble(workload: str) -> Path:
     source = WORKLOAD_DIR / f"{workload}.wat"
     module = MODULE_DIR / f"{workload}.wasm"
-    run_checked(["wat2wasm", str(source), "-o", str(module)])
+    spec = WORKLOAD_SPECS[workload]
+    if spec.assembler == "wasm-tools":
+        run_checked(["wasm-tools", "parse", str(source), "-o", str(module)])
+    else:
+        run_checked(["wat2wasm", str(source), "-o", str(module)])
     run_checked(["wasm-tools", "validate", "--features", "all", str(module)])
     return module
 
@@ -104,6 +160,7 @@ def prepare(
     WAZERO_CACHE.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, dict[str, Path | None]] = {}
     for workload in workloads:
+        spec = WORKLOAD_SPECS[workload]
         module = assemble(workload)
         artifacts = {
             "module": module,
@@ -113,36 +170,48 @@ def prepare(
             "wasmedge": ARTIFACT_DIR / f"{workload}.aot.wasm",
             "wamr": ARTIFACT_DIR / f"{workload}.aot",
         }
-        run_checked([
-            str(wasmlight),
-            "aot",
-            str(module),
-            "-o",
-            str(artifacts["wasmlight"]),
-        ])
-        run_checked([
-            "wasmtime",
-            "compile",
-            "-o",
-            str(artifacts["wasmtime"]),
-            str(module),
-        ])
-        run_checked([
-            "wasmer",
-            "compile",
-            "-q",
-            "--enable-simd",
-            "-o",
-            str(artifacts["wasmer"]),
-            str(module),
-        ])
-        run_checked([
-            "wasmedge",
-            "compile",
-            str(module),
-            str(artifacts["wasmedge"]),
-        ])
-        if shutil.which("wamrc") is not None:
+        if "wasmlight" in spec.runtime_keys:
+            run_checked([
+                str(wasmlight),
+                "aot",
+                str(module),
+                "-o",
+                str(artifacts["wasmlight"]),
+            ])
+        else:
+            artifacts["wasmlight"] = None
+        if "wasmtime" in spec.runtime_keys:
+            run_checked([
+                "wasmtime",
+                "compile",
+                "-o",
+                str(artifacts["wasmtime"]),
+                str(module),
+            ])
+        else:
+            artifacts["wasmtime"] = None
+        if "wasmer" in spec.runtime_keys:
+            run_checked([
+                "wasmer",
+                "compile",
+                "-q",
+                "--enable-simd",
+                "-o",
+                str(artifacts["wasmer"]),
+                str(module),
+            ])
+        else:
+            artifacts["wasmer"] = None
+        if "wasmedge" in spec.runtime_keys:
+            run_checked([
+                "wasmedge",
+                "compile",
+                str(module),
+                str(artifacts["wasmedge"]),
+            ])
+        else:
+            artifacts["wasmedge"] = None
+        if "wamr" in spec.runtime_keys and shutil.which("wamrc") is not None:
             wamr_targets = {
                 "x86_64": "x86_64",
                 "AMD64": "x86_64",
@@ -161,13 +230,14 @@ def prepare(
             ])
         else:
             artifacts["wamr"] = None
-        run_checked([
-            "wazero",
-            "compile",
-            "-cachedir",
-            str(WAZERO_CACHE),
-            str(module),
-        ])
+        if "wazero" in spec.runtime_keys:
+            run_checked([
+                "wazero",
+                "compile",
+                "-cachedir",
+                str(WAZERO_CACHE),
+                str(module),
+            ])
         outputs[workload] = artifacts
     return outputs
 
@@ -177,11 +247,8 @@ def configs(
     artifacts: dict[str, Path | None],
     wasmlight: Path,
 ) -> tuple[RuntimeConfig, ...]:
+    spec = WORKLOAD_SPECS[workload]
     assert artifacts["module"] is not None
-    assert artifacts["wasmlight"] is not None
-    assert artifacts["wasmtime"] is not None
-    assert artifacts["wasmer"] is not None
-    assert artifacts["wasmedge"] is not None
     module = str(artifacts["module"])
     wamr_artifact = artifacts["wamr"]
     if wamr_artifact is not None:
@@ -194,8 +261,10 @@ def configs(
         wamr_note = (
             "No runnable wamrc was available on this host, so AOT is not represented."
         )
-    return (
-        RuntimeConfig(
+    selected = []
+    if "wasmlight" in spec.runtime_keys:
+        assert artifacts["wasmlight"] is not None
+        selected.append(RuntimeConfig(
             "wasmlight-aot",
             "wasmlight",
             "best",
@@ -208,32 +277,39 @@ def configs(
                 module,
             ),
             artifacts["wasmlight"],
-        ),
-        RuntimeConfig(
+        ))
+    if "wasmtime" in spec.runtime_keys:
+        assert artifacts["wasmtime"] is not None
+        selected.append(RuntimeConfig(
             "wasmtime-aot",
             "Wasmtime",
             "best",
             "Cranelift AOT",
             ("wasmtime", "run", "--allow-precompiled", str(artifacts["wasmtime"])),
             artifacts["wasmtime"],
-        ),
-        RuntimeConfig(
+        ))
+    if "wasmer" in spec.runtime_keys:
+        assert artifacts["wasmer"] is not None
+        selected.append(RuntimeConfig(
             "wasmer-aot",
             "Wasmer",
             "best",
             "Cranelift AOT",
             ("wasmer", "run", "-q", str(artifacts["wasmer"])),
             artifacts["wasmer"],
-        ),
-        RuntimeConfig(
+        ))
+    if "wasmedge" in spec.runtime_keys:
+        assert artifacts["wasmedge"] is not None
+        selected.append(RuntimeConfig(
             "wasmedge-aot",
             "WasmEdge",
             "best",
             "LLVM AOT",
             ("wasmedge", "run", "--run-mode=aot", str(artifacts["wasmedge"])),
             artifacts["wasmedge"],
-        ),
-        RuntimeConfig(
+        ))
+    if "wamr" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wamr-best",
             "WAMR",
             "best",
@@ -241,59 +317,66 @@ def configs(
             wamr_command,
             wamr_artifact,
             note=wamr_note,
-        ),
-        RuntimeConfig(
+        ))
+    if "wazero" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wazero-compiler",
             "wazero",
             "best",
             "compiler cache",
             ("wazero", "run", "-cachedir", str(WAZERO_CACHE), module),
             note="The native-code cache was populated before measurement.",
-        ),
-        RuntimeConfig(
+        ))
+    if "wasm3" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wasm3-interp-best",
             "wasm3",
             "best",
             "interpreter",
             ("wasm3", module),
             note="wasm3 is interpreter-only.",
-        ),
-        RuntimeConfig(
+        ))
+    if "wasmlight" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wasmlight-interp",
             "wasmlight",
             "interpreter",
             "interpreter",
             (str(wasmlight), "run", "--no-aot", module),
-        ),
-        RuntimeConfig(
+        ))
+    if "wasmedge" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wasmedge-interp",
             "WasmEdge",
             "interpreter",
             "interpreter",
             ("wasmedge", "run", "--run-mode=interpreter", module),
-        ),
-        RuntimeConfig(
+        ))
+    if "wamr" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wamr-interp",
             "WAMR",
             "interpreter",
             "interpreter",
             ("iwasm", "--interp", module),
-        ),
-        RuntimeConfig(
+        ))
+    if "wazero" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wazero-interp",
             "wazero",
             "interpreter",
             "interpreter",
             ("wazero", "run", "-interpreter", module),
-        ),
-        RuntimeConfig(
+        ))
+    if "wasm3" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
             "wasm3-interp",
             "wasm3",
             "interpreter",
             "interpreter",
             ("wasm3", module),
-        ),
-    )
+        ))
+    return tuple(selected)
 
 
 @contextlib.contextmanager
@@ -382,10 +465,7 @@ def render_markdown(result: dict) -> str:
     for profile in result["profiles"]:
         lines.extend((f"## {profile.title()}", ""))
         rows = [row for row in result["results"] if row["profile"] == profile]
-        runtime_order = []
-        for row in rows:
-            if row["runtime"] not in runtime_order:
-                runtime_order.append(row["runtime"])
+        runtime_order = PROFILE_RUNTIME_ORDER[profile]
         lines.append("| Workload | " + " | ".join(runtime_order) + " |")
         lines.append("| --- | " + " | ".join("---:" for _ in runtime_order) + " |")
         for workload in result["workloads"]:
@@ -393,9 +473,12 @@ def render_markdown(result: dict) -> str:
             baseline = workload_rows["wasmlight"]["median_ms"]
             cells = []
             for runtime in runtime_order:
-                row = workload_rows[runtime]
-                ratio = baseline / row["median_ms"]
-                cells.append(f"{row['median_ms']:.3f} ({ratio:.2f}x)")
+                row = workload_rows.get(runtime)
+                if row is None:
+                    cells.append("—")
+                else:
+                    ratio = baseline / row["median_ms"]
+                    cells.append(f"{row['median_ms']:.3f} ({ratio:.2f}x)")
             lines.append(f"| {workload} | " + " | ".join(cells) + " |")
         lines.append("")
     lines.extend((
@@ -423,7 +506,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workload",
         action="append",
-        choices=DEFAULT_WORKLOADS,
+        choices=tuple(WORKLOAD_SPECS),
         dest="workloads",
     )
     parser.add_argument("--prepare-only", action="store_true")
@@ -481,6 +564,9 @@ def main() -> int:
             "path": str(artifacts["module"].relative_to(ROOT)),
             "bytes": len(module_bytes),
             "sha256": hashlib.sha256(module_bytes).hexdigest(),
+            "description": WORKLOAD_SPECS[workload].description,
+            "assembler": WORKLOAD_SPECS[workload].assembler,
+            "supported_runtimes": sorted(WORKLOAD_SPECS[workload].runtime_keys),
         }
 
     with performance_lock():

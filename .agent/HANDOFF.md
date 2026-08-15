@@ -1,5 +1,39 @@
 # Handoff
 
+Updated: 2026-08-15 (runtime comparison expanded)
+
+## Diagnostic runtime workloads
+
+- The default runtime-comparison suite now has eleven self-checking workloads.
+  Seven new fixtures separate cache-resident linear-memory loads, stores,
+  generic two-parameter cross-function calls, 4,096 one-page `memory.grow`
+  operations, bounded-live-set GC allocation, dependent i32x4 SIMD, and one
+  million WASI monotonic-clock host calls.
+- `bench.py` owns a workload registry with descriptions, assembler selection,
+  and verified runtime support. Capability-heavy workloads are not weakened to
+  fit old peers: GC runs on wasmlight and Wasmtime, SIMD on wasmlight,
+  Wasmtime, Wasmer, WasmEdge, and wazero, and host-call everywhere except
+  wasm3. Missing cells render as unavailable in Markdown and the existing PR
+  comment renderer. GC uses `wasm-tools parse` because WABT 1.0.41 does not
+  accept the current Core 3.0 GC text forms.
+- A seven-sample rotated best-profile run passed for all new applicable
+  configurations. Apple M5 Max wasmlight/Wasmtime medians in ms were:
+  load 46.702/33.111, store 39.013/28.915, generic call 725.350/64.599,
+  memory-grow 14.584/16.173, GC 131.539/29.696, SIMD 24.063/5.959, and host
+  call 36.040/39.732. These are diagnostic observations, not CI thresholds.
+- A separate interpreter smoke run passed every applicable runtime/workload
+  combination. All eleven modules also prepared and validated together from
+  the final release build. Generated modules, artifacts, and reports remain
+  under ignored `build/runtime-comparison/`.
+- Added four Python harness tests covering registry/source completeness, GC
+  parser and capability scope, unsupported-config omission, and unavailable
+  table cells; the four existing PR-comment tests remain green.
+- Gates: frozen install, clean dev and release builds (3/3 each), full unit
+  suite 44/44, Python tests 8/8, format 90/90, generated-agent check,
+  Markdown lint 42 files, Python byte-compilation, and diff whitespace all
+  pass. No runtime implementation or conformance behavior changed, so the
+  pinned external corpus was not rerun for this benchmark-only patch.
+
 Updated: 2026-08-15 (runtime optimization goal reached)
 
 ## Within 1.5x of Wasmtime

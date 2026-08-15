@@ -4,6 +4,22 @@ This harness compares command-level execution of wasmlight, Wasmtime, Wasmer,
 WasmEdge, WAMR, wazero, and wasm3 on identical self-checking WASI preview1
 modules. It is a measurement tool, never a CI assertion.
 
+The default suite contains eleven checked workloads:
+
+| Workload | Hot-path boundary |
+| --- | --- |
+| `startup` | Process launch, artifact load, instantiation, a tiny loop, and `proc_exit` |
+| `loop` | 300 million dependent scalar integer iterations |
+| `fib` | Recursive one-parameter direct calls through `fib(35)` |
+| `memory` | 50 million paired varying-address `i32.store`/`i32.load` operations |
+| `memory-load` | 100 million cache-resident varying-address `i32.load` operations |
+| `memory-store` | 100 million cache-resident varying-address `i32.store` operations |
+| `call` | 50 million generic two-parameter cross-function direct calls |
+| `memory-grow` | 4,096 one-page linear-memory growth operations, with every page touched |
+| `gc` | Two million struct allocations with a rotating 1,024-object live root set |
+| `simd` | One million dependent `i32x4` arithmetic iterations |
+| `host-call` | One million WASI monotonic-clock calls and result reads |
+
 ## Boundary
 
 - `best` uses a precompiled artifact for wasmlight, Wasmtime, Wasmer, and
@@ -18,6 +34,14 @@ modules. It is a measurement tool, never a CI assertion.
 - Each workload exits nonzero when its computed result is wrong.
 - One warm-up and seven measured samples are the defaults. Runtime order rotates
   between samples, and the entire run holds `/tmp/wasmlight-perf-gate.lock`.
+
+Workloads run only on peers verified to support their required proposal and
+host surface. An unavailable cell is rendered as `—`, not treated as a failed
+measurement. GC currently runs on wasmlight and Wasmtime; the current WABT
+parser does not accept the Core 3.0 GC text forms, so that fixture is assembled
+with `wasm-tools parse`. SIMD runs on wasmlight, Wasmtime, Wasmer, WasmEdge, and
+wazero. The host-call workload runs everywhere except wasm3. The other eight
+workloads run on all seven peers.
 
 The WAMR project supports AOT and JIT, but its 2.4.5 macOS release publishes
 `wamrc` only for x86-64. An arm64 macOS host without Rosetta therefore records
@@ -44,6 +68,16 @@ python3 tools/runtime-comparison/bench.py
 Generated modules, artifacts, raw samples, and a rendered result table land in
 `build/runtime-comparison/`. Use `--help` to select workloads, profiles, sample
 counts, or preparation without measurement.
+
+For a focused run, repeat `--workload` as needed:
+
+```sh
+python3 tools/runtime-comparison/bench.py \
+  --profile best \
+  --workload memory-load \
+  --workload memory-store \
+  --workload gc
+```
 
 ## Pull-request gate
 
