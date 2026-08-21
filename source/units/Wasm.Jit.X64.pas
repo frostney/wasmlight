@@ -3511,6 +3511,10 @@ begin
   X64EmitCallHelper(ABuf, aohVecDispatch);
 end;
 
+{ iroMoveVec and iroV128Const join the native subset for the same reason as
+  the Arm64 backend: they dominate vector-bearing loops' helper traffic, and
+  a move is one MOVDQU pair while a const bakes its compile-time aux bits as
+  two movabs/MOVQ halves joined by PUNPCKLQDQ. }
 function X64NativeVecOp(const AOp: TWasmIrOp): Boolean;
 begin
   case AOp of
@@ -3520,7 +3524,8 @@ begin
     iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
     iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
     iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
-    iroI32x4ExtractLane, iroI64x2ExtractLane:
+    iroI32x4ExtractLane, iroI64x2ExtractLane,
+    iroMoveVec, iroV128Const:
       Result := True;
   else
     Result := False;
@@ -3556,9 +3561,37 @@ begin
 end;
 
 procedure EmitNativeVec(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr);
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32);
+var
+  VTmp: TWasmV128;
+
+  procedure EmitMovQXmmFromReg(const AXmm, AReg: Byte);
+  begin
+    { MOVQ xmm, r64 = 66 REX.W 0F 6E /r }
+    ABuf.EmitByte($66);
+    X64EmitRex(ABuf, 1, AXmm shr 3, 0, AReg shr 3);
+    ABuf.EmitByte($0F);
+    ABuf.EmitByte($6E);
+    EmitModRMReg(ABuf, AXmm, AReg);
+  end;
+
 begin
   case AIns.Op of
+    iroMoveVec:
+      begin
+        X64EmitLoadVec(ABuf, 0, AIns.A);
+        X64EmitStoreVec(ABuf, 0, AIns.Dest);
+      end;
+    iroV128Const:
+      begin
+        IrAuxReadV128(AAux, UInt32(AIns.Imm), VTmp);
+        X64EmitMovRegImm64(ABuf, X64_RAX, VTmp.U64[0]);
+        EmitMovQXmmFromReg(0, X64_RAX);
+        X64EmitMovRegImm64(ABuf, X64_RAX, VTmp.U64[1]);
+        EmitMovQXmmFromReg(1, X64_RAX);
+        X64EmitVecBinary(ABuf, $6C, 0, 1);   { PUNPCKLQDQ xmm0, xmm1 }
+        X64EmitStoreVec(ABuf, 0, AIns.Dest);
+      end;
     iroV128Not:
       begin
         X64EmitLoadVec(ABuf, 0, AIns.A);
@@ -4188,7 +4221,7 @@ begin
 
   else
     if X64NativeVecOp(AIns.Op) then
-      EmitNativeVec(ABuf, AIns)
+      EmitNativeVec(ABuf, AIns, AAux)
     else if X64LeafBinaryOp(AIns.Op) then
       EmitLeafBinary(ABuf, AIns)
     else if X64LeafUnaryOp(AIns.Op) then
