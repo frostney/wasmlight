@@ -246,10 +246,10 @@ type
       answer, because a layout is a pure function of the composite. }
     procedure Define(const AId: TWasmGcTypeId; const AComp: TWasmCompType);
 
-    function IsDefined(const AId: TWasmGcTypeId): Boolean;
+    function IsDefined(const AId: TWasmGcTypeId): Boolean; inline;
     { Raises EWasmError for an id with no layout — an internal invariant
       violation, since every engine type gets one at intern time. }
-    function Layout(const AId: TWasmGcTypeId): PWasmGcLayout;
+    function Layout(const AId: TWasmGcTypeId): PWasmGcLayout; inline;
     function Count: Integer;
   end;
 
@@ -429,13 +429,14 @@ type
     FThreshold: UInt64;
     FThresholdFloor: UInt64;
 
-    function ClassOf(const ASize: UInt32): Integer;
+    function ClassOf(const ASize: UInt32): Integer; inline;
     function NewBlock(const AClassIndex: Integer; const ACellSize: UInt32;
       const ACellCount: UInt32; const AIsLarge: Boolean): PWasmGcBlock;
     procedure FreeBlock(const ABlock: PWasmGcBlock);
-    function TakeCell(const ASize: UInt32): PByte;
+    function TakeCell(const AClassIndex: Integer; const ACellSize: UInt32;
+      const ASize: UInt32): PByte;
     function Allocate(const ASize: UInt32; const AKind: TWasmObjKind;
-      const ATypeId: TWasmGcTypeId): PByte;
+      const ATypeId: TWasmGcTypeId): PByte; inline;
     function AllocConvert(const AKind: TWasmObjKind;
       const AInner: TWasmRef): TWasmRef;
 
@@ -942,6 +943,43 @@ begin
   Result := (AOffset + (AAlign - 1)) and not (AAlign - 1);
 end;
 
+{ A cell's size is a multiple of WASM_GC_ALIGNMENT (8) and its address is
+  8-aligned, so the zero fill is whole u64 stores. The small sizes that
+  dominate allocation are written directly; only a large object pays the
+  RTL call, which is the same trade every hot-path primitive here makes
+  and which wasmspec's tracing semantics pin exactly: every byte of the
+  cell is zero before the header goes down. }
+procedure ZeroCell(const ACell: PByte; const ASize: UInt32); inline;
+var
+  Offset: UInt32;
+begin
+  if ASize > 128 then
+  begin
+    FillChar(ACell^, ASize, 0);
+    Exit;
+  end;
+  Offset := 0;
+  while Offset + 32 <= ASize do
+  begin
+    PWasmU64(ACell + Offset)^ := 0;
+    PWasmU64(ACell + Offset + 8)^ := 0;
+    PWasmU64(ACell + Offset + 16)^ := 0;
+    PWasmU64(ACell + Offset + 24)^ := 0;
+    Offset := Offset + 32;
+  end;
+  if Offset + 16 <= ASize then
+  begin
+    PWasmU64(ACell + Offset)^ := 0;
+    PWasmU64(ACell + Offset + 8)^ := 0;
+    Offset := Offset + 16;
+  end;
+  if Offset + 8 <= ASize then
+  begin
+    PWasmU64(ACell + Offset)^ := 0;
+    Offset := Offset + 8;
+  end;
+end;
+
 procedure TWasmGcTypes.Grow(const ACount: Integer);
 var
   Index: Integer;
@@ -1050,12 +1088,12 @@ begin
   Layout^.Defined := True;
 end;
 
-function TWasmGcTypes.IsDefined(const AId: TWasmGcTypeId): Boolean;
+function TWasmGcTypes.IsDefined(const AId: TWasmGcTypeId): Boolean; inline;
 begin
   Result := (AId < UInt32(Length(FLayouts))) and FLayouts[AId].Defined;
 end;
 
-function TWasmGcTypes.Layout(const AId: TWasmGcTypeId): PWasmGcLayout;
+function TWasmGcTypes.Layout(const AId: TWasmGcTypeId): PWasmGcLayout; inline;
 begin
   if not IsDefined(AId) then
     raise EWasmError.CreateFmt('internal: engine type %u has no layout',
@@ -1129,7 +1167,7 @@ begin
   FThreshold := AValue;
 end;
 
-function TWasmGcHeap.ClassOf(const ASize: UInt32): Integer;
+function TWasmGcHeap.ClassOf(const ASize: UInt32): Integer; inline;
 var
   Index: Integer;
 begin
@@ -1202,10 +1240,9 @@ begin
   Dispose(ABlock);
 end;
 
-function TWasmGcHeap.TakeCell(const ASize: UInt32): PByte;
+function TWasmGcHeap.TakeCell(const AClassIndex: Integer;
+  const ACellSize: UInt32; const ASize: UInt32): PByte;
 var
-  ClassIndex: Integer;
-  CellSize: UInt32;
   Block: PWasmGcBlock;
   Cell: UInt32;
 begin
@@ -1220,9 +1257,7 @@ begin
       '(a host release hook must not allocate)');
 {$ENDIF}
 
-  ClassIndex := ClassOf(ASize);
-
-  if ClassIndex < 0 then
+  if AClassIndex < 0 then
   begin
     { A large object owns its block. Freeing it outright at sweep is what
       keeps a heap that allocated one huge array from holding the memory
@@ -1239,45 +1274,43 @@ begin
     Exit(Block^.Base);
   end;
 
-  CellSize := WASM_GC_SIZE_CLASSES[ClassIndex];
-
-  Result := FFree[ClassIndex];
+  Result := FFree[AClassIndex];
   if Result <> nil then
   begin
     { The free list threads through the first two words of a free cell;
       the per-block bitmap, not the link, is what says a cell is free, so
       overwriting them on allocation loses nothing. }
-    FFree[ClassIndex] := PByte(NativeUInt(
+    FFree[AClassIndex] := PByte(NativeUInt(
       PWasmU64(Result + WASM_GC_FREE_LINK_OFFSET)^));
     Block := PWasmGcBlock(NativeUInt(
       PWasmU64(Result + WASM_GC_FREE_BLOCK_OFFSET)^));
-    Cell := UInt32(Result - Block^.Base) div CellSize;
+    Cell := UInt32(Result - Block^.Base) div ACellSize;
     SetCellAllocated(Block, Cell);
     Exit;
   end;
 
-  Block := FBump[ClassIndex];
+  Block := FBump[AClassIndex];
   if (Block = nil) or (Block^.Carved >= Block^.CellCount) then
   begin
-    Block := NewBlock(ClassIndex, CellSize,
-      UInt32(WASM_GC_BLOCK_BYTES) div CellSize, False);
+    Block := NewBlock(AClassIndex, ACellSize,
+      UInt32(WASM_GC_BLOCK_BYTES) div ACellSize, False);
     if Block = nil then
       Exit(nil);
     if FBlockCount >= Length(FBlocks) then
       SetLength(FBlocks, (FBlockCount + 1) * 2);
     FBlocks[FBlockCount] := Block;
     Inc(FBlockCount);
-    FBump[ClassIndex] := Block;
+    FBump[AClassIndex] := Block;
   end;
 
   Cell := Block^.Carved;
   Inc(Block^.Carved);
   SetCellAllocated(Block, Cell);
-  Result := Block^.Base + Cell * CellSize;
+  Result := Block^.Base + Cell * ACellSize;
 end;
 
 function TWasmGcHeap.Allocate(const ASize: UInt32;
-  const AKind: TWasmObjKind; const ATypeId: TWasmGcTypeId): PByte;
+  const AKind: TWasmObjKind; const ATypeId: TWasmGcTypeId): PByte; inline;
 var
   Size: UInt32;
   ClassIndex: Integer;
@@ -1309,7 +1342,7 @@ begin
   if (not FCollecting) and (FBytesLive + UInt64(CellSize) > FThreshold) then
     Collect;
 
-  Result := TakeCell(Size);
+  Result := TakeCell(ClassIndex, CellSize, Size);
   if (Result = nil) and (not FCollecting) then
   begin
     { The host allocator failed. Design §7.3 / M8: collect once and retry
@@ -1317,14 +1350,14 @@ begin
       otherwise (NewBlock used to trap on the spot). The retry reuses
       reclaimed cells first, then grows; only a still-nil result traps. }
     Collect;
-    Result := TakeCell(Size);
+    Result := TakeCell(ClassIndex, CellSize, Size);
   end;
   if Result = nil then
     TrapNow(wtkAllocationFailure);
 
   { A recycled cell holds whatever the last object left; zeroing before
     the header goes down is what stops the next collection tracing it. }
-  FillChar(Result^, CellSize, 0);
+  ZeroCell(Result, CellSize);
   { The mark bit is set to the current epoch's live value, so the next
     cycle's polarity flip unmarks this object cleanly along with every
     survivor (H8, design §7.1). }
