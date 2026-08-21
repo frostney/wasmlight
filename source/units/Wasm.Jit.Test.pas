@@ -1113,6 +1113,54 @@ begin
   ]);
 end;
 
+{ v128 local traffic: every function is dominated by v128.const and
+  local.set/get/tee — the two ops the backends lower natively as register
+  moves and baked immediates rather than the vector-helper dispatch. The
+  const bits are chosen so each lane pair differs, so a wrong half of a
+  baked immediate or a mis-addressed slot copy cannot cancel out. }
+function SimdLocalsModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $01, $7F]),                    { 0: ()->i32 }
+      BLit([$60, $01, $7F, $01, $7F])])),            { 1: (i32)->i32 }
+    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$01]),
+      BLit([$01])])),
+    Sect(7, VecOf([
+      ExportEntry('setget', $00, 0),
+      ExportEntry('tee', $00, 1),
+      ExportEntry('move', $00, 2),
+      ExportEntry('move2', $00, 3)])),
+    Sect(10, VecOf([
+      { const -> local.set -> local.get -> extract lane 2 = 0x08090A0B }
+      CodeEntry(Cat([BLit([$01, $01, $7B]), Fd(12),
+        V16([$00, $01, $02, $03, $04, $05, $06, $07,
+        $08, $09, $0A, $0B, $0C, $0D, $0E, $0F]),
+        BLit([$21, $00]), BLit([$20, $00]), Fd(27), BLit([$02, $0B])])),
+      { const all-EE -> local.tee keeps the value -> extract lane 1 }
+      CodeEntry(Cat([BLit([$01, $01, $7B]), Fd(12), V16([$EE, $EE]),
+        BLit([$22, $00]), Fd(27), BLit([$01, $0B])])),
+      { splat param into the local after a const occupied it: the move
+        overwrites both slots; extract lane 3 = param }
+      CodeEntry(Cat([BLit([$01, $01, $7B]), Fd(12),
+        V16([$10, $20, $30, $40, $50, $60, $70, $80,
+        $90, $A0, $B0, $C0, $D0, $E0, $F0, $01]),
+        BLit([$21, $01]), BLit([$20, $00]), Fd(17),
+        BLit([$21, $01]), BLit([$20, $01]), Fd(27), BLit([$03, $0B])])),
+      { move BETWEEN locals: local1 gets the const, local2 gets
+        splat(param) with lane 2 replaced by param again, result reads
+        local2 lane 2 = param }
+      CodeEntry(Cat([BLit([$02, $01, $7B, $01, $7B]), Fd(12),
+        V16([$11, $22, $33, $44, $55, $66, $77, $88,
+        $99, $AA, $BB, $CC, $DD, $EE, $FF, $07]),
+        BLit([$21, $01]), BLit([$20, $00]), Fd(17), BLit([$20, $00]),
+        Fd(28), BLit([$02]),
+        BLit([$21, $02]), BLit([$20, $02]), Fd(27), BLit([$02, $0B])]))
+    ]))
+  ]);
+end;
+
 { v128 float ops whose identity is the whole point: a NaN through f32x4.add
   (canonical-NaN bits), and pmin/pmax/relaxed_min (payload-preserving / R=0
   selection). Signatures take f32 params carrying the exact bit patterns. }
@@ -1426,6 +1474,7 @@ type
 
     { --- Wave 6: v128 SIMD via the Wasm.Interp.Vector leaves --------- }
     procedure TestSimdCompute;
+    procedure TestSimdLocalsMoveConst;
     procedure TestSimdFloatNanPminRelaxed;
     procedure TestSimdMemory;
     procedure TestSimdMemoryOob;
@@ -3316,6 +3365,22 @@ begin
     [])).ToBe(VEC_COMPILED);
 end;
 
+procedure TJitTests.TestSimdLocalsMoveConst;
+begin
+  { v128.const and v128 local.set/get/tee are lowered natively by both
+    compiling tiers (baked immediates and register-slot moves); the
+    differential proves the compiled results stay bit-identical to the
+    interpreter through every moved/overwritten slot pair. }
+  Expect<Boolean>(DiffModule(SimdLocalsModuleBytes, 'setget',
+    [])).ToBe(VEC_COMPILED);
+  Expect<Boolean>(DiffModule(SimdLocalsModuleBytes, 'tee',
+    [])).ToBe(VEC_COMPILED);
+  Expect<Boolean>(DiffModule(SimdLocalsModuleBytes, 'move',
+    [MakeValueI32($12345678)])).ToBe(VEC_COMPILED);
+  Expect<Boolean>(DiffModule(SimdLocalsModuleBytes, 'move2',
+    [MakeValueI32($76543210)])).ToBe(VEC_COMPILED);
+end;
+
 procedure TJitTests.TestSimdFloatNanPminRelaxed;
 begin
   { THE IDENTITY PROPERTY. A NaN through f32x4.add must yield the interpreter's
@@ -3487,6 +3552,8 @@ begin
 
   Test('v128 const/splat/extract/replace/add/eq/shuffle/swizzle match',
     TestSimdCompute);
+  Test('v128 consts and local set/get/tee move natively and match',
+    TestSimdLocalsMoveConst);
   Test('v128 NaN canonicalisation, pmin/pmax, and a relaxed op match per lane',
     TestSimdFloatNanPminRelaxed);
   Test('v128 load/store round-trip through the chokepoint matches',

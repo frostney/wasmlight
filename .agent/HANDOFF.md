@@ -1,5 +1,57 @@
 # Handoff
 
+Updated: 2026-08-21 (native v128 move/const emission, both backends)
+
+## v128 helper-crossing elimination
+
+- Branch `codex/optimize-profile-driven` from exact
+  `origin/main@8a01d6ecec2f0569daefa61068f8bdb4078d44ac`. Accepted commits:
+  `0ad4959` (`perf(jit): emit v128 moves and consts natively on arm64`) and
+  `6a8c238` (`perf(jit): emit v128 moves and consts natively on x64`).
+  Delivery not requested; the branch is local and unpushed.
+- Profile-driven target selection. Serialized wasmbench baseline (release,
+  7 samples) at the exact starting commit showed compiled-tier SIMD as the
+  outlier (127 ns/op). A `sample(1)` profile of a 20M-iteration simd jit run
+  attributed the samples to `InterpContextFor` (82), `_platform_memmove` +
+  `FPC_MOVE` (~109), and generated-code helper regions. Mechanism: every
+  `iroMoveVec` (v128 local.get/set/tee) and `iroV128Const` paid the full
+  `JitVecDispatch` crossing — native call, activation lookup, ~200-arm case
+  dispatch, 16-byte record copy — despite the arithmetic ops already being
+  native. Vector-bearing loops execute ~10+ such crossings per iteration.
+- Lane A (Arm64, `0ad4959`): `iroMoveVec` emits one Q-register LDR/STR pair;
+  `iroV128Const` reads its bits from the aux block at compile time and bakes
+  two movz/movk immediates into the destination slot pair. Everything else
+  keeps the helper fallback; no new helpers, no ABI change, no scope-fence
+  change. macOS/aarch64 serialized A/B (one warm-up discarded, 7 samples,
+  BASE-CAND-CAND-BASE under `/tmp/wasmlight-perf-gate.lock`): simd jit
+  126/126 -> 69/69 ms and simd aot 126/126 -> 69/69 ms (-45%); loop, fib,
+  memory, numeric guards flat; startup inside noise.
+- Lane B (x64, `6a8c238`): mirror shape — MOVDQU load/store pair for the
+  move; two movabs/MOVQ halves joined by PUNPCKLQDQ for the const.
+  x86-64 evidence from OrbStack `wasmx64` (virtualized amd64 over an Arm
+  host — same-VM A/B evidence, not a native hardware claim): simd jit
+  1432/1457 -> 455/469 ms (-68%) and simd aot 1117/1117 -> 342/342 ms
+  (-69%); loop, fib, memory, numeric guards flat.
+- Correctness: all 44 unit suites pass on macOS/aarch64 and Linux/x86-64
+  (LWPT 0.6.0 explicit binary at `/tmp/lwpt-0.6.0.Uq7icT/lwpt-0.6.0-linux-x64/`,
+  never the stale VM-PATH 0.4.0). The recursive 288-script corpus at
+  `de54fd27` is byte-identical across interpreter/JIT/AOT before and after:
+  pass=65851 fail=368 skip=904 staged=0 errors=0 (compiled=8799 aarch64,
+  8800 x86-64). Frozen install, format, agents check, dev + release builds,
+  and Markdown lint pass on the combined head.
+- Operational notes for future waves: macOS has no `flock` — use the
+  mkdir-based `/tmp/wasmlight-perf-gate.lock` directory lock; a stale plain
+  file of that name existed on BOTH hosts (VM one dated Aug 15) and silently
+  blocked acquisition until removed. macOS bsdtar archives sprout AppleDouble
+  `._*` files when extracted by GNU tar — delete them before running
+  `wasmspec` or every file double-counts as an error.
+- Remaining profiled bottlenecks for a later wave: GC allocation (~4.4x
+  Wasmtime on the bounded-live-set workload) and scalar memory load/store
+  (~1.4x); the SIMD gap that motivated this wave closed to within roughly
+  2.2x on the wasmbench shape (69 vs ~30 ns/op equivalent) with the residual
+  being the remaining helper-dispatched vector forms (comparisons, shifts,
+  min/max, narrowing) rather than moves or consts.
+
 Updated: 2026-08-15 (post-v1 roadmap and 0.1.0 release)
 
 ## Durable roadmap and release decisions
