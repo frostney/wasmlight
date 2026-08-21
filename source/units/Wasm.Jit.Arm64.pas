@@ -5143,6 +5143,12 @@ begin
   Arm64EmitCallHelper(ABuf, aohVecDispatch);
 end;
 
+{ iroMoveVec and iroV128Const join the native subset because they dominate
+  vector-bearing loops' helper traffic: every v128 local.get/set/tee lowers to
+  a move and every literal to a const, and each used to pay the full dispatch
+  crossing for what is one Q-register copy or two immediate stores. The const
+  bits are read from the aux block at COMPILE time and baked as movz/movk
+  pairs, so no run-time aux reach is needed. }
 function Arm64NativeVecOp(const AOp: TWasmIrOp): Boolean;
 begin
   case AOp of
@@ -5152,7 +5158,8 @@ begin
     iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
     iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
     iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
-    iroI32x4ExtractLane, iroI64x2ExtractLane:
+    iroI32x4ExtractLane, iroI64x2ExtractLane,
+    iroMoveVec, iroV128Const:
       Result := True;
   else
     Result := False;
@@ -5201,9 +5208,24 @@ begin
 end;
 
 procedure EmitNativeVec(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr);
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32);
+var
+  VTmp: TWasmV128;
 begin
   case AIns.Op of
+    iroMoveVec:
+      begin
+        LdQ(ABuf, 0, AIns.A);
+        StQ(ABuf, 0, AIns.Dest);
+      end;
+    iroV128Const:
+      begin
+        IrAuxReadV128(AAux, UInt32(AIns.Imm), VTmp);
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, VTmp.U64[0]);
+        StX(ABuf, ARM64_REG_T0, AIns.Dest);
+        Arm64EmitLoadImm64(ABuf, ARM64_REG_T1, VTmp.U64[1]);
+        StX(ABuf, ARM64_REG_T1, AIns.Dest + 1);
+      end;
     iroV128Not:
       begin
         LdQ(ABuf, 0, AIns.A);
@@ -5660,7 +5682,7 @@ begin
 
   else
     if Arm64NativeVecOp(AIns.Op) then
-      EmitNativeVec(ABuf, AIns)
+      EmitNativeVec(ABuf, AIns, AAux)
     else if Arm64LeafBinaryOp(AIns.Op) then
       EmitLeafBinary(ABuf, AIns)
     else if Arm64LeafUnaryOp(AIns.Op) then
