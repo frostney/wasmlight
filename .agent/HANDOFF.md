@@ -1,5 +1,62 @@
 # Handoff
 
+Updated: 2026-08-21 (gc allocation fast-path wave)
+
+## GC allocation fast path
+
+- Branch `optimize/runtime-wave` from exact
+  `origin/main@659fd3711dd596176b7d86bdfc9d130e9b6e5015` (post-PR #10 tip).
+  Accepted commit `22053d6` (`perf(gc): consolidate the allocation fast path`)
+  on lane branch `optimize/gc-alloc-fastpath`, fast-forwarded into the
+  delivery branch. Delivery not requested; both branches are local and
+  unpushed.
+- Target selection. The previous wave's residual list named GC allocation as
+  the largest measured gap (~4.4x Wasmtime). Serialized baseline (release,
+  bench.py best profile, 7 samples) at the exact starting commit: gc
+  124.592 ms vs Wasmtime 28.282 ms (4.41x); guards loop 374.9, fib 33.0,
+  memory 21.6, memory-load 43.0, memory-store 43.2, simd 9.4, startup
+  2.93 ms.
+- Profile-driven mechanism. A `sample(1)` profile of a 20M-iteration gc AOT
+  run attributed ~270/741 samples to `TWasmGcHeap.AllocStruct` →
+  `Allocate`: duplicate size-class classification (Allocate computed
+  ClassOf/CellSize, then TakeCell recomputed them), layered helper calls,
+  generic FillChar→memset zeroing of every cell, plus amortized
+  Collect/Sweep; a further ~90 samples re-resolved type layouts through
+  `TWasmGcTypes.Layout`/`IsDefined` on every AllocStruct/StructField.
+- Accepted candidate (`22053d6`, Wasm.Runtime.Gc.pas only): TakeCell takes
+  the already-derived class index and cell size; per-cell zeroing uses an
+  inline u64 store loop up to 128 bytes (cells are 8-aligned, sizes are
+  multiples of 8) and keeps the RTL fill for large objects;
+  Allocate/ClassOf/TWasmGcTypes.Layout/IsDefined marked inline. No ABI,
+  artifact-format, safepoint, trap, or allocation-trigger change: Allocate
+  remains the only collection trigger and every byte of a cell is still
+  zero before the header goes down.
+- Serialized A/B under `/tmp/wasmlight-perf-gate.lock` (one warm-up
+  discarded, 7 samples, BASE-CAND-CAND-BASE): gc wasmlight median
+  127.498 → 118.107 ms forward and 117.819 vs 127.231 ms reverse (-7.4%
+  both orders, spreads disjoint: base 125.7–128.9, cand 115.7–119.9).
+  Guards forward then reverse: loop +2.68%/+0.40%, fib +1.27%/+0.17%,
+  simd +2.16%/+0.61%, memory-load −8.69%/+1.51%, memory-store
+  −10.74%/−3.70% — the forward memory deltas reversed sign and the wide
+  short-process spreads straddle zero, so guards are flat within noise and
+  the loop/fib/simd first-pass shifts were host-load drift, not code.
+- Combined integration head equals the lane head byte-for-byte (same
+  sha256 release binary), so the lane A/B is the combined measurement.
+- Correctness on the combined head (macOS/aarch64): frozen install, format
+  90/90, agents check, diff check, dev + release builds, Markdown lint, and
+  all 44 unit suites pass. The recursive 288-script corpus at `de54fd27` is
+  byte-identical across interpreter/JIT/AOT:
+  pass=65851 fail=368 skip=904 staged=0 errors=0 (compiled=8799).
+- Not yet done before any PR: the Linux/x86-64 leg (unit suites + corpus
+  identity). The change touches no generated-code emitter and no artifact
+  ABI, but prior runtime waves still proved x86-64 before delivery; CI on
+  the PR would cover it.
+- Rejected/not pursued this wave: caching resolved layout pointers per
+  object header (changes the object model for ~12% of samples — deferred);
+  native inline emission of struct.new/array.set in the JIT/AOT backends
+  (the shape that closed the SIMD gap, but a full backend lane — the
+  natural next wave if the remaining ~118 ms vs 28 ms gap must close).
+
 Updated: 2026-08-21 (native v128 move/const emission, both backends)
 
 ## v128 helper-crossing elimination
