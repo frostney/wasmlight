@@ -1,6 +1,113 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 3 candidate rejected; scalar memory + simd profiled)
+Updated: 2026-08-22 (wave 5: SIMD Q-host lane REJECTED and reverted)
+
+## Wave 5 — v128 constant Q-hosts + vector static-cache admission REJECTED
+
+- Lane built directly on wave 4's const-slot machinery: admitted
+  Arm64NativeVecOp into StaticCacheOp (vector loop functions become static-
+  cache eligible), extended AnalyzeConstSlots with iroV128Const candidates
+  (pair base slot, 128 bits from IrAuxReadV128, offered only when defined in
+  a loop span and EVERY consumer is a native vec template — helper-dispatched
+  readers would see an never-written canonical pair), seeded caller-saved
+  v16/v17 once at frame entry via two LoadImm64 + INS pairs (new builder
+  Arm64MovGeneralToVecD, imm5 = %01000 + lane<<4, verified against
+  `mov v16.d[0],x9` = 4E081D30), parameterized every EmitNativeVec source
+  load through a host-aware resolver, routed native vec ops through the
+  cached path WITHOUT flush/invalidate, and made splats consume scalar cache
+  hosts directly.
+- Generated code was correct and much smaller: the simd loop went from ~47
+  to ~28 instructions — const-B hosted in v16 (`add.4s v0,v0,v16`), limit
+  hoisted to x14, splat reading w15. Measured result was a REPEATABLE
+  REGRESSION: serialized simd-only A/B (7 samples, both orders) gave cand
+  11.455/11.489 ms vs base 9.484/9.986 ms (+17-21%, disjoint spreads); the
+  full-schedule legs agreed (+18.2%/+12.7%).
+- Root cause NOT fully identified: fewer instructions but slower — the same
+  wall wave 3 hit when admitting vector ops to the static cache. Suspected
+  residual: changed loop-body code layout/fetch alignment (backedge target
+  moved from 0x60, 16-aligned, to 0xac) and/or spill-pattern side effects of
+  scalar static allocation inside vector loops. Fully reverted; nothing
+  remains in the tree. Any retry must first explain WHY the smaller loop is
+  slower — e.g. by bisecting eligibility-admission alone vs Q-hosting alone,
+  or by measuring with forced 16-byte alignment padding before the loop
+  header.
+
+## Wave 4 — loop-invariant constants seeded once in static cache hosts
+
+- Goal for this session was "0.7x–0.85x of Wasmtime": every wasmbench
+  workload at ≥70% of Wasmtime throughput (≤1.43x time). Baseline at exact
+  `origin/main@e686e0a` (release binary sha256 `d795d942…`, retained at
+  `/tmp/wasmlight-wave4-baseline.e686e0a/`) measured, serialized under the
+  perf gate (best profile, 1 warm-up discarded, 7 samples): startup 2.47 ms,
+  loop 378/365 ms, fib 33 ms, memory 22 ms, memory-load 41→44 ms,
+  memory-store 49→36 ms, call 138→155 ms, memory-grow 13 ms, gc 106→112 ms,
+  simd 8.4→10.7 ms, host-call 35→38 ms across the four legs — i.e. failing
+  workloads were gc (~3.65x), call (~2.2x), simd (~1.9x), memory-store
+  (~1.75x time).
+- Profiles captured (`sample(1)` on long scaled AOT runs, artifacts under
+  `/var/folders/mv/6_sclnc96hgfcv9gknbsqr880000gn/T/opencode/wave4-profile/`):
+  - **gc**: ~44% generated loop body, ~37% allocation machinery
+    (AllocStruct/Allocate/TakeCell + Collect/Sweep ≈4%), ~9% StructSet helper
+    re-resolving TWasmGcTypes.Layout per set, plus InterpContextFor crossings.
+    Three helper blrs per iteration (struct.new/array.set/struct.get).
+  - **call**: 100% generated code, zero helpers. The native leaf core wastes
+    ~6 of ~13 instructions moving operands into value positions
+    (`mov x14,x12; mov x15,x13 … mov x17,x16; mov x12,x17`); the caller
+    re-resolves FuncAddrs×sizeof/entry/caps every call (~22 instructions of
+    plumbing around one blr).
+  - **simd**: two v128 constants rebuilt via 8×movz/movk + slot traffic EVERY
+    iteration, accumulator spilled/reloaded through canonical slots, scalar
+    limit rebuilt per iteration. ~37 instructions where ~6 do the work.
+  - **memory loops**: the br_if limit constant is materialized inside the
+    loop body (movz+movk+mov) every iteration because its IR instruction is.
+- Accepted commit `f191e18`
+  (`perf(jit): seed loop-invariant constants once in static cache hosts`,
+  branch `t3code/optimize-runtime-wasmtime-gap-1`): a driver analysis picks
+  up to ONE constant-defined slot (unique writer, not already allocated,
+  defined inside a backward-jump loop span, not SkipPlanned by fusion),
+  `Arm64EnableConstSlots` appends it behind the leading statics and seeds the
+  host register once at frame entry via immediate materialization, and the
+  defining const instruction then emits nothing. The dynamic victim pool is
+  now `[DynBase..DynBase+DynCount)` instead of hardcoded `[3..6]`
+  (`TArm64RegCache.DynBase/DynCount/ConstFrom`); FlushDynamicRegCache keeps
+  starting at StaticCount because native-core non-leaf mode keeps dirty
+  parameter entries below any fixed boundary — that distinction is load-
+  bearing and broke fac/fib i64 until restored. Arm64-only this wave; x64
+  inert (enable call sits in the ARM64 block), so x86-64 corpus identity was
+  trivially preserved but must be proven in the VM before any PR.
+- Serialized release A/B BASE-CAND-CAND-BASE under `/tmp/wasmlight-perf-gate.lock`
+  (7 samples each leg, raw JSON in `/tmp/ab2/*.json`): loop −3.8%/−3.8%
+  (367.5/367.0 → 353.4/352.9 ms, disjoint spreads); all other guards flat:
+  fib +0.9/+0.4, memory-load +2.6/−6.0, memory-store −2.7/+4.8, gc
+  +1.1/−0.5, simd −1.4/+0.3, host-call +2.3/+0.6, grow/startup flat. The
+  call reverse-leg median (+19%) was background host load — its samples are
+  bimodal (136–192 ms) while both clean legs cluster 127–155.
+- REJECTED variant: two const slots (K=2). Same schedule measured loop
+  −5.5%/−6.7% BUT memory-load +21.8%/+8.7% in BOTH orders — appending a
+  second host shrinks the dynamic pool to two registers and the load loop's
+  expression pressure thrashes. Fully reverted before acceptance; do not
+  re-attempt without a pressure-aware gate.
+- PROCESS NOTE: an intermediate A/B compared a DEV-mode candidate against
+  the RELEASE baseline (gc +173%, host-call +165%) — build modes must match
+  on both sides of every comparison; dev builds are correctness gates only.
+- Correctness on the accepted head (release `76eb3fd0…`): frozen install,
+  format, agents check green; 44/44 unit suites; corpus byte-identical in
+  interpreter/JIT/AOT at pass=65851 fail=368 skip=904 staged=0 errors=0
+  (compiled=8799); Markdown lint clean.
+- Band status after the wave (same-schedule Wasmtime medians): IN BAND
+  startup 0.64x, loop 1.05x, fib 0.99x, memory 1.13x, memory-grow 0.99x,
+  host-call 0.92x; BORDERLINE memory-load ~1.36x / memory-store ~1.34x
+  (inside 1.43x but not improved by this lane — they are store/load
+  bandwidth-bound, instruction removal hides under latency); OUT OF BAND
+  simd ~1.87x, call ~2.2x, gc ~3.8x.
+- Next lanes, pre-seeded with profile evidence above: (1) GC native inline
+  allocation fast path in both backends (bump/free-list inline, collect
+  slow path as the allocation-site safepoint per ADR-0011) — largest gap;
+  (2) SIMD Q-register caching of vector values + v128 constant hoisting for
+  call-free functions (wave-3's counter-caching variant failed; Q-value
+  caching remains unbuilt machinery in both backends); (3) native scalar
+  leaf-core operand cleanup (consume x12/x13 in place, produce x12) plus
+  hoisting direct-call metadata resolution across backedges.
 
 ## Wave 3 — static cache for vector loops REJECTED and reverted
 
