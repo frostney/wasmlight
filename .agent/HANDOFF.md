@@ -1,5 +1,128 @@
 # Handoff
 
+Updated: 2026-08-22 (wave 3 candidate rejected; scalar memory + simd profiled)
+
+## Wave 3 — static cache for vector loops REJECTED and reverted
+
+- Lane `optimize/vec-static-cache` from `4d83d63`: admitted the natively
+  emitted vector op set (Arm64NativeVecOp/X64NativeVecOp — identical lists)
+  into StaticCacheOp and restricted cache-slot selection to wvkNum slots.
+  Built clean, results verified, but serialized simd A/B measured a
+  regression: cand medians 11.122/11.335 ms vs base 10.686/10.312 ms
+  (+4–10%, both orders). The extended-frame prologue plus per-exit
+  write-back cost more than caching the loop counter saved. Fully
+  reverted; nothing remains in the tree.
+- Profile facts recorded for the next lanes (both from `sample(1)` on long
+  AOT runs of scaled workload modules):
+  - Scalar memory-load/store: 100% of samples inside generated code, zero
+    helper crossings. The ~1.34x/1.51x residual vs Wasmtime is pure
+    codegen quality (loop overhead amortized over one access), not chokepoint
+    or helper cost — heavily mined territory (five prior waves, several
+    recorded rejections).
+  - SIMD workload: also 100% generated code now (PR #10 closed the helper
+    crossings). The disassembly shows the remaining cost is spill/reload
+    traffic through canonical frame slots and per-iteration rebuilding of
+    v128 constants (two movz/movk pairs + slot stores + Q load every
+    iteration). The bounded counter-caching lane above did not pay for it;
+    what remains is a Q-register static cache entry for vector locals
+    (v16-v31 are caller-saved and these functions are call-free) and/or
+    loop-invariant constant hoisting — both new machinery in both backends,
+    each its own future wave.
+- GC native inline allocation in the JIT/AOT backends remains the largest
+  open gap (gc ~104 ms vs Wasmtime ~28 ms): inline bump/free-list fast path
+  with the collect-slow-path call as the safepoint, per ADR-0011's
+  allocation-site stack-map obligation. Also its own wave.
+
+Updated: 2026-08-22 (wave 2: GC field access through pointers + WASI RemoveTree fix)
+
+## Wave 2 — field/layout resolution and a test-harness hang
+
+- Lane `optimize/gc-field-access` from `1d8f188` (the wave-1 delivery head),
+  accepted commits `5bf5574` (`perf(gc): resolve struct and array fields
+  through pointers`) and `6d7eb49` (`fix(test): probe symlinks in the WASI
+  suite's RemoveTree`), fast-forwarded into `optimize/runtime-wave`. Local,
+  unpushed, delivery not requested.
+- Mechanism: StructField copied the resolved TWasmGcField record per access
+  and ArrayElement added a call layer plus a second copy; both re-resolved
+  layout every time. The candidate returns a PWasmGcField into the layout
+  table (StructFieldPtr) and folds null/kind/bounds/offset for scalar array
+  paths (ResolveElement); ReadField/WriteField/ExtendSigned take the field
+  by pointer.
+- Serialized gc A/B under the perf gate (7 samples, BASE-CAND-CAND-BASE):
+  116.743 → 104.604 ms forward and 104.531 vs 116.949 ms reverse (-10.5%
+  both orders, disjoint spreads). Guards in two rotated passes: loop
+  −1.0%/+0.1%, fib +0.5%/+1.2%, memory-load −2.2%/−4.0%,
+  memory-store −7.1%/−3.1%, simd +5.5%/−1.6%, startup +9.9%/−3.2% — the
+  simd/startup flips are short-process noise; no material regression.
+- Correctness on the combined head (`f0407e1` release binary): all 44 unit
+  suites pass; recursive corpus byte-identical in interpreter/JIT/AOT at
+  pass=65851 fail=368 skip=904 staged=0 errors=0, compiled=8799; format,
+  agents check, diff check, Markdown lint green.
+- Harness defect found by the wave: Wasm.Wasi.Test's RemoveTree relied on
+  faSymLink, which Darwin's FindFirst NEVER sets (it stats entries), so
+  `escape -> /etc` was recursed and system files were being unlinked; an
+  unlink there now wedges forever and hung any full-suite run that executed
+  the WASI suite (reproduced twice). Fixed with fpReadLink; suite drops
+  from hang to 2.7 s. Any environment where full suites stall in
+  Wasm.Wasi.Test should check for this class first.
+
+Updated: 2026-08-21 (gc allocation fast-path wave)
+
+## GC allocation fast path
+
+- Branch `optimize/runtime-wave` from exact
+  `origin/main@659fd3711dd596176b7d86bdfc9d130e9b6e5015` (post-PR #10 tip).
+  Accepted commit `22053d6` (`perf(gc): consolidate the allocation fast path`)
+  on lane branch `optimize/gc-alloc-fastpath`, fast-forwarded into the
+  delivery branch. Delivery not requested; both branches are local and
+  unpushed.
+- Target selection. The previous wave's residual list named GC allocation as
+  the largest measured gap (~4.4x Wasmtime). Serialized baseline (release,
+  bench.py best profile, 7 samples) at the exact starting commit: gc
+  124.592 ms vs Wasmtime 28.282 ms (4.41x); guards loop 374.9, fib 33.0,
+  memory 21.6, memory-load 43.0, memory-store 43.2, simd 9.4, startup
+  2.93 ms.
+- Profile-driven mechanism. A `sample(1)` profile of a 20M-iteration gc AOT
+  run attributed ~270/741 samples to `TWasmGcHeap.AllocStruct` →
+  `Allocate`: duplicate size-class classification (Allocate computed
+  ClassOf/CellSize, then TakeCell recomputed them), layered helper calls,
+  generic FillChar→memset zeroing of every cell, plus amortized
+  Collect/Sweep; a further ~90 samples re-resolved type layouts through
+  `TWasmGcTypes.Layout`/`IsDefined` on every AllocStruct/StructField.
+- Accepted candidate (`22053d6`, Wasm.Runtime.Gc.pas only): TakeCell takes
+  the already-derived class index and cell size; per-cell zeroing uses an
+  inline u64 store loop up to 128 bytes (cells are 8-aligned, sizes are
+  multiples of 8) and keeps the RTL fill for large objects;
+  Allocate/ClassOf/TWasmGcTypes.Layout/IsDefined marked inline. No ABI,
+  artifact-format, safepoint, trap, or allocation-trigger change: Allocate
+  remains the only collection trigger and every byte of a cell is still
+  zero before the header goes down.
+- Serialized A/B under `/tmp/wasmlight-perf-gate.lock` (one warm-up
+  discarded, 7 samples, BASE-CAND-CAND-BASE): gc wasmlight median
+  127.498 → 118.107 ms forward and 117.819 vs 127.231 ms reverse (-7.4%
+  both orders, spreads disjoint: base 125.7–128.9, cand 115.7–119.9).
+  Guards forward then reverse: loop +2.68%/+0.40%, fib +1.27%/+0.17%,
+  simd +2.16%/+0.61%, memory-load −8.69%/+1.51%, memory-store
+  −10.74%/−3.70% — the forward memory deltas reversed sign and the wide
+  short-process spreads straddle zero, so guards are flat within noise and
+  the loop/fib/simd first-pass shifts were host-load drift, not code.
+- Combined integration head equals the lane head byte-for-byte (same
+  sha256 release binary), so the lane A/B is the combined measurement.
+- Correctness on the combined head (macOS/aarch64): frozen install, format
+  90/90, agents check, diff check, dev + release builds, Markdown lint, and
+  all 44 unit suites pass. The recursive 288-script corpus at `de54fd27` is
+  byte-identical across interpreter/JIT/AOT:
+  pass=65851 fail=368 skip=904 staged=0 errors=0 (compiled=8799).
+- Not yet done before any PR: the Linux/x86-64 leg (unit suites + corpus
+  identity). The change touches no generated-code emitter and no artifact
+  ABI, but prior runtime waves still proved x86-64 before delivery; CI on
+  the PR would cover it.
+- Rejected/not pursued this wave: caching resolved layout pointers per
+  object header (changes the object model for ~12% of samples — deferred);
+  native inline emission of struct.new/array.set in the JIT/AOT backends
+  (the shape that closed the SIMD gap, but a full backend lane — the
+  natural next wave if the remaining ~118 ms vs 28 ms gap must close).
+
 Updated: 2026-08-21 (native v128 move/const emission, both backends)
 
 ## v128 helper-crossing elimination
