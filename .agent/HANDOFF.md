@@ -1,6 +1,36 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 8: gc profile refresh; layout memo rejected as noise)
+Updated: 2026-08-22 (wave 9: native struct field access ACCEPTED — gc −25%)
+
+## Wave 9 — numeric struct.get/get_s/get_u/set natively on arm64 ACCEPTED
+
+- Commit `ec294dd` (`perf(jit): emit numeric struct field access natively on
+  arm64`). The driver's AnalyzeGcFieldAccess mirrors TWasmGcTypes' layout
+  math exactly (header 8, per-field align-up to storage width, cumulative
+  advance) over AIr.CanonTypes[TypeIndexToCanon[Imm.hi]].Comp, baking offset/
+  width/signedness into a per-instruction shape word (bit0 native, bit1
+  signed, bits8-15 width, bits16-31 offset). Ref fields and v128 stay on the
+  helper path (write barrier / Q regs); offsets that do not fit the scaled
+  imm12 decline. Arm64EmitGcFieldAccess emits: cached ref load → cbnz past a
+  type-specific null trap (`wtkNullStructReference`, same kind and position
+  as the helper) → width-sized load with sign/zero extension or width-sized
+  store from the value's cache host. No engine ids are baked — offsets are
+  pure functions of the module composite, so AOT artifacts stay
+  instance/store-agnostic.
+- Emitted shape per access ≈ 5 instructions replacing a full helper crossing
+  plus internal layout resolution. Verified by carve: `ldrsb w10,[x9,#24]`
+  for an i8 get_s at baked offset 24.
+- Serialized release A/B vs the wave-6 baseline binary: gc **−24.8%/−25.2%**
+  (101.2/101.5 → 76.1/75.9 ms; spreads fully disjoint). gc/Wasmtime ratio
+  improves from ~3.5x to ~2.6x. All other workloads untouched (shapes fire
+  only for struct ops).
+- Correctness: 44/44 suites; corpus byte-identical interp/JIT/AOT at
+  pass=65851 fail=368 skip=904 staged=0 errors=0 (compiled=8799); format
+  green. x64 inert (shape array only passed to the arm64 call site).
+- Follow-ups in priority order: (1) native struct.new allocation fast path
+  per wave 8's design notes (now the largest remaining gc cost); (2) native
+  array.get/set with baked element offsets + bounds check (kills the runtime
+  IrAux reads ~140 samples and another crossing); (3) x64 mirror of both.
 
 ## Wave 8 — GC groundwork: fresh profile, layout memo REJECTED as noise
 
