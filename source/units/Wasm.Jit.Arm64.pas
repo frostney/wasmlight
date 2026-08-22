@@ -107,6 +107,13 @@ type
     and lets every other internal error surface loudly (jit-spec §4.3). }
   EWasmJitBranchRange = class(EWasmError);
 
+  { Per-instruction native-shape words handed over by the driver's
+    AnalyzeGcFieldAccess; indexed by IR instruction index. }
+  TArm64GcShapeArray = array[0..$FFFFFF] of UInt64;
+  PArm64GcShapeArray = ^TArm64GcShapeArray;
+
+  PArm64RegCache = ^TArm64RegCache;
+
   TArm64RegCacheEntry = record
     Valid: Boolean;
     Dirty: Boolean;
@@ -540,7 +547,14 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   AUsePinnedMemoryBase, AExtendedFrame, ANativeScalarSelf: Boolean;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
-  var ACache: TArm64RegCache): Boolean; overload;
+  var ACache: TArm64RegCache;
+  const AGcShapes: PArm64GcShapeArray = nil): Boolean; overload;
+{ Numeric struct field access with a baked byte offset — the layout math is
+  mirrored in the driver's AnalyzeGcFieldAccess, so no runtime resolution
+  remains. Null refs trap the struct-specific kind before any load. }
+procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TArm64RegCache);
 function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
   const AValue: UInt32): Boolean;
 function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
@@ -945,7 +959,80 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
 begin
   Result := Arm64EmitOpCached(ABuf, AIns, AAux, AInsIndex, AAddr64,
     AUsePinnedMemory, AUsePinnedMemoryBase, AExtendedFrame, False, 0, 0, 0,
-    0, 0, ACache);
+    0, 0, ACache, nil);
+end;
+
+procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TArm64RegCache);
+var
+  Offset: UInt32;
+  Width, AccessSize: Byte;
+  LdrOp, StrOp: UInt32;
+  Signed: Boolean;
+  Val: Byte;
+  GoodLabel: TWasmJitLabel;
+
+  function LoadWord(const APrefix: UInt32; const ARt, ARn: Byte;
+    const AOffset: UInt32): UInt32;
+  begin
+    { Unsigned-offset form: imm12 is scaled by the access size. }
+    Result := APrefix or ((AOffset div AccessSize) shl 10)
+      or (UInt32(ARn) shl 5) or ARt;
+  end;
+
+begin
+  Offset := UInt32(AShape shr 16);
+  Width := Byte((AShape shr 8) and $FF);
+  Signed := (AShape and 2) <> 0;
+  AccessSize := Width;
+
+  { The reference arrives in a value slot; T0 carries it for the null check
+    and stays the base address. }
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+  GoodLabel := ABuf.NewLabel;
+  EmitCbnzTo(ABuf, ARM64_REG_T0, GoodLabel);
+  Arm64EmitLoadImm32(ABuf, 0, Ord(wtkNullStructReference));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(GoodLabel);
+
+  case AIns.Op of
+    iroStructGet, iroStructGetS, iroStructGetU:
+      begin
+        if Width = 1 then
+          if Signed then
+            LdrOp := $39C00000
+          else
+            LdrOp := $39400000
+        else if Width = 2 then
+          if Signed then
+            LdrOp := $79C00000
+          else
+            LdrOp := $79400000
+        else if Width = 4 then
+          LdrOp := $B9400000
+        else
+          LdrOp := $F9400000;
+        ABuf.EmitU32(LoadWord(LdrOp, ARM64_REG_T1, ARM64_REG_T0, Offset));
+        { W-form loads zero the high half, which is exactly the canonical
+          slot rule; the x load fills it verbatim. }
+        StX(ABuf, ARM64_REG_T1, AIns.Dest);
+      end;
+    iroStructSet:
+      begin
+        Val := Arm64CachedSourceReg(ABuf, ACache, AIns.B,
+          ARM64_REG_T1);
+        if Width = 1 then
+          StrOp := $39000000
+        else if Width = 2 then
+          StrOp := $79000000
+        else if Width = 4 then
+          StrOp := $B9000000
+        else
+          StrOp := $F9000000;
+        ABuf.EmitU32(LoadWord(StrOp, Val, ARM64_REG_T0, Offset));
+      end;
+  end;
 end;
 
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
@@ -954,7 +1041,8 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   AUsePinnedMemoryBase, AExtendedFrame, ANativeScalarSelf: Boolean;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
-  var ACache: TArm64RegCache): Boolean; overload;
+  var ACache: TArm64RegCache;
+  const AGcShapes: PArm64GcShapeArray): Boolean; overload;
 var
   Source, Dest: Byte;
   ArgSlot, ResultSlot: UInt32;
@@ -1133,6 +1221,12 @@ begin
     iroI64Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvX, ACache);
   else
   begin
+    if (AGcShapes <> nil) and
+      ((AGcShapes[AInsIndex] and 1) <> 0) then
+    begin
+      Arm64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+      Exit;
+    end;
     { Helpers, safepoints, complex control and currently uncached templates all
       observe/write the canonical memory register file. }
     Arm64FlushDynamicRegCache(ABuf, ACache);

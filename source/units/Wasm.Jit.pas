@@ -484,6 +484,7 @@ var
   UseThirdStatic: Boolean;
   ConstSlots: array[0..0] of UInt32;
   ConstSlotBits: array[0..0] of UInt64;
+  GcShapes: array of UInt64;
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
@@ -1489,6 +1490,103 @@ var
     end;
   end;
 
+  { Numeric struct.get/get_s/get_u/set bake their field offset instead of
+    paying a helper crossing that re-resolves the layout per access. The
+    offset mirrors TWasmGcTypes' layout math exactly (header, per-field
+    align-up to storage width, cumulative advance); ref fields stay on the
+    helper path because stores need the write barrier. }
+  procedure AnalyzeGcFieldAccess;
+  var
+    K, F, CanonIdx: Integer;
+    TargetIdx, FieldIdx, Offset, Width: UInt32;
+    IsRef, IsPacked: Boolean;
+    PackedKind: TWasmPackedType;
+    Comp: ^TWasmCompType;
+
+    function StorageWidthOf(const AStorage: TWasmStorageType): UInt32;
+    begin
+      if AStorage.IsPacked then
+      begin
+        if AStorage.PackedType = wpkI8 then
+          Result := 1
+        else
+          Result := 2;
+        Exit;
+      end;
+      case AStorage.ValueType.Kind of
+        wvkNum:
+          if (AStorage.ValueType.Num = wntI32) or
+            (AStorage.ValueType.Num = wntF32) then
+            Result := 4
+          else
+            Result := 8;
+        wvkVec:
+          Result := 16;
+      else
+        Result := 8;
+      end;
+    end;
+
+  begin
+    SetLength(GcShapes, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      GcShapes[K] := 0;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if not ((AFn^.Code[K].Op = iroStructGet) or
+        (AFn^.Code[K].Op = iroStructGetS) or
+        (AFn^.Code[K].Op = iroStructGetU) or
+        (AFn^.Code[K].Op = iroStructSet)) then
+        Continue;
+      IrUnpack(AFn^.Code[K].Imm, TargetIdx, FieldIdx);
+      if TargetIdx >= UInt32(Length(AIr.CanonTypes)) then
+        Continue;
+      CanonIdx := Integer(AIr.TypeIndexToCanon[TargetIdx]);
+      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
+        Continue;
+      Comp := @AIr.CanonTypes[CanonIdx].Comp;
+      if (Comp^.Kind <> wckStruct) or
+        (FieldIdx >= UInt32(Length(Comp^.Struct.Fields))) then
+        Continue;
+      IsRef := False;
+      IsPacked := False;
+      PackedKind := wpkI8;
+      Width := 0;
+      Offset := 8;
+      for F := 0 to Integer(FieldIdx) do
+      begin
+        Width := StorageWidthOf(
+          Comp^.Struct.Fields[F].Storage);
+        Offset := (Offset + Width - 1) and not (Width - 1);
+        if F = Integer(FieldIdx) then
+        begin
+          IsRef := (not Comp^.Struct.Fields[F].Storage.IsPacked) and
+            (Comp^.Struct.Fields[F].Storage.ValueType.Kind = wvkRef);
+          IsPacked := Comp^.Struct.Fields[F].Storage.IsPacked;
+          PackedKind := Comp^.Struct.Fields[F].Storage.PackedType;
+        end
+        else
+          Offset := Offset + Width;
+      end;
+      if IsRef or (Width > 8) or (Offset >= $10000) or
+        ((Offset div Width) >= $1000) then
+        Continue;
+      case AFn^.Code[K].Op of
+        iroStructGet:
+          if IsPacked then
+            Continue;
+        iroStructGetS, iroStructGetU:
+          if not IsPacked then
+            Continue;
+      end;
+      { bit0 native | bit1 signed | bits8-15 width | bits16-31 offset }
+      GcShapes[K] := 1 or
+        (Ord(AFn^.Code[K].Op = iroStructGetS) shl 1) or
+        (UInt64(Width) shl 8) or
+        (UInt64(Offset) shl 16);
+    end;
+  end;
+
   procedure AnalyzePinnedMemory;
   var
     K: Integer;
@@ -1637,6 +1735,9 @@ begin
       host register their defining instruction would never have used. }
     AnalyzeConstSlots;
     {$IFDEF WASM_JIT_ARM64}
+    AnalyzeGcFieldAccess;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_ARM64}
     AnalyzeDynamicWriteBack;
     {$ENDIF}
 
@@ -1767,7 +1868,8 @@ begin
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
-            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache);
+            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
+            @GcShapes[0]);
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
