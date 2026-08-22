@@ -1,6 +1,25 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 6: native-core param forwarding + in-place consts)
+Updated: 2026-08-22 (wave 7: loop-header alignment REJECTED — no effect)
+
+## Wave 7 — fetch-alignment padding for backward targets REJECTED
+
+- Tested wave 5's residual theory directly: pad every backward-jump target
+  (loop header) to a 16-byte boundary with A64 NOPs before BindLabel, so
+  iterations enter on a full decode window. Semantically transparent — corpus
+  identity held immediately (65851/368/904 in jit); one shape-pin test grew
+  by the two NOP words as expected.
+- Clean-environment serialized A/B (after catching and stopping a UTM/QEMU
+  Windows VM that had been eating ~176% CPU and poisoning several earlier
+  legs — always `ps aux -r` before trusting a schedule): loop −0.6%/−0.2%,
+  simd +2.4%/−2.2%, fib/memory flat, memory-store unmeasurable (its samples
+  are bimodal 27–49 ms even within one leg on this host). No repeatable
+  positive delta → reverted; binary hash back to the exact wave-6 build.
+- CONSEQUENCE FOR WAVE 5: simple loop-header alignment does NOT explain why
+  the smaller vector loop measured slower. The simd retry needs a real
+  microarchitectural bisect (candidates: scalar-static allocation inside vec
+  functions forcing value slot round-trips; Q-bank effects; per-op cache
+  invalidation patterns). Do not re-attempt on the alignment theory.
 
 ## Wave 6 — leaf-core operand cleanup ACCEPTED
 
