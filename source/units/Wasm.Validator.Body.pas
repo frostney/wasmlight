@@ -5088,7 +5088,7 @@ begin
     from here than from a tier: the invariant is one trailing iroReturn. }
   I := Length(FFn.Code);
   if (I = 0) or (FFn.Code[I - 1].Op <> iroReturn) then
-    raise EWasmValidationError.Create(
+    raise EWasmInternal.Create(
       'internal: function IR does not end with a return');
 
   Result := FFn;

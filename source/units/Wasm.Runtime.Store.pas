@@ -989,7 +989,7 @@ begin
   if AHeap.IsAbstract then
     Exit;
   if AHeap.TypeIndex >= UInt32(Length(AMap)) then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: type index %u has no engine id', [AHeap.TypeIndex]);
   Result.TypeIndex := AMap[AHeap.TypeIndex];
 end;
@@ -1139,7 +1139,7 @@ begin
     Exit;
   if (AType.Ref.Heap.TypeIndex >= UInt32(Length(AMap))) or
     (AMap[AType.Ref.Heap.TypeIndex] = WASM_NO_ADDR) then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: canonical type %u is not interned yet',
       [AType.Ref.Heap.TypeIndex]);
   Result.Ref.Heap.TypeIndex := AMap[AType.Ref.Heap.TypeIndex];
@@ -1202,7 +1202,7 @@ begin
   begin
     Local := ALocalBase + Member;
     if Local >= UInt32(Length(AIr.CanonTypes)) then
-      raise EWasmError.Create(
+      raise EWasmInternal.Create(
         'internal: rec group runs past the canonical type table');
 
     FTypes[ABase + Member].Comp :=
@@ -1217,7 +1217,7 @@ begin
     begin
       Source := AIr.CanonTypes[Local].Display[Entry];
       if (Source >= UInt32(Length(AMap))) or (AMap[Source] = WASM_NO_ADDR) then
-        raise EWasmError.CreateFmt(
+        raise EWasmInternal.CreateFmt(
           'internal: display entry %u is not interned yet', [Source]);
       FTypes[ABase + Member].Display[Entry] := AMap[Source];
     end;
@@ -1270,7 +1270,7 @@ begin
     end;
     if UInt64(First) + UInt64(Size) >
       UInt64(Length(AIr.TypeIndexToCanon)) then
-      raise EWasmError.Create(
+      raise EWasmInternal.Create(
         'internal: rec group sizes do not cover the type index space');
 
     LocalBase := AIr.TypeIndexToCanon[First];
@@ -1300,7 +1300,7 @@ begin
     while Member < Size do
     begin
       if LocalBase + Member >= UInt32(Length(ACanonToEngine)) then
-        raise EWasmError.Create(
+        raise EWasmInternal.Create(
           'internal: rec group runs past the canonical type table');
       ACanonToEngine[LocalBase + Member] := Base + Member;
       Inc(Member);
@@ -1313,7 +1313,7 @@ begin
   end;
 
   if First <> UInt32(Length(AIr.TypeIndexToCanon)) then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: rec group sizes do not cover the type index space');
 
   { B22: the collector's layout table is Define'd once per engine type, in
@@ -1322,7 +1322,7 @@ begin
     the invariant is asserted rather than assumed: every allocated engine
     type has a materialised GC layout. }
   if FGcTypes.Count <> FTypeCount then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: %d engine types but %d GC layouts', [FTypeCount,
       FGcTypes.Count]);
 
@@ -1345,7 +1345,7 @@ function TWasmEngine.EngineType(
   const AId: TWasmEngineTypeId): TWasmEngineType;
 begin
   if AId >= UInt32(FTypeCount) then
-    raise EWasmError.CreateFmt('internal: no engine type %u', [AId]);
+    raise EWasmInternal.CreateFmt('internal: no engine type %u', [AId]);
   Result := FTypes[AId];
 end;
 
@@ -1363,7 +1363,7 @@ begin
     match; a valid id is never WASM_NO_ADDR, so the guard rejects the
     absent case rather than letting equality answer for it. }
   if (ASub >= UInt32(FTypeCount)) or (ASuper >= UInt32(FTypeCount)) then
-    raise EWasmError.Create('internal: engine type id out of range');
+    raise EWasmInternal.Create('internal: engine type id out of range');
   if ASub = ASuper then
     Exit(True);
   SuperDepth := FTypes[ASuper].Depth;
@@ -1375,7 +1375,7 @@ function TWasmEngine.AbsKindOf(
   const AId: TWasmEngineTypeId): TWasmAbsHeapType;
 begin
   if AId >= UInt32(FTypeCount) then
-    raise EWasmError.CreateFmt('internal: no engine type %u', [AId]);
+    raise EWasmInternal.CreateFmt('internal: no engine type %u', [AId]);
   case FTypes[AId].Kind of
     wckStruct: Result := wahStruct;
     wckArray: Result := wahArray;
@@ -1843,7 +1843,7 @@ end;
 procedure CheckMemAddr(const AAddr: TWasmMemAddr; const ACount: Integer);
 begin
   if AAddr >= UInt32(ACount) then
-    raise EWasmError.CreateFmt('internal: no memory %u', [AAddr]);
+    raise EWasmInternal.CreateFmt('internal: no memory %u', [AAddr]);
 end;
 
 function TWasmStore.MemoryAddrType(
@@ -1901,7 +1901,7 @@ procedure TWasmStore.TableSet(const AAddr: TWasmTableAddr;
   const AIndex: UInt64; const ARef: TWasmRef);
 begin
   if AAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [AAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [AAddr]);
   if TableIndexOutOfBounds(Tables[AAddr], AIndex) then
     TrapNow(wtkTableOutOfBounds);
   { Root-array store: barrier BEFORE the write so a future generational
@@ -1916,7 +1916,7 @@ var
   Cursor: UInt64;
 begin
   if AAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [AAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [AAddr]);
   TableCheckRange(Tables[AAddr], AIndex, ACount);
   { One barrier for the whole fill: every stored slot takes the same
     reference, so recording that edge once is sufficient for any
@@ -1939,7 +1939,7 @@ var
   Cursor: UInt64;
 begin
   if AAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [AAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [AAddr]);
   { table.grow returns -1 on failure and does not trap. }
   OldSize := UInt64(Length(Tables[AAddr].Elems));
   if ADelta > Tables[AAddr].MaxSize - OldSize then
@@ -1979,7 +1979,7 @@ var
   Count: UInt64;
 begin
   if AAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [AAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [AAddr]);
   Count := UInt64(Length(ASrc));
   { Range check precedes any write, so a trapping table.init writes
     nothing — table.init's own semantics. }
@@ -2003,7 +2003,7 @@ begin
   { O-2 sliced form (the interpreter's table.init). BOTH sides are checked
     before any write, so a trapping table.init writes nothing. }
   if AAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [AAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [AAddr]);
   { Source range against the element instance's length; subtracting form so
     a large offset on a long slice cannot wrap. A dropped segment has
     Length 0, so any non-empty slice traps. Same message as the dest side. }
@@ -2030,9 +2030,9 @@ var
   Ref: TWasmRef;
 begin
   if ADestAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [ADestAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [ADestAddr]);
   if ASrcAddr >= UInt32(Length(Tables)) then
-    raise EWasmError.CreateFmt('internal: no table %u', [ASrcAddr]);
+    raise EWasmInternal.CreateFmt('internal: no table %u', [ASrcAddr]);
   { BOTH ranges checked before any write, trapping 'out of bounds table
     access' (exec-table.copy). The range check precedes the copy so a
     trapping table.copy leaves the destination untouched. }

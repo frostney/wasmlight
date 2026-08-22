@@ -809,7 +809,7 @@ end;
 function HeaderOf(const ARef: TWasmRef): PWasmU64; inline;
 begin
   if not RefIsObject(ARef) then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: a null or i31 reference has no heap object header');
   Result := PWasmU64(RefToPointer(ARef));
 end;
@@ -855,7 +855,7 @@ var
 begin
   Header := HeaderOf(ARef);
   if KindOfHeader(Header^) <> wokFuncRef then
-    raise EWasmError.Create('internal: not a function reference');
+    raise EWasmInternal.Create('internal: not a function reference');
   Result := PWasmU32(PByte(Header) + WASM_FUNCREF_ADDR_OFFSET)^;
 end;
 
@@ -865,7 +865,7 @@ var
 begin
   Header := HeaderOf(ARef);
   if KindOfHeader(Header^) <> wokHostBox then
-    raise EWasmError.Create('internal: not a host box');
+    raise EWasmInternal.Create('internal: not a host box');
   Result := PNativeUInt(PByte(Header) + WASM_HOSTBOX_PAYLOAD_OFFSET)^;
 end;
 
@@ -877,7 +877,7 @@ begin
   Header := HeaderOf(ARef);
   Kind := KindOfHeader(Header^);
   if (Kind <> wokExternalized) and (Kind <> wokInternalized) then
-    raise EWasmError.Create('internal: not a converted reference');
+    raise EWasmInternal.Create('internal: not a converted reference');
   Result := PWasmRef(PByte(Header) + WASM_CONVERT_INNER_OFFSET)^;
 end;
 
@@ -1019,7 +1019,7 @@ begin
     collect; growing FLayouts here mid-collection would dangle it. Define
     runs at intern time, never during a cycle — assert it (B21/L21). }
   if GWasmGcCollecting then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: a GC type layout was defined during collection');
 {$ENDIF}
 
@@ -1103,7 +1103,7 @@ end;
 function TWasmGcTypes.Layout(const AId: TWasmGcTypeId): PWasmGcLayout; inline;
 begin
   if not IsDefined(AId) then
-    raise EWasmError.CreateFmt('internal: engine type %u has no layout',
+    raise EWasmInternal.CreateFmt('internal: engine type %u has no layout',
       [AId]);
   Result := @FLayouts[AId];
 end;
@@ -1259,7 +1259,7 @@ begin
     skips its collect while FCollecting, so a re-entrant alloc reaches
     TakeCell directly — make that loud rather than silent. }
   if FCollecting then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: allocation during collection ' +
       '(a host release hook must not allocate)');
 {$ENDIF}
@@ -1327,7 +1327,7 @@ begin
   { Collection never allocates; a re-entrant call here is a host release
     hook breaking its no-alloc contract (B10). }
   if FCollecting then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: allocation during collection ' +
       '(a host release hook must not allocate)');
 {$ENDIF}
@@ -1383,7 +1383,7 @@ var
 begin
   Layout := FTypes.Layout(ATypeId);
   if Layout^.Kind <> wckStruct then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: engine type %u is not a struct type', [ATypeId]);
   Result := MakeObjectRef(Allocate(Layout^.Size, wokStruct, ATypeId));
 end;
@@ -1397,7 +1397,7 @@ var
 begin
   Layout := FTypes.Layout(ATypeId);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: engine type %u is not an array type', [ATypeId]);
 
   { Computed in u64 and compared before narrowing: a length near 2^32 with
@@ -1463,7 +1463,7 @@ begin
     failure H8 has to unwind. Catch it here, before the object exists. }
   Layout := FTypes.Layout(ATypeId);
   if Layout^.Kind <> wckFunc then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: engine type %u is not a tag (func) type', [ATypeId]);
 
   Bytes := UInt64(WASM_EXN_ARGS_OFFSET) +
@@ -1599,7 +1599,7 @@ begin
     rather than left to a cast so the i8 and i16 cases are visibly the
     same rule at two widths. }
   if not AField^.IsPacked then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: get_s on a field that is not packed');
   if AField^.PackedKind = wpkI8 then
     Result := Int32(Int8(Byte(AValue.Bits)))
@@ -1619,9 +1619,9 @@ begin
     TrapNow(wtkNullStructReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckStruct then
-    raise EWasmError.Create('internal: not a struct instance');
+    raise EWasmInternal.Create('internal: not a struct instance');
   if AField >= UInt32(Length(Layout^.Fields)) then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: struct field %u of %u', [AField,
       UInt32(Length(Layout^.Fields))]);
   Result := @Layout^.Fields[AField];
@@ -1647,7 +1647,7 @@ var
 begin
   Field := StructFieldPtr(ARef, AField);
   if Field^.IsPacked then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: struct.get on a packed field needs get_s or get_u');
   Result := ReadField(PByte(RefToPointer(ARef)), Field);
 end;
@@ -1668,7 +1668,7 @@ var
 begin
   Field := StructFieldPtr(ARef, AField);
   if not Field^.IsPacked then
-    raise EWasmError.Create('internal: get_u on a field that is not packed');
+    raise EWasmInternal.Create('internal: get_u on a field that is not packed');
   { Zero extension is what the narrow read already did. }
   Result := UInt32(ReadField(PByte(RefToPointer(ARef)), Field).Bits);
 end;
@@ -1706,7 +1706,7 @@ begin
     TrapNow(wtkNullStructReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckStruct then
-    raise EWasmError.Create('internal: not a struct instance');
+    raise EWasmInternal.Create('internal: not a struct instance');
   Value.Bits := 0;
   for Index := 0 to High(Layout^.Fields) do
   begin
@@ -1741,7 +1741,7 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create('internal: not an array instance');
+    raise EWasmInternal.Create('internal: not an array instance');
   if AIndex >= ArrayLength(ARef) then
     TrapNow(wtkArrayOutOfBounds);
   Result := Layout^.Elem;
@@ -1762,7 +1762,7 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create('internal: not an array instance');
+    raise EWasmInternal.Create('internal: not an array instance');
   if AIndex >= ArrayLength(ARef) then
     TrapNow(wtkArrayOutOfBounds);
   ABase := PByte(RefToPointer(ARef));
@@ -1778,7 +1778,7 @@ var
 begin
   ResolveElement(ARef, AIndex, Base, Field);
   if Field.IsPacked then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: array.get on a packed element needs get_s or get_u');
   Result := ReadField(Base, @Field);
 end;
@@ -1801,7 +1801,7 @@ var
 begin
   ResolveElement(ARef, AIndex, Base, Field);
   if not Field.IsPacked then
-    raise EWasmError.Create('internal: get_u on an element that is not packed');
+    raise EWasmInternal.Create('internal: get_u on an element that is not packed');
   Result := UInt32(ReadField(Base, @Field).Bits);
 end;
 
@@ -1852,7 +1852,7 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create('internal: not an array instance');
+    raise EWasmInternal.Create('internal: not an array instance');
   Base := PByte(RefToPointer(ARef));
   Len := UInt32(PWasmU64(Base + WASM_ARRAY_LENGTH_OFFSET)^);
   if (AOffset > Len) or (ACount > Len - AOffset) then
@@ -1888,7 +1888,7 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create('internal: not an array instance');
+    raise EWasmInternal.Create('internal: not an array instance');
   Base := PByte(RefToPointer(ARef));
   Len := UInt32(PWasmU64(Base + WASM_ARRAY_LENGTH_OFFSET)^);
   { Overflow-safe range test (array.fill traps out of bounds): guard the
@@ -1934,7 +1934,7 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ARef);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create('internal: not an array instance');
+    raise EWasmInternal.Create('internal: not an array instance');
   { A zeroed object already holds aux-default's value for every
     defaultable storage type; what this adds is the CHECK that one exists,
     which is the invariant array.new_default relies on. }
@@ -1969,11 +1969,11 @@ begin
     TrapNow(wtkNullArrayReference);
   DestLayout := LayoutOf(ADest);
   if DestLayout^.Kind <> wckArray then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: array.copy destination is not an array');
   SrcLayout := LayoutOf(ASrc);
   if SrcLayout^.Kind <> wckArray then
-    raise EWasmError.Create('internal: array.copy source is not an array');
+    raise EWasmInternal.Create('internal: array.copy source is not an array');
 
   DestBase := PByte(RefToPointer(ADest));
   SrcBase := PByte(RefToPointer(ASrc));
@@ -2038,12 +2038,12 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ADest);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: array.init_data target is not an array');
   { array.init_data's element type is numeric or packed, never a reference
     (the validator guarantees it), so no write barrier is owed. }
   if Layout^.Elem.IsRef then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: array.init_data on a reference-element array');
 
   Base := PByte(RefToPointer(ADest));
@@ -2099,10 +2099,10 @@ begin
     TrapNow(wtkNullArrayReference);
   Layout := LayoutOf(ADest);
   if Layout^.Kind <> wckArray then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: array.init_elem target is not an array');
   if not Layout^.Elem.IsRef then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: array.init_elem on a non-reference-element array');
 
   Base := PByte(RefToPointer(ADest));
@@ -2148,7 +2148,7 @@ function TWasmGcHeap.ExnArg(const ARef: TWasmRef;
   const AIndex: UInt32): TWasmValue;
 begin
   if AIndex >= ExnArgCount(ARef) then
-    raise EWasmError.CreateFmt('internal: exception argument %u of %u',
+    raise EWasmInternal.CreateFmt('internal: exception argument %u of %u',
       [AIndex, ExnArgCount(ARef)]);
   Result := PWasmValue(PByte(RefToPointer(ARef)) + WASM_EXN_ARGS_OFFSET +
     AIndex * SizeOf(TWasmValue))^;
@@ -2162,7 +2162,7 @@ var
   IsRefArg: Boolean;
 begin
   if AIndex >= ExnArgCount(ARef) then
-    raise EWasmError.CreateFmt('internal: exception argument %u of %u',
+    raise EWasmInternal.CreateFmt('internal: exception argument %u of %u',
       [AIndex, ExnArgCount(ARef)]);
   PWasmValue(PByte(RefToPointer(ARef)) + WASM_EXN_ARGS_OFFSET +
     AIndex * SizeOf(TWasmValue))^ := AValue;
@@ -2210,7 +2210,7 @@ end;
 function TWasmGcHeap.RootGet(const AHandle: TWasmRootHandle): TWasmRef;
 begin
   if AHandle >= UInt32(FRootCount) then
-    raise EWasmError.CreateFmt('internal: no root handle %u', [AHandle]);
+    raise EWasmInternal.CreateFmt('internal: no root handle %u', [AHandle]);
   { No read barrier and no indirection: the collector never moves an
     object, which is the whole reason it is mark-sweep. }
   Result := FRoots[AHandle];
@@ -2220,14 +2220,14 @@ procedure TWasmGcHeap.RootSet(const AHandle: TWasmRootHandle;
   const ARef: TWasmRef);
 begin
   if AHandle >= UInt32(FRootCount) then
-    raise EWasmError.CreateFmt('internal: no root handle %u', [AHandle]);
+    raise EWasmInternal.CreateFmt('internal: no root handle %u', [AHandle]);
   FRoots[AHandle] := ARef;
 end;
 
 procedure TWasmGcHeap.RootRelease(const AHandle: TWasmRootHandle);
 begin
   if AHandle >= UInt32(FRootCount) then
-    raise EWasmError.CreateFmt('internal: no root handle %u', [AHandle]);
+    raise EWasmInternal.CreateFmt('internal: no root handle %u', [AHandle]);
   FRoots[AHandle] := WASM_REF_NULL;
   if AHandle = UInt32(FRootCount - 1) then
   begin
@@ -2253,7 +2253,7 @@ var
   Write: Integer;
 begin
   if AMark > UInt32(FRootCount) then
-    raise EWasmError.Create('internal: root scope mark is above the stack');
+    raise EWasmInternal.Create('internal: root scope mark is above the stack');
   FRootCount := Integer(AMark);
   { Free-list entries above the mark name slots that no longer exist;
     dropping them is what keeps the stack discipline and the free list
@@ -2282,7 +2282,7 @@ end;
 procedure TWasmGcHeap.PopFrame;
 begin
   if FFrames = nil then
-    raise EWasmError.Create('internal: popping an empty frame chain');
+    raise EWasmInternal.Create('internal: popping an empty frame chain');
   FFrames := FFrames^.Prev;
 end;
 

@@ -41,6 +41,7 @@ type
     procedure TestExternKindOrdinals;
     procedure TestExternalTypeConstructors;
     procedure TestCompTypeConstructors;
+    procedure TestInternalErrorClassHierarchy;
   end;
 
 function TCoreTests.DescribeCode(const ACode: Int64): string;
@@ -330,6 +331,30 @@ begin
   Expect<string>(Comp.Arr.Elem.Describe).ToBe('i16');
 end;
 
+procedure TCoreTests.TestInternalErrorClassHierarchy;
+var
+  Raised: Boolean;
+begin
+  { EWasmInternal is the runtime-invariant leaf: under EWasmError so a
+    host's broadest handler still catches it, but a SIBLING of the five
+    module-facing classes, never a subclass of one of them — an internal
+    defect must never surface as a decode/validation/link/trap claim. }
+  Expect<Boolean>(EWasmInternal.InheritsFrom(EWasmError)).ToBe(True);
+  Expect<Boolean>(EWasmInternal.InheritsFrom(EWasmDecodeError)).ToBe(False);
+  Expect<Boolean>(EWasmInternal.InheritsFrom(EWasmValidationError)).ToBe(False);
+  Expect<Boolean>(EWasmInternal.InheritsFrom(EWasmLinkError)).ToBe(False);
+  Expect<Boolean>(EWasmInternal.InheritsFrom(EWasmTrap)).ToBe(False);
+  Expect<Boolean>(EWasmInternal.InheritsFrom(EWasmException)).ToBe(False);
+  Raised := False;
+  try
+    raise EWasmInternal.Create('internal: probe');
+  except
+    on E: EWasmError do
+      Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
 procedure TCoreTests.SetupTests;
 begin
   Test('number type codes', TestNumTypeCodes);
@@ -353,6 +378,7 @@ begin
   Test('extern kind ordinals', TestExternKindOrdinals);
   Test('external type constructors', TestExternalTypeConstructors);
   Test('composite type constructors', TestCompTypeConstructors);
+  Test('internal error class hierarchy', TestInternalErrorClassHierarchy);
 end;
 
 begin

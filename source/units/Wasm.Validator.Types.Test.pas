@@ -668,12 +668,13 @@ begin
     return. That is an internal error, and it must NOT be reported with a
     canonical prefix — a conformance runner prefix-matches those, and an
     impossible internal state dressed as `unknown type` would read as a
-    rejected module. }
+    rejected module. It surfaces as EWasmInternal, never as a validation
+    claim about a module. }
   Outcome := 'no error';
   try
     FContext.TopHeapType(MakeBotHeapType);
   except
-    on E: EWasmValidationError do
+    on E: EWasmInternal do
       if Copy(E.Message, 1, Length(MSG_UNKNOWN_TYPE)) = MSG_UNKNOWN_TYPE
       then
         Outcome := 'canonical prefix'

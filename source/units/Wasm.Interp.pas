@@ -390,7 +390,7 @@ var
   I: UInt32;
 begin
   if ACount > WASM_TIER_TAIL_CAP then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: cross-tier tail-call arity exceeds the marshal cap');
   I := 0;
   while I < ACount do
@@ -699,7 +699,7 @@ begin
        stack local, not managed state a TrapNow could skip. }
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
   if ArgN > WASM_INTERP_MAX_MARSHAL then
-    raise EWasmError.Create('internal: tail-call arity exceeds the marshal cap');
+    raise EWasmInternal.Create('internal: tail-call arity exceeds the marshal cap');
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
   while I < ArgN do
@@ -748,7 +748,7 @@ begin
   ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
   ResN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
   if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmError.Create('internal: host-call arity exceeds the marshal cap');
+    raise EWasmInternal.Create('internal: host-call arity exceeds the marshal cap');
 
   CallerRegs := Frame(ACtx^.Values, ACaller^.Base);
   I := 0;
@@ -786,7 +786,7 @@ begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
   ResN := ATop^.Fn^.ResultCount;   { equals the host func's result arity }
   if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmError.Create('internal: host-call arity exceeds the marshal cap');
+    raise EWasmInternal.Create('internal: host-call arity exceeds the marshal cap');
 
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
@@ -882,7 +882,7 @@ begin
   ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
   ResN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
   if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmError.Create('internal: compiled-call arity exceeds the marshal cap');
+    raise EWasmInternal.Create('internal: compiled-call arity exceeds the marshal cap');
 
   CallerRegs := Frame(ACtx^.Values, ACaller^.Base);
   I := 0;
@@ -941,7 +941,7 @@ begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
   ResN := ATop^.Fn^.ResultCount;   { equals the tail callee's result arity }
   if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmError.Create('internal: compiled-call arity exceeds the marshal cap');
+    raise EWasmInternal.Create('internal: compiled-call arity exceeds the marshal cap');
 
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
@@ -1054,7 +1054,7 @@ var
 begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
   if ArgN > WASM_TIER_TAIL_CAP then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: cross-tier tail-call arity exceeds the marshal cap');
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
@@ -1705,7 +1705,7 @@ end;
   managed locals, so every string lives in a leaf like this one. }
 procedure UnhandledOp(const AOp: TWasmIrOp);
 begin
-  raise EWasmError.Create('internal: unhandled IR op ' + IrOpMnemonic(AOp));
+  raise EWasmInternal.Create('internal: unhandled IR op ' + IrOpMnemonic(AOp));
 end;
 
 { --- exception delivery + the explicit unwind (eh-spec §2.3) -------------

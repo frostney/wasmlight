@@ -1661,7 +1661,7 @@ begin
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
           internal inconsistency, not a fall-back path. }
-        raise EWasmError.CreateFmt(
+        raise EWasmInternal.CreateFmt(
           'internal: JIT predicate passed but op %d has no template',
           [Ord(AFn^.Code[I].Op)]);
     end;
