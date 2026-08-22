@@ -1,6 +1,27 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 9: native struct field access ACCEPTED — gc −25%)
+Updated: 2026-08-22 (wave 10: StructSetSeq accepted — gc −4%/−1%)
+
+## Wave 10 — struct.new fills resolve layout once ACCEPTED (small)
+
+- Commit `bbedb4a` (`perf(gc): resolve struct.new field layout once per
+  fill`). New heap method `StructSetSeq(Ref, Values, Count)`: one null/kind/
+  bounds check and ONE LayoutOf resolution, then N direct WriteField calls —
+  replacing N per-field StructSet crossings that each re-resolved the layout
+  (the fresh profile showed 78 samples of TWasmGcTypes.Layout under
+  StructSet). Both tiers route through it for arities ≤ 8 via a stack temp;
+  larger arities keep the legacy loop. The v1 write barrier is empty by
+  design, so the sequential fill is observably identical.
+- Serialized A/B vs the true wave-9 head (ec294dd, rebuilt + hash-retained at
+  /tmp/wave9-head.ec294dd): gc −4.1%/−1.4% — small, forward-dominant, no
+  regression in 14 samples. Corpus byte-identical in all three tiers on this
+  exact tree; format green. NOTE: an earlier comparison against the WAVE-6
+  baseline read −27% — always diff against the IMMEDIATE predecessor head.
+- Post-wave-9 gc profile (for the next session): alloc family ~52%
+  (AllocStruct 558+158, TakeCell ~414, Collect/Sweep only ~170), StructSet
+  family down to ~9% after this slice, generated body ~58% — inline
+  allocation is now unambiguously the next move, exactly per wave 8's design
+  notes.
 
 ## Wave 9 — numeric struct.get/get_s/get_u/set natively on arm64 ACCEPTED
 
