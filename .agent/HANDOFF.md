@@ -1,6 +1,42 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 7: loop-header alignment REJECTED — no effect)
+Updated: 2026-08-22 (wave 8: gc profile refresh; layout memo rejected as noise)
+
+## Wave 8 — GC groundwork: fresh profile, layout memo REJECTED as noise
+
+- Refreshed `sample(1)` profile of the scaled gc workload on the current head
+  (3824 loop samples): alloc family ~23% (AllocStruct 602+200, TakeCell ~430,
+  Collect/Sweep only ~170 ≈ 5%), StructSet family ~9% (body 138,
+  **TWasmGcTypes.Layout re-resolution 85**, GcRefTypeId 37 = roots-array ref
+  barrier — inherent), IrAuxBlockItem/Count runtime reads ~140 (the array-set
+  dispatch reads aux tables per call at runtime), generated body ~43%.
+- Tried: single-entry Layout memo in TWasmGcTypes (fields FMemoId/FMemoLayout,
+  High sentinel ctor, resets in Define/Grow because SetLength reallocates).
+  Correct, all suites green — but serialized release A/B measured gc
+  −1.4%/+1.0%: flat within noise. REJECTED per the no-repeatable-delta rule;
+  reverted; binary hash back to the exact wave-6 build.
+- **PROCESS GUARD, SECOND OFFENSE**: an interim A/B compared a DEV-mode
+  candidate against the RELEASE baseline again (gc "277 ms", +164%). The
+  signature is unmistakable: compiled-tier workloads ~2.6x slow, perfectly
+  stable across legs. RULE: after ANY `lwpt build wasmlight`, a release
+  rebuild (`lwpt build --mode release`) is mandatory before any measurement;
+  check `shasum build/wasmlight` against the retained baseline binary when in
+  doubt. Consider a wrapper or hook to enforce this.
+- DESIGN GROUNDWORK for the dedicated inline-allocation session (the only
+  lane that moves gc materially): free-list pop is FFree[const class] head +
+  link load/store (~4 instrs); the blocker is SetCellAllocated's bitmap word
+  (cell = (head−Base)/CellSize, then div-32 index + variable-shift ORR ≈ 7-8
+  instrs — CellSize is compile-time constant per fixed type so magic-multiply
+  applies); ZeroCell can shrink to a tail store ONLY if nothing reads raw
+  cell bytes outside layouts (needs a design-doc proof before touching);
+  counters (FBytesLive/Allocated/ObjectCount) must still update (~6 instrs);
+  threshold-check/collect stays as THE allocation-site safepoint per
+  ADR-0011; slow path = existing helper unchanged. Estimated fast path ~25-30
+  instructions vs ~40 today including crossings — worth it only together
+  with native struct.get/array.set to also kill the crossing overhead.
+- The array.set runtime aux reads (~140 samples) are the same shape as the
+  struct.get/array.set native-template lane; bounded follow-up: bake the
+  field index/count into the emitted code for fixed-type array shapes.
 
 ## Wave 7 — fetch-alignment padding for backward targets REJECTED
 
