@@ -1,28 +1,32 @@
 ---
-name: implement-issue
+name: implement-idea
 description: >-
-  Validates and implements a GitHub issue against current repository evidence,
-  repeats code review and black-box testing, runs the project's completion gate,
-  and opens a draft pull request. Use when the user runs /implement-issue with
-  an issue number.
+  Turns an unfiled idea into a confirmed mini-spec, implements the selected
+  approach, repeats code review and black-box testing, runs the project gate,
+  and opens a draft pull request. Use when the user runs /implement-idea or asks
+  to build something without an existing issue.
 license: Unlicense OR MIT
 compatibility: >-
-  Requires the GitHub CLI (gh) authenticated to the target repository and
-  network access. Non-automatic mode also requires registered grilling and
-  render-html skills plus Python 3. Verification is driven by the project's
+  Requires git and the GitHub CLI (gh) for the /create-pr handoff, plus network
+  access. Non-automatic mode also requires registered grilling and render-html
+  skills plus Python 3. Verification is driven by the project's
   DEFINITION_OF_DONE.md and declared commands.
 ---
 
-# Implement issue
+# Implement idea
 
-Resolve the issue end to end against the current repository, or establish with
-evidence that no implementation is needed.
+Turn the idea into a confirmed mini-spec, then deliver it end to end in the
+current repository.
 
 ## Gates
 
-- Read the issue, project instructions, vision, contribution guidance,
-  Definition of Ready, Definition of Done, relevant domain skills, real project
-  commands, affected code paths, tests, and reproduction before deciding.
+- Start with a provisional mini-spec of at most 400 characters, including
+  spaces. Confirm the final mini-spec covering the user-visible outcome,
+  scope/non-goals, and testable measures of success only after the
+  artifact-assisted grill.
+- Read project instructions, vision, contribution guidance, Definition of Ready,
+  Definition of Done, relevant domain skills, real project commands, affected
+  code paths, tests, and related work before deciding.
 - Always perform and record web search for current evidence before presenting
   options. Prefer official and primary sources, reconcile them with the versions
   in the checkout, and treat remembered links only as search leads. Stop if the
@@ -31,10 +35,10 @@ evidence that no implementation is needed.
   skills plus Python 3. Stop if any dependency is unavailable. Use the actual
   `grilling` decision loop; do not imitate it with ad-hoc questions.
 - Before proposing an option, assemble one neutral evidence packet from the
-  issue, repository, reproduction, project contracts, current web research, and
-  shared current-state artifacts. Derive every option from this same packet.
-- Define one comparison rubric from the issue outcome, constraints, and
-  requirements before scoring. Give every viable option equivalent
+  repository, reproduction, project contracts, current web research, and shared
+  current-state artifacts. Derive every option from this same packet.
+- Define one comparison rubric from the confirmed outcome, constraints, and
+  measures of success before scoring. Give every viable option equivalent
   decision-relevant validation:
   - for UI/UX differences, show each materially different experience;
   - for architecture or workflow differences, show each relevant flow;
@@ -59,10 +63,8 @@ evidence that no implementation is needed.
   Include shared structured evidence, the declared rubric, option impacts,
   pros, cons, scores, uncertainties, and copyable discussion prompts. Keep the
   recommendation in the closing section after every neutral option.
-- When current evidence conclusively fails a required prototype or readiness
-  threshold, report that stop without asking whether to bypass the gate.
 - For any code or test change, repeat `/code-review fix-all` and black-box
-  testing against the issue until both pass on the same unchanged
+  testing against the confirmed mini-spec until both pass on the same unchanged
   implementation, then complete the project gate and `/create-pr`.
 
 ## Project definitions
@@ -84,55 +86,50 @@ architecture, security, scope, or vision decision disables automatic mode.
 
 ## Workflow
 
-1. Fetch the issue, including comments and labels; verify it is open,
-   implementation-ready, and not a PR, duplicate, blocked, or rejected item.
+1. Draft the provisional mini-spec in at most 400 characters, including spaces.
+   Treat it as a starting point, not a confirmed contract.
 2. Load the applicable project contracts and specialized skills.
-3. Trace the full behavior from entry point to symptom and run the cited
-   reproduction or artifact when possible. Search callers, siblings, tests,
-   configuration, and history far enough to identify the real layer. Always
-   perform current web search and reconcile its results with the checkout.
-4. If the behavior no longer reproduces, distinguish:
-   - already fixed and covered: recommend closing with the fixing code/commit
-     and test evidence;
-   - fixed without regression coverage: add the missing test only;
-   - shared-root-cause sibling paths still affected: include only those paths.
-5. Build the neutral evidence packet and comparison rubric, derive the options,
+3. Find the existing extension point, reusable patterns, sibling features,
+   tests, and architectural constraints. Always perform current web search and
+   reconcile its results with the checkout. If the idea already exists,
+   recommend using it; if partial, extend rather than duplicate it.
+4. Build the neutral evidence packet and comparison rubric, derive the options,
    and validate each with equivalent decision-relevant checks. Compare first;
    recommend only afterward.
-6. Outside automatic mode, create a temporary directory outside the worktree.
+5. Outside automatic mode, create a temporary directory outside the worktree.
    Follow the `render-html` schema and render the option comparison there. Open
    the report for review. If inline host preview is unavailable, provide its
    absolute path and continue. Run `grilling` one decision at a time using the
-   report and shared evidence, then wait for the user's choice in chat. Remove
-   the temporary report and its inputs after selection unless the user
-   explicitly asks to keep them.
-7. After selection, reuse or create a focused branch/worktree and apply the
+   report and shared evidence, confirm the final mini-spec, then wait for the
+   user's choice in chat. Remove the temporary report and its inputs after
+   selection unless the user explicitly asks to keep them.
+6. After selection, reuse or create a focused branch/worktree and apply the
    `git-workflow` remote-default synchronization gate before editing.
-8. Implement the smallest complete change at the correct layer. Update tests and
-   docs required by the issue and project contracts.
-9. For UI/UX work, render every affected state; capture reviewable before/after
+7. Implement the smallest complete change at the correct layer. Update tests and
+   docs required by the mini-spec and project contracts.
+8. For UI/UX work, render every affected state; capture reviewable before/after
    evidence; check accessibility, responsive behavior, themes, and design-system
    consistency; attach the evidence to the PR.
-10. Run targeted checks while developing. Fix failures rather than weakening a
+9. Run targeted checks while developing. Fix failures rather than weakening a
    check.
-11. Run `/code-review fix-all` against the requirements, Definition of Done,
-    project conventions, branch diff, and reproducible behavior. Resolve every
-    validated in-scope finding. Stop for a material new decision or unresolved
-    Blocking or Important finding. If `/code-review` is unavailable, perform
-    the same bounded review and fix pass directly.
-12. Run `/test-against-spec fix` when it is available. Otherwise perform the
-    same black-box test directly: use explicit issue requirements, avoid source
-    as proof, prefer an exact-revision preview deployment when available, and
-    fall back to the local environment. Record each requirement and its observed
+10. Run `/code-review fix-all` against the measures of success, Definition of
+   Done, project conventions, branch diff, and reproducible behavior. Resolve
+   every validated in-scope finding. Stop for a material new decision or
+   unresolved Blocking or Important finding. If `/code-review` is unavailable,
+   perform the same bounded review and fix pass directly.
+11. Run `/test-against-spec fix` when it is available. Otherwise perform the
+    same black-box test directly: use the confirmed mini-spec, avoid source as
+    proof, prefer an exact-revision preview deployment when available, and fall
+    back to the local environment. Record each requirement and its observed
     result or limitation.
-13. If step 11 or 12 changes the implementation or reports incomplete work,
-    continue implementing and restart at step 11. Repeat until code review and
+12. If step 10 or 11 changes the implementation or reports incomplete work,
+    continue implementing and restart at step 10. Repeat until code review and
     behavior testing both pass on the same unchanged implementation. Stop and
     ask when required behavior remains unverified after exhausting the available
     environments, unless the user explicitly accepts the limitation or requests
     a draft PR to obtain the missing preview environment.
-14. Run the applicable Definition of Done and repository gate. If fixing a gate
-    failure changes the implementation, return to step 11. Do not duplicate a
+13. Run the applicable Definition of Done and repository gate. If fixing a gate
+    failure changes the implementation, return to step 10. Do not duplicate a
     broad gate inside the behavior-testing step.
-15. Use `/create-pr`, include `Closes #<issue>`, pass forward the current
-    completion evidence, and report only observed results.
+14. Use `/create-pr` and pass forward the current mini-spec, delivered outcome,
+    and observed completion evidence for the PR.
