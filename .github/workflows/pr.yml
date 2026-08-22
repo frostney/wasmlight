@@ -37,6 +37,32 @@ env:
   LWPT_VERSION: "0.6.0"
 
 jobs:
+  # Branches come from main only. A PR head must CONTAIN the current default
+  # branch tip: a stale base means the gate below tests a merge against code
+  # nobody is shipping, and a native stack whose bottom layer squash-merges
+  # leaves its upper layers stale until `gh stack sync` rebases them — this
+  # job is what makes that sync non-optional rather than a convention.
+  branch-freshness:
+    name: branch contains main tip
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the head descends from the default branch tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/${{ github.repository }}/commits/${{ github.event.repository.default_branch || 'main' }}" --jq '.sha')"
+          git init -q .
+          git fetch --no-tags --quiet "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$MAIN_SHA" "$HEAD_SHA"
+          if git merge-base --is-ancestor "$MAIN_SHA" "$HEAD_SHA"; then
+            echo "HEAD $HEAD_SHA contains main ($MAIN_SHA)."
+          else
+            BASE="$(git merge-base "$HEAD_SHA" "$MAIN_SHA" || true)"
+            echo "::error::Branch is not based on the current default branch tip (main $MAIN_SHA, divergence at ${BASE:-nothing}). Merge or rebase onto main — for a stack, run gh stack sync — and push."
+            exit 1
+          fi
+
   build-and-test:
     strategy:
       fail-fast: false
