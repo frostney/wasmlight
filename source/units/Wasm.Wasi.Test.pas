@@ -347,11 +347,13 @@ begin
           Full := IncludeTrailingPathDelimiter(APath) + Sr.Name;
           { A directory that is NOT a symlink is recursed; everything else
             (files, and symlinks even to dirs) is unlinked directly.
-            faSymLink carries a platform-portability warning we accept — it is
-            the correct guard against following a symlinked directory. }
+            faSymLink cannot be trusted here: Darwin's FindFirst stats the
+            entry, so a symlinked directory arrives as a plain directory and
+            the attr guard would follow `escape -> /etc` and try to unlink
+            system files. fpReadLink asks the question lstat does. }
           {$PUSH}{$WARN SYMBOL_PLATFORM OFF}
           if ((Sr.Attr and faDirectory) <> 0) and
-            ((Sr.Attr and faSymLink) = 0) then
+            (fpReadLink(RawByteString(Full)) = '') then
           {$POP}
             RemoveTree(Full)
           else
