@@ -987,20 +987,26 @@ begin
       begin
         { A loop-invariant constant with a dedicated static host was seeded at
           frame entry; re-emitting it inside the loop body would rebuild the
-          same bits on every iteration. }
+          same bits on every iteration. Otherwise materialize straight into
+          the freshly reserved destination — the T0 hop costs an extra mov
+          per constant in the native-core shapes. }
         if not Arm64ConstSlotHost(ACache, AIns.Dest, ConstHost) then
         begin
-          Arm64EmitLoadImm32(ABuf, ARM64_REG_T0,
+          Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest,
+            ARM64_REG_ZR, ARM64_REG_ZR, ARM64_REG_T0);
+          Arm64EmitLoadImm32(ABuf, Dest,
             UInt32(AIns.Imm and $FFFFFFFF));
-          Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+          Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
         end;
       end;
     iroI64Const, iroF64Const:
       begin
         if not Arm64ConstSlotHost(ACache, AIns.Dest, ConstHost) then
         begin
-          Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, UInt64(AIns.Imm));
-          Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+          Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest,
+            ARM64_REG_ZR, ARM64_REG_ZR, ARM64_REG_T0);
+          Arm64EmitLoadImm64(ABuf, Dest, UInt64(AIns.Imm));
+          Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
         end;
       end;
     iroBranchIf, iroBranchIfNot:

@@ -933,12 +933,14 @@ var
   begin
     {$IFDEF WASM_JIT_ARM64}
     { Validation lowers local.get to a move into a one-use expression slot.
-      In the helper-free base-pinned loop shape, forward that exact alias into
-      an already-cached consumer without changing the canonical IR or labels.
-      The four-instruction window covers the bounded lowering shapes while a
-      target, safepoint, or intervening write to the visible source ends the
-      proof. }
-    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Forward that exact alias into an already-cached consumer without
+      changing the canonical IR or labels — in the helper-free base-pinned
+      loop shape, and in the closed native-scalar core whose parameters sit
+      in fixed hosts. The four-instruction window covers the bounded lowering
+      shapes while a target, safepoint, or intervening write to the visible
+      source ends the proof. }
+    if not ((UsePinnedMemoryBase and UseStaticCache) or
+        UseNativeScalarCore) then
       Exit;
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op = iroMove) and not SkipPlanned[K] and
