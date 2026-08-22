@@ -535,6 +535,13 @@ type
       const AField: UInt32): Int32;
     function StructGetUnsigned(const ARef: TWasmRef;
       const AField: UInt32): UInt32;
+    { Writes fields 0..Count-1 from Values[0..Count-1] with a single layout
+      resolution — struct.new's shape, where per-field StructSet calls would
+      re-resolve the same layout N times. WriteField semantics per field are
+      unchanged; the v1 write barrier is empty (see its declaration), so a
+      sequential fill is observably identical to the per-field path. }
+    procedure StructSetSeq(const ARef: TWasmRef;
+      const AValues: PWasmValue; const ACount: UInt32);
     procedure StructSet(const ARef: TWasmRef; const AField: UInt32;
       const AValue: TWasmValue);
     { struct.get / struct.set on a v128 field (simd-spec §7). The field is
@@ -1671,6 +1678,24 @@ begin
     raise EWasmInternal.Create('internal: get_u on a field that is not packed');
   { Zero extension is what the narrow read already did. }
   Result := UInt32(ReadField(PByte(RefToPointer(ARef)), Field).Bits);
+end;
+
+procedure TWasmGcHeap.StructSetSeq(const ARef: TWasmRef;
+  const AValues: PWasmValue; const ACount: UInt32);
+var
+  Layout: PWasmGcLayout;
+  I: Integer;
+begin
+  if RefIsNull(ARef) then
+    TrapNow(wtkNullStructReference);
+  Layout := LayoutOf(ARef);
+  if Layout^.Kind <> wckStruct then
+    raise EWasmInternal.Create('internal: not a struct instance');
+  if UInt32(Length(Layout^.Fields)) < ACount then
+    raise EWasmInternal.Create('internal: struct field sequence overrun');
+  for I := 0 to Integer(ACount) - 1 do
+    WriteField(PByte(RefToPointer(ARef)), @Layout^.Fields[I],
+      PWasmValue(PByte(AValues) + NativeUInt(I) * SizeOf(TWasmValue))^);
 end;
 
 procedure TWasmGcHeap.StructSet(const ARef: TWasmRef; const AField: UInt32;
