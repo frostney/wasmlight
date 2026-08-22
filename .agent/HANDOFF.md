@@ -1,6 +1,35 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 5: SIMD Q-host lane REJECTED and reverted)
+Updated: 2026-08-22 (wave 6: native-core param forwarding + in-place consts)
+
+## Wave 6 — leaf-core operand cleanup ACCEPTED
+
+- Two contained changes on top of f191e18, commit `6187bae`
+  (`perf(jit): forward native-core param aliases and emit consts in place`):
+  1. AnalyzeLocalAliases' gate widened from `(UsePinnedMemoryBase and
+     UseStaticCache)` to also admit `UseNativeScalarCore` — the pass already
+     forwarded local.get-moves into consumers for memory loops; closed
+     native-scalar cores have the identical proof shape (helper-free,
+     params in fixed hosts, one-use temps). ImmediateFusion and
+     StoreLoadForwarding keep their narrower gates deliberately.
+  2. Cached iro*Const emission now reserves its destination victim first
+     (Arm64CachedDestReg) and materializes the immediate directly into it,
+     removing the T0→victim mov hop per constant in write-back mode.
+- Evidence: carved leaf core of a two-arg LCG leaf shrank 14 → 9
+  instructions (`eor w14,w12,w13` consumes ABI regs directly; consts land in
+  value positions); remaining double-bounce (`mov x15,x14; mov x12,x15`) is
+  blocked by the x12 fixed-mapping conflict (result reg cannot share the
+  param's cache slot) — needs a result-register mapping design if pursued.
+- Serialized A/B under load (host ~3x slower than usual during this run —
+  absolute medians inflated equally on both sides, relative deltas valid):
+  fib(35) **−10.3%/−8.2%**, call −2.9%/−2.4%, both orders consistent.
+  Fib gains most because self-recursion executes the cleaned core.
+- Wasm.Jit.Arm64.Test's dynamic-write-back test re-pinned to the tighter
+  emission (28 bytes dead / 32 bytes one-spill, spill word at index 6).
+- x64 inert: the widened gate sits inside the ARM64 ifdef.
+- Next call-lane step (unbuilt): hoist per-call target/cap resolution across
+  backedges for proof-gated direct calls to compiled leaves — caller-side
+  plumbing (~22 instructions around each blr) dominates over the callee now.
 
 ## Wave 5 — v128 constant Q-hosts + vector static-cache admission REJECTED
 
