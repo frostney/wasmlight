@@ -1,5 +1,38 @@
 # Handoff
 
+Updated: 2026-08-22 (wave 2: GC field access through pointers + WASI RemoveTree fix)
+
+## Wave 2 — field/layout resolution and a test-harness hang
+
+- Lane `optimize/gc-field-access` from `1d8f188` (the wave-1 delivery head),
+  accepted commits `5bf5574` (`perf(gc): resolve struct and array fields
+  through pointers`) and `6d7eb49` (`fix(test): probe symlinks in the WASI
+  suite's RemoveTree`), fast-forwarded into `optimize/runtime-wave`. Local,
+  unpushed, delivery not requested.
+- Mechanism: StructField copied the resolved TWasmGcField record per access
+  and ArrayElement added a call layer plus a second copy; both re-resolved
+  layout every time. The candidate returns a PWasmGcField into the layout
+  table (StructFieldPtr) and folds null/kind/bounds/offset for scalar array
+  paths (ResolveElement); ReadField/WriteField/ExtendSigned take the field
+  by pointer.
+- Serialized gc A/B under the perf gate (7 samples, BASE-CAND-CAND-BASE):
+  116.743 → 104.604 ms forward and 104.531 vs 116.949 ms reverse (-10.5%
+  both orders, disjoint spreads). Guards in two rotated passes: loop
+  −1.0%/+0.1%, fib +0.5%/+1.2%, memory-load −2.2%/−4.0%,
+  memory-store −7.1%/−3.1%, simd +5.5%/−1.6%, startup +9.9%/−3.2% — the
+  simd/startup flips are short-process noise; no material regression.
+- Correctness on the combined head (`f0407e1` release binary): all 44 unit
+  suites pass; recursive corpus byte-identical in interpreter/JIT/AOT at
+  pass=65851 fail=368 skip=904 staged=0 errors=0, compiled=8799; format,
+  agents check, diff check, Markdown lint green.
+- Harness defect found by the wave: Wasm.Wasi.Test's RemoveTree relied on
+  faSymLink, which Darwin's FindFirst NEVER sets (it stats entries), so
+  `escape -> /etc` was recursed and system files were being unlinked; an
+  unlink there now wedges forever and hung any full-suite run that executed
+  the WASI suite (reproduced twice). Fixed with fpReadLink; suite drops
+  from hang to 2.7 s. Any environment where full suites stall in
+  Wasm.Wasi.Test should check for this class first.
+
 Updated: 2026-08-21 (gc allocation fast-path wave)
 
 ## GC allocation fast path
