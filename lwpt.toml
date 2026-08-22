@@ -44,3 +44,18 @@ stamp-version = { command = "instantfpc",
 # project-owned Pascal that is not a unit, so it is added explicitly.
 [format]
 include = ["scripts/*.pas"]
+
+# Analysis gates. Every limit sits just above the measured baseline
+# (lwpt health / lwpt duplication, 2026-08 audit): file cyclomatic 1147,
+# file cognitive 988, routine cyclomatic 497, routine cognitive 182,
+# duplication 9.3%. These are regression ratchets — CI fails when a
+# change pushes a metric past its ceiling; lowering a ceiling IS the
+# follow-up refactor, never a drive-by edit.
+[health]
+max-file-cyclomatic = 1200
+max-file-cognitive = 1050
+max-routine-cyclomatic = 520
+max-routine-cognitive = 200
+
+[duplication]
+maximum-percent = 10

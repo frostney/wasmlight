@@ -1279,7 +1279,7 @@ begin
     runner. Without this guard the bottom sentinel falls through to
     ConcreteAbsKind and raises exactly that. }
   if IsBotHeapType(A) then
-    raise EWasmValidationError.Create(
+    raise EWasmInternal.Create(
       'internal error: TopHeapType has no answer for the bottom heap '
       + 'type; the caller must test IsBotHeapType first');
 

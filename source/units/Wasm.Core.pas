@@ -312,6 +312,15 @@ type
   EWasmLinkError = class(EWasmError);
   EWasmTrap = class(EWasmError);
 
+  { An internal invariant failure: a "internal: ..." defect on a code path
+    the validator's type check proves unreachable for a validated module.
+    NOT part of the host-facing vocabulary above — those five classes mean
+    something about the MODULE or the invocation, this one means the
+    runtime contradicted its own proof. It stays under EWasmError so a
+    host's broadest handler still catches it, but it is never raised where
+    a module-facing class applies, and no module-facing path may raise it. }
+  EWasmInternal = class(EWasmError);
+
   { An uncaught WebAssembly exception (`throw` / `throw_ref`) that reached the
     invocation boundary with no `try_table` clause catching it. A SIBLING of
     EWasmTrap, not a subclass (see the hierarchy note above): the unwind that

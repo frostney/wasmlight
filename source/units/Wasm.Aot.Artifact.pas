@@ -519,7 +519,7 @@ begin
   { The header is exactly WAOT_HEADER_SIZE by construction; assert the invariant
     the reader relies on. }
   if Out_.Len <> WAOT_HEADER_SIZE then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: .waot header is %d bytes, expected %d',
       [Out_.Len, WAOT_HEADER_SIZE]);
   WBytes(Out_, Body.Buf);

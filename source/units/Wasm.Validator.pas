@@ -175,7 +175,7 @@ const
 function GroupMemberCount(const AKey: TWasmBytes): UInt32;
 begin
   if Length(AKey) < 4 then
-    raise EWasmError.Create('internal: malformed rec-group key');
+    raise EWasmInternal.Create('internal: malformed rec-group key');
   Result := UInt32(AKey[0]) or (UInt32(AKey[1]) shl 8) or
     (UInt32(AKey[2]) shl 16) or (UInt32(AKey[3]) shl 24);
 end;
@@ -189,7 +189,7 @@ var
   procedure Need(const ACount: Integer);
   begin
     if P + ACount > Length(Buf) then
-      raise EWasmError.Create('internal: rec-group key truncated');
+      raise EWasmInternal.Create('internal: rec-group key truncated');
   end;
 
   function ReadU32: UInt32;
@@ -206,7 +206,7 @@ var
     Engine: UInt32;
   begin
     if ALocal >= UInt32(Length(ACanonToEngine)) then
-      raise EWasmError.Create(
+      raise EWasmInternal.Create(
         'internal: rec-group key names an out-of-range out-of-group type');
     Engine := ACanonToEngine[ALocal];
     { High(UInt32) is the "not interned yet" marker the caller seeds the
@@ -214,7 +214,7 @@ var
       which is always already interned, so hitting it is an invariant
       violation, not a legal state. }
     if Engine = High(UInt32) then
-      raise EWasmError.Create(
+      raise EWasmInternal.Create(
         'internal: rec-group key names an un-interned out-of-group type');
     Buf[APos] := Byte(Engine and $FF);
     Buf[APos + 1] := Byte((Engine shr 8) and $FF);
@@ -278,11 +278,11 @@ var
                 MapCanonAt(Pos, Local);
               end;
           else
-            raise EWasmError.Create('internal: bad heap tag in rec-group key');
+            raise EWasmInternal.Create('internal: bad heap tag in rec-group key');
           end;
         end;
     else
-      raise EWasmError.Create('internal: bad value tag in rec-group key');
+      raise EWasmInternal.Create('internal: bad value tag in rec-group key');
     end;
   end;
 
@@ -362,7 +362,7 @@ begin
       KEY_COMP_ARRAY:
         RewriteFieldType;
     else
-      raise EWasmError.Create('internal: bad comp tag in rec-group key');
+      raise EWasmInternal.Create('internal: bad comp tag in rec-group key');
     end;
     Inc(I);
   end;

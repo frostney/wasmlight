@@ -83,7 +83,10 @@ canonical vocabulary before planning anything.
   guest-requested exit raised by WASI `proc_exit` — is a further sibling
   under `EWasmError`, declared in `Wasm.Engine`: it is neither a fault nor
   a `throw`, so never fold it into `EWasmTrap` or `EWasmException`; `run`
-  maps it to the process exit code.
+  maps it to the process exit code. Internal invariant defects — the
+  `"internal: ..."` sites on paths the validator's proof makes unreachable —
+  raise `EWasmInternal`, a leaf under `EWasmError`: never on a
+  module-facing path, and never in place of one of the classes above.
 - **A store belongs to one thread**
   ([ADR-0008](docs/adr/0008-a-store-is-confined-to-one-thread.md)). Do not
   add synchronisation to runtime structures "just in case" — that cost is

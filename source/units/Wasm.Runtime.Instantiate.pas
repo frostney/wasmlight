@@ -218,7 +218,7 @@ end;
 procedure CheckReg(const AReg, ACount: UInt32; const AWhat: string);
 begin
   if AReg >= ACount then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: constant expression names register %u of %u (%s)',
       [AReg, ACount, AWhat]);
 end;
@@ -231,7 +231,7 @@ function EngineIdOf(const AInstance: TWasmModuleInstance;
   const ATypeIndex: UInt32): TWasmEngineTypeId;
 begin
   if ATypeIndex >= UInt32(Length(AInstance.EngineTypeIds)) then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: constant expression names type %u of %u',
       [ATypeIndex, UInt32(Length(AInstance.EngineTypeIds))]);
   Result := AInstance.EngineTypeIds[ATypeIndex];
@@ -267,7 +267,7 @@ var
 
 begin
   if Length(AExpr.Code) = 0 then
-    raise EWasmError.Create(
+    raise EWasmInternal.Create(
       'internal: evaluating an absent constant expression');
 
   Count := AExpr.RegisterCount;
@@ -376,7 +376,7 @@ begin
           CheckReg(Instr.Dest, Count, 'ref.func');
           FuncIndex := UInt32(Instr.Imm);
           if FuncIndex >= UInt32(Length(AInstance.FuncAddrs)) then
-            raise EWasmError.CreateFmt(
+            raise EWasmInternal.CreateFmt(
               'internal: ref.func names function %u of %u',
               [FuncIndex, UInt32(Length(AInstance.FuncAddrs))]);
           Addr := AInstance.FuncAddrs[FuncIndex];
@@ -399,7 +399,7 @@ begin
           CheckReg(Instr.Dest, Count, 'global.get');
           GlobalIndex := UInt32(Instr.Imm);
           if GlobalIndex >= UInt32(Length(AInstance.GlobalAddrs)) then
-            raise EWasmError.CreateFmt(
+            raise EWasmInternal.CreateFmt(
               'internal: global.get names global %u of %u',
               [GlobalIndex, UInt32(Length(AInstance.GlobalAddrs))]);
           Addr := AInstance.GlobalAddrs[GlobalIndex];
@@ -712,7 +712,7 @@ begin
       AIr.TableInits[ADefinedIndex]).Ref);
 
   if not AIr.Tables[ModuleIndex].RefType.Nullable then
-    raise EWasmError.CreateFmt(
+    raise EWasmInternal.CreateFmt(
       'internal: table %u has a non-nullable element type and no '
       + 'initialiser', [ModuleIndex]);
   Result := WASM_REF_NULL;
@@ -1004,7 +1004,7 @@ begin
     if (Span.Size > 0) and
       ((ABytes = nil) or (Span.Offset > ABytesLength) or
        (Span.Size > ABytesLength - Span.Offset)) then
-      raise EWasmError.CreateFmt(
+      raise EWasmInternal.CreateFmt(
         'internal: data segment %d spans [%u, %u) outside a %u-byte '
         + 'buffer', [Index, UInt64(Span.Offset),
         UInt64(Span.Offset) + UInt64(Span.Size), UInt64(ABytesLength)]);
