@@ -14,13 +14,21 @@ name: PR
 # the same release tag and are verified against the committed lockfile +
 # .lwpt/modules tree via install --frozen.
 
+# No `branches:` filter on purpose. That key matches the pull request's BASE,
+# so a stacked pull request — one whose base is the layer below it rather
+# than main — was skipped entirely (the gap stack gh-15 hit on #13/#14).
+# Every pull request runs this workflow whatever its base.
+#
+# Widening the trigger multiplies runs across a stack, so supersede rather
+# than accumulate: a new push cancels the previous run for the same pull
+# request, keeping the verdict attached to the current head.
 on:
-  # Every PR, whatever its base — native stacks give intermediate layers a
-  # non-main base branch, and the fast gate must run on those too (the
-  # workflow file a stacked PR executes comes from its own base ref, so the
-  # fix has to be on main before stacked layers can see it).
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
