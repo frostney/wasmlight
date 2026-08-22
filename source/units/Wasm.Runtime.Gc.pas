@@ -196,6 +196,7 @@ type
 
   TWasmGcFields = array of TWasmGcField;
   TWasmGcOffsets = array of UInt32;
+  PWasmGcField = ^TWasmGcField;
 
   PWasmGcLayout = ^TWasmGcLayout;
 
@@ -451,9 +452,15 @@ type
       const AValue: TWasmValue);
     procedure ReleaseObject(const ACell: PByte);
 
-    function LayoutOf(const ARef: TWasmRef): PWasmGcLayout;
+    function LayoutOf(const ARef: TWasmRef): PWasmGcLayout; inline;
+    { Pointer variant of StructField: the hot get/set paths index straight
+      into the layout table instead of copying the field record out. }
+    function StructFieldPtr(const ARef: TWasmRef;
+      const AField: UInt32): PWasmGcField; inline;
     function StructField(const ARef: TWasmRef;
       const AField: UInt32): TWasmGcField;
+    procedure ResolveElement(const ARef: TWasmRef;
+      const AIndex: UInt32; out ABase: PByte; out AField: TWasmGcField); inline;
     function ArrayElement(const ARef: TWasmRef;
       const AIndex: UInt32): TWasmGcField;
 
@@ -1525,22 +1532,22 @@ begin
 end;
 
 function ReadField(const ABase: PByte;
-  const AField: TWasmGcField): TWasmValue;
+  const AField: PWasmGcField): TWasmValue;
 begin
   { Bits is the canonical raw view and every read fills the whole slot,
     which is the same rule Wasm.Runtime.Values imposes on a register: a
     stale high half would be traced as a pointer. }
   Result.Bits := 0;
-  if AField.IsRef then
+  if AField^.IsRef then
   begin
-    Result.Bits := UInt64(PWasmRef(ABase + AField.Offset)^);
+    Result.Bits := UInt64(PWasmRef(ABase + AField^.Offset)^);
     Exit;
   end;
-  case AField.Width of
-    1: Result.Bits := UInt64(PWasmU8(ABase + AField.Offset)^);
-    2: Result.Bits := UInt64(PWasmU16(ABase + AField.Offset)^);
-    4: Result.Bits := UInt64(PWasmU32(ABase + AField.Offset)^);
-    8: Result.Bits := PWasmU64(ABase + AField.Offset)^;
+  case AField^.Width of
+    1: Result.Bits := UInt64(PWasmU8(ABase + AField^.Offset)^);
+    2: Result.Bits := UInt64(PWasmU16(ABase + AField^.Offset)^);
+    4: Result.Bits := UInt64(PWasmU32(ABase + AField^.Offset)^);
+    8: Result.Bits := PWasmU64(ABase + AField^.Offset)^;
     { Width 16 (v128) does not have an 8-byte scalar view: a v128 field is
       read only through ReadFieldV128, driven by the iroStructGetVec /
       iroArrayGetVec ops. The scalar path never asks for a v128 value —
@@ -1551,33 +1558,33 @@ end;
 
 { A 16-byte copy at the field's offset (simd-spec §7). A v128 is never
   packed, never a reference: no truncation, no sign-extension, no barrier. }
-procedure ReadFieldV128(const ABase: PByte; const AField: TWasmGcField;
+procedure ReadFieldV128(const ABase: PByte; const AField: PWasmGcField;
   const ADest: PWasmV128);
 begin
-  Move((ABase + AField.Offset)^, ADest^, 16);
+  Move((ABase + AField^.Offset)^, ADest^, 16);
 end;
 
-procedure WriteFieldV128(const ABase: PByte; const AField: TWasmGcField;
+procedure WriteFieldV128(const ABase: PByte; const AField: PWasmGcField;
   const ASrc: PWasmV128);
 begin
-  Move(ASrc^, (ABase + AField.Offset)^, 16);
+  Move(ASrc^, (ABase + AField^.Offset)^, 16);
 end;
 
-procedure WriteField(const ABase: PByte; const AField: TWasmGcField;
+procedure WriteField(const ABase: PByte; const AField: PWasmGcField;
   const AValue: TWasmValue);
 begin
-  if AField.IsRef then
+  if AField^.IsRef then
   begin
-    PWasmRef(ABase + AField.Offset)^ := TWasmRef(AValue.Bits);
+    PWasmRef(ABase + AField^.Offset)^ := TWasmRef(AValue.Bits);
     Exit;
   end;
   { A packed store TRUNCATES (`aux-packfield`), which the narrow store
     does by itself. }
-  case AField.Width of
-    1: PWasmU8(ABase + AField.Offset)^ := Byte(AValue.Bits);
-    2: PWasmU16(ABase + AField.Offset)^ := Word(AValue.Bits);
-    4: PWasmU32(ABase + AField.Offset)^ := UInt32(AValue.Bits);
-    8: PWasmU64(ABase + AField.Offset)^ := AValue.Bits;
+  case AField^.Width of
+    1: PWasmU8(ABase + AField^.Offset)^ := Byte(AValue.Bits);
+    2: PWasmU16(ABase + AField^.Offset)^ := Word(AValue.Bits);
+    4: PWasmU32(ABase + AField^.Offset)^ := UInt32(AValue.Bits);
+    8: PWasmU64(ABase + AField^.Offset)^ := AValue.Bits;
     { Width 16 (v128) is written only through WriteFieldV128 (the *Vec IR
       ops). The one scalar caller that names a v128 field is the
       new_default zeroing loop, and a v128's default is the zero the cell
@@ -1586,22 +1593,22 @@ begin
 end;
 
 function ExtendSigned(const AValue: TWasmValue;
-  const AField: TWasmGcField): Int32;
+  const AField: PWasmGcField): Int32;
 begin
   { `aux-unpackfield` sign-extends from the packed width. Written out
     rather than left to a cast so the i8 and i16 cases are visibly the
     same rule at two widths. }
-  if not AField.IsPacked then
+  if not AField^.IsPacked then
     raise EWasmError.Create(
       'internal: get_s on a field that is not packed');
-  if AField.PackedKind = wpkI8 then
+  if AField^.PackedKind = wpkI8 then
     Result := Int32(Int8(Byte(AValue.Bits)))
   else
     Result := Int32(Int16(Word(AValue.Bits)));
 end;
 
-function TWasmGcHeap.StructField(const ARef: TWasmRef;
-  const AField: UInt32): TWasmGcField;
+function TWasmGcHeap.StructFieldPtr(const ARef: TWasmRef;
+  const AField: UInt32): PWasmGcField;
 var
   Layout: PWasmGcLayout;
 begin
@@ -1617,7 +1624,13 @@ begin
     raise EWasmError.CreateFmt(
       'internal: struct field %u of %u', [AField,
       UInt32(Length(Layout^.Fields))]);
-  Result := Layout^.Fields[AField];
+  Result := @Layout^.Fields[AField];
+end;
+
+function TWasmGcHeap.StructField(const ARef: TWasmRef;
+  const AField: UInt32): TWasmGcField;
+begin
+  Result := StructFieldPtr(ARef, AField)^;
 end;
 
 function TWasmGcHeap.StructFieldCount(const ARef: TWasmRef): UInt32;
@@ -1630,10 +1643,10 @@ end;
 function TWasmGcHeap.StructGet(const ARef: TWasmRef;
   const AField: UInt32): TWasmValue;
 var
-  Field: TWasmGcField;
+  Field: PWasmGcField;
 begin
-  Field := StructField(ARef, AField);
-  if Field.IsPacked then
+  Field := StructFieldPtr(ARef, AField);
+  if Field^.IsPacked then
     raise EWasmError.Create(
       'internal: struct.get on a packed field needs get_s or get_u');
   Result := ReadField(PByte(RefToPointer(ARef)), Field);
@@ -1642,20 +1655,19 @@ end;
 function TWasmGcHeap.StructGetSigned(const ARef: TWasmRef;
   const AField: UInt32): Int32;
 var
-  Field: TWasmGcField;
+  Field: PWasmGcField;
 begin
-  Field := StructField(ARef, AField);
-  Result := ExtendSigned(ReadField(PByte(RefToPointer(ARef)), Field),
-    Field);
+  Field := StructFieldPtr(ARef, AField);
+  Result := ExtendSigned(ReadField(PByte(RefToPointer(ARef)), Field), Field);
 end;
 
 function TWasmGcHeap.StructGetUnsigned(const ARef: TWasmRef;
   const AField: UInt32): UInt32;
 var
-  Field: TWasmGcField;
+  Field: PWasmGcField;
 begin
-  Field := StructField(ARef, AField);
-  if not Field.IsPacked then
+  Field := StructFieldPtr(ARef, AField);
+  if not Field^.IsPacked then
     raise EWasmError.Create('internal: get_u on a field that is not packed');
   { Zero extension is what the narrow read already did. }
   Result := UInt32(ReadField(PByte(RefToPointer(ARef)), Field).Bits);
@@ -1664,24 +1676,24 @@ end;
 procedure TWasmGcHeap.StructSet(const ARef: TWasmRef; const AField: UInt32;
   const AValue: TWasmValue);
 var
-  Field: TWasmGcField;
+  Field: PWasmGcField;
 begin
-  Field := StructField(ARef, AField);
+  Field := StructFieldPtr(ARef, AField);
   WriteField(PByte(RefToPointer(ARef)), Field, AValue);
-  if Field.IsRef then
+  if Field^.IsRef then
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
 end;
 
 procedure TWasmGcHeap.StructGetVec(const ARef: TWasmRef; const AField: UInt32;
   const ADest: PWasmV128);
 begin
-  ReadFieldV128(PByte(RefToPointer(ARef)), StructField(ARef, AField), ADest);
+  ReadFieldV128(PByte(RefToPointer(ARef)), StructFieldPtr(ARef, AField), ADest);
 end;
 
 procedure TWasmGcHeap.StructSetVec(const ARef: TWasmRef; const AField: UInt32;
   const ASrc: PWasmV128);
 begin
-  WriteFieldV128(PByte(RefToPointer(ARef)), StructField(ARef, AField), ASrc);
+  WriteFieldV128(PByte(RefToPointer(ARef)), StructFieldPtr(ARef, AField), ASrc);
 end;
 
 procedure TWasmGcHeap.StructSetDefaults(const ARef: TWasmRef);
@@ -1705,7 +1717,7 @@ begin
       because the validator should have rejected the module. }
     if not Layout^.Fields[Index].HasDefault then
       raise EWasmError.CreateFmt(MSG_GC_STRUCT_FIELD_NO_DEFAULT, [Index]);
-    WriteField(PByte(RefToPointer(ARef)), Layout^.Fields[Index], Value);
+    WriteField(PByte(RefToPointer(ARef)), @Layout^.Fields[Index], Value);
   end;
 end;
 
@@ -1736,60 +1748,93 @@ begin
   Result.Offset := Result.Offset + AIndex * Result.Width;
 end;
 
+{ The shared resolve behind the scalar array accessors: null check (O-5,
+  'null array reference'), kind check, bounds check, then the element's
+  field record with its per-index offset applied. Resolving inline instead
+  of calling ArrayElement keeps one call layer and one record copy off
+  each access. }
+procedure TWasmGcHeap.ResolveElement(const ARef: TWasmRef;
+  const AIndex: UInt32; out ABase: PByte; out AField: TWasmGcField); inline;
+var
+  Layout: PWasmGcLayout;
+begin
+  if RefIsNull(ARef) then
+    TrapNow(wtkNullArrayReference);
+  Layout := LayoutOf(ARef);
+  if Layout^.Kind <> wckArray then
+    raise EWasmError.Create('internal: not an array instance');
+  if AIndex >= ArrayLength(ARef) then
+    TrapNow(wtkArrayOutOfBounds);
+  ABase := PByte(RefToPointer(ARef));
+  AField := Layout^.Elem;
+  AField.Offset := AField.Offset + AIndex * AField.Width;
+end;
+
 function TWasmGcHeap.ArrayGet(const ARef: TWasmRef;
   const AIndex: UInt32): TWasmValue;
 var
+  Base: PByte;
   Field: TWasmGcField;
 begin
-  Field := ArrayElement(ARef, AIndex);
+  ResolveElement(ARef, AIndex, Base, Field);
   if Field.IsPacked then
     raise EWasmError.Create(
       'internal: array.get on a packed element needs get_s or get_u');
-  Result := ReadField(PByte(RefToPointer(ARef)), Field);
+  Result := ReadField(Base, @Field);
 end;
 
 function TWasmGcHeap.ArrayGetSigned(const ARef: TWasmRef;
   const AIndex: UInt32): Int32;
 var
+  Base: PByte;
   Field: TWasmGcField;
 begin
-  Field := ArrayElement(ARef, AIndex);
-  Result := ExtendSigned(ReadField(PByte(RefToPointer(ARef)), Field),
-    Field);
+  ResolveElement(ARef, AIndex, Base, Field);
+  Result := ExtendSigned(ReadField(Base, @Field), @Field);
 end;
 
 function TWasmGcHeap.ArrayGetUnsigned(const ARef: TWasmRef;
   const AIndex: UInt32): UInt32;
 var
+  Base: PByte;
   Field: TWasmGcField;
 begin
-  Field := ArrayElement(ARef, AIndex);
+  ResolveElement(ARef, AIndex, Base, Field);
   if not Field.IsPacked then
     raise EWasmError.Create('internal: get_u on an element that is not packed');
-  Result := UInt32(ReadField(PByte(RefToPointer(ARef)), Field).Bits);
+  Result := UInt32(ReadField(Base, @Field).Bits);
 end;
 
 procedure TWasmGcHeap.ArraySet(const ARef: TWasmRef; const AIndex: UInt32;
   const AValue: TWasmValue);
 var
+  Base: PByte;
   Field: TWasmGcField;
 begin
-  Field := ArrayElement(ARef, AIndex);
-  WriteField(PByte(RefToPointer(ARef)), Field, AValue);
+  ResolveElement(ARef, AIndex, Base, Field);
+  WriteField(Base, @Field, AValue);
   if Field.IsRef then
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
 end;
 
 procedure TWasmGcHeap.ArrayGetVec(const ARef: TWasmRef; const AIndex: UInt32;
   const ADest: PWasmV128);
+var
+  Base: PByte;
+  Field: TWasmGcField;
 begin
-  ReadFieldV128(PByte(RefToPointer(ARef)), ArrayElement(ARef, AIndex), ADest);
+  ResolveElement(ARef, AIndex, Base, Field);
+  ReadFieldV128(Base, @Field, ADest);
 end;
 
 procedure TWasmGcHeap.ArraySetVec(const ARef: TWasmRef; const AIndex: UInt32;
   const ASrc: PWasmV128);
+var
+  Base: PByte;
+  Field: TWasmGcField;
 begin
-  WriteFieldV128(PByte(RefToPointer(ARef)), ArrayElement(ARef, AIndex), ASrc);
+  ResolveElement(ARef, AIndex, Base, Field);
+  WriteFieldV128(Base, @Field, ASrc);
 end;
 
 { The v128 twin of FillRange: layout, base and length read ONCE, the range
@@ -1819,7 +1864,7 @@ begin
   while Cursor < ACount do
   begin
     Field.Offset := ElemOffset + (AOffset + Cursor) * ElemWidth;
-    WriteFieldV128(Base, Field, ASrc);
+    WriteFieldV128(Base, @Field, ASrc);
     Inc(Cursor);
   end;
 end;
@@ -1858,7 +1903,7 @@ begin
   while Cursor < ACount do
   begin
     Field.Offset := ElemOffset + (AOffset + Cursor) * ElemWidth;
-    WriteField(Base, Field, AValue);
+    WriteField(Base, @Field, AValue);
     Inc(Cursor);
   end;
   { One barrier for the whole fill rather than one per element — the value
@@ -1964,8 +2009,8 @@ begin
       (ASrcIdx + Slot) * SrcLayout^.Elem.Width;
     DestField.Offset := DestLayout^.Elem.Offset +
       (ADestIdx + Slot) * DestLayout^.Elem.Width;
-    Value := ReadField(SrcBase, SrcField);
-    WriteField(DestBase, DestField, Value);
+    Value := ReadField(SrcBase, @SrcField);
+    WriteField(DestBase, @DestField, Value);
     { Barriered per reference element (empty in v1; the site is the point). }
     if DestField.IsRef then
       WriteBarrier(ADest, TWasmRef(Value.Bits));
