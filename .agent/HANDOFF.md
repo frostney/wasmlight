@@ -1,5 +1,38 @@
 # Handoff
 
+Updated: 2026-08-22 (wave 3 candidate rejected; scalar memory + simd profiled)
+
+## Wave 3 — static cache for vector loops REJECTED and reverted
+
+- Lane `optimize/vec-static-cache` from `4d83d63`: admitted the natively
+  emitted vector op set (Arm64NativeVecOp/X64NativeVecOp — identical lists)
+  into StaticCacheOp and restricted cache-slot selection to wvkNum slots.
+  Built clean, results verified, but serialized simd A/B measured a
+  regression: cand medians 11.122/11.335 ms vs base 10.686/10.312 ms
+  (+4–10%, both orders). The extended-frame prologue plus per-exit
+  write-back cost more than caching the loop counter saved. Fully
+  reverted; nothing remains in the tree.
+- Profile facts recorded for the next lanes (both from `sample(1)` on long
+  AOT runs of scaled workload modules):
+  - Scalar memory-load/store: 100% of samples inside generated code, zero
+    helper crossings. The ~1.34x/1.51x residual vs Wasmtime is pure
+    codegen quality (loop overhead amortized over one access), not chokepoint
+    or helper cost — heavily mined territory (five prior waves, several
+    recorded rejections).
+  - SIMD workload: also 100% generated code now (PR #10 closed the helper
+    crossings). The disassembly shows the remaining cost is spill/reload
+    traffic through canonical frame slots and per-iteration rebuilding of
+    v128 constants (two movz/movk pairs + slot stores + Q load every
+    iteration). The bounded counter-caching lane above did not pay for it;
+    what remains is a Q-register static cache entry for vector locals
+    (v16-v31 are caller-saved and these functions are call-free) and/or
+    loop-invariant constant hoisting — both new machinery in both backends,
+    each its own future wave.
+- GC native inline allocation in the JIT/AOT backends remains the largest
+  open gap (gc ~104 ms vs Wasmtime ~28 ms): inline bump/free-list fast path
+  with the collect-slow-path call as the safepoint, per ADR-0011's
+  allocation-site stack-map obligation. Also its own wave.
+
 Updated: 2026-08-22 (wave 2: GC field access through pointers + WASI RemoveTree fix)
 
 ## Wave 2 — field/layout resolution and a test-harness hang
