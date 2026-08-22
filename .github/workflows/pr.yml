@@ -15,9 +15,11 @@ name: PR
 # .lwpt/modules tree via install --frozen.
 
 on:
+  # Every PR, whatever its base — native stacks give intermediate layers a
+  # non-main base branch, and the fast gate must run on those too (the
+  # workflow file a stacked PR executes comes from its own base ref, so the
+  # fix has to be on main before stacked layers can see it).
   pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
