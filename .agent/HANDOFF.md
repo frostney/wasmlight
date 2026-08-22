@@ -1,6 +1,45 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 10: StructSetSeq accepted — gc −4%/−1%)
+Updated: 2026-08-22 (wave 11 scoping: inline-alloc design RESOLVED, not built)
+
+## Wave 11 — inline struct.new allocation: design finalized, execution deferred
+
+- Scoping pass produced every remaining design answer; implementation did
+  not start (GC-critical surface + late-session budget). Build order for the
+  dedicated session:
+  1. PROBES: mirror WasmJitFrameOffsets' uninitialized-local address trick.
+     Needed: (a) Gc-unit probe for TWasmGcHeap privates {FFree[0] base,
+     FMarkState, FBytesLive, FBytesAllocated, ObjectCount}; (b) Store-unit
+     probe for {TWasmStore.FHeap} and {TWasmModuleInstance.EngineTypeIds} —
+     both classes, so the probe constructs a throwaway Engine/Store/Instance,
+     takes field addresses, frees, caches lazily. Block-field offsets
+     (Base@8, Allocated dyn-array ptr) are computable in the backend directly
+     if TWasmGcBlock is interface-visible (verify).
+  2. ENTRY ABI DECISION (pick one): load the runtime engine type id via the
+     context chain (~7 instructions per alloc: ctx.Acts[Depth-1].Instance.
+     EngineTypeIds[idx]; all offsets already probed except EngineTypeIds),
+     OR pass Instance as a new compiled-entry argument (x5) — cleaner code
+     but bumps the entry ABI fingerprint (fails old artifacts closed) and
+     touches both InvokeCompiled marshals + AOT wiring.
+  3. FAST PATH (free-list hit ONLY; miss → existing AllocStruct dispatch
+     sequence emitted inline as the slow branch — it remains THE collect
+     safepoint per ADR-0011): head = [heap+FFree0+cls*8]; cbz → slow; pop
+     link; bitmap word |= bit (cell = diff >> log2CellSize — POW2 CLASSES
+     ONLY initially, {16,32,64,128,256}, others decline to helper); tail
+     zero ≤ 8 bytes (decline larger); header := markState | kindConst<<2 |
+     typeId<<32; counters BytesLive/BytesAllocated += CellSize, ObjectCount++
+     (~7 instrs, non-negotiable); numeric field stores at baked offsets
+     (truncating strb/strh like WriteField); publish Dest last.
+  4. DECLINES: any ref field (barrier shape), v128 field, non-pow2 cell,
+     tail > 8, struct.new_default (defaults loop differs).
+  5. GATES: differential gc module exercising free-list reuse across a
+     forced collect; corpus ×3 tiers; byte-pin test for the sequence.
+- ZeroCell shrink question remains open (needs the nothing-reads-raw-bytes
+  proof) but is INDEPENDENT: fast path can keep full ZeroCell semantics by
+  simply declining to skip it (zeroing stays in the slow path; fast path
+  writes header+fields over recycled bytes whose stale content is only
+  reachable through fields it immediately overwrites or tail bytes it
+  zeroes — write the argument down either way).
 
 ## Wave 10 — struct.new fills resolve layout once ACCEPTED (small)
 
