@@ -970,6 +970,37 @@ begin
   ]);
 end;
 
+{ Wave 11 differential: ONE struct type, and a body that drops a live struct
+  and allocates again. With Threshold=0 (set by the test) the second
+  struct.new collects first, sweeps the dropped cell onto its free list, and
+  the compiled fast path pops that RECYCLED cell — stale header, poison bytes
+  in padding and all — then writes its own header and field. Both tiers must
+  observe the identical fresh value, which is only possible if every byte any
+  instruction can name is rewritten by the fast path. }
+function GcReuseModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $01, $7F, $01]),                    { 0: struct (mut i32) }
+      BLit([$60, $01, $7F, $01, $7F])])),            { 1: (i32)->i32 }
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(7, VecOf([ExportEntry('reuse', $00, 0)])),
+    Sect(10, VecOf([
+      CodeEntry([$01, $01, $63, $00,                  { local (ref null 0) }
+        $20, $00,                                     { local.get 0 }
+        $FB, $00, $00,                                { struct.new 0 -> A }
+        $21, $01,                                     { local.set 1 }
+        $D0, $00,                                     { ref.null 0 }
+        $21, $01,                                     { drop A }
+        $20, $00, $41, $01, $6A,                      { arg + 1 }
+        $FB, $00, $00,                                { struct.new 0 -> B recycles A }
+        $21, $01,
+        $20, $01,                                     { local.get 1 }
+        $FB, $02, $00, $00,                           { struct.get 0 0 }
+        $0B])]))]);
+end;
+
 { GC arrays. type 0 = array (mut i32); type 1 = array (mut i8) packed. Round-
   trip, length, packed sign/zero get, and an out-of-bounds get (a 'out of
   bounds array access' trap). }
@@ -1471,6 +1502,7 @@ type
     procedure TestArrayOobTrap;
     procedure TestI31;
     procedure TestGcMidBodyCollectionWalkable;
+    procedure TestGcInlineAllocFreeListReuse;
 
     { --- Wave 6: v128 SIMD via the Wasm.Interp.Vector leaves --------- }
     procedure TestSimdCompute;
@@ -3291,7 +3323,7 @@ begin
     [MakeValueI32($FF)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   { struct.set (barriered) then read back. }
   Expect<Boolean>(DiffFresh(GcStructModuleBytes, 'setget',
-    [MakeValueI32(777)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+    [MakeValueI32(777)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF})
 end;
 
 procedure TJitTests.TestArrayRoundTrip;
@@ -3323,6 +3355,17 @@ begin
   DiffFresh(I31ModuleBytes, 'null_trap', []);
   Expect<string>(TrapMessageOf(I31ModuleBytes, 'null_trap', []))
     .ToBe('null i31 reference');
+end;
+
+procedure TJitTests.TestGcInlineAllocFreeListReuse;
+begin
+  { Threshold 0 makes EVERY allocation collect, so the second struct.new runs
+    the compiled fast path over a cell the sweep just recycled. The result
+    must be exactly arg+1 under BOTH tiers — stale header or poison bytes
+    surfacing anywhere would diverge or fault. }
+  FDiffThreshold := 0;
+  Expect<Boolean>(DiffFresh(GcReuseModuleBytes, 'reuse',
+    [MakeValueI32(41)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
 procedure TJitTests.TestGcMidBodyCollectionWalkable;
@@ -3549,6 +3592,8 @@ begin
   Test('i31 ref/get_s/get_u and null trap match', TestI31);
   Test('a mid-body collection keeps a live ref (compiled frame is GC-walkable)',
     TestGcMidBodyCollectionWalkable);
+  Test('inline struct.new reuses a recycled cell across forced collects',
+    TestGcInlineAllocFreeListReuse);
 
   Test('v128 const/splat/extract/replace/add/eq/shuffle/swizzle match',
     TestSimdCompute);

@@ -768,6 +768,26 @@ function GcConvertInner(const ARef: TWasmRef): TWasmRef;
   this map through Wasm.Runtime.Store.IsRefOfRefType unchanged. }
 function GcAbsKindOf(const AKind: TWasmObjKind): TWasmAbsHeapType;
 
+{ The TWasmGcHeap / TWasmGcBlock field offsets the JIT's inline-allocation
+  fast path bakes into generated code (wave 11). The heap fields are private,
+  so the probe lives in this unit and answers through a throwaway
+  Types+Heap pair that is constructed once, measured, and freed; only field
+  ADDRESSES are ever taken. Block offsets come from an uninitialised record
+  local the same way WasmJitFrameOffsets reads records — FPC nils the managed
+  Allocated field at declaration and nothing dereferences it. }
+type
+  TWasmJitGcOffsets = record
+    HeapFFree0: NativeUInt;        { TWasmGcHeap.FFree[0] — class k at +k*8 }
+    HeapMarkState: NativeUInt;     { TWasmGcHeap.FMarkState }
+    HeapBytesLive: NativeUInt;     { TWasmGcHeap.FBytesLive }
+    HeapBytesAllocated: NativeUInt;
+    HeapObjectCount: NativeUInt;   { TWasmGcHeap.FObjectCount }
+    BlockBase: NativeUInt;         { TWasmGcBlock.Base }
+    BlockAllocated: NativeUInt;    { TWasmGcBlock.Allocated (dyn-array ptr) }
+  end;
+
+function WasmJitGcHeapOffsets: TWasmJitGcOffsets;
+
 implementation
 
 type
@@ -784,6 +804,50 @@ type
   that reallocated FLayouts during that window would dangle the pointer. }
 threadvar
   GWasmGcCollecting: Boolean;
+
+var
+  GJitGcOffsets: TWasmJitGcOffsets;
+  GJitGcOffsetsValid: Boolean = False;
+
+function WasmJitGcHeapOffsets: TWasmJitGcOffsets;
+var
+  Types: TWasmGcTypes;
+  Heap: TWasmGcHeap;
+  Block: TWasmGcBlock;
+begin
+  { Layout is fixed per class, so the answer is computed once over a real,
+    empty heap and cached. Construction has no observable side effect: an
+    empty heap owns no blocks, and the borrowed Types outlives it. }
+  if not GJitGcOffsetsValid then
+  begin
+    Types := TWasmGcTypes.Create;
+    try
+      Heap := TWasmGcHeap.Create(Types);
+      try
+        GJitGcOffsets.HeapFFree0 :=
+          PtrUInt(@Heap.FFree[0]) - PtrUInt(Pointer(Heap));
+        GJitGcOffsets.HeapMarkState :=
+          PtrUInt(@Heap.FMarkState) - PtrUInt(Pointer(Heap));
+        GJitGcOffsets.HeapBytesLive :=
+          PtrUInt(@Heap.FBytesLive) - PtrUInt(Pointer(Heap));
+        GJitGcOffsets.HeapBytesAllocated :=
+          PtrUInt(@Heap.FBytesAllocated) - PtrUInt(Pointer(Heap));
+        GJitGcOffsets.HeapObjectCount :=
+          PtrUInt(@Heap.FObjectCount) - PtrUInt(Pointer(Heap));
+        GJitGcOffsets.BlockBase :=
+          PtrUInt(@Block.Base) - PtrUInt(@Block);
+        GJitGcOffsets.BlockAllocated :=
+          PtrUInt(@Block.Allocated) - PtrUInt(@Block);
+      finally
+        Heap.Free;
+      end;
+    finally
+      Types.Free;
+    end;
+    GJitGcOffsetsValid := True;
+  end;
+  Result := GJitGcOffsets;
+end;
 
 { --- allocation bitmap --------------------------------------------------- }
 

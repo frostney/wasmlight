@@ -974,11 +974,75 @@ type
     MemInstStride: NativeUInt;       { SizeOf(TWasmMemoryInst) }
     MemBase: NativeUInt;             { TWasmMemoryInst.Base }
     MemByteSize: NativeUInt;         { TWasmMemoryInst.ByteSize }
+    { Wave 11 inline-allocation fast path: the three runtime anchors generated
+      code walks for a struct.new — the store's GC heap, the per-store
+      interpreter context, and the instance's engine-id map. All are folded
+      into the AOT ABI fingerprint like every other baked offset. }
+    StoreFHeap: NativeUInt;          { TWasmStore.FHeap }
+    StoreTierContext: NativeUInt;    { TWasmStore.TierContext }
+    InstEngineTypeIds: NativeUInt;   { TWasmModuleInstance.EngineTypeIds }
   end;
 
 function WasmJitOffsets(const AStore: TWasmStore): TWasmJitOffsets;
 
+{ The wave-11 inline-allocation anchors as a layout-only, parameterless
+  probe: the store-relative heap and tier-context offsets plus the module
+  instance's engine-id map offset. Computed once over a throwaway
+  Engine+Store+Instance trio and cached — object layouts are fixed per
+  class, so one measurement answers for every future instance, and no live
+  store is needed at JIT staging time. }
+type
+  TWasmJitStoreAllocOffsets = record
+    FHeapOffset: NativeUInt;
+    TierContextOffset: NativeUInt;
+    EngineTypeIdsOffset: NativeUInt;
+  end;
+
+function WasmJitStoreAllocOffsets: TWasmJitStoreAllocOffsets;
+
 implementation
+
+var
+  { Lazy cache for WasmJitOffsets' InstEngineTypeIds probe; -1 until measured. }
+  GJitInstEngineTypeIdsOffset: NativeInt = -1;
+
+var
+  GJitStoreAllocOffsets: TWasmJitStoreAllocOffsets;
+  GJitStoreAllocOffsetsValid: Boolean = False;
+
+function WasmJitStoreAllocOffsets: TWasmJitStoreAllocOffsets;
+var
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Inst: TWasmModuleInstance;
+begin
+  if not GJitStoreAllocOffsetsValid then
+  begin
+    Engine := TWasmEngine.Create;
+    try
+      Store := TWasmStore.Create(Engine);
+      try
+        GJitStoreAllocOffsets.FHeapOffset :=
+          PtrUInt(@Store.FHeap) - PtrUInt(Pointer(Store));
+        GJitStoreAllocOffsets.TierContextOffset :=
+          PtrUInt(@Store.TierContext) - PtrUInt(Pointer(Store));
+        Inst := TWasmModuleInstance.Create;
+        try
+          GJitStoreAllocOffsets.EngineTypeIdsOffset :=
+            PtrUInt(@Inst.EngineTypeIds) - PtrUInt(Pointer(Inst));
+        finally
+          Inst.Free;
+        end;
+      finally
+        Store.Free;
+      end;
+    finally
+      Engine.Free;
+    end;
+    GJitStoreAllocOffsetsValid := True;
+  end;
+  Result := GJitStoreAllocOffsets;
+end;
 
 { --- module space to engine space ---------------------------------------- }
 
@@ -2293,6 +2357,26 @@ function WasmJitOffsets(const AStore: TWasmStore): TWasmJitOffsets;
 var
   F: TWasmFuncInst;
   M: TWasmMemoryInst;
+  Inst: TWasmModuleInstance;
+
+  function ProbeEngineTypeIds: NativeUInt;
+  begin
+    { The engine-id map is one field on a plain class, so a throwaway
+      instance answers the offset; cached because the fingerprint and every
+      staged allocating function ask for it. }
+    if GJitInstEngineTypeIdsOffset < 0 then
+    begin
+      Inst := TWasmModuleInstance.Create;
+      try
+        GJitInstEngineTypeIdsOffset :=
+          NativeInt(PtrUInt(@Inst.EngineTypeIds) - PtrUInt(Pointer(Inst)));
+      finally
+        Inst.Free;
+      end;
+    end;
+    Result := NativeUInt(GJitInstEngineTypeIdsOffset);
+  end;
+
 begin
   { Only the ADDRESSES of fields are taken, never their values, so the
     uninitialised locals F and M are not read. }
@@ -2301,6 +2385,10 @@ begin
     PtrUInt(@AStore.EpochSnapshot) - PtrUInt(Pointer(AStore));
   Result.StoreJitHelperTable :=
     PtrUInt(@AStore.JitHelperTable) - PtrUInt(Pointer(AStore));
+  Result.StoreFHeap := PtrUInt(@AStore.FHeap) - PtrUInt(Pointer(AStore));
+  Result.StoreTierContext :=
+    PtrUInt(@AStore.TierContext) - PtrUInt(Pointer(AStore));
+  Result.InstEngineTypeIds := ProbeEngineTypeIds;
   Result.FuncInstStride := SizeOf(TWasmFuncInst);
   Result.FuncKind := PtrUInt(@F.Kind) - PtrUInt(@F);
   Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);
