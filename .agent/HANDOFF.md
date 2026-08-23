@@ -1,6 +1,83 @@
 # Handoff
 
-Updated: 2026-08-23 (PR #19 CI repair validated locally)
+Updated: 2026-08-23 (Wave 12 Arm64 fixed-array access accepted)
+
+## Wave 12 — fixed-type scalar array access natively on Arm64 ACCEPTED
+
+- Exact starting point was fetched `origin/main@1a89b4779e71b855cbbac7d90ebc69aee31b6295`
+  after PR #19 merged green. Delivery branch
+  `t3code/optimize-runtime-parallel` now points at accepted commit `cbbc09e`
+  (`perf(jit): emit fixed-type array access natively on arm64`); it is local
+  and unpushed. The retained exact-main release binary is
+  `/tmp/wasmlight-wave12-base.ySYtuH/wasmlight`, SHA-256 `364aa3bd…`; the
+  integrated release is `f103d8f7…`, byte-identical to the accepted lane
+  binary.
+- Fresh exact-main comparison (Apple M5 Max, macOS 26.5.2/arm64, best/AOT,
+  one warm-up discarded, seven samples) put gc at 45.705 ms versus Wasmtime
+  28.858 ms. A 4-second `sample(1)` profile of a self-checking 250M-iteration
+  scaled module attributed the largest named leaf to `ArraySet` (254 samples),
+  plus layout resolution 189, `GcRefTypeId` 122, array length 79, the v1 empty
+  write barrier 44, and 85 runtime IR-aux reads. This confirmed fixed-type
+  array access as the next bottleneck on current main.
+- Mechanism: the driver bakes validated fixed-array width, signedness, element
+  base, and reference shape into the existing per-instruction GC shape word.
+  The Arm64 emitter performs null, kind/invariant, and unsigned bounds checks
+  in the runtime's original order, then uses scaled `[base,Windex,UXTW]`
+  loads/stores for scalar `array.get/get_s/get_u/set`. A validator-unreachable
+  kind mismatch retains the unchanged runtime `EWasmInternal` helper route.
+  Reference stores are direct because the stop-the-world v1 write barrier is
+  deliberately empty and the store cannot collect; the code comment requires
+  reference shapes to decline or gain a PIC helper before that collector
+  policy can become non-empty. No process/store/type address is baked, so AOT
+  PIC, fingerprint, and artifact compatibility are unchanged.
+- Clean serialized lane B-C-C-B under the persistent `fcntl` performance lock
+  (release, one warm-up, seven samples) measured gc
+  **44.876 -> 25.883 -> 25.663 -> 43.704 ms**: -42.33% forward and -41.28%
+  reverse, with fully disjoint ranges (bases 43.616-45.091 / 43.068-44.367;
+  candidates 25.529-26.275 / 25.339-26.157). Same-schedule candidate/Wasmtime
+  ratios were 0.92x/0.90x. Raw full schedules are
+  `/tmp/w12-array-{base1,cand1,cand2,base2}.json`.
+- The post-integration target-only B-C-C-B independently confirmed the exact
+  combined state: **43.551 -> 24.925 -> 24.182 -> 43.631 ms**, or -42.77%
+  forward and -44.57% reverse; ranges remained disjoint. Raw results are
+  `/tmp/w12-integrated-{base1,cand1,cand2,base2}.json`. The full lane schedule
+  found no material guard regression: startup/fib/host-call stayed in their
+  prior bands; loop/SIMD movement co-drifted with peers; memory and call kept
+  their already documented broad, bimodal within-leg spreads.
+- Correctness on exact `cbbc09e`: focused Arm64 27/27 and JIT 67/67; all 44
+  unit programs; release builds of all three apps; frozen install; format;
+  agents check; diff check. The recursive pinned corpus is byte-identical in
+  interpreter/JIT/AOT: files=288 errors=0 pass=65851 fail=368 skip=904
+  staged=0 total=67123, compiled=8799 in JIT/AOT. New differentials force a
+  collection after a reference-array store (the stored struct is reachable
+  only through the array), pin null-before-bounds, and keep an unrelated dirty
+  cached local live across native `array.get`.
+- A review caught and fixed the initial candidate's only correctness defect
+  before measurement: a common cache invalidation could discard an unrelated
+  dirty dynamic value. Native gets now use `Arm64CachedStore`; native stores
+  preserve the existing cache state; the new `dirty` differential fails the
+  old form. No result from the earlier loaded-VM/compiler period was accepted.
+- REJECTED lanes, fully reverted with clean worktrees and no commits:
+  (1) direct-call target/cap hoisting expanded the Arm64 frame and added 276
+  lines but clean B-C-C-B paired medians regressed call by 8.56% (149.282 ->
+  162.066 ms), guards flat; raw files under
+  `/tmp/wasmlight-wave12-call-measure/`. (2) SIMD scalar static-cache admission
+  was recognized as the already-rejected Wave 3 shape; one clean forward leg
+  made the loop smaller (57 -> 42 A64 instructions) but regressed SIMD 12.10%
+  (9.183 -> 10.294 ms, disjoint ranges), so reverse legs were deliberately not
+  repeated; evidence is `/tmp/wasmlight-wave12-simd-evidence/`.
+- Process notes: current `bench.py` uses `fcntl.flock` on the persistent
+  zero-byte regular `/tmp/wasmlight-perf-gate.lock`; do not replace it with the
+  older directory-lock protocol. Harness locks do not serialize unrelated lane
+  compilers/probes, so the integration owner must grant explicit measurement
+  windows. `lantaarn-spike` and `wasmx64` were gracefully paused for accepted
+  timing after vmgr reached ~3 cores, then both restored to their prior running
+  state.
+- Remaining out-of-band priorities after this wave: direct calls (the hoist
+  design lost; re-profile before a genuinely different mechanism), SIMD (do
+  not retry static-cache admission or alignment), then x64 mirrors of the
+  accepted Arm64 struct/array GC paths. GC itself is now faster than Wasmtime
+  on this diagnostic shape and is no longer the first gap.
 
 ## PR #19 CI repair
 
@@ -15,8 +92,8 @@ Updated: 2026-08-23 (PR #19 CI repair validated locally)
   Ubuntu Noble/x86-64 release builds all three programs and passes the JIT +
   X64 suites; the universal macOS gate passes frozen install, format, all
   three builds, all 44 test programs, `lwpt agents --check`, and diff check.
-- Delivery stays on draft PR #19. Re-query its exact head and checks rather
-  than relying on this handoff for live CI state.
+- PR #19 merged as `1a89b47` with every configured check green. Re-query its
+  exact head and checks rather than relying on this handoff for live CI state.
 
 ## Wave 11 — inline struct.new allocation fast path ACCEPTED
 
