@@ -1,8 +1,66 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 11 scoping: inline-alloc design RESOLVED, not built)
+Updated: 2026-08-23 (wave 11 executed: inline struct.new fast path ACCEPTED)
 
-## Wave 11 — inline struct.new allocation: design finalized, execution deferred
+## Wave 11 — inline struct.new allocation fast path ACCEPTED
+
+- Commit `6aea5ef` (`perf(jit): inline the struct.new allocation fast path
+  on arm64`) on `t3code/optimize-runtime-wasmtime-gap-2` from exact
+  `12c41b7` (the post-PR-18 main tip). Local, unpushed; delivery not
+  requested.
+- Mechanism per the wave-11 design: eligible `struct.new` sites emit the
+  whole free-list-hit allocation inline — context-chain engine-id walk,
+  heap/head load, cbz miss branch into the UNCHANGED generic emission (still
+  THE collect safepoint per ADR-0011), pop, bitmap mark, counters ×3,
+  two-half header, baked numeric field stores, Dest publish last. Driver
+  analysis mirrors Allocate's class math exactly; pow2 classes only
+  (16/32/64/128/256 — where CellSize == AlignUp(layoutSize,8), so the tail
+  is zero by construction and no inline zeroing is needed); declines ref/v128
+  fields, struct.new_default, arity > 16, non-pow2/large cells, offsets out
+  of imm12 range. New probes (WasmJitGcHeapOffsets, WasmJitStoreAllocOffsets)
+  expose the private anchors; ALL folded into the ABI fingerprint, revision
+  15 (old artifacts fail closed).
+- TWO emitter defects found and fixed inside the wave:
+  1. Arm64MaddX used the $8B (ADD/W-MADD) base instead of $9B — the walk
+     computed a garbage activation address; found by bisect + llvm-mc
+     cross-check of the pinned words.
+  2. The header stores preceded the link pop, overwriting [head+0] before
+     the link was read — the free list was poisoned with mark-state values
+     and the NEXT fast-path allocation jumped to garbage. Found only when a
+     workload actually recycles cells (runtime-comparison gc module under
+     --aot); the corpus never fires the fast path (tiny heaps, empty lists),
+     which is why three-tier corpus identity alone did not catch it. The
+     reuse test now covers this shape.
+- Serialized release A/B under the perf gate (bench.py best profile, 1
+  warmup discarded, 7 samples, BASE-CAND-CAND-BASE): gc **−39.9%/−39.9%**
+  (76.209/76.511 → 45.780/45.773 ms; spreads disjoint: base 75.86–85.51,
+  cand 45.34–46.16). Guards flat within this host's documented noise:
+  fib/call/host-call/simd/startup deltas < ±2%; loop and memory-* legs
+  drifted across LATER legs on BOTH binaries (base2 measured loop 362.9 ≈
+  cand's 363.0), so those swings are host drift, not candidate effects —
+  no guard regressed in like-for-like order pairs.
+- Band status vs same-schedule Wasmtime-AOT medians: IN BAND startup 0.67x,
+  host-call 0.90x, fib 0.93x, memory-grow 0.89x, loop 1.06x, memory 1.13x,
+  memory-load 1.19x; BORDERLINE memory-store 1.45x; OUT OF BAND gc **1.61x**
+  (was ~2.5x), call 2.30x, simd 1.82x. Goal remains every workload ≤ 1.43x.
+- Correctness on the accepted head (release `8613383e…`): 44/44 unit suites;
+  corpus byte-identical in interpreter/JIT/AOT at pass=65851 fail=368
+  skip=904 staged=0 errors=0 (compiled=8799); format, agents check, frozen
+  install, diff-check, Markdown lint green. New tests: differential
+  recycled-cell reuse under threshold-0 forced collects (both tiers agree)
+  and a 43-word pin of the emitted fast-path sequence.
+- PROCESS NOTE: dev and release builds have DIFFERENT object layouts
+  (test-only fields under {$IFNDEF PRODUCTION}); probes are self-consistent
+  per build and the fingerprint keeps artifacts from crossing builds — do
+  not compare dev-baked offsets against release runs.
+- Next lanes in priority order: (1) native array.get/set with baked element
+  offsets + bounds check (remaining gc-workload crossings + runtime IrAux
+  reads); (2) hoist per-call target/cap resolution across backedges for
+  proof-gated direct calls (call lane, ~22 instructions around each blr);
+  (3) simd microarchitectural bisect (wave 7 ruled out alignment);
+  (4) x64 mirrors of the arm64 GC lanes.
+
+## Wave 11 design record — superseded by the execution above
 
 - Scoping pass produced every remaining design answer; implementation did
   not start (GC-critical surface + late-session budget). Build order for the
