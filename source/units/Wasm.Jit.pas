@@ -584,6 +584,25 @@ var
     SetLength(SkipPlanned, Length(AFn^.Code));
     for K := 0 to High(AFn^.Code) do
       PlannedCode[K] := AFn^.Code[K];
+    {$IFDEF WASM_JIT_ARM64}
+    for K := 1 to High(PlannedCode) do
+      if (PlannedCode[K].Op = iroMoveVec) and
+        Arm64NativeVecOp(PlannedCode[K - 1].Op) and
+        (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
+        (PlannedCode[K - 1].Dest < UInt32(Length(AFn^.RegTypes))) and
+        (AFn^.RegTypes[PlannedCode[K - 1].Dest].Kind = wvkVec) and
+        not IsVisibleFrameReg(PlannedCode[K - 1].Dest) and
+        IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not Targets[K - 1] and not Targets[K] then
+      begin
+        { A validated expression result is consumed by the immediately
+          following lowering move. Store the native Q result in the move's
+          canonical local/result slot directly; both IR labels remain bound at
+          the same fallthrough point and no vector state crosses an edge. }
+        PlannedCode[K - 1].Dest := PlannedCode[K].Dest;
+        SkipPlanned[K] := True;
+      end;
+    {$ENDIF}
     if not UseStaticCache then
       Exit;
     for K := 1 to High(PlannedCode) do

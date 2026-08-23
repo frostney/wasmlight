@@ -542,6 +542,7 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
   freshly per invocation — so nothing about the host process is ever baked, and
   this also subsumes the old Fix-C @AIns-by-reference concern. }
 function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
+function Arm64NativeVecOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AUsePinnedMemory: Boolean = False;

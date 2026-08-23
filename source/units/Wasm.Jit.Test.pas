@@ -1547,6 +1547,7 @@ type
 
     { --- Wave 6: v128 SIMD via the Wasm.Interp.Vector leaves --------- }
     procedure TestSimdCompute;
+    procedure TestSimdLocalResultFusionCodeShape;
     procedure TestSimdLocalsMoveConst;
     procedure TestSimdFloatNanPminRelaxed;
     procedure TestSimdMemory;
@@ -3460,6 +3461,36 @@ begin
     [])).ToBe(VEC_COMPILED);
 end;
 
+procedure TJitTests.TestSimdLocalResultFusionCodeShape;
+{$IFDEF WASM_JIT_ARM64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_ARM64}
+  FBytes := SimdLocalsModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, @FIr.Functions[0], EntryOffset,
+    RegisterCount);
+  { v128.const writes the visible local directly: the following move.v128
+    keeps its label but emits no redundant Q-register load/store pair. }
+  Expect<Integer>(Length(Code)).ToBe(148);
+  Expect<NativeUInt>(EntryOffset).ToBe(0);
+  Expect<UInt32>(RegisterCount).ToBe(FIr.Functions[0].RegisterCount);
+  Code := JitStageFunctionBytes(FStore, @FIr.Functions[2], EntryOffset,
+    RegisterCount);
+  { The same peephole applies when a native splat produces Q0: its result is
+    stored once in the local rather than round-tripping through a temp slot. }
+  Expect<Integer>(Length(Code)).ToBe(176);
+  Expect<UInt32>(RegisterCount).ToBe(FIr.Functions[2].RegisterCount);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestSimdLocalsMoveConst;
 begin
   { v128.const and v128 local.set/get/tee are lowered natively by both
@@ -3651,6 +3682,8 @@ begin
 
   Test('v128 const/splat/extract/replace/add/eq/shuffle/swizzle match',
     TestSimdCompute);
+  Test('native v128 results bypass an adjacent lowering move',
+    TestSimdLocalResultFusionCodeShape);
   Test('v128 consts and local set/get/tee move natively and match',
     TestSimdLocalsMoveConst);
   Test('v128 NaN canonicalisation, pmin/pmax, and a relaxed op match per lane',
