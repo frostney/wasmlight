@@ -65,6 +65,7 @@ type
     procedure TestPredicateDeclinesEh;
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
+    procedure TestGcFieldAccessBytes;
 
     procedure TestExecPlaceholder;
   end;
@@ -631,6 +632,65 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestGcFieldAccessBytes;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+
+  function HasSeq(const AExpected: array of Byte): Boolean;
+  var
+    I, J: Integer;
+  begin
+    for I := 0 to Buf.Size - Length(AExpected) do
+    begin
+      Result := True;
+      for J := 0 to High(AExpected) do
+        if Buf.ByteAt(I + J) <> AExpected[J] then
+        begin
+          Result := False;
+          Break;
+        end;
+      if Result then
+        Exit;
+    end;
+    Result := False;
+  end;
+
+begin
+  { get_s i8 at offset 24: direct MOVSX from the baked address, with the null
+    trap retained and no generic runtime dispatch call. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64InitRegCache(Cache);
+    X64EmitGcFieldAccess(Buf,
+      MakeIrInstr(iroStructGetS, 2, 1, 0, 0),
+      1 or 2 or (UInt64(1) shl 8) or (UInt64(24) shl 16), Cache);
+    X64ResolvePatches(Buf);
+    Expect<Boolean>(HasSeq([$48, $8D, $40, $18, $0F, $BE, $00]))
+      .ToBe(True);
+    Expect<Boolean>(HasSeq([$41, $FF, $57,
+      Byte(Ord(aohRtDispatch) * 8)])).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+
+  { struct.set i32 at offset 8 stores the low 32 bits directly. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64InitRegCache(Cache);
+    X64EmitGcFieldAccess(Buf,
+      MakeIrInstr(iroStructSet, 0, 1, 2, 0),
+      1 or (UInt64(4) shl 8) or (UInt64(8) shl 16), Cache);
+    X64ResolvePatches(Buf);
+    Expect<Boolean>(HasSeq([$48, $8D, $40, $08])).ToBe(True);
+    Expect<Boolean>(HasSeq([$89, $08])).ToBe(True);
+    Expect<Boolean>(HasSeq([$41, $FF, $57,
+      Byte(Ord(aohRtDispatch) * 8)])).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestSlotOffset;
 begin
   Expect<UInt32>(X64SlotByteOffset(0)).ToBe(0);
@@ -726,6 +786,8 @@ begin
   Test('the call-site arity fence admits a zero-slot call', TestCallArityFence);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
+  Test('numeric GC fields use baked native x64 loads and stores',
+    TestGcFieldAccessBytes);
   Test('executable proof is gated to a real x86-64 host', TestExecPlaceholder);
 end;
 

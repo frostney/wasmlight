@@ -115,6 +115,11 @@ type
     FixedWriteThrough: Boolean;
   end;
 
+  { Per-instruction native-shape words handed over by the driver's
+    AnalyzeGcFieldAccess; indexed by IR instruction index. }
+  TX64GcShapeArray = array[0..$FFFFFF] of UInt64;
+  PX64GcShapeArray = ^TX64GcShapeArray;
+
 const
   { --- x86-64 register numbers (SDM Vol. 2 Table 2-2) --------------------- }
   X64_RAX = 0;
@@ -385,7 +390,13 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   const ARetainContext, AUseNativeScalarCall: Boolean;
-  var ACache: TX64RegCache): Boolean; overload;
+  var ACache: TX64RegCache;
+  const AGcShapes: PX64GcShapeArray): Boolean; overload;
+{ Numeric struct field access with a validated baked byte offset. Null refs
+  trap before the load; reference and vector fields never receive a shape. }
+procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TX64RegCache);
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
@@ -417,6 +428,11 @@ uses
 procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAddr64,
   AUsePinnedMemory: Boolean); forward;
+procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean); forward;
+procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase: Byte; const ASize: UInt32); forward;
 
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
@@ -521,7 +537,44 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
 begin
   Result := X64EmitOpCached(ABuf, AIns, AAux, AInsIndex, AAddr64,
     AUsePinnedMemory, False, False, 0, 0, 0, -1, -1, False, False,
-    ACache);
+    ACache, nil);
+end;
+
+procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TX64RegCache);
+var
+  Offset, Width: UInt32;
+  Signed: Boolean;
+  GoodLabel: TWasmJitLabel;
+begin
+  Offset := UInt32(AShape shr 16);
+  Width := UInt32((AShape shr 8) and $FF);
+  Signed := (AShape and 2) <> 0;
+
+  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
+  X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);
+  GoodLabel := ABuf.NewLabel;
+  X64EmitJccTo(ABuf, X64_CC_NE, UInt32(GoodLabel));
+  X64EmitMovRegImm32(ABuf, X64_ARG0,
+    UInt32(Ord(wtkNullStructReference)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(GoodLabel);
+
+  X64EmitLea(ABuf, X64_RAX, X64_RAX, Int32(Offset));
+  case AIns.Op of
+    iroStructGet, iroStructGetS, iroStructGetU:
+      begin
+        X64EmitLoadScalar(ABuf, X64_RAX, X64_RAX, Width, Signed,
+          Width = 8);
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+      end;
+    iroStructSet:
+      begin
+        X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
+        X64EmitStoreScalar(ABuf, X64_RCX, X64_RAX, Width);
+      end;
+  end;
 end;
 
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
@@ -531,13 +584,21 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   const ARetainContext, AUseNativeScalarCall: Boolean;
-  var ACache: TX64RegCache): Boolean;
+  var ACache: TX64RegCache;
+  const AGcShapes: PX64GcShapeArray): Boolean;
 begin
   Result := True;
   if X64ScalarMemoryOp(AIns.Op) then
   begin
     X64InvalidateRegCache(ACache);
     X64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
+    Exit;
+  end;
+  if (AGcShapes <> nil) and
+    ((AGcShapes[AInsIndex] and 1) <> 0) and
+    ((AGcShapes[AInsIndex] and 4) = 0) then
+  begin
+    X64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
     Exit;
   end;
   case AIns.Op of

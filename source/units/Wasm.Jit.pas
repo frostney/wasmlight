@@ -1985,8 +1985,8 @@ begin
     { After fusion planning, so already-folded constants are not offered a
       host register their defining instruction would never have used. }
     AnalyzeConstSlots;
-    {$IFDEF WASM_JIT_ARM64}
     AnalyzeGcFieldAccess;
+    {$IFDEF WASM_JIT_ARM64}
     AnalyzeGcInlineAlloc;
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
@@ -2143,7 +2143,7 @@ begin
           AFn^.RegisterCount, NativeParamReg, NativeResultReg,
           NativeCoreLabel, NativeExhaustedLabel, UseX64ExtendedFrame,
           NativeScalarCall,
-          X64Cache);
+          X64Cache, @GcShapes[0]);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
