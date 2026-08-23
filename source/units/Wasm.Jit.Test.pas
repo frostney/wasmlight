@@ -953,12 +953,15 @@ begin
       BLit([$5F, $01, $7F, $01]),                    { 0: struct (mut i32) }
       BLit([$5F, $01, $78, $01]),                    { 1: struct (mut i8) }
       BLit([$60, $01, $7F, $01, $7F])])),            { 2: (i32)->i32 }
-    Sect(3, VecOf([BLit([$02]), BLit([$02]), BLit([$02]), BLit([$02])])),
+    Sect(3, VecOf([BLit([$02]), BLit([$02]), BLit([$02]), BLit([$02]),
+      BLit([$02]), BLit([$02])])),
     Sect(7, VecOf([
       ExportEntry('rt', $00, 0),
       ExportEntry('gets', $00, 1),
       ExportEntry('getu', $00, 2),
-      ExportEntry('setget', $00, 3)])),
+      ExportEntry('setget', $00, 3),
+      ExportEntry('nullget', $00, 4),
+      ExportEntry('dirty', $00, 5)])),
     Sect(10, VecOf([
       CodeEntry([$00, $20, $00, $FB, $00, $00, $FB, $02, $00, $00, $0B]),
       CodeEntry([$00, $20, $00, $FB, $00, $01, $FB, $03, $01, $00, $0B]),
@@ -966,7 +969,14 @@ begin
       CodeEntry([$01, $01, $63, $00,                  { local (ref null 0) }
         $FB, $01, $00, $21, $01,                      { new_default; local.set1 }
         $20, $01, $20, $00, $FB, $05, $00, $00,       { struct.set 0 0 = arg0 }
-        $20, $01, $FB, $02, $00, $00, $0B])]))        { struct.get 0 0 }
+        $20, $01, $FB, $02, $00, $00, $0B]),          { struct.get 0 0 }
+      CodeEntry([$00, $D0, $00, $FB, $02, $00, $00, $0B]),
+      CodeEntry([$02, $01, $7F, $01, $63, $00,         { i32, ref null 0 }
+        $FB, $01, $00, $21, $02,                      { new_default; ref local }
+        $41, $2A, $21, $01,                            { dirty local := 42 }
+        $20, $02, $20, $00, $FB, $05, $00, $00,       { struct.set arg0 }
+        $20, $02, $FB, $02, $00, $00, $1A,            { struct.get; drop }
+        $20, $01, $0B])]))                             { dirty local survives }
   ]);
 end;
 
@@ -3371,7 +3381,12 @@ begin
     [MakeValueI32($FF)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   { struct.set (barriered) then read back. }
   Expect<Boolean>(DiffFresh(GcStructModuleBytes, 'setget',
-    [MakeValueI32(777)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF})
+    [MakeValueI32(777)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  DiffFresh(GcStructModuleBytes, 'nullget', [MakeValueI32(0)]);
+  Expect<string>(TrapMessageOf(GcStructModuleBytes, 'nullget',
+    [MakeValueI32(0)])).ToBe('null structure reference');
+  Expect<Boolean>(DiffFresh(GcStructModuleBytes, 'dirty',
+    [MakeValueI32(123)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF})
 end;
 
 procedure TJitTests.TestArrayRoundTrip;

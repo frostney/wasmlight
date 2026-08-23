@@ -1,6 +1,84 @@
 # Handoff
 
-Updated: 2026-08-23 (Wave 13 Arm64 adjacent-vector-result fusion accepted)
+Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
+
+## Wave 14 — numeric fixed-struct field access natively on x64 ACCEPTED
+
+- Started from freshly fetched `origin/main@e7ee03be80ad713c4061308c224bb096a1df2e72`
+  (merged PR #20) in clean branch `t3code/optimize-runtime-wave14`. The single
+  accepted commit is `2e33b67fc8cef4d5baa7b7192d8f07f613bf129a`
+  (`perf(jit): emit numeric struct fields natively on x64`), local and
+  unpushed. The integration was an exact fast-forward to that measured lane
+  commit, so no post-measurement source combination was introduced.
+- Fresh exact-main macOS/Arm64 best/AOT baseline (one warm-up, seven rotated
+  samples) left direct call as the sole goal miss: 144.659 ms versus Wasmtime
+  59.792 ms (2.42x). The remaining ratios were startup 0.64x, loop 1.04x,
+  fib 0.93x, memory 1.17x, memory-load 1.14x, memory-store 1.41x,
+  memory-grow 0.99x, gc 0.93x, SIMD 1.29x, and host-call 0.90x. Raw evidence
+  is `/tmp/wasmlight-wave14-baseline-e7ee03b.json`.
+- A five-second `sample(1)` profile of a self-checking 30x scaled call module
+  put all 3,875 samples in generated code. Two different bounded Arm64 call
+  experiments were therefore measured and REJECTED: (1) omitting zero MOVK
+  halves shortened the hot function from 269 to 242 instructions but
+  regressed B-C-C-B by 38.67% forward / 63.02% reverse (raw
+  `/tmp/w14-imm-{base1,cand1,cand2,base2}.json`); (2) rescheduling independent
+  cap loads was flat/noisy at -0.08% with fully overlapping ranges (raw
+  `/tmp/w14-call-{base1,cand1,cand2,base2}.json`). Both worktrees were fully
+  reverted and remain clean with no commits. Do not retry activation-wide
+  hoisting, per-instance call tables, scaled-LDR-only, zero-MOVK omission, or
+  this cap-load scheduling shape without new evidence.
+- The accepted x64 mechanism reuses the driver's validated per-instruction GC
+  shape analysis. Eligible numeric `struct.get`, `struct.get_s`,
+  `struct.get_u`, and `struct.set` sites receive only a validated width,
+  signedness, and byte offset. The x64 emitter performs the cached reference
+  load and null-structure trap before a direct canonical scalar load or
+  truncating store. Numeric stores require no write barrier; reference/vector
+  fields, arrays, and ineligible shapes retain the unchanged generic helper.
+  No runtime address is baked, and allocation, GC, safepoints, barriers, and
+  AOT PIC/fingerprint contracts are unchanged. Differential tests pin signed
+  and unsigned packed loads, read/write round trips, exact null-trap order,
+  and an unrelated cached local surviving the access; x64 byte-shape tests
+  pin direct load/store emission and absence of runtime dispatch.
+- Linux/x86-64 profiling ran in OrbStack 7.0.14, explicitly virtualized amd64
+  over Arm. `perf_event_open` is unavailable there (`ENOSYS`), so no sampling
+  claim was made. A controlled exact-release self-checking profile instead
+  measured 20 million fixed-field accesses at 3,032.418 ms versus a matched
+  numeric control at 193.271 ms (15.69x, about 142 ns/helper crossing). The
+  first VM preparation under `/tmp` was discarded after stop/start erased the
+  VM tmpfs; all accepted source, binaries, raw data, and gates were rebuilt
+  durably under `/home/jstein/w14-x64-field` with checksum-verified LWPT 0.6.0.
+- Exact retained binary B-C-C-B (one warm-up, seven samples per leg under the
+  persistent flock gate) improved the standard GC workload
+  **1265.464 -> 908.161 -> 915.298 -> 1267.813 ms**, -28.23% forward and
+  -27.80% reverse, with candidate maxima below baseline minima. Raw files are
+  `/home/jstein/w14-x64-field/measurement/gc-{base1,cand1,cand2,base2}.json`.
+  The isolated 20M field workload measured
+  **3046.743 -> 219.657 -> 220.406 -> 2966.666 ms**, -92.79%/-92.57%, with
+  all legs self-checking and disjoint. Raw files use the corresponding
+  `measurement/field-*` names.
+- The complete x64 best-profile 11-workload guard pair measured GC at
+  1032.180 -> 703.613 ms (-31.83%); loop, fib, memory, load, store, and call
+  overlapped and stayed within +/-1.82%, while several other paths improved.
+  Startup's apparent +6.449 ms was classified as noise by its own B-C-C-B
+  (45.600, 47.478, 44.627, 47.516 ms): forward +4.12%, reverse -6.08%, all
+  ranges overlapping. Guard raw files are `measurement/guards-{base,candidate}.raw.json`
+  and `measurement/startup-{base1,cand1,cand2,base2}.json` in the durable VM
+  evidence directory. Both OrbStack VMs were restored to running and the
+  persistent timing lock was verified free.
+- Exact accepted x64 gates pass: frozen install; format 91/91; agents check;
+  dev and release build 3/3; all 44 test programs (focused JIT 68/68 and x64
+  26/26); pinned core corpus byte-identical across interpreter/JIT/AOT at
+  files=257 pass=65188 fail=0 skip=0 staged=0, with 8704 compiled functions in
+  JIT/AOT. Independent exact integration gates on macOS/Arm64 pass frozen
+  install, format, agents check, diff check, Markdown lint, dev/release 3/3,
+  all 44 tests, and the same 65,188/0/0 core tally in every tier (8703 compiled
+  in JIT/AOT). The recursive 288-file diagnostic also reproduces the documented
+  65851/368/904/0 proposal-and-legacy residue tally.
+- Next x64 optimization candidates, only after a fresh baseline/profile, are
+  the already accepted Arm64 fixed-array access mirror and then allocation.
+  On Arm64, direct calls remain the only current 1.43x goal miss, but the two
+  new rejected mechanisms above remove the obvious small instruction-selection
+  variations from consideration.
 
 ## Wave 13 — adjacent Arm64 vector-result moves fused ACCEPTED
 
