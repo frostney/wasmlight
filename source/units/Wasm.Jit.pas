@@ -561,6 +561,41 @@ var
       end;
   end;
 
+  function VectorUseCount(const AReg: UInt32): UInt32;
+  var
+    Info: TWasmIrOpInfo;
+    K, N: Integer;
+
+    procedure CountIfSame(const ASource: UInt32);
+    begin
+      if ASource = AReg then
+        Inc(Result);
+    end;
+
+  begin
+    Result := 0;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      Info := IR_OP_INFO[AFn^.Code[K].Op];
+      if Info.DestKind = ifkSrcReg then
+        CountIfSame(AFn^.Code[K].Dest);
+      if Info.AKind = ifkSrcReg then
+        CountIfSame(AFn^.Code[K].A)
+      else if Info.AKind = ifkAuxIndex then
+        { Every A aux block is a source-register list. B aux blocks carry
+          call results or control targets; Imm aux blocks carry literals,
+          masks, or memory arguments. }
+        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+          AFn^.Code[K].A)) - 1 do
+          CountIfSame(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
+            UInt32(N)));
+      if Info.BKind = ifkSrcReg then
+        CountIfSame(AFn^.Code[K].B);
+      if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
+        CountIfSame(UInt32(AFn^.Code[K].Imm));
+    end;
+  end;
+
   function IsVisibleFrameReg(const AReg: UInt32): Boolean; forward;
 
   function NativeScalarLeafTarget(const AFuncIdx: UInt32): Boolean;
@@ -591,6 +626,7 @@ var
         (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
         (PlannedCode[K - 1].Dest < UInt32(Length(AFn^.RegTypes))) and
         (AFn^.RegTypes[PlannedCode[K - 1].Dest].Kind = wvkVec) and
+        (VectorUseCount(PlannedCode[K - 1].Dest) = 1) and
         not IsVisibleFrameReg(PlannedCode[K - 1].Dest) and
         IsVisibleFrameReg(PlannedCode[K].Dest) and
         not Targets[K - 1] and not Targets[K] then

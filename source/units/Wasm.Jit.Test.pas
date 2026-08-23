@@ -1197,12 +1197,13 @@ begin
       BLit([$60, $00, $01, $7F]),                    { 0: ()->i32 }
       BLit([$60, $01, $7F, $01, $7F])])),            { 1: (i32)->i32 }
     Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$01]),
-      BLit([$01])])),
+      BLit([$01]), BLit([$01])])),
     Sect(7, VecOf([
       ExportEntry('setget', $00, 0),
       ExportEntry('tee', $00, 1),
       ExportEntry('move', $00, 2),
-      ExportEntry('move2', $00, 3)])),
+      ExportEntry('move2', $00, 3),
+      ExportEntry('tee_both', $00, 4)])),
     Sect(10, VecOf([
       { const -> local.set -> local.get -> extract lane 2 = 0x08090A0B }
       CodeEntry(Cat([BLit([$01, $01, $7B]), Fd(12),
@@ -1227,7 +1228,12 @@ begin
         $99, $AA, $BB, $CC, $DD, $EE, $FF, $07]),
         BLit([$21, $01]), BLit([$20, $00]), Fd(17), BLit([$20, $00]),
         Fd(28), BLit([$02]),
-        BLit([$21, $02]), BLit([$20, $02]), Fd(27), BLit([$02, $0B])]))
+        BLit([$21, $02]), BLit([$20, $02]), Fd(27), BLit([$02, $0B])])),
+      { local.tee's result remains the producer temporary while local.get
+        reads the visible local. Both lane extracts must observe the splat. }
+      CodeEntry(Cat([BLit([$01, $01, $7B, $20, $00]), Fd(17),
+        BLit([$22, $01]), Fd(27), BLit([$00, $20, $01]), Fd(27),
+        BLit([$00, $6A, $0B])]))
     ]))
   ]);
 end;
@@ -3486,6 +3492,11 @@ begin
     stored once in the local rather than round-tripping through a temp slot. }
   Expect<Integer>(Length(Code)).ToBe(176);
   Expect<UInt32>(RegisterCount).ToBe(FIr.Functions[2].RegisterCount);
+  Code := JitStageFunctionBytes(FStore, @FIr.Functions[4], EntryOffset,
+    RegisterCount);
+  { The producer temporary remains live after local.tee, so this function
+    must retain its move instead of applying the single-use fusion. }
+  Expect<Integer>(Length(Code)).ToBe(180);
   {$ELSE}
   Expect<Boolean>(True).ToBe(True);
   {$ENDIF}
@@ -3505,6 +3516,10 @@ begin
     [MakeValueI32($12345678)])).ToBe(VEC_COMPILED);
   Expect<Boolean>(DiffModule(SimdLocalsModuleBytes, 'move2',
     [MakeValueI32($76543210)])).ToBe(VEC_COMPILED);
+  { Separate stores matter here: running the interpreter first in the JIT
+    store could leave the otherwise unwritten temporary looking valid. }
+  Expect<Boolean>(DiffFresh(SimdLocalsModuleBytes, 'tee_both',
+    [MakeValueI32(37)])).ToBe(VEC_COMPILED);
 end;
 
 procedure TJitTests.TestSimdFloatNanPminRelaxed;
