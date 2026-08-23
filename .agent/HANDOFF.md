@@ -2,6 +2,24 @@
 
 Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
 
+## Runtime optimization skill retro follow-up — adopted
+
+- Resumed the unpublished retro follow-up from local commit `2b9a82d` onto
+  freshly fetched `origin/main@92c2de3` as commit `4869b50` on
+  `t3code/adopt-optimize-runtime`; the original sibling branch was stale and
+  had never published this commit in a pull request.
+- `.agents/skills/optimize-runtime/SKILL.md` now requires release-binary hash
+  verification against the immediate predecessor, a host-load check before
+  each measurement schedule, and mechanism-plus-measurement evidence for every
+  rejected experiment. These are workflow safeguards only; runtime source,
+  benchmark implementations, tier behavior, and architecture contracts are
+  unchanged.
+- The resumed change passed the skill validator in an isolated `uvx` PyYAML
+  environment, frozen install, format, generated-agent check, Markdown lint,
+  development build of all three programs, and all 44 default test programs.
+  No runtime benchmark or spec-corpus rerun applies to this documentation-only
+  workflow change.
+
 ## Wave 14 — numeric fixed-struct field access natively on x64 ACCEPTED
 
 - Started from freshly fetched `origin/main@e7ee03be80ad713c4061308c224bb096a1df2e72`
