@@ -447,8 +447,9 @@ begin
         MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
         UInt32(I), False, False, False, False, Cache)).ToBe(True);
     { The fifth value evicts the first after its last use count reached zero.
-      Two static loads plus two words per constant: no canonical spill. }
-    Expect<Integer>(Buf.Size).ToBe(12 * SizeOf(UInt32));
+      Two static loads plus one word per constant — the immediate lands
+      directly in the freshly reserved victim, no T0 hop. }
+    Expect<Integer>(Buf.Size).ToBe(7 * SizeOf(UInt32));
   finally
     Buf.Free;
   end;
@@ -465,10 +466,11 @@ begin
       Expect<Boolean>(Arm64EmitOpCached(Buf,
         MakeIrInstr(iroI32Const, UInt32(I + 2), 0, 0, I), Aux,
         UInt32(I), False, False, False, False, Cache)).ToBe(True);
-    { Slot 2 still has a future use, so its eviction writes one canonical
-      value before x14 is reassigned. }
-    Expect<Integer>(Buf.Size).ToBe(13 * SizeOf(UInt32));
-    Expect<UInt32>(EmittedWord(Buf, 11)).ToBe(
+    { Slot 2 still has a future use; five constants rotate through four
+      victims, so exactly one eviction spills it (word 6) before its host is
+      reassigned to the fifth constant. }
+    Expect<Integer>(Buf.Size).ToBe(8 * SizeOf(UInt32));
+    Expect<UInt32>(EmittedWord(Buf, 6)).ToBe(
       Arm64StrX(ARM64_REG_CACHE2, ARM64_REG_REGFILE,
         Arm64SlotByteOffset(2)));
   finally

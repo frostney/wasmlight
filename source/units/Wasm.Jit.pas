@@ -482,6 +482,9 @@ var
   MaskedShiftShape: array of UInt32;
   UseStaticCache: Boolean;
   UseThirdStatic: Boolean;
+  ConstSlots: array[0..0] of UInt32;
+  ConstSlotBits: array[0..0] of UInt64;
+  GcShapes: array of UInt64;
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
@@ -931,12 +934,14 @@ var
   begin
     {$IFDEF WASM_JIT_ARM64}
     { Validation lowers local.get to a move into a one-use expression slot.
-      In the helper-free base-pinned loop shape, forward that exact alias into
-      an already-cached consumer without changing the canonical IR or labels.
-      The four-instruction window covers the bounded lowering shapes while a
-      target, safepoint, or intervening write to the visible source ends the
-      proof. }
-    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Forward that exact alias into an already-cached consumer without
+      changing the canonical IR or labels — in the helper-free base-pinned
+      loop shape, and in the closed native-scalar core whose parameters sit
+      in fixed hosts. The four-instruction window covers the bounded lowering
+      shapes while a target, safepoint, or intervening write to the visible
+      source ends the proof. }
+    if not ((UsePinnedMemoryBase and UseStaticCache) or
+        UseNativeScalarCore) then
       Exit;
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op = iroMove) and not SkipPlanned[K] and
@@ -1361,6 +1366,227 @@ var
     UseStaticCache := True;
   end;
 
+  { Loop-invariant constants (loop limits, multipliers) sit inside the loop
+    body in IR order, so their materialization re-executes on every iteration.
+    A constant-defined slot with a dedicated static host register is seeded
+    once at frame entry instead; the defining const instruction then emits
+    nothing. Only slots written by exactly one const instruction qualify, and
+    never a slot the ordinary static allocation already claimed. }
+  procedure AnalyzeConstSlots;
+  type
+    TSpan = record
+      Lo: UInt32;
+      Hi: UInt32;
+    end;
+  var
+    K, M, Slot: Integer;
+    UniqueWriter: Boolean;
+    InLoop: Boolean;
+    ConstInLoop: array[0..0] of Boolean;
+    ConstLoopSpans: array of TSpan;
+
+    function SlotBeats(const AInLoop: Boolean; const AScore: UInt32;
+      const ABInLoop: Boolean; const ABScore: UInt32): Boolean;
+    begin
+      if AInLoop <> ABInLoop then
+        Result := AInLoop
+      else
+        Result := AScore > ABScore;
+    end;
+
+    function CoveredByLoop(const AIndex: UInt32): Boolean;
+    var
+      N: Integer;
+    begin
+      Result := False;
+      for N := 0 to High(ConstLoopSpans) do
+        if (ConstLoopSpans[N].Lo <= AIndex) and
+          (AIndex <= ConstLoopSpans[N].Hi) then
+          Exit(True);
+    end;
+
+    function AlreadyClaimed(const ASlot: UInt32): Boolean;
+    var
+      N: Integer;
+    begin
+      Result := True;
+      for N := 0 to High(ConstSlots) do
+        if ConstSlots[N] = ASlot then
+          Exit;
+      for N := 0 to High(AllocatedSlots) do
+        if AllocatedSlots[N] = ASlot then
+          Exit;
+      Result := False;
+    end;
+
+  procedure OfferConstSlot(const ASlot: UInt32; const ABits: UInt64;
+    const AInLoop: Boolean);
+    var
+      N: Integer;
+    begin
+      for N := 0 to High(ConstSlots) do
+      begin
+        if ConstSlots[N] = ASlot then
+          Exit;
+        if (ConstSlots[N] = High(UInt32)) or
+          SlotBeats(AInLoop, SlotScores[ASlot],
+          ConstInLoop[N], SlotScores[ConstSlots[N]]) then
+        begin
+          ConstSlots[N] := ASlot;
+          ConstSlotBits[N] := ABits;
+          ConstInLoop[N] := AInLoop;
+          Exit;
+        end;
+      end;
+    end;
+
+  begin
+    ConstSlots[0] := High(UInt32);
+    ConstInLoop[0] := False;
+    if not UseStaticCache or (Length(SlotScores) = 0) then
+      Exit;
+    { Loop spans from backward jumps: a constant defined between a back-edge
+      target and its jump re-materializes on every iteration, which is exactly
+      the cost a static host removes. Out-of-loop constants only save their
+      single emission, so they rank strictly below in-loop candidates. }
+    SetLength(ConstLoopSpans, 0);
+    for K := 0 to High(AFn^.Code) do
+      if (AFn^.Code[K].Op = iroJump) and
+        (AFn^.Code[K].A <= UInt32(K)) then
+      begin
+        SetLength(ConstLoopSpans, Length(ConstLoopSpans) + 1);
+        ConstLoopSpans[High(ConstLoopSpans)].Lo := AFn^.Code[K].A;
+        ConstLoopSpans[High(ConstLoopSpans)].Hi := UInt32(K);
+      end;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if not (AFn^.Code[K].Op in [iroI32Const, iroI64Const,
+        iroF32Const, iroF64Const]) then
+        Continue;
+      { A constant folded into a consumer never emits, so there is nothing
+        per-iteration to save. }
+      if SkipPlanned[K] then
+        Continue;
+      Slot := Integer(AFn^.Code[K].Dest);
+      if (Slot < 0) or (Slot >= Length(SlotScores)) then
+        Continue;
+      UniqueWriter := True;
+      for M := 0 to High(AFn^.Code) do
+        if (M <> K) and (AFn^.Code[M].Dest = AFn^.Code[K].Dest) then
+        begin
+          UniqueWriter := False;
+          Break;
+        end;
+      if not UniqueWriter or AlreadyClaimed(AFn^.Code[K].Dest) then
+        Continue;
+      InLoop := CoveredByLoop(UInt32(K));
+      case AFn^.Code[K].Op of
+        iroI32Const, iroF32Const:
+          OfferConstSlot(AFn^.Code[K].Dest,
+            UInt64(UInt32(AFn^.Code[K].Imm and $FFFFFFFF)), InLoop);
+        iroI64Const, iroF64Const:
+          OfferConstSlot(AFn^.Code[K].Dest, UInt64(AFn^.Code[K].Imm), InLoop);
+      end;
+    end;
+  end;
+
+  { Numeric struct.get/get_s/get_u/set bake their field offset instead of
+    paying a helper crossing that re-resolves the layout per access. The
+    offset mirrors TWasmGcTypes' layout math exactly (header, per-field
+    align-up to storage width, cumulative advance); ref fields stay on the
+    helper path because stores need the write barrier. }
+  procedure AnalyzeGcFieldAccess;
+  var
+    K, F, CanonIdx: Integer;
+    TargetIdx, FieldIdx, Offset, Width: UInt32;
+    IsRef, IsPacked: Boolean;
+    PackedKind: TWasmPackedType;
+    Comp: ^TWasmCompType;
+
+    function StorageWidthOf(const AStorage: TWasmStorageType): UInt32;
+    begin
+      if AStorage.IsPacked then
+      begin
+        if AStorage.PackedType = wpkI8 then
+          Result := 1
+        else
+          Result := 2;
+        Exit;
+      end;
+      case AStorage.ValueType.Kind of
+        wvkNum:
+          if (AStorage.ValueType.Num = wntI32) or
+            (AStorage.ValueType.Num = wntF32) then
+            Result := 4
+          else
+            Result := 8;
+        wvkVec:
+          Result := 16;
+      else
+        Result := 8;
+      end;
+    end;
+
+  begin
+    SetLength(GcShapes, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      GcShapes[K] := 0;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if not ((AFn^.Code[K].Op = iroStructGet) or
+        (AFn^.Code[K].Op = iroStructGetS) or
+        (AFn^.Code[K].Op = iroStructGetU) or
+        (AFn^.Code[K].Op = iroStructSet)) then
+        Continue;
+      IrUnpack(AFn^.Code[K].Imm, TargetIdx, FieldIdx);
+      if TargetIdx >= UInt32(Length(AIr.CanonTypes)) then
+        Continue;
+      CanonIdx := Integer(AIr.TypeIndexToCanon[TargetIdx]);
+      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
+        Continue;
+      Comp := @AIr.CanonTypes[CanonIdx].Comp;
+      if (Comp^.Kind <> wckStruct) or
+        (FieldIdx >= UInt32(Length(Comp^.Struct.Fields))) then
+        Continue;
+      IsRef := False;
+      IsPacked := False;
+      PackedKind := wpkI8;
+      Width := 0;
+      Offset := 8;
+      for F := 0 to Integer(FieldIdx) do
+      begin
+        Width := StorageWidthOf(
+          Comp^.Struct.Fields[F].Storage);
+        Offset := (Offset + Width - 1) and not (Width - 1);
+        if F = Integer(FieldIdx) then
+        begin
+          IsRef := (not Comp^.Struct.Fields[F].Storage.IsPacked) and
+            (Comp^.Struct.Fields[F].Storage.ValueType.Kind = wvkRef);
+          IsPacked := Comp^.Struct.Fields[F].Storage.IsPacked;
+          PackedKind := Comp^.Struct.Fields[F].Storage.PackedType;
+        end
+        else
+          Offset := Offset + Width;
+      end;
+      if IsRef or (Width > 8) or (Offset >= $10000) or
+        ((Offset div Width) >= $1000) then
+        Continue;
+      case AFn^.Code[K].Op of
+        iroStructGet:
+          if IsPacked then
+            Continue;
+        iroStructGetS, iroStructGetU:
+          if not IsPacked then
+            Continue;
+      end;
+      { bit0 native | bit1 signed | bits8-15 width | bits16-31 offset }
+      GcShapes[K] := 1 or
+        (Ord(AFn^.Code[K].Op = iroStructGetS) shl 1) or
+        (UInt64(Width) shl 8) or
+        (UInt64(Offset) shl 16);
+    end;
+  end;
+
   procedure AnalyzePinnedMemory;
   var
     K: Integer;
@@ -1505,6 +1731,12 @@ begin
     {$ENDIF}
     AnalyzeImmediateFusion;
     AnalyzeFusion;
+    { After fusion planning, so already-folded constants are not offered a
+      host register their defining instruction would never have used. }
+    AnalyzeConstSlots;
+    {$IFDEF WASM_JIT_ARM64}
+    AnalyzeGcFieldAccess;
+    {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeDynamicWriteBack;
     {$ENDIF}
@@ -1543,6 +1775,8 @@ begin
     if UseStaticCache then
     begin
       Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
+      if ConstSlots[0] <> High(UInt32) then
+        Arm64EnableConstSlots(Buf, ArmCache, ConstSlots, ConstSlotBits);
       if UsePinnedMemoryBase then
         Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
           @VisibleSlots[0], AFn^.RegisterCount);
@@ -1634,7 +1868,8 @@ begin
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
-            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache);
+            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
+            @GcShapes[0]);
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}

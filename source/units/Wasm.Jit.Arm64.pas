@@ -107,6 +107,13 @@ type
     and lets every other internal error surface loudly (jit-spec §4.3). }
   EWasmJitBranchRange = class(EWasmError);
 
+  { Per-instruction native-shape words handed over by the driver's
+    AnalyzeGcFieldAccess; indexed by IR instruction index. }
+  TArm64GcShapeArray = array[0..$FFFFFF] of UInt64;
+  PArm64GcShapeArray = ^TArm64GcShapeArray;
+
+  PArm64RegCache = ^TArm64RegCache;
+
   TArm64RegCacheEntry = record
     Valid: Boolean;
     Dirty: Boolean;
@@ -128,6 +135,15 @@ type
     UseCounts: PUInt32;
     VisibleSlots: PBoolean;
     SlotCount: UInt32;
+    { Dynamic (round-robin victim) entries live at [DynBase .. DynBase+DynCount-1].
+      Constant slots appended behind the leading statics raise StaticCount and
+      shrink this range, so every dynamic-range loop derives from it rather
+      than assuming the original four-register pool. }
+    DynBase: Byte;
+    DynCount: Byte;
+    { First index owned by EnableConstSlots; below it sit the ordinary statics
+      whose defining instructions must always emit. High value = none. }
+    ConstFrom: Byte;
   end;
 
   TArm64WordBin = function(const ARd, ARn, ARm: Byte): UInt32;
@@ -504,6 +520,11 @@ function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
 procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache; const ASlots: array of UInt32);
+procedure Arm64EnableConstSlots(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlots: array of UInt32;
+  const ABits: array of UInt64);
+function Arm64ConstSlotHost(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
 procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
   const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
   const ASlotCount: UInt32);
@@ -526,7 +547,14 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   AUsePinnedMemoryBase, AExtendedFrame, ANativeScalarSelf: Boolean;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
-  var ACache: TArm64RegCache): Boolean; overload;
+  var ACache: TArm64RegCache;
+  const AGcShapes: PArm64GcShapeArray = nil): Boolean; overload;
+{ Numeric struct field access with a baked byte offset — the layout math is
+  mirrored in the driver's AnalyzeGcFieldAccess, so no runtime resolution
+  remains. Null refs trap the struct-specific kind before any load. }
+procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TArm64RegCache);
 function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
   const AValue: UInt32): Boolean;
 function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
@@ -931,7 +959,80 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
 begin
   Result := Arm64EmitOpCached(ABuf, AIns, AAux, AInsIndex, AAddr64,
     AUsePinnedMemory, AUsePinnedMemoryBase, AExtendedFrame, False, 0, 0, 0,
-    0, 0, ACache);
+    0, 0, ACache, nil);
+end;
+
+procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TArm64RegCache);
+var
+  Offset: UInt32;
+  Width, AccessSize: Byte;
+  LdrOp, StrOp: UInt32;
+  Signed: Boolean;
+  Val: Byte;
+  GoodLabel: TWasmJitLabel;
+
+  function LoadWord(const APrefix: UInt32; const ARt, ARn: Byte;
+    const AOffset: UInt32): UInt32;
+  begin
+    { Unsigned-offset form: imm12 is scaled by the access size. }
+    Result := APrefix or ((AOffset div AccessSize) shl 10)
+      or (UInt32(ARn) shl 5) or ARt;
+  end;
+
+begin
+  Offset := UInt32(AShape shr 16);
+  Width := Byte((AShape shr 8) and $FF);
+  Signed := (AShape and 2) <> 0;
+  AccessSize := Width;
+
+  { The reference arrives in a value slot; T0 carries it for the null check
+    and stays the base address. }
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, AIns.A);
+  GoodLabel := ABuf.NewLabel;
+  EmitCbnzTo(ABuf, ARM64_REG_T0, GoodLabel);
+  Arm64EmitLoadImm32(ABuf, 0, Ord(wtkNullStructReference));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(GoodLabel);
+
+  case AIns.Op of
+    iroStructGet, iroStructGetS, iroStructGetU:
+      begin
+        if Width = 1 then
+          if Signed then
+            LdrOp := $39C00000
+          else
+            LdrOp := $39400000
+        else if Width = 2 then
+          if Signed then
+            LdrOp := $79C00000
+          else
+            LdrOp := $79400000
+        else if Width = 4 then
+          LdrOp := $B9400000
+        else
+          LdrOp := $F9400000;
+        ABuf.EmitU32(LoadWord(LdrOp, ARM64_REG_T1, ARM64_REG_T0, Offset));
+        { W-form loads zero the high half, which is exactly the canonical
+          slot rule; the x load fills it verbatim. }
+        StX(ABuf, ARM64_REG_T1, AIns.Dest);
+      end;
+    iroStructSet:
+      begin
+        Val := Arm64CachedSourceReg(ABuf, ACache, AIns.B,
+          ARM64_REG_T1);
+        if Width = 1 then
+          StrOp := $39000000
+        else if Width = 2 then
+          StrOp := $79000000
+        else if Width = 4 then
+          StrOp := $B9000000
+        else
+          StrOp := $F9000000;
+        ABuf.EmitU32(LoadWord(StrOp, Val, ARM64_REG_T0, Offset));
+      end;
+  end;
 end;
 
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
@@ -940,10 +1041,12 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   AUsePinnedMemoryBase, AExtendedFrame, ANativeScalarSelf: Boolean;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
-  var ACache: TArm64RegCache): Boolean; overload;
+  var ACache: TArm64RegCache;
+  const AGcShapes: PArm64GcShapeArray): Boolean; overload;
 var
   Source, Dest: Byte;
   ArgSlot, ResultSlot: UInt32;
+  ConstHost: Byte;
 begin
   Result := True;
   if Arm64ScalarMemoryOp(AIns.Op) then
@@ -970,14 +1073,29 @@ begin
       end;
     iroI32Const, iroF32Const:
       begin
-        Arm64EmitLoadImm32(ABuf, ARM64_REG_T0,
-          UInt32(AIns.Imm and $FFFFFFFF));
-        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+        { A loop-invariant constant with a dedicated static host was seeded at
+          frame entry; re-emitting it inside the loop body would rebuild the
+          same bits on every iteration. Otherwise materialize straight into
+          the freshly reserved destination — the T0 hop costs an extra mov
+          per constant in the native-core shapes. }
+        if not Arm64ConstSlotHost(ACache, AIns.Dest, ConstHost) then
+        begin
+          Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest,
+            ARM64_REG_ZR, ARM64_REG_ZR, ARM64_REG_T0);
+          Arm64EmitLoadImm32(ABuf, Dest,
+            UInt32(AIns.Imm and $FFFFFFFF));
+          Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
+        end;
       end;
     iroI64Const, iroF64Const:
       begin
-        Arm64EmitLoadImm64(ABuf, ARM64_REG_T0, UInt64(AIns.Imm));
-        Arm64CachedStore(ABuf, ACache, ARM64_REG_T0, AIns.Dest);
+        if not Arm64ConstSlotHost(ACache, AIns.Dest, ConstHost) then
+        begin
+          Dest := Arm64CachedDestReg(ABuf, ACache, AIns.Dest,
+            ARM64_REG_ZR, ARM64_REG_ZR, ARM64_REG_T0);
+          Arm64EmitLoadImm64(ABuf, Dest, UInt64(AIns.Imm));
+          Arm64CachedStore(ABuf, ACache, Dest, AIns.Dest);
+        end;
       end;
     iroBranchIf, iroBranchIfNot:
       begin
@@ -1103,6 +1221,12 @@ begin
     iroI64Rotr: Arm64CachedAlu(ABuf, AIns, @Arm64RorvX, ACache);
   else
   begin
+    if (AGcShapes <> nil) and
+      ((AGcShapes[AInsIndex] and 1) <> 0) then
+    begin
+      Arm64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+      Exit;
+    end;
     { Helpers, safepoints, complex control and currently uncached templates all
       observe/write the canonical memory register file. }
     Arm64FlushDynamicRegCache(ABuf, ACache);
@@ -1902,6 +2026,7 @@ var
   Fn: PWasmIrFunction;
   Obj: TWasmRef;
   N, I, U1, U2, TypeIdx, DataIdx, ElemIdx, Aux: UInt32;
+  TmpFields: array[0..7] of TWasmValue;
   ElemOffset, Count, SrcLen: UInt32;
   DataAddr: TWasmDataAddr;
   ElemAddr: TWasmElemAddr;
@@ -1915,12 +2040,21 @@ begin
         Obj := AStore.Heap.AllocStruct(Inst.EngineTypeIds[UInt32(AIns^.Imm)]);
         Reg[AIns^.Dest].Bits := UInt64(Obj);            { publish before fill }
         N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
-        I := 0;
-        while I < N do
+        if N <= UInt32(Length(TmpFields)) then
         begin
-          AStore.Heap.StructSet(Obj, I,
-            Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
-          Inc(I);
+          for I := 0 to Integer(N) - 1 do
+            TmpFields[I] := Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
+          AStore.Heap.StructSetSeq(Obj, @TmpFields[0], N);
+        end
+        else
+        begin
+          I := 0;
+          while I < N do
+          begin
+            AStore.Heap.StructSet(Obj, I,
+              Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+            Inc(I);
+          end;
         end;
       end;
     iroStructNewDefault:
@@ -3149,6 +3283,10 @@ end;
 procedure Arm64InitRegCache(out ACache: TArm64RegCache);
 begin
   FillChar(ACache, SizeOf(ACache), 0);
+  { The original dynamic pool is x14..x17 (entries 3..6). }
+  ACache.DynBase := 3;
+  ACache.DynCount := 4;
+  ACache.ConstFrom := High(Byte);
 end;
 
 procedure Arm64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
@@ -3166,6 +3304,55 @@ begin
       LdX(ABuf, Arm64CacheHostReg(ACache.StaticCount), ASlots[I]);
       Inc(ACache.StaticCount);
   end;
+end;
+
+{ Append loop-invariant constant slots behind the leading statics. Each host
+  register is seeded ONCE with its immediate at frame entry; the defining
+  const instruction emits nothing, so a value that sat inside the loop body
+  stops being rebuilt on every iteration. }
+procedure Arm64EnableConstSlots(const ABuf: TWasmCodeBuffer;
+  var ACache: TArm64RegCache; const ASlots: array of UInt32;
+  const ABits: array of UInt64);
+var
+  I: Integer;
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  ACache.ConstFrom := ACache.StaticCount;
+  for I := 0 to High(ASlots) do
+  begin
+    if (I > High(ABits)) or (ASlots[I] = High(UInt32)) or
+      (ACache.StaticCount > High(ACache.Entries)) then
+      Continue;
+    Arm64EmitLoadImm64(ABuf, Arm64CacheHostReg(ACache.StaticCount), ABits[I]);
+    ACache.Entries[ACache.StaticCount].Valid := True;
+    ACache.Entries[ACache.StaticCount].Slot := ASlots[I];
+    Inc(ACache.StaticCount);
+  end;
+  ACache.DynBase := ACache.StaticCount;
+  ACache.DynCount := Byte(High(ACache.Entries) + 1 - ACache.DynBase);
+  { The round-robin cursor ranged over the old four-register pool. }
+  if ACache.Next >= ACache.DynCount then
+    ACache.Next := 0;
+end;
+
+{ True when ASlot is served by one of the appended constant entries; the
+  defining iro*Const may then emit nothing. Slot numbers are unique per SSA
+  value, and the driver never hands an already-allocated slot here, so a hit
+  is unambiguous. }
+function Arm64ConstSlotHost(const ACache: TArm64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := ACache.ConstFrom to ACache.StaticCount - 1 do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := Arm64CacheHostReg(I);
+      Result := True;
+      Exit;
+    end;
 end;
 
 procedure Arm64EnableDynamicWriteBack(var ACache: TArm64RegCache;
@@ -3195,6 +3382,9 @@ begin
       older fixed mapping would win the next lookup. }
     ACache.StaticCount := Byte(AParamCount);
   end;
+  { The victim pool stays x14..x17 in both modes: entry 2 (x26) is reserved by
+    the self-recursion budget ABI, and the parameter entries are served by
+    their fixed hosts, never round-robin. }
   ACache.Entries[0].Valid := True;
   ACache.Entries[0].Dirty := True;
   ACache.Entries[0].Slot := AParam0Slot;
@@ -3239,6 +3429,10 @@ var
 begin
   if not ACache.WriteBackDynamics then
     Exit;
+  { Starts at StaticCount, not DynBase: in native-core modes the dirty
+    parameter entries sit below any fixed boundary and depend on this spill
+    for their canonical write-back; ordinary statics are flushed by
+    FlushRegCache instead. }
   for I := ACache.StaticCount to High(ACache.Entries) do
     Arm64SpillCacheEntry(ABuf, ACache, I);
 end;
@@ -3269,7 +3463,7 @@ var
 begin
   if ACache.StaticAllocation then
   begin
-    for I := 3 to High(ACache.Entries) do
+    for I := ACache.DynBase to High(ACache.Entries) do
       ACache.Entries[I].Valid := False;
     ACache.Next := 0;
     Exit;
@@ -3303,8 +3497,8 @@ begin
     end;
   if ACache.StaticAllocation then
   begin
-    Victim := 3 + ACache.Next;
-    ACache.Next := Byte((ACache.Next + 1) and 3);
+    Victim := ACache.DynBase + ACache.Next;
+    ACache.Next := Byte((ACache.Next + 1) mod ACache.DynCount);
   end
   else
   begin
@@ -3355,8 +3549,8 @@ begin
     { A one-source cached operation can load a missing expression directly
       into its selected dynamic entry. This is the same round-robin victim and
       liveness spill used by CachedLoad, without an unnecessary scratch copy. }
-    Victim := 3 + ACache.Next;
-    ACache.Next := Byte((ACache.Next + 1) and 3);
+    Victim := ACache.DynBase + ACache.Next;
+    ACache.Next := Byte((ACache.Next + 1) mod ACache.DynCount);
     if ACache.WriteBackDynamics then
       Arm64SpillCacheEntry(ABuf, ACache, Victim);
     Result := Arm64CacheHostReg(Victim);
@@ -3468,7 +3662,7 @@ begin
   { Reuse an established dynamic destination only when it is not an operand.
     If it is an operand, retain the scratch path so the input survives until
     the instruction has read it and no duplicate slot mapping is created. }
-  for I := 3 to High(ACache.Entries) do
+  for I := ACache.DynBase to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
     begin
       Host := Arm64CacheHostReg(I);
@@ -3480,10 +3674,10 @@ begin
   { Reserve a non-source entry before emission. Its previous value is spilled
     through the existing liveness predicate; CachedStore marks the new value
     dirty after the instruction writes it. }
-  for Attempt := 0 to 3 do
+  for Attempt := 0 to ACache.DynCount - 1 do
   begin
-    Offset := (Integer(ACache.Next) + Attempt) and 3;
-    I := 3 + Offset;
+    Offset := (Integer(ACache.Next) + Attempt) mod ACache.DynCount;
+    I := ACache.DynBase + Offset;
     Host := Arm64CacheHostReg(I);
     if (Host = AExclude0) or (Host = AExclude1) then
       Continue;
@@ -3492,7 +3686,7 @@ begin
     ACache.Entries[I].Valid := True;
     ACache.Entries[I].Dirty := False;
     ACache.Entries[I].Slot := ASlot;
-    ACache.Next := Byte((Offset + 1) and 3);
+    ACache.Next := Byte((Offset + 1) mod ACache.DynCount);
     Exit(Host);
   end;
 end;
@@ -3523,8 +3717,8 @@ begin
       StX(ABuf, ASrc, ASlot);
     if Victim < ACache.StaticCount then
     begin
-      Victim := 3 + ACache.Next;
-      ACache.Next := Byte((ACache.Next + 1) and 3);
+      Victim := ACache.DynBase + ACache.Next;
+      ACache.Next := Byte((ACache.Next + 1) mod ACache.DynCount);
     end;
     if ACache.WriteBackDynamics then
       Arm64SpillCacheEntry(ABuf, ACache, Victim);

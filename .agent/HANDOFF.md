@@ -1,6 +1,287 @@
 # Handoff
 
-Updated: 2026-08-22 (wave 3 candidate rejected; scalar memory + simd profiled)
+Updated: 2026-08-22 (wave 11 scoping: inline-alloc design RESOLVED, not built)
+
+## Wave 11 — inline struct.new allocation: design finalized, execution deferred
+
+- Scoping pass produced every remaining design answer; implementation did
+  not start (GC-critical surface + late-session budget). Build order for the
+  dedicated session:
+  1. PROBES: mirror WasmJitFrameOffsets' uninitialized-local address trick.
+     Needed: (a) Gc-unit probe for TWasmGcHeap privates {FFree[0] base,
+     FMarkState, FBytesLive, FBytesAllocated, ObjectCount}; (b) Store-unit
+     probe for {TWasmStore.FHeap} and {TWasmModuleInstance.EngineTypeIds} —
+     both classes, so the probe constructs a throwaway Engine/Store/Instance,
+     takes field addresses, frees, caches lazily. Block-field offsets
+     (Base@8, Allocated dyn-array ptr) are computable in the backend directly
+     if TWasmGcBlock is interface-visible (verify).
+  2. ENTRY ABI DECISION (pick one): load the runtime engine type id via the
+     context chain (~7 instructions per alloc: ctx.Acts[Depth-1].Instance.
+     EngineTypeIds[idx]; all offsets already probed except EngineTypeIds),
+     OR pass Instance as a new compiled-entry argument (x5) — cleaner code
+     but bumps the entry ABI fingerprint (fails old artifacts closed) and
+     touches both InvokeCompiled marshals + AOT wiring.
+  3. FAST PATH (free-list hit ONLY; miss → existing AllocStruct dispatch
+     sequence emitted inline as the slow branch — it remains THE collect
+     safepoint per ADR-0011): head = [heap+FFree0+cls*8]; cbz → slow; pop
+     link; bitmap word |= bit (cell = diff >> log2CellSize — POW2 CLASSES
+     ONLY initially, {16,32,64,128,256}, others decline to helper); tail
+     zero ≤ 8 bytes (decline larger); header := markState | kindConst<<2 |
+     typeId<<32; counters BytesLive/BytesAllocated += CellSize, ObjectCount++
+     (~7 instrs, non-negotiable); numeric field stores at baked offsets
+     (truncating strb/strh like WriteField); publish Dest last.
+  4. DECLINES: any ref field (barrier shape), v128 field, non-pow2 cell,
+     tail > 8, struct.new_default (defaults loop differs).
+  5. GATES: differential gc module exercising free-list reuse across a
+     forced collect; corpus ×3 tiers; byte-pin test for the sequence.
+- ZeroCell shrink question remains open (needs the nothing-reads-raw-bytes
+  proof) but is INDEPENDENT: fast path can keep full ZeroCell semantics by
+  simply declining to skip it (zeroing stays in the slow path; fast path
+  writes header+fields over recycled bytes whose stale content is only
+  reachable through fields it immediately overwrites or tail bytes it
+  zeroes — write the argument down either way).
+
+## Wave 10 — struct.new fills resolve layout once ACCEPTED (small)
+
+- Commit `bbedb4a` (`perf(gc): resolve struct.new field layout once per
+  fill`). New heap method `StructSetSeq(Ref, Values, Count)`: one null/kind/
+  bounds check and ONE LayoutOf resolution, then N direct WriteField calls —
+  replacing N per-field StructSet crossings that each re-resolved the layout
+  (the fresh profile showed 78 samples of TWasmGcTypes.Layout under
+  StructSet). Both tiers route through it for arities ≤ 8 via a stack temp;
+  larger arities keep the legacy loop. The v1 write barrier is empty by
+  design, so the sequential fill is observably identical.
+- Serialized A/B vs the true wave-9 head (ec294dd, rebuilt + hash-retained at
+  /tmp/wave9-head.ec294dd): gc −4.1%/−1.4% — small, forward-dominant, no
+  regression in 14 samples. Corpus byte-identical in all three tiers on this
+  exact tree; format green. NOTE: an earlier comparison against the WAVE-6
+  baseline read −27% — always diff against the IMMEDIATE predecessor head.
+- Post-wave-9 gc profile (for the next session): alloc family ~52%
+  (AllocStruct 558+158, TakeCell ~414, Collect/Sweep only ~170), StructSet
+  family down to ~9% after this slice, generated body ~58% — inline
+  allocation is now unambiguously the next move, exactly per wave 8's design
+  notes.
+
+## Wave 9 — numeric struct.get/get_s/get_u/set natively on arm64 ACCEPTED
+
+- Commit `ec294dd` (`perf(jit): emit numeric struct field access natively on
+  arm64`). The driver's AnalyzeGcFieldAccess mirrors TWasmGcTypes' layout
+  math exactly (header 8, per-field align-up to storage width, cumulative
+  advance) over AIr.CanonTypes[TypeIndexToCanon[Imm.hi]].Comp, baking offset/
+  width/signedness into a per-instruction shape word (bit0 native, bit1
+  signed, bits8-15 width, bits16-31 offset). Ref fields and v128 stay on the
+  helper path (write barrier / Q regs); offsets that do not fit the scaled
+  imm12 decline. Arm64EmitGcFieldAccess emits: cached ref load → cbnz past a
+  type-specific null trap (`wtkNullStructReference`, same kind and position
+  as the helper) → width-sized load with sign/zero extension or width-sized
+  store from the value's cache host. No engine ids are baked — offsets are
+  pure functions of the module composite, so AOT artifacts stay
+  instance/store-agnostic.
+- Emitted shape per access ≈ 5 instructions replacing a full helper crossing
+  plus internal layout resolution. Verified by carve: `ldrsb w10,[x9,#24]`
+  for an i8 get_s at baked offset 24.
+- Serialized release A/B vs the wave-6 baseline binary: gc **−24.8%/−25.2%**
+  (101.2/101.5 → 76.1/75.9 ms; spreads fully disjoint). gc/Wasmtime ratio
+  improves from ~3.5x to ~2.6x. All other workloads untouched (shapes fire
+  only for struct ops).
+- Correctness: 44/44 suites; corpus byte-identical interp/JIT/AOT at
+  pass=65851 fail=368 skip=904 staged=0 errors=0 (compiled=8799); format
+  green. x64 inert (shape array only passed to the arm64 call site).
+- Follow-ups in priority order: (1) native struct.new allocation fast path
+  per wave 8's design notes (now the largest remaining gc cost); (2) native
+  array.get/set with baked element offsets + bounds check (kills the runtime
+  IrAux reads ~140 samples and another crossing); (3) x64 mirror of both.
+
+## Wave 8 — GC groundwork: fresh profile, layout memo REJECTED as noise
+
+- Refreshed `sample(1)` profile of the scaled gc workload on the current head
+  (3824 loop samples): alloc family ~23% (AllocStruct 602+200, TakeCell ~430,
+  Collect/Sweep only ~170 ≈ 5%), StructSet family ~9% (body 138,
+  **TWasmGcTypes.Layout re-resolution 85**, GcRefTypeId 37 = roots-array ref
+  barrier — inherent), IrAuxBlockItem/Count runtime reads ~140 (the array-set
+  dispatch reads aux tables per call at runtime), generated body ~43%.
+- Tried: single-entry Layout memo in TWasmGcTypes (fields FMemoId/FMemoLayout,
+  High sentinel ctor, resets in Define/Grow because SetLength reallocates).
+  Correct, all suites green — but serialized release A/B measured gc
+  −1.4%/+1.0%: flat within noise. REJECTED per the no-repeatable-delta rule;
+  reverted; binary hash back to the exact wave-6 build.
+- **PROCESS GUARD, SECOND OFFENSE**: an interim A/B compared a DEV-mode
+  candidate against the RELEASE baseline again (gc "277 ms", +164%). The
+  signature is unmistakable: compiled-tier workloads ~2.6x slow, perfectly
+  stable across legs. RULE: after ANY `lwpt build wasmlight`, a release
+  rebuild (`lwpt build --mode release`) is mandatory before any measurement;
+  check `shasum build/wasmlight` against the retained baseline binary when in
+  doubt. Consider a wrapper or hook to enforce this.
+- DESIGN GROUNDWORK for the dedicated inline-allocation session (the only
+  lane that moves gc materially): free-list pop is FFree[const class] head +
+  link load/store (~4 instrs); the blocker is SetCellAllocated's bitmap word
+  (cell = (head−Base)/CellSize, then div-32 index + variable-shift ORR ≈ 7-8
+  instrs — CellSize is compile-time constant per fixed type so magic-multiply
+  applies); ZeroCell can shrink to a tail store ONLY if nothing reads raw
+  cell bytes outside layouts (needs a design-doc proof before touching);
+  counters (FBytesLive/Allocated/ObjectCount) must still update (~6 instrs);
+  threshold-check/collect stays as THE allocation-site safepoint per
+  ADR-0011; slow path = existing helper unchanged. Estimated fast path ~25-30
+  instructions vs ~40 today including crossings — worth it only together
+  with native struct.get/array.set to also kill the crossing overhead.
+- The array.set runtime aux reads (~140 samples) are the same shape as the
+  struct.get/array.set native-template lane; bounded follow-up: bake the
+  field index/count into the emitted code for fixed-type array shapes.
+
+## Wave 7 — fetch-alignment padding for backward targets REJECTED
+
+- Tested wave 5's residual theory directly: pad every backward-jump target
+  (loop header) to a 16-byte boundary with A64 NOPs before BindLabel, so
+  iterations enter on a full decode window. Semantically transparent — corpus
+  identity held immediately (65851/368/904 in jit); one shape-pin test grew
+  by the two NOP words as expected.
+- Clean-environment serialized A/B (after catching and stopping a UTM/QEMU
+  Windows VM that had been eating ~176% CPU and poisoning several earlier
+  legs — always `ps aux -r` before trusting a schedule): loop −0.6%/−0.2%,
+  simd +2.4%/−2.2%, fib/memory flat, memory-store unmeasurable (its samples
+  are bimodal 27–49 ms even within one leg on this host). No repeatable
+  positive delta → reverted; binary hash back to the exact wave-6 build.
+- CONSEQUENCE FOR WAVE 5: simple loop-header alignment does NOT explain why
+  the smaller vector loop measured slower. The simd retry needs a real
+  microarchitectural bisect (candidates: scalar-static allocation inside vec
+  functions forcing value slot round-trips; Q-bank effects; per-op cache
+  invalidation patterns). Do not re-attempt on the alignment theory.
+
+## Wave 6 — leaf-core operand cleanup ACCEPTED
+
+- Two contained changes on top of f191e18, commit `6187bae`
+  (`perf(jit): forward native-core param aliases and emit consts in place`):
+  1. AnalyzeLocalAliases' gate widened from `(UsePinnedMemoryBase and
+     UseStaticCache)` to also admit `UseNativeScalarCore` — the pass already
+     forwarded local.get-moves into consumers for memory loops; closed
+     native-scalar cores have the identical proof shape (helper-free,
+     params in fixed hosts, one-use temps). ImmediateFusion and
+     StoreLoadForwarding keep their narrower gates deliberately.
+  2. Cached iro*Const emission now reserves its destination victim first
+     (Arm64CachedDestReg) and materializes the immediate directly into it,
+     removing the T0→victim mov hop per constant in write-back mode.
+- Evidence: carved leaf core of a two-arg LCG leaf shrank 14 → 9
+  instructions (`eor w14,w12,w13` consumes ABI regs directly; consts land in
+  value positions); remaining double-bounce (`mov x15,x14; mov x12,x15`) is
+  blocked by the x12 fixed-mapping conflict (result reg cannot share the
+  param's cache slot) — needs a result-register mapping design if pursued.
+- Serialized A/B under load (host ~3x slower than usual during this run —
+  absolute medians inflated equally on both sides, relative deltas valid):
+  fib(35) **−10.3%/−8.2%**, call −2.9%/−2.4%, both orders consistent.
+  Fib gains most because self-recursion executes the cleaned core.
+- Wasm.Jit.Arm64.Test's dynamic-write-back test re-pinned to the tighter
+  emission (28 bytes dead / 32 bytes one-spill, spill word at index 6).
+- x64 inert: the widened gate sits inside the ARM64 ifdef.
+- Next call-lane step (unbuilt): hoist per-call target/cap resolution across
+  backedges for proof-gated direct calls to compiled leaves — caller-side
+  plumbing (~22 instructions around each blr) dominates over the callee now.
+
+## Wave 5 — v128 constant Q-hosts + vector static-cache admission REJECTED
+
+- Lane built directly on wave 4's const-slot machinery: admitted
+  Arm64NativeVecOp into StaticCacheOp (vector loop functions become static-
+  cache eligible), extended AnalyzeConstSlots with iroV128Const candidates
+  (pair base slot, 128 bits from IrAuxReadV128, offered only when defined in
+  a loop span and EVERY consumer is a native vec template — helper-dispatched
+  readers would see an never-written canonical pair), seeded caller-saved
+  v16/v17 once at frame entry via two LoadImm64 + INS pairs (new builder
+  Arm64MovGeneralToVecD, imm5 = %01000 + lane<<4, verified against
+  `mov v16.d[0],x9` = 4E081D30), parameterized every EmitNativeVec source
+  load through a host-aware resolver, routed native vec ops through the
+  cached path WITHOUT flush/invalidate, and made splats consume scalar cache
+  hosts directly.
+- Generated code was correct and much smaller: the simd loop went from ~47
+  to ~28 instructions — const-B hosted in v16 (`add.4s v0,v0,v16`), limit
+  hoisted to x14, splat reading w15. Measured result was a REPEATABLE
+  REGRESSION: serialized simd-only A/B (7 samples, both orders) gave cand
+  11.455/11.489 ms vs base 9.484/9.986 ms (+17-21%, disjoint spreads); the
+  full-schedule legs agreed (+18.2%/+12.7%).
+- Root cause NOT fully identified: fewer instructions but slower — the same
+  wall wave 3 hit when admitting vector ops to the static cache. Suspected
+  residual: changed loop-body code layout/fetch alignment (backedge target
+  moved from 0x60, 16-aligned, to 0xac) and/or spill-pattern side effects of
+  scalar static allocation inside vector loops. Fully reverted; nothing
+  remains in the tree. Any retry must first explain WHY the smaller loop is
+  slower — e.g. by bisecting eligibility-admission alone vs Q-hosting alone,
+  or by measuring with forced 16-byte alignment padding before the loop
+  header.
+
+## Wave 4 — loop-invariant constants seeded once in static cache hosts
+
+- Goal for this session was "0.7x–0.85x of Wasmtime": every wasmbench
+  workload at ≥70% of Wasmtime throughput (≤1.43x time). Baseline at exact
+  `origin/main@e686e0a` (release binary sha256 `d795d942…`, retained at
+  `/tmp/wasmlight-wave4-baseline.e686e0a/`) measured, serialized under the
+  perf gate (best profile, 1 warm-up discarded, 7 samples): startup 2.47 ms,
+  loop 378/365 ms, fib 33 ms, memory 22 ms, memory-load 41→44 ms,
+  memory-store 49→36 ms, call 138→155 ms, memory-grow 13 ms, gc 106→112 ms,
+  simd 8.4→10.7 ms, host-call 35→38 ms across the four legs — i.e. failing
+  workloads were gc (~3.65x), call (~2.2x), simd (~1.9x), memory-store
+  (~1.75x time).
+- Profiles captured (`sample(1)` on long scaled AOT runs, artifacts under
+  `/var/folders/mv/6_sclnc96hgfcv9gknbsqr880000gn/T/opencode/wave4-profile/`):
+  - **gc**: ~44% generated loop body, ~37% allocation machinery
+    (AllocStruct/Allocate/TakeCell + Collect/Sweep ≈4%), ~9% StructSet helper
+    re-resolving TWasmGcTypes.Layout per set, plus InterpContextFor crossings.
+    Three helper blrs per iteration (struct.new/array.set/struct.get).
+  - **call**: 100% generated code, zero helpers. The native leaf core wastes
+    ~6 of ~13 instructions moving operands into value positions
+    (`mov x14,x12; mov x15,x13 … mov x17,x16; mov x12,x17`); the caller
+    re-resolves FuncAddrs×sizeof/entry/caps every call (~22 instructions of
+    plumbing around one blr).
+  - **simd**: two v128 constants rebuilt via 8×movz/movk + slot traffic EVERY
+    iteration, accumulator spilled/reloaded through canonical slots, scalar
+    limit rebuilt per iteration. ~37 instructions where ~6 do the work.
+  - **memory loops**: the br_if limit constant is materialized inside the
+    loop body (movz+movk+mov) every iteration because its IR instruction is.
+- Accepted commit `f191e18`
+  (`perf(jit): seed loop-invariant constants once in static cache hosts`,
+  branch `t3code/optimize-runtime-wasmtime-gap-1`): a driver analysis picks
+  up to ONE constant-defined slot (unique writer, not already allocated,
+  defined inside a backward-jump loop span, not SkipPlanned by fusion),
+  `Arm64EnableConstSlots` appends it behind the leading statics and seeds the
+  host register once at frame entry via immediate materialization, and the
+  defining const instruction then emits nothing. The dynamic victim pool is
+  now `[DynBase..DynBase+DynCount)` instead of hardcoded `[3..6]`
+  (`TArm64RegCache.DynBase/DynCount/ConstFrom`); FlushDynamicRegCache keeps
+  starting at StaticCount because native-core non-leaf mode keeps dirty
+  parameter entries below any fixed boundary — that distinction is load-
+  bearing and broke fac/fib i64 until restored. Arm64-only this wave; x64
+  inert (enable call sits in the ARM64 block), so x86-64 corpus identity was
+  trivially preserved but must be proven in the VM before any PR.
+- Serialized release A/B BASE-CAND-CAND-BASE under `/tmp/wasmlight-perf-gate.lock`
+  (7 samples each leg, raw JSON in `/tmp/ab2/*.json`): loop −3.8%/−3.8%
+  (367.5/367.0 → 353.4/352.9 ms, disjoint spreads); all other guards flat:
+  fib +0.9/+0.4, memory-load +2.6/−6.0, memory-store −2.7/+4.8, gc
+  +1.1/−0.5, simd −1.4/+0.3, host-call +2.3/+0.6, grow/startup flat. The
+  call reverse-leg median (+19%) was background host load — its samples are
+  bimodal (136–192 ms) while both clean legs cluster 127–155.
+- REJECTED variant: two const slots (K=2). Same schedule measured loop
+  −5.5%/−6.7% BUT memory-load +21.8%/+8.7% in BOTH orders — appending a
+  second host shrinks the dynamic pool to two registers and the load loop's
+  expression pressure thrashes. Fully reverted before acceptance; do not
+  re-attempt without a pressure-aware gate.
+- PROCESS NOTE: an intermediate A/B compared a DEV-mode candidate against
+  the RELEASE baseline (gc +173%, host-call +165%) — build modes must match
+  on both sides of every comparison; dev builds are correctness gates only.
+- Correctness on the accepted head (release `76eb3fd0…`): frozen install,
+  format, agents check green; 44/44 unit suites; corpus byte-identical in
+  interpreter/JIT/AOT at pass=65851 fail=368 skip=904 staged=0 errors=0
+  (compiled=8799); Markdown lint clean.
+- Band status after the wave (same-schedule Wasmtime medians): IN BAND
+  startup 0.64x, loop 1.05x, fib 0.99x, memory 1.13x, memory-grow 0.99x,
+  host-call 0.92x; BORDERLINE memory-load ~1.36x / memory-store ~1.34x
+  (inside 1.43x but not improved by this lane — they are store/load
+  bandwidth-bound, instruction removal hides under latency); OUT OF BAND
+  simd ~1.87x, call ~2.2x, gc ~3.8x.
+- Next lanes, pre-seeded with profile evidence above: (1) GC native inline
+  allocation fast path in both backends (bump/free-list inline, collect
+  slow path as the allocation-site safepoint per ADR-0011) — largest gap;
+  (2) SIMD Q-register caching of vector values + v128 constant hoisting for
+  call-free functions (wave-3's counter-caching variant failed; Q-value
+  caching remains unbuilt machinery in both backends); (3) native scalar
+  leaf-core operand cleanup (consume x12/x13 in place, produce x12) plus
+  hoisting direct-call metadata resolution across backedges.
 
 ## Wave 3 — static cache for vector loops REJECTED and reverted
 

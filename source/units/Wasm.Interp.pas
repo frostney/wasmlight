@@ -1421,6 +1421,7 @@ var
   Fn: PWasmIrFunction;
   Obj: TWasmRef;
   N, I: UInt32;
+  TmpFields: array[0..7] of TWasmValue;
 begin
   Store := ACtx^.Store;
   Reg := Frame(ACtx^.Values, AAct^.Base);
@@ -1428,11 +1429,21 @@ begin
   Obj := Store.Heap.AllocStruct(AAct^.Instance.EngineTypeIds[UInt32(AIns^.Imm)]);
   Reg[AIns^.Dest].Bits := UInt64(Obj);            { publish before filling }
   N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
-  I := 0;
-  while I < N do
+  if N <= UInt32(Length(TmpFields)) then
   begin
-    Store.Heap.StructSet(Obj, I, Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
-    Inc(I);
+    for I := 0 to Integer(N) - 1 do
+      TmpFields[I] := Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
+    Store.Heap.StructSetSeq(Obj, @TmpFields[0], N);
+  end
+  else
+  begin
+    I := 0;
+    while I < N do
+    begin
+      Store.Heap.StructSet(Obj, I,
+        Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+      Inc(I);
+    end;
   end;
 end;
 
