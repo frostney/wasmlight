@@ -542,6 +542,7 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
   freshly per invocation — so nothing about the host process is ever baked, and
   this also subsumes the old Fix-C @AIns-by-reference concern. }
 function Arm64CanEmitOp(const AOp: TWasmIrOp): Boolean;
+function Arm64NativeVecOp(const AOp: TWasmIrOp): Boolean;
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AUsePinnedMemory: Boolean = False;
@@ -590,6 +591,12 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   remains. Null refs trap the struct-specific kind before any load. }
 procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AShape: UInt64;
+  var ACache: TArm64RegCache);
+{ Fixed-type scalar array access. A kind mismatch takes the unchanged helper
+  route so the runtime's internal invariant remains authoritative; null and
+  bounds traps are emitted in their original order on the native path. }
+procedure Arm64EmitGcArrayAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AInsIndex: UInt32; const AShape: UInt64;
   var ACache: TArm64RegCache);
 { Wave 11 — the inline struct.new fast path. Emits the free-list-hit
   allocation straight line (pop, bitmap, counters, header, baked numeric
@@ -1082,6 +1089,123 @@ begin
   end;
 end;
 
+procedure Arm64EmitGcArrayAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AInsIndex: UInt32; const AShape: UInt64;
+  var ACache: TArm64RegCache);
+var
+  ObjSlot, IndexSlot: UInt32;
+  Width: Byte;
+  LdrOp, StrOp: UInt32;
+  Signed: Boolean;
+  Val: Byte;
+  NonNull, KindFallback, InBounds, Done: TWasmJitLabel;
+
+  function ScaledRegOffset(const APrefix: UInt32; const ARt: Byte): UInt32;
+  begin
+    { S=1 scales Wm by the access width; the array index is i32, so UXTW
+      keeps its full unsigned range. }
+    Result := Arm64MemRegOffset(APrefix, ARt, ARM64_REG_T0,
+      ARM64_REG_T1, False) or $1000;
+  end;
+
+begin
+  Width := Byte((AShape shr 8) and $FF);
+  Signed := (AShape and 2) <> 0;
+  if AIns.Op = iroArraySet then
+  begin
+    ObjSlot := AIns.Dest;
+    IndexSlot := AIns.A;
+  end
+  else
+  begin
+    ObjSlot := AIns.A;
+    IndexSlot := AIns.B;
+  end;
+
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T0, ObjSlot);
+  Arm64CachedLoad(ABuf, ACache, ARM64_REG_T1, IndexSlot);
+  NonNull := ABuf.NewLabel;
+  KindFallback := ABuf.NewLabel;
+  InBounds := ABuf.NewLabel;
+  Done := ABuf.NewLabel;
+
+  EmitCbnzTo(ABuf, ARM64_REG_T0, NonNull);
+  Arm64EmitLoadImm32(ABuf, 0, Ord(wtkNullArrayReference));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(NonNull);
+
+  { Preserve ResolveElement's null -> layout/kind -> bounds order. The kind
+    mismatch is validator-unreachable, so the cold helper call exists only to
+    retain its exact EWasmInternal invariant rather than inventing a backend
+    error path. }
+  Arm64EmitLdrW(ABuf, ARM64_REG_T2, ARM64_REG_T0, 0);
+  ABuf.EmitU32(Arm64LsrImmW(ARM64_REG_T2, ARM64_REG_T2,
+    WASM_OBJ_KIND_SHIFT));
+  ABuf.EmitU32(Arm64AndLowMaskImmW(ARM64_REG_T2, ARM64_REG_T2, 3));
+  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_T2, ARM64_REG_T2, Ord(wokArray)));
+  ABuf.EmitU32(Arm64CmpX(ARM64_REG_T2, ARM64_REG_ZR));
+  EmitBCondTo(ABuf, ARM64_COND_NE, KindFallback);
+
+  Arm64EmitLdrW(ABuf, ARM64_REG_T2, ARM64_REG_T0,
+    WASM_ARRAY_LENGTH_OFFSET);
+  ABuf.EmitU32(Arm64CmpW(ARM64_REG_T1, ARM64_REG_T2));
+  EmitBCondTo(ABuf, ARM64_COND_LO, InBounds);
+  Arm64EmitLoadImm32(ABuf, 0, Ord(wtkArrayOutOfBounds));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(InBounds);
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_T0, ARM64_REG_T0,
+    WASM_ARRAY_ELEMS_OFFSET));
+
+  if AIns.Op = iroArraySet then
+  begin
+    Val := Arm64CachedSourceReg(ABuf, ACache, AIns.B, ARM64_REG_T2);
+    if Width = 1 then
+      StrOp := $39000000
+    else if Width = 2 then
+      StrOp := $79000000
+    else if Width = 4 then
+      StrOp := $B9000000
+    else
+      StrOp := $F9000000;
+    ABuf.EmitU32(ScaledRegOffset(StrOp, Val));
+    { The v1 barrier is deliberately empty and a store cannot collect, so the
+      direct reference write has the same visibility semantics as ArraySet.
+      A non-empty future barrier must make reference shapes decline here or
+      gain a dedicated PIC helper before it changes collector policy. }
+  end
+  else
+  begin
+    if Width = 1 then
+      if Signed then
+        LdrOp := $39C00000
+      else
+        LdrOp := $39400000
+    else if Width = 2 then
+      if Signed then
+        LdrOp := $79C00000
+      else
+        LdrOp := $79400000
+    else if Width = 4 then
+      LdrOp := $B9400000
+    else
+      LdrOp := $F9400000;
+    ABuf.EmitU32(ScaledRegOffset(LdrOp, ARM64_REG_T2));
+    Arm64CachedStore(ABuf, ACache, ARM64_REG_T2, AIns.Dest);
+  end;
+  EmitBranchTo(ABuf, UInt32(Done));
+
+  ABuf.BindLabel(KindFallback);
+  { ResolveElement raises before consulting index/value on this path. Publish
+    the already-loaded object so JitRtDispatch observes the exact ref even if
+    its source slot currently lives only in the dynamic cache. }
+  StX(ABuf, ARM64_REG_T0, ObjSlot);
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));
+  Arm64EmitIrInsPtr(ABuf, 2, AInsIndex);
+  Arm64EmitCallHelper(ABuf, aohRtDispatch);
+  ABuf.BindLabel(Done);
+end;
+
 procedure Arm64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AShape: TWasmGcAllocShape;
   const AInfo: TWasmGcAllocInfo; var ACache: TArm64RegCache;
@@ -1409,7 +1533,11 @@ begin
     if (AGcShapes <> nil) and
       ((AGcShapes[AInsIndex] and 1) <> 0) then
     begin
-      Arm64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+      if (AGcShapes[AInsIndex] and 4) <> 0 then
+        Arm64EmitGcArrayAccess(ABuf, AIns, AInsIndex,
+          AGcShapes[AInsIndex], ACache)
+      else
+        Arm64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
       Exit;
     end;
     { Wave 11: an eligible struct.new takes the inline free-list fast path;

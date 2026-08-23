@@ -561,6 +561,41 @@ var
       end;
   end;
 
+  function VectorUseCount(const AReg: UInt32): UInt32;
+  var
+    Info: TWasmIrOpInfo;
+    K, N: Integer;
+
+    procedure CountIfSame(const ASource: UInt32);
+    begin
+      if ASource = AReg then
+        Inc(Result);
+    end;
+
+  begin
+    Result := 0;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      Info := IR_OP_INFO[AFn^.Code[K].Op];
+      if Info.DestKind = ifkSrcReg then
+        CountIfSame(AFn^.Code[K].Dest);
+      if Info.AKind = ifkSrcReg then
+        CountIfSame(AFn^.Code[K].A)
+      else if Info.AKind = ifkAuxIndex then
+        { Every A aux block is a source-register list. B aux blocks carry
+          call results or control targets; Imm aux blocks carry literals,
+          masks, or memory arguments. }
+        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+          AFn^.Code[K].A)) - 1 do
+          CountIfSame(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
+            UInt32(N)));
+      if Info.BKind = ifkSrcReg then
+        CountIfSame(AFn^.Code[K].B);
+      if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
+        CountIfSame(UInt32(AFn^.Code[K].Imm));
+    end;
+  end;
+
   function IsVisibleFrameReg(const AReg: UInt32): Boolean; forward;
 
   function NativeScalarLeafTarget(const AFuncIdx: UInt32): Boolean;
@@ -584,6 +619,26 @@ var
     SetLength(SkipPlanned, Length(AFn^.Code));
     for K := 0 to High(AFn^.Code) do
       PlannedCode[K] := AFn^.Code[K];
+    {$IFDEF WASM_JIT_ARM64}
+    for K := 1 to High(PlannedCode) do
+      if (PlannedCode[K].Op = iroMoveVec) and
+        Arm64NativeVecOp(PlannedCode[K - 1].Op) and
+        (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
+        (PlannedCode[K - 1].Dest < UInt32(Length(AFn^.RegTypes))) and
+        (AFn^.RegTypes[PlannedCode[K - 1].Dest].Kind = wvkVec) and
+        (VectorUseCount(PlannedCode[K - 1].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K - 1].Dest) and
+        IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not Targets[K - 1] and not Targets[K] then
+      begin
+        { A validated expression result is consumed by the immediately
+          following lowering move. Store the native Q result in the move's
+          canonical local/result slot directly; both IR labels remain bound at
+          the same fallthrough point and no vector state crosses an edge. }
+        PlannedCode[K - 1].Dest := PlannedCode[K].Dest;
+        SkipPlanned[K] := True;
+      end;
+    {$ENDIF}
     if not UseStaticCache then
       Exit;
     for K := 1 to High(PlannedCode) do
@@ -1495,11 +1550,10 @@ var
     end;
   end;
 
-  { Numeric struct.get/get_s/get_u/set bake their field offset instead of
-    paying a helper crossing that re-resolves the layout per access. The
-    offset mirrors TWasmGcTypes' layout math exactly (header, per-field
-    align-up to storage width, cumulative advance); ref fields stay on the
-    helper path because stores need the write barrier. }
+  { Fixed-type struct and array access bake their field shape instead of
+    paying a helper crossing that re-resolves the layout per access. Struct
+    offsets mirror TWasmGcTypes' layout math; arrays have a fixed 16-byte
+    element base and a statically known element width. }
   procedure AnalyzeGcFieldAccess;
   var
     K, F, CanonIdx: Integer;
@@ -1589,6 +1643,37 @@ var
         (Ord(AFn^.Code[K].Op = iroStructGetS) shl 1) or
         (UInt64(Width) shl 8) or
         (UInt64(Offset) shl 16);
+    end;
+
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if not (AFn^.Code[K].Op in [iroArrayGet, iroArrayGetS,
+        iroArrayGetU, iroArraySet]) then
+        Continue;
+      TargetIdx := UInt32(AFn^.Code[K].Imm);
+      if (TargetIdx >= UInt32(Length(AIr.TypeIndexToCanon))) then
+        Continue;
+      CanonIdx := Integer(AIr.TypeIndexToCanon[TargetIdx]);
+      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
+        Continue;
+      Comp := @AIr.CanonTypes[CanonIdx].Comp;
+      if Comp^.Kind <> wckArray then
+        Continue;
+      Width := StorageWidthOf(Comp^.Arr.Elem.Storage);
+      IsRef := (not Comp^.Arr.Elem.Storage.IsPacked) and
+        (Comp^.Arr.Elem.Storage.ValueType.Kind = wvkRef);
+      IsPacked := Comp^.Arr.Elem.Storage.IsPacked;
+      if (Width > 8) or
+        ((AFn^.Code[K].Op = iroArrayGet) and IsPacked) or
+        ((AFn^.Code[K].Op in [iroArrayGetS, iroArrayGetU]) and
+          not IsPacked) then
+        Continue;
+      { bit0 native | bit1 signed | bit2 array | bit3 reference |
+        bits8-15 width | bits16-31 element-zero offset }
+      GcShapes[K] := 1 or
+        (Ord(AFn^.Code[K].Op = iroArrayGetS) shl 1) or 4 or
+        (Ord(IsRef) shl 3) or (UInt64(Width) shl 8) or
+        (UInt64(WASM_ARRAY_ELEMS_OFFSET) shl 16);
     end;
   end;
 
