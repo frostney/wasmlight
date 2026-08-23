@@ -1101,14 +1101,6 @@ var
 begin
   GO := WasmJitGcHeapOffsets;
   FO := WasmJitFrameOffsets;
-  if GetEnvironmentVariable('WASMLIGHT_DUMP_FASTPATH') <> '' then
-    WriteLn('TEMP-EMIT tierctx=', AInfo.TierContextOffset,
-      ' fheap=', AInfo.FHeapOffset, ' etids=', AInfo.EngineTypeIdsOffset,
-      ' depth=', FO.CtxDepth, ' acts=', FO.CtxActs, ' stride=', FO.ActStride,
-      ' actinst=', FO.ActInstance, ' ffree0=', GO.HeapFFree0,
-      ' mark=', GO.HeapMarkState, ' blkbase=', GO.BlockBase,
-      ' blkalloc=', GO.BlockAllocated, ' blive=', GO.HeapBytesLive,
-      ' balloc=', GO.HeapBytesAllocated, ' objs=', GO.HeapObjectCount);
   Count := Integer((AShape.Word shr 8) and $FF);
   Log2Cell := Integer((AShape.Word shr 16) and $FF);
   FreeOff := UInt32(GO.HeapFFree0) +

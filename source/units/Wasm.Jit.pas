@@ -486,8 +486,10 @@ var
   ConstSlots: array[0..0] of UInt32;
   ConstSlotBits: array[0..0] of UInt64;
   GcShapes: array of UInt64;
+  {$IFDEF WASM_JIT_ARM64}
   GcAllocShapes: array of TWasmGcAllocShape;
   GcAllocInfo: TWasmGcAllocInfo;
+  {$ENDIF}
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
@@ -1590,6 +1592,7 @@ var
     end;
   end;
 
+  {$IFDEF WASM_JIT_ARM64}
   { Wave 11 — inline struct.new allocation. For a FIXED struct type the whole
     Allocate sequence except collection is compile-time: layout size, size
     class, cell size, field offsets. When the class size is a power of two
@@ -1734,7 +1737,7 @@ var
         Continue;
       CellSize := WASM_GC_SIZE_CLASSES[ClassIndex];
       Log2Cell := Log2OfPow2(CellSize);
-      if Log2Cell < 0 then
+      if (Log2Cell < 0) or (CellSize <> Size) then
         Continue;
       FreeOff := WasmJitGcHeapOffsets.HeapFFree0 + UInt32(ClassIndex) * 8;
       if (FreeOff >= $8000) or (TypeIdx >= 4096) then
@@ -1748,6 +1751,7 @@ var
         (UInt64(ClassIndex) shl 24);
     end;
   end;
+  {$ENDIF}
 
   procedure AnalyzePinnedMemory;
   var

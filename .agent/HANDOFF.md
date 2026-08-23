@@ -1,13 +1,28 @@
 # Handoff
 
-Updated: 2026-08-23 (wave 11 executed: inline struct.new fast path ACCEPTED)
+Updated: 2026-08-23 (PR #19 CI repair validated locally)
+
+## PR #19 CI repair
+
+- Exact failing head `eac9dbe`: Linux/x86-64 and runtime-comparison builds
+  could not resolve the arm64-only `TWasmGcAllocShape` / `TWasmGcAllocInfo`
+  types because their driver variables and analyzer were backend-shared.
+- Repair: compile those declarations and the analyzer only under
+  `WASM_JIT_ARM64`; keep exact-size eligibility aligned with the PR claim
+  (`CellSize == Size`); remove the temporary `WASMLIGHT_DUMP_FASTPATH`
+  emitter output.
+- Current local evidence: macOS/arm64 focused JIT + emitter suites pass;
+  Ubuntu Noble/x86-64 release builds all three programs and passes the JIT +
+  X64 suites; the universal macOS gate passes frozen install, format, all
+  three builds, all 44 test programs, `lwpt agents --check`, and diff check.
+- Delivery stays on draft PR #19. Re-query its exact head and checks rather
+  than relying on this handoff for live CI state.
 
 ## Wave 11 — inline struct.new allocation fast path ACCEPTED
 
 - Commit `6aea5ef` (`perf(jit): inline the struct.new allocation fast path
   on arm64`) on `t3code/optimize-runtime-wasmtime-gap-2` from exact
-  `12c41b7` (the post-PR-18 main tip). Local, unpushed; delivery not
-  requested.
+  `12c41b7` (the post-PR-18 main tip). Published through draft PR #19.
 - Mechanism per the wave-11 design: eligible `struct.new` sites emit the
   whole free-list-hit allocation inline — context-chain engine-id walk,
   heap/head load, cbz miss branch into the UNCHANGED generic emission (still
