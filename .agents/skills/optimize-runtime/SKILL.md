@@ -34,19 +34,28 @@ accept it.
 
 1. Build and retain a baseline binary from the exact starting commit with the
    same compiler, dependencies, flags, and host used for candidates.
-2. Stop competing benchmark processes. Serialize measurements through one
+2. Verify measurement validity before every schedule. Each of these has
+   invalidated whole comparison sets at least once:
+   - rebuild with `--mode release` and confirm the binary hash against the
+     retained predecessor before treating any run as a candidate —
+     development builds are correctness gates, never candidates;
+   - check `ps aux -r` and the load average for external consumers (VMs,
+     browsers, builds) that the shared lock cannot exclude;
+   - diff strictly against the immediate predecessor head's retained binary,
+     not an older wave's.
+3. Stop competing benchmark processes. Serialize measurements through one
    shared exclusive lock, conventionally `/tmp/wasmlight-perf-gate.lock`.
-3. Discard at least one warm-up. Default to seven measured samples and report
+4. Discard at least one warm-up. Default to seven measured samples and report
    the median plus the sample spread. Use fewer only for an expensive workload
    and record why.
-4. Measure the target and representative guards from `wasmbench`: startup,
+5. Measure the target and representative guards from `wasmbench`: startup,
    loop, fib/direct calls, scalar memory, varying-address memory, numeric, and
    SIMD as applicable. Keep iteration counts large enough to escape timer
    quantization.
-5. Record the exact commit, command, OS, architecture, execution tier, workload
+6. Record the exact commit, command, OS, architecture, execution tier, workload
    size, warm-up count, sample count, order, median, spread, and verified
    result.
-6. When comparing Wasmtime, run an identical module and entry point, exclude
+7. When comparing Wasmtime, run an identical module and entry point, exclude
    compilation from both sides, precompile both artifacts, verify observable
    results, and run on the same host. Label emulated or virtualized Linux
    results explicitly rather than presenting them as native hardware.
@@ -103,8 +112,9 @@ implementation, builds, and correctness tests; serialize performance runs.
    the user explicitly accepts that trade-off after seeing both measurements.
 4. Require identical verified results and relevant focused tests before
    integration. Never turn benchmark numbers into test assertions.
-5. Keep rejected work out of the accepted commit. Record why it lost so a later
-   wave does not unknowingly repeat it.
+5. Keep rejected work out of the accepted commit. Record why it lost — the
+   mechanism and the deciding measurements — so a later wave does not
+   unknowingly repeat it.
 
 ## Re-measure combined integration
 
