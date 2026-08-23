@@ -1034,6 +1034,46 @@ begin
   ]);
 end;
 
+{ A reference array store followed by a forced collection. The stored struct
+  is reachable only through the array when the second struct.new collects, so
+  the final field read proves the native store is visible to precise tracing.
+  The second export pins array.set's null-before-bounds trap order. }
+function GcRefArrayModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $01, $7F, $01]),                    { 0: struct (mut i32) }
+      BLit([$5E, $63, $00, $01]),                    { 1: array (mut ref null 0) }
+      BLit([$60, $00, $01, $7F])])),                 { 2: ()->i32 }
+    Sect(3, VecOf([BLit([$02]), BLit([$02]), BLit([$02])])),
+    Sect(7, VecOf([
+      ExportEntry('visible', $00, 0),
+      ExportEntry('nullset', $00, 1),
+      ExportEntry('dirty', $00, 2)])),
+    Sect(10, VecOf([
+      CodeEntry([
+        $01, $01, $63, $01,                          { local (ref null 1) }
+        $41, $01, $FB, $07, $01, $21, $00,           { array.new_default 1 }
+        $20, $00, $41, $00, $41, $FB, $00,           { array, index 0, 123 }
+        $FB, $00, $00, $FB, $0E, $01,                { struct.new; array.set }
+        $41, $E7, $07, $FB, $00, $00, $1A,           { allocate/drop struct(999) }
+        $20, $00, $41, $00, $FB, $0B, $01,           { array.get 1 }
+        $FB, $02, $00, $00, $0B]),                   { struct.get 0 0 }
+      CodeEntry([
+        $00, $D0, $01, $41, $FF, $01, $41, $00,      { null, index 255, value }
+        $FB, $00, $00, $FB, $0E, $01,                { struct.new; array.set }
+        $41, $00, $0B]),
+      CodeEntry([
+        $02, $01, $63, $01, $01, $7F,                { ref-array + i32 locals }
+        $41, $01, $FB, $07, $01, $21, $00,           { array.new_default 1 }
+        $41, $4D, $21, $01,                           { dirty local := 77 }
+        $20, $00, $41, $00, $FB, $0B, $01, $1A,      { array.get; drop }
+        $20, $01, $0B])                               { dirty local remains 77 }
+    ]))
+  ]);
+end;
+
 { i31: ref.i31 then i31.get_s / i31.get_u (31-bit sign vs zero extension), and
   i31.get_s on a null (a 'null i31 reference' trap). }
 function I31ModuleBytes: TWasmBytes;
@@ -1500,6 +1540,7 @@ type
     procedure TestStructRoundTrip;
     procedure TestArrayRoundTrip;
     procedure TestArrayOobTrap;
+    procedure TestReferenceArrayStoreGcVisibility;
     procedure TestI31;
     procedure TestGcMidBodyCollectionWalkable;
     procedure TestGcInlineAllocFreeListReuse;
@@ -3344,6 +3385,17 @@ begin
     [MakeValueI32(9)])).ToBe('out of bounds array access');
 end;
 
+procedure TJitTests.TestReferenceArrayStoreGcVisibility;
+begin
+  FDiffThreshold := 0;
+  Expect<Boolean>(DiffFresh(GcRefArrayModuleBytes, 'visible', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<string>(TrapMessageOf(GcRefArrayModuleBytes, 'nullset', []))
+    .ToBe('null array reference');
+  Expect<Boolean>(DiffFresh(GcRefArrayModuleBytes, 'dirty', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
 procedure TJitTests.TestI31;
 begin
   { i31.get_s sign-extends the 31-bit payload; get_u zero-extends. }
@@ -3589,6 +3641,8 @@ begin
     TestStructRoundTrip);
   Test('array new/get/len incl. packed extension match', TestArrayRoundTrip);
   Test('out-of-bounds array access traps identically', TestArrayOobTrap);
+  Test('reference array stores stay visible to GC and trap null first',
+    TestReferenceArrayStoreGcVisibility);
   Test('i31 ref/get_s/get_u and null trap match', TestI31);
   Test('a mid-body collection keeps a live ref (compiled frame is GC-walkable)',
     TestGcMidBodyCollectionWalkable);

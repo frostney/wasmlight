@@ -1495,11 +1495,10 @@ var
     end;
   end;
 
-  { Numeric struct.get/get_s/get_u/set bake their field offset instead of
-    paying a helper crossing that re-resolves the layout per access. The
-    offset mirrors TWasmGcTypes' layout math exactly (header, per-field
-    align-up to storage width, cumulative advance); ref fields stay on the
-    helper path because stores need the write barrier. }
+  { Fixed-type struct and array access bake their field shape instead of
+    paying a helper crossing that re-resolves the layout per access. Struct
+    offsets mirror TWasmGcTypes' layout math; arrays have a fixed 16-byte
+    element base and a statically known element width. }
   procedure AnalyzeGcFieldAccess;
   var
     K, F, CanonIdx: Integer;
@@ -1589,6 +1588,37 @@ var
         (Ord(AFn^.Code[K].Op = iroStructGetS) shl 1) or
         (UInt64(Width) shl 8) or
         (UInt64(Offset) shl 16);
+    end;
+
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if not (AFn^.Code[K].Op in [iroArrayGet, iroArrayGetS,
+        iroArrayGetU, iroArraySet]) then
+        Continue;
+      TargetIdx := UInt32(AFn^.Code[K].Imm);
+      if (TargetIdx >= UInt32(Length(AIr.TypeIndexToCanon))) then
+        Continue;
+      CanonIdx := Integer(AIr.TypeIndexToCanon[TargetIdx]);
+      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
+        Continue;
+      Comp := @AIr.CanonTypes[CanonIdx].Comp;
+      if Comp^.Kind <> wckArray then
+        Continue;
+      Width := StorageWidthOf(Comp^.Arr.Elem.Storage);
+      IsRef := (not Comp^.Arr.Elem.Storage.IsPacked) and
+        (Comp^.Arr.Elem.Storage.ValueType.Kind = wvkRef);
+      IsPacked := Comp^.Arr.Elem.Storage.IsPacked;
+      if (Width > 8) or
+        ((AFn^.Code[K].Op = iroArrayGet) and IsPacked) or
+        ((AFn^.Code[K].Op in [iroArrayGetS, iroArrayGetU]) and
+          not IsPacked) then
+        Continue;
+      { bit0 native | bit1 signed | bit2 array | bit3 reference |
+        bits8-15 width | bits16-31 element-zero offset }
+      GcShapes[K] := 1 or
+        (Ord(AFn^.Code[K].Op = iroArrayGetS) shl 1) or 4 or
+        (Ord(IsRef) shl 3) or (UInt64(Width) shl 8) or
+        (UInt64(WASM_ARRAY_ELEMS_OFFSET) shl 16);
     end;
   end;
 
