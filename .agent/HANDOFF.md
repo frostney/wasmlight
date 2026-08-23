@@ -1,6 +1,76 @@
 # Handoff
 
-Updated: 2026-08-23 (Wave 12 Arm64 fixed-array access accepted)
+Updated: 2026-08-23 (Wave 13 Arm64 adjacent-vector-result fusion accepted)
+
+## Wave 13 — adjacent Arm64 vector-result moves fused ACCEPTED
+
+- Continued from the accepted Wave 12 integration head `675213a` after a
+  fresh fetch confirmed `origin/main@1a89b4779e71b855cbbac7d90ebc69aee31b6295`
+  was unchanged. The accepted implementation is `93b3278` (`perf(jit): fuse
+  adjacent Arm64 vector result moves`) plus the required correctness follow-up
+  `85b2737` (`fix(jit): preserve live Arm64 vector temporaries`), both local
+  and unpushed on `t3code/optimize-runtime-parallel`.
+- The fresh seven-sample best/AOT baseline at `675213a` measured call 136.516
+  ms versus Wasmtime 60.037 ms (2.27x), SIMD 8.429 versus 4.572 ms (1.84x),
+  memory-load 45.281 versus 30.239 ms (1.50x), and GC 24.582 versus 26.903 ms
+  (0.91x). Scaled self-checking `sample(1)` profiles put effectively every
+  call and SIMD sample in generated code, so three isolated lanes covered
+  local call instruction selection, adjacent SIMD traffic, and the borderline
+  memory-load path.
+- The retained Arm64-only compile plan recognizes a native v128 producer
+  immediately followed by `iroMoveVec` into a visible local/result slot. It
+  redirects the producer to that canonical slot and skips the redundant
+  Q-register load/store pair only when the producer temp is a non-visible
+  `wvkVec`, the destination is visible, neither instruction is a branch
+  target, and an `IR_OP_INFO`-driven source scan proves the temp has exactly
+  one use (including direct fields, Imm source registers, and A-aux argument
+  lists). No vector value is cached across an instruction or control-flow
+  boundary; the static-cache, Q-host-constant, prologue, and alignment designs
+  rejected in earlier waves remain absent.
+- Independent review caught a real defect in the first measured commit before
+  integration: `local.tee` writes the visible local but deliberately keeps the
+  producer temporary live on the operand stack. The initial peephole left that
+  temp unwritten. A fresh-store `tee_both` differential reproduced the failure
+  (a same-store differential could be masked by interpreter residue); the
+  follow-up single-use proof now retains the 180-byte unfused shape for that
+  case while the safe shapes remain 148/176 bytes.
+- The corrected exact candidate (`0eb642df...`) passed a fresh serialized
+  B-C-C-B: **8.602 -> 5.742 -> 5.827 -> 8.809 ms**, improving SIMD 33.25%
+  forward and 33.85% reverse. Wasmtime-normalized ratios improved from
+  1.736x/1.762x to 1.189x/1.176x (-31.54%/-33.25%). Raw results are
+  `/tmp/w13-simd-guarded-{base1,cand1,cand2,base2}.json`. The integrated
+  seven-sample full schedule independently measured SIMD at 5.412 ms versus
+  Wasmtime 4.450 ms (1.22x). Its release binary
+  `/tmp/wasmlight-wave13-integrated.Vsucn8/wasmlight` is byte-identical to the
+  guarded lane binary.
+- The full schedule's scalar call/memory medians retained their documented
+  broad dispersion. Deterministic AOT comparison proved every non-SIMD
+  workload artifact byte-identical between the retained Wave 12 and integrated
+  Wave 13 binaries; only `simd.waot` changed, so those scalar swings are not
+  codegen regressions from this wave.
+- REJECTED and fully reverted with clean, uncommitted lane branches: (1) a
+  scaled-immediate `LDR W` removed two instructions from the hot direct-call
+  lookup, but the only clean forward pair was effectively flat (145.124 ->
+  143.941 ms, -0.82%) and the reverse baseline suffered corroborated host
+  drift; artifacts are under
+  `/tmp/wasmlight-wave13-call-measure/{base1,cand1,cand2,base2}.json`.
+  (2) preferring the widest loop constant reduced the memory-load loop from
+  16 to 14 instructions, but candidate medians differed by 23.9% and the
+  apparent gains (14.30%/3.90%) overlapped 21-41% dispersion; artifacts are
+  `/tmp/w13-memory-{base1,cand1,cand2,base2}.json`.
+- Exact integrated gates pass: frozen install; release build 3/3; format 91/91;
+  agents check; diff check; all 44 unit programs. The recursive pinned corpus
+  at `de54fd27` is byte-identical across interpreter/JIT/AOT:
+  files=288 errors=0 pass=65851 fail=368 skip=904 staged=0 total=67123, with
+  compiled=8799 in JIT/AOT. The corpus was read from the clean pinned checkout
+  under `t3code-b5095128` because this isolated worktree had no local fetched
+  mirror. `lantaarn-spike` and `wasmx64` were gracefully paused for timing and
+  restored to running afterward.
+- Begin the next wave from `85b2737`. SIMD is now inside the 1.43x Wasmtime
+  goal and GC remains faster on its diagnostic. Direct calls remain the clear
+  out-of-band gap, but do not retry activation-wide hoisting, per-instance
+  call tables, or the scaled-LDR-only candidate; otherwise prioritize x64
+  mirrors of accepted Arm64 struct/array GC paths.
 
 ## Wave 12 — fixed-type scalar array access natively on Arm64 ACCEPTED
 
