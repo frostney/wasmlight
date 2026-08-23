@@ -230,6 +230,7 @@ uses
   {$IFDEF WASM_JIT_X64}
   Wasm.Jit.X64,
   {$ENDIF}
+  Wasm.Runtime.Gc,
   Wasm.Runtime.Traps;
 
 { --- the compiled-function dispatcher (the JitInvokeCompiled hook) --------
@@ -485,6 +486,10 @@ var
   ConstSlots: array[0..0] of UInt32;
   ConstSlotBits: array[0..0] of UInt64;
   GcShapes: array of UInt64;
+  {$IFDEF WASM_JIT_ARM64}
+  GcAllocShapes: array of TWasmGcAllocShape;
+  GcAllocInfo: TWasmGcAllocInfo;
+  {$ENDIF}
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
   PinnedMemoryIndex: UInt32;
@@ -1587,6 +1592,167 @@ var
     end;
   end;
 
+  {$IFDEF WASM_JIT_ARM64}
+  { Wave 11 — inline struct.new allocation. For a FIXED struct type the whole
+    Allocate sequence except collection is compile-time: layout size, size
+    class, cell size, field offsets. When the class size is a power of two
+    and every field is a numeric <=64-bit member, the backend emits the
+    free-list-hit fast path with these shapes; the helper path stays as the
+    miss branch and remains the only collect trigger. Ref fields stay off
+    (the barrier shape belongs to the helper), v128 fields, struct.new_default,
+    non-pow2 classes, and large objects all decline. Baked runtime offsets are
+    range-checked here so emission can use scaled-imm12 addressing directly. }
+  procedure AnalyzeGcInlineAlloc;
+  var
+    K, F, C, CanonIdx, ClassIndex, Log2Cell: Integer;
+    TypeIdx: UInt32;
+    Offset, Width, Size, CellSize, FreeOff: UInt32;
+    Ok: Boolean;
+    Comp: ^TWasmCompType;
+
+    function StorageWidthOf(const AStorage: TWasmStorageType): UInt32;
+    begin
+      if AStorage.IsPacked then
+      begin
+        if AStorage.PackedType = wpkI8 then
+          Result := 1
+        else
+          Result := 2;
+        Exit;
+      end;
+      case AStorage.ValueType.Kind of
+        wvkNum:
+          if (AStorage.ValueType.Num = wntI32) or
+            (AStorage.ValueType.Num = wntF32) then
+            Result := 4
+          else
+            Result := 8;
+        wvkVec:
+          Result := 16;
+      else
+        Result := 8;
+      end;
+    end;
+
+    function Log2OfPow2(const AValue: UInt32): Integer;
+    begin
+      if (AValue <> 0) and ((AValue and (AValue - 1)) = 0) then
+      begin
+        Result := 0;
+        while (UInt32(1) shl Result) <> AValue do
+          Inc(Result);
+      end
+      else
+        Result := -1;
+    end;
+
+  begin
+    SetLength(GcAllocShapes, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      GcAllocShapes[K].Word := 0;
+    if UseNativeScalarCore then
+      Exit;
+    with WasmJitStoreAllocOffsets do
+    begin
+      GcAllocInfo.FHeapOffset := FHeapOffset;
+      GcAllocInfo.TierContextOffset := TierContextOffset;
+      GcAllocInfo.EngineTypeIdsOffset := EngineTypeIdsOffset;
+      if (FHeapOffset >= $8000) or (TierContextOffset >= $8000) or
+        (EngineTypeIdsOffset >= $8000) then
+        Exit;
+    end;
+    with WasmJitFrameOffsets do
+      if (CtxDepth >= $8000) or (CtxActs >= $8000) or
+        (ActInstance >= $8000) or (ActStride > High(UInt16)) then
+        Exit;
+    with WasmJitGcHeapOffsets do
+      if (HeapFFree0 + WASM_GC_CLASS_COUNT * 8 >= $8000) or
+        (HeapMarkState >= $8000) or (HeapBytesLive >= $8000) or
+        (HeapBytesAllocated >= $8000) or (HeapObjectCount >= $8000) or
+        (BlockBase >= $8000) or (BlockAllocated >= $8000) then
+        Exit;
+
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if AFn^.Code[K].Op <> iroStructNew then
+        Continue;
+      TypeIdx := UInt32(AFn^.Code[K].Imm);
+      if TypeIdx >= UInt32(Length(AIr.CanonTypes)) then
+        Continue;
+      CanonIdx := Integer(AIr.TypeIndexToCanon[TypeIdx]);
+      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
+        Continue;
+      Comp := @AIr.CanonTypes[CanonIdx].Comp;
+      if (Comp^.Kind <> wckStruct) then
+        Continue;
+      F := Length(Comp^.Struct.Fields);
+      if (F = 0) or (F > 16) then
+        Continue;
+
+      { Field walk — identical arithmetic to TWasmGcTypes' layout pass and
+        AnalyzeGcFieldAccess above: header 8, per-field align-up to storage
+        width, cumulative advance. }
+      Offset := 8;
+      Ok := True;
+      for C := 0 to F - 1 do
+      begin
+        Width := StorageWidthOf(Comp^.Struct.Fields[C].Storage);
+        if Width > 8 then
+        begin
+          Ok := False;
+          Break;
+        end;
+        if (not Comp^.Struct.Fields[C].Storage.IsPacked) and
+          (Comp^.Struct.Fields[C].Storage.ValueType.Kind = wvkRef) then
+        begin
+          Ok := False;
+          Break;
+        end;
+        Offset := (Offset + Width - 1) and not (Width - 1);
+        GcAllocShapes[K].Fields[C].Slot :=
+          IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A, UInt32(C));
+        GcAllocShapes[K].Fields[C].Offset := Offset;
+        GcAllocShapes[K].Fields[C].Width := Width;
+        Offset := Offset + Width;
+      end;
+      if not Ok then
+        Continue;
+
+      { Size-class math mirrors TWasmGcHeap.Allocate exactly: Layout.Size is
+        the align-up-8 of the field span, sizes below the first class bump to
+        it, ClassOf takes the first class >= the size. A power-of-two class
+        means CellSize == Size exactly, so the cell tail past the aligned
+        layout is zero bytes and nothing needs an inline zero fill. }
+      Size := (Offset + 7) and not UInt32(7);
+      if Size < WASM_GC_SIZE_CLASSES[0] then
+        Size := WASM_GC_SIZE_CLASSES[0];
+      ClassIndex := -1;
+      for C := 0 to WASM_GC_CLASS_COUNT - 1 do
+        if Size <= WASM_GC_SIZE_CLASSES[C] then
+        begin
+          ClassIndex := C;
+          Break;
+        end;
+      if ClassIndex < 0 then
+        Continue;
+      CellSize := WASM_GC_SIZE_CLASSES[ClassIndex];
+      Log2Cell := Log2OfPow2(CellSize);
+      if (Log2Cell < 0) or (CellSize <> Size) then
+        Continue;
+      FreeOff := WasmJitGcHeapOffsets.HeapFFree0 + UInt32(ClassIndex) * 8;
+      if (FreeOff >= $8000) or (TypeIdx >= 4096) then
+        Continue;
+
+      { bit0 enabled | bits8-15 count | bits16-23 log2(CellSize) |
+        bits24-31 class index }
+      GcAllocShapes[K].Word := 1 or
+        (UInt64(F) shl 8) or
+        (UInt64(Log2Cell) shl 16) or
+        (UInt64(ClassIndex) shl 24);
+    end;
+  end;
+  {$ENDIF}
+
   procedure AnalyzePinnedMemory;
   var
     K: Integer;
@@ -1736,6 +1902,7 @@ begin
     AnalyzeConstSlots;
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeGcFieldAccess;
+    AnalyzeGcInlineAlloc;
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeDynamicWriteBack;
@@ -1869,7 +2036,7 @@ begin
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
             NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
-            @GcShapes[0]);
+            @GcShapes[0], @GcAllocShapes[0], GcAllocInfo);
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}

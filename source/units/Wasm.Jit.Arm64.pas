@@ -112,6 +112,38 @@ type
   TArm64GcShapeArray = array[0..$FFFFFF] of UInt64;
   PArm64GcShapeArray = ^TArm64GcShapeArray;
 
+  { One baked numeric field of a wave-11 inline struct.new: the source
+    register slot, the cell byte offset, and the truncating store width —
+    the same three numbers TWasmGcHeap's WriteField would have resolved at
+    run time. }
+  TWasmGcAllocField = record
+    Slot: UInt32;
+    Offset: UInt32;
+    Width: Byte;
+  end;
+
+  { Per-instruction shape for the inline-allocation fast path. Word bit0
+    enables; bits8-15 hold the field count, bits16-23 log2(CellSize) of the
+    power-of-two size class. The engine type id is deliberately NOT here —
+    it is per-store runtime state, loaded through the context chain so AOT
+    artifacts stay instance/store-agnostic. }
+  TWasmGcAllocShape = record
+    Word: UInt64;
+    Fields: array[0..15] of TWasmGcAllocField;
+  end;
+
+  TArm64GcAllocArray = array[0..$FFFFFF] of TWasmGcAllocShape;
+  PArm64GcAllocArray = ^TArm64GcAllocArray;
+
+  { The store-relative offsets the fast path cannot probe itself (FHeap is
+    private to Wasm.Runtime.Store); computed once per staged function from
+    WasmJitOffsets and threaded beside the shape array. }
+  TWasmGcAllocInfo = record
+    FHeapOffset: NativeUInt;
+    TierContextOffset: NativeUInt;
+    EngineTypeIdsOffset: NativeUInt;
+  end;
+
   PArm64RegCache = ^TArm64RegCache;
 
   TArm64RegCacheEntry = record
@@ -241,6 +273,7 @@ function Arm64SubW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64SubX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64MulW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64MulX(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64MaddX(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64SdivW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64SdivX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64UdivW(const ARd, ARn, ARm: Byte): UInt32;
@@ -250,6 +283,7 @@ function Arm64MsubX(const ARd, ARn, ARm, ARa: Byte): UInt32;
 function Arm64AndW(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64AndLowMaskImmW(const ARd, ARn, AOnes: Byte): UInt32;
 function Arm64LslImmW(const ARd, ARn, AShift: Byte): UInt32;
+function Arm64LsrImmW(const ARd, ARn, AShift: Byte): UInt32;
 function Arm64AddImmW(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 function Arm64AndX(const ARd, ARn, ARm: Byte): UInt32;
 function Arm64OrrW(const ARd, ARn, ARm: Byte): UInt32;
@@ -548,13 +582,24 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   var ACache: TArm64RegCache;
-  const AGcShapes: PArm64GcShapeArray = nil): Boolean; overload;
+  const AGcShapes: PArm64GcShapeArray;
+  const AGcAlloc: PArm64GcAllocArray;
+  const AGcAllocInfo: TWasmGcAllocInfo): Boolean; overload;
 { Numeric struct field access with a baked byte offset — the layout math is
   mirrored in the driver's AnalyzeGcFieldAccess, so no runtime resolution
   remains. Null refs trap the struct-specific kind before any load. }
 procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AShape: UInt64;
   var ACache: TArm64RegCache);
+{ Wave 11 — the inline struct.new fast path. Emits the free-list-hit
+  allocation straight line (pop, bitmap, counters, header, baked numeric
+  fields) and jumps to ADoneLabel; the caller binds its slow label at the
+  unchanged generic (helper) emission so a miss or an exhausted class falls
+  back to exactly the code that ran before. }
+procedure Arm64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: TWasmGcAllocShape;
+  const AInfo: TWasmGcAllocInfo; var ACache: TArm64RegCache;
+  out ASlowLabel, ADoneLabel: TWasmJitLabel);
 function Arm64CanUseI32Immediate(const AOp: TWasmIrOp;
   const AValue: UInt32): Boolean;
 function Arm64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
@@ -625,6 +670,8 @@ function Arm64CachedDestReg(const ABuf: TWasmCodeBuffer;
 procedure EmitCbnzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
 procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
+  const ATarget: UInt32); forward;
+procedure EmitBranchTo(const ABuf: TWasmCodeBuffer;
   const ATarget: UInt32); forward;
 procedure EmitNativeScalarSelfCallReg(const ABuf: TWasmCodeBuffer;
   const ARegisterCount: UInt32;
@@ -959,7 +1006,7 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
 begin
   Result := Arm64EmitOpCached(ABuf, AIns, AAux, AInsIndex, AAddr64,
     AUsePinnedMemory, AUsePinnedMemoryBase, AExtendedFrame, False, 0, 0, 0,
-    0, 0, ACache, nil);
+    0, 0, ACache, nil, nil, Default(TWasmGcAllocInfo));
 end;
 
 procedure Arm64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
@@ -1035,6 +1082,141 @@ begin
   end;
 end;
 
+procedure Arm64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AShape: TWasmGcAllocShape;
+  const AInfo: TWasmGcAllocInfo; var ACache: TArm64RegCache;
+  out ASlowLabel, ADoneLabel: TWasmJitLabel);
+const
+  { Two scratches beyond the named three. The caller has flushed and
+    invalidated the value cache before this template runs, and a function
+    containing an allocation is never static-cache eligible (iroStructNew
+    fails StaticCacheOp), so the write-through hosts are dead metadata here. }
+  R3 = ARM64_REG_CACHE0;   { x12 }
+  R4 = ARM64_REG_CACHE1;   { x13 }
+var
+  GO: TWasmJitGcOffsets;
+  FO: TWasmJitFrameOffsets;
+  Count, Log2Cell, F: Integer;
+  FreeOff: UInt32;
+begin
+  GO := WasmJitGcHeapOffsets;
+  FO := WasmJitFrameOffsets;
+  Count := Integer((AShape.Word shr 8) and $FF);
+  Log2Cell := Integer((AShape.Word shr 16) and $FF);
+  FreeOff := UInt32(GO.HeapFFree0) +
+    UInt32((AShape.Word shr 24) and $FF) * 8;
+  ASlowLabel := ABuf.NewLabel;
+  ADoneLabel := ABuf.NewLabel;
+
+  { The engine type id is per-store runtime state: walk the context chain to
+    THIS activation's instance (the walk is call-safe — an activation's
+    Instance field is fixed for its lifetime) and load EngineTypeIds[Imm].
+    wokStruct is ordinal 0, so a struct header's kind bits are zero and the
+    whole word is markState | typeId shl 32, written as two halves. }
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_STORE,
+    UInt32(AInfo.TierContextOffset));
+  Arm64EmitLdrX(ABuf, R3, ARM64_REG_T0, UInt32(FO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(R3, R3, 1));
+  Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_T0, UInt32(FO.CtxActs));
+  ABuf.EmitU32(Arm64MovzW(ARM64_REG_T0, UInt16(FO.ActStride), 0));
+  ABuf.EmitU32(Arm64MaddX(R3, R3, ARM64_REG_T0, ARM64_REG_T1));
+  Arm64EmitLdrX(ABuf, R3, R3, UInt32(FO.ActInstance));
+  Arm64EmitLdrX(ABuf, R3, R3, UInt32(AInfo.EngineTypeIdsOffset));
+  Arm64EmitLdrW(ABuf, ARM64_REG_T0, R3, UInt32(AIns.Imm) * 4);
+
+  { Free-list head for this size class; a miss falls to the unchanged
+    helper path, which stays THE collect safepoint (ADR-0011). }
+  Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_STORE,
+    UInt32(AInfo.FHeapOffset));
+  Arm64EmitLdrX(ABuf, ARM64_REG_T2, ARM64_REG_T1, FreeOff);
+  EmitCbzTo(ABuf, ARM64_REG_T2, UInt32(ASlowLabel));
+
+  { Pop FIRST: FFree[class] := [head + LINK]. The link word shares its qword
+    with the header low half this very sequence is about to write, so the
+    header stores MUST NOT precede it — and the pop parks the new head in R3,
+    leaving T0's parked type id alone. }
+  Arm64EmitLdrX(ABuf, R3, ARM64_REG_T2,
+    WASM_GC_FREE_LINK_OFFSET);
+  Arm64EmitStrX(ABuf, R3, ARM64_REG_T1, FreeOff);
+
+  { Header high half — consumes the parked type id. }
+  Arm64EmitStrW(ABuf, ARM64_REG_T0, ARM64_REG_T2, 4);
+
+  { Header low half = mark state; the next cycle's polarity flip (H8)
+    unmarks exactly like an Allocate-written header. }
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_T1,
+    UInt32(GO.HeapMarkState));
+  Arm64EmitStrW(ABuf, ARM64_REG_T0, ARM64_REG_T2, 0);
+
+  { Bitmap: word = Allocated[(head-Base)/CellSize div 32] |=
+    1 shl (... mod 32). CellSize is a power-of-two class size, so the
+    division is one shift and the cell index needs no magic multiply. }
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_T2,
+    WASM_GC_FREE_BLOCK_OFFSET);
+  Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_T0, UInt32(GO.BlockBase));
+  ABuf.EmitU32(Arm64SubX(ARM64_REG_T1, ARM64_REG_T2, ARM64_REG_T1));
+  ABuf.EmitU32(Arm64LsrImmW(ARM64_REG_T1, ARM64_REG_T1, Byte(Log2Cell)));
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_T0,
+    UInt32(GO.BlockAllocated));
+  ABuf.EmitU32(Arm64LsrImmW(R3, ARM64_REG_T1, 5));            { word idx }
+  ABuf.EmitU32(Arm64AndLowMaskImmW(R4, ARM64_REG_T1, 31));    { bit no }
+  ABuf.EmitU32(Arm64MovzW(ARM64_REG_T1, 1, 0));
+  ABuf.EmitU32(Arm64LslvW(ARM64_REG_T1, ARM64_REG_T1, R4));   { mask }
+  ABuf.EmitU32(Arm64MemRegOffset($B9400000, R4, ARM64_REG_T0, R3, True));
+  ABuf.EmitU32(Arm64OrrW(R4, R4, ARM64_REG_T1));
+  ABuf.EmitU32(Arm64MemRegOffset($B9000000, R4, ARM64_REG_T0, R3, True));
+
+  { Host-visible counters. Each reloads the heap base — the pop above
+    consumed the only copy — because three live base pointers do not fit
+    the scratch set and one LDR is cheaper than a fourth register would be.
+    CellSize == the class size == 2^Log2Cell exactly on this path. }
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_STORE,
+    UInt32(AInfo.FHeapOffset));
+  Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
+    UInt32(GO.HeapBytesLive));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_T1, ARM64_REG_T1,
+    UInt32(1) shl Log2Cell));
+  Arm64EmitStrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
+    UInt32(GO.HeapBytesLive));
+  Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
+    UInt32(GO.HeapBytesAllocated));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_T1, ARM64_REG_T1,
+    UInt32(1) shl Log2Cell));
+  Arm64EmitStrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
+    UInt32(GO.HeapBytesAllocated));
+  Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
+    UInt32(GO.HeapObjectCount));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_T1, ARM64_REG_T1, 1));
+  Arm64EmitStrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
+    UInt32(GO.HeapObjectCount));
+
+  { Numeric field fills at baked offsets, sources straight from the
+    canonical register file (the cache was invalidated on entry). }
+  for F := 0 to Count - 1 do
+  begin
+    Arm64EmitLdrX(ABuf, R3, ARM64_REG_REGFILE,
+      Arm64SlotByteOffset(AShape.Fields[F].Slot));
+    case AShape.Fields[F].Width of
+      1: ABuf.EmitU32($39000000 or AShape.Fields[F].Offset or
+           (UInt32(ARM64_REG_T2) shl 5) or R3);
+      2: ABuf.EmitU32($79000000 or ((UInt32(AShape.Fields[F].Offset)
+           div 2) shl 10) or (UInt32(ARM64_REG_T2) shl 5) or R3);
+      4: ABuf.EmitU32($B9000000 or ((UInt32(AShape.Fields[F].Offset)
+           div 4) shl 10) or (UInt32(ARM64_REG_T2) shl 5) or R3);
+    else
+      ABuf.EmitU32($F9000000 or ((UInt32(AShape.Fields[F].Offset)
+        div 8) shl 10) or (UInt32(ARM64_REG_T2) shl 5) or R3);
+    end;
+  end;
+
+  { Publish the reference last. Nothing between the header store and here
+    can collect — the fast path contains no safepoint — so publish-first's
+    ordering obligation is met trivially, and a source slot that equals
+    Dest was read before this overwrite. }
+  StX(ABuf, ARM64_REG_T2, AIns.Dest);
+  EmitBranchTo(ABuf, UInt32(ADoneLabel));
+end;
+
 function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
@@ -1042,11 +1224,14 @@ function Arm64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   var ACache: TArm64RegCache;
-  const AGcShapes: PArm64GcShapeArray): Boolean; overload;
+  const AGcShapes: PArm64GcShapeArray;
+  const AGcAlloc: PArm64GcAllocArray;
+  const AGcAllocInfo: TWasmGcAllocInfo): Boolean; overload;
 var
   Source, Dest: Byte;
   ArgSlot, ResultSlot: UInt32;
   ConstHost: Byte;
+  SlowLabel, DoneLabel: TWasmJitLabel;
 begin
   Result := True;
   if Arm64ScalarMemoryOp(AIns.Op) then
@@ -1225,6 +1410,25 @@ begin
       ((AGcShapes[AInsIndex] and 1) <> 0) then
     begin
       Arm64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+      Exit;
+    end;
+    { Wave 11: an eligible struct.new takes the inline free-list fast path;
+      its miss branch lands on the unchanged generic (helper) emission below,
+      so the slow path is byte-for-byte what this op emitted before. }
+    if (AGcAlloc <> nil) and (AIns.Op = iroStructNew) and
+      ((AGcAlloc[AInsIndex].Word and 1) <> 0) then
+    begin
+      Arm64FlushDynamicRegCache(ABuf, ACache);
+      Arm64InvalidateRegCache(ACache);
+      DoneLabel := 0;
+      Arm64EmitInlineStructNew(ABuf, AIns, AGcAlloc[AInsIndex],
+        AGcAllocInfo, ACache, SlowLabel, DoneLabel);
+      ABuf.BindLabel(SlowLabel);
+      Arm64InvalidateRegCache(ACache);
+      Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex, AUsePinnedMemory,
+        ANativeScalarSelf, ANativeRegisterCount, ANativeParamReg,
+        ANativeResultReg, ANativeCoreLabel, ANativeExhaustedLabel);
+      ABuf.BindLabel(DoneLabel);
       Exit;
     end;
     { Helpers, safepoints, complex control and currently uncached templates all
@@ -2479,6 +2683,15 @@ begin
   Result := $9B007C00 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
 end;
 
+function Arm64MaddX(const ARd, ARn, ARm, ARa: Byte): UInt32;
+begin
+  { MADD Xd,Xn,Xm,Xa — the general three-operand form Arm64MulX specializes.
+    The X-form base is $9B (bit31 sf=1 above the $1B W-form); $8B would be a
+    plain shifted-register ADD. }
+  Result := $9B000000 or (UInt32(ARm) shl 16) or (UInt32(ARa) shl 10) or
+    (UInt32(ARn) shl 5) or ARd;
+end;
+
 function Arm64SdivW(const ARd, ARn, ARm: Byte): UInt32;
 begin
   Result := $1AC00C00 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
@@ -2529,6 +2742,13 @@ begin
   Shift := AShift and 31;
   Result := $53000000 or (UInt32((32 - Shift) and 31) shl 16) or
     (UInt32(31 - Shift) shl 10) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64LsrImmW(const ARd, ARn, AShift: Byte): UInt32;
+begin
+  { LSR Wd,Wn,#s = UBFM Wd,Wn,#s,#31. }
+  Result := $53000000 or (UInt32(AShift and 31) shl 16) or
+    (UInt32(31) shl 10) or (UInt32(ARn) shl 5) or ARd;
 end;
 
 function Arm64AddImmW(const ARd, ARn: Byte;

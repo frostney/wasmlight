@@ -73,6 +73,7 @@ type
     procedure TestExecSubTemplate;
     procedure TestExecShlMasksCount;
     procedure TestExecRelopSigned;
+    procedure TestInlineStructNewFastPathWords;
     procedure TestExecConst;
     procedure TestExecI64Add;
   end;
@@ -389,7 +390,8 @@ begin
     Arm64InitRegCache(Cache);
     Expect<Boolean>(Arm64EmitOpCached(Buf,
       MakeIrInstr(iroI32Const, 0, 0, 0, 7), Aux,
-      0, False, False, False, False, True, 1, 0, 0, 0, 0, Cache)).ToBe(True);
+      0, False, False, False, False, True, 1, 0, 0, 0, 0, Cache,
+      nil, nil, Default(TWasmGcAllocInfo))).ToBe(True);
     Expect<Boolean>(Buf.Size > 0).ToBe(True);
   finally
     Buf.Free;
@@ -806,6 +808,76 @@ begin
   {$ENDIF}
 end;
 
+const
+  { Wave 11 -- the inline struct.new fast path pinned word for word for the
+    canonical shape of one i32 field at cell offset 8, class-16 cell, engine
+    id loaded through the context chain. Offsets are the dev-build probe
+    values; emitter drift, encoder typos, or offset changes fail here first. }
+  FastPathWords: array[0 .. 42] of UInt32 = (
+    $F9405689, $F9401D2C, $D100058C, $F940152A,             { ctx walk }
+    $52800F09, $9B09298C, $F940058C, $F9402D8C, $B9400189,
+    $F9400E8A,                                             { store -> heap }
+    $F940194B,                                             { FFree[0] head }
+    $3400040B,                                             { cbz head -> slow }
+    $F940016C, $F900194C,                                  { pop link FIRST }
+    $B9000569,                                             { hdr hi = typeId }
+    $F9408549, $B9000169,                                  { hdr lo = mark }
+    $F9400569, $F940052A, $CB0A016A,                       { block, base, diff }
+    $53047D4A,                                             { lsr w10,#4 cell }
+    $F9401129,                                             { alloc bitmap ptr }
+    $53057D4C, $1200794D, $5280002A, $1ACD214A,            { word idx, mask }
+    $B86C692D, $2A0A01AD, $B82C692D,                       { word |= mask }
+    $F9400E89, $F9408D2A, $9100414A, $F9008D2A,            { BytesLive += 16 }
+    $F940912A, $9100414A, $F900912A,                       { BytesAllocated }
+    $F9409D2A, $9100054A, $F9009D2A,                       { ObjectCount += 1 }
+    $F9400A6C, $B900096C,                                  { field i32 @8 }
+    $F9000E6B,                                             { publish Dest }
+    $14000001);                                            { b Done }
+
+procedure TArm64Tests.TestInlineStructNewFastPathWords;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  Ins: TWasmIrInstr;
+  Shape: TWasmGcAllocShape;
+  Info: TWasmGcAllocInfo;
+  SlowLbl, DoneLbl: TWasmJitLabel;
+  I: Integer;
+  W: UInt32;
+  Words: TWasmBytes;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64InitRegCache(Cache);
+    FillChar(Shape, SizeOf(Shape), 0);
+    Shape.Word := 1 or (UInt64(1) shl 8) or (UInt64(4) shl 16);
+    Shape.Fields[0].Slot := 2;
+    Shape.Fields[0].Offset := 8;
+    Shape.Fields[0].Width := 4;
+    Info.FHeapOffset := 24;
+    Info.TierContextOffset := 168;
+    Info.EngineTypeIdsOffset := 88;
+    Ins := MakeIrInstr(iroStructNew, 3, 0, 0, 0);
+    Arm64EmitInlineStructNew(Buf, Ins, Shape, Info, Cache, SlowLbl, DoneLbl);
+    Buf.BindLabel(SlowLbl);
+    Buf.BindLabel(DoneLbl);
+    Arm64ResolvePatches(Buf);
+    Words := Buf.SnapshotBytes;
+    Expect<NativeUInt>(NativeUInt(Length(Words)) div 4)
+      .ToBe(NativeUInt(Length(FastPathWords)));
+    W := 0;
+    for I := 0 to High(FastPathWords) do
+    begin
+      Move(Words[I * 4], W, 4);
+      if (W <> FastPathWords[I]) and (I < High(FastPathWords)) then
+        Break;
+    end;
+    Expect<UInt32>(W).ToBe(FastPathWords[High(FastPathWords)]);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TArm64Tests.TestExecRelopSigned;
 {$IF DEFINED(WASM_JIT_EXEC) AND DEFINED(CPUAARCH64)}
 var
@@ -922,6 +994,7 @@ begin
   Test('executes the move template as a full slot copy', TestExecMoveTemplate);
   Test('executes the i32.sub template', TestExecSubTemplate);
   Test('i32.shl masks the shift count modulo 32', TestExecShlMasksCount);
+  Test('inline struct.new fast path emits the pinned words', TestInlineStructNewFastPathWords);
   Test('executes a signed i32 relop via cmp+cset', TestExecRelopSigned);
   Test('executes an i32.const template', TestExecConst);
   Test('executes a full-width i64.add template', TestExecI64Add);

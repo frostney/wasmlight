@@ -337,7 +337,10 @@ const
     template's byte layout, a pinned-register reassignment, the entry-ABI shape.
     Bump it whenever position-independent codegen changes in a way that would
     make an existing artifact's bytes wrong. }
-  AOT_ABI_REVISION = 14;
+  { Revision 15: the wave-11 inline struct.new fast path bakes the GC-heap,
+    block, and instance engine-id offsets; artifacts from revision 14 carry
+    no such loads but fail closed against a runtime that could emit them. }
+  AOT_ABI_REVISION = 15;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -3459,6 +3462,7 @@ var
   H: UInt64;
   JO: TWasmJitOffsets;
   FO: TWasmJitFrameOffsets;
+  GO: TWasmJitGcOffsets;
 
   { FNV-1a-64 fold of one 64-bit datum: enough to make an accidental ABI drift
     change the fingerprint deterministically (this is an identity guard, not a
@@ -3505,6 +3509,19 @@ begin
   Fold(JO.MemInstStride);
   Fold(JO.MemBase);
   Fold(JO.MemByteSize);
+  Fold(JO.StoreFHeap);
+  Fold(JO.StoreTierContext);
+  Fold(JO.InstEngineTypeIds);
+
+  { The inline-allocation fast path bakes heap/block offsets too (wave 11). }
+  GO := WasmJitGcHeapOffsets;
+  Fold(GO.HeapFFree0);
+  Fold(GO.HeapMarkState);
+  Fold(GO.HeapBytesLive);
+  Fold(GO.HeapBytesAllocated);
+  Fold(GO.HeapObjectCount);
+  Fold(GO.BlockBase);
+  Fold(GO.BlockAllocated);
 
   Fold(FO.ValueSlotSize);
   Fold(FO.CtxValues);
