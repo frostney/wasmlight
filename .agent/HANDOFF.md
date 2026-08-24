@@ -13,11 +13,18 @@ Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
   the 32-bit compiler cannot represent.
 - Copied the existing `i386-win32` Windows target from post-merge CI into the
   PR matrix and updated the workflow comment to describe both Windows targets.
+- Draft PR #26's first i386 run proved the pointer repair: all 44 test programs
+  compiled and the build completed 3/3. It then exposed one runtime-only test
+  defect in `TestInlineStructNewFastPathWords`: the test hard-coded 64-bit host
+  record offsets and reported a misleading final-word expectation after the
+  first mismatch. The test now retains the full hard-pinned 64-bit sequence,
+  derives only host-layout immediate words on `CPU32`, and compares every word
+  directly. No suite or assertion is skipped on i386.
 - Local evidence on macOS/Arm64: frozen install; focused Arm64/JIT suites 2/2;
   format 91/91; generated-agent check; development build 3/3; full tests 44/44;
   `actionlint` clean with the pre-existing SC2005 warning ignored; diff check.
-  Exact i386 compilation, tests, smoke, and interpreter conformance await the
-  new PR job on the published exact head.
+  Exact i386 compilation, tests, smoke, and interpreter conformance must be
+  reconfirmed by the PR job after the follow-up is pushed.
 
 Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
 
