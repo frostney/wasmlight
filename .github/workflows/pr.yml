@@ -225,15 +225,15 @@ jobs:
           SHELL_BIN=./build/wasmlight-shell${{ matrix.exe }}
           test -x "$SHELL_BIN"
           set +e
-          "$SHELL_BIN" >/tmp/shell-empty.out 2>/tmp/shell-empty.err
+          "$SHELL_BIN" >"$RUNNER_TEMP/shell-empty.out" 2>"$RUNNER_TEMP/shell-empty.err"
           STATUS=$?
           set -e
           if [ "$STATUS" -eq 0 ]; then
             echo "::error::empty shell template exited 0"; exit 1
           fi
-          if ! grep -q 'no embedded module' /tmp/shell-empty.err; then
+          if ! grep -q 'no embedded module' "$RUNNER_TEMP/shell-empty.err"; then
             echo "::error::empty shell template did not report a missing module"
-            cat /tmp/shell-empty.err
+            cat "$RUNNER_TEMP/shell-empty.err"
             exit 1
           fi
           if [ "${{ matrix.jit }}" = "true" ]; then
