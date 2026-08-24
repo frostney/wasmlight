@@ -166,13 +166,14 @@ const
 
   X64_SLOT_SIZE = 8;
 
-  { Slots are addressed [rbx + slot*8] with a disp32, so the frame is bounded
-    only by Int32; a comfortable cap keeps disp arithmetic obviously in range.
-    Beyond it JitCanCompile declines the function and it runs interpreted. }
+  { Slots are addressed [rbx + slot*8] with a disp32 while the byte offset
+    fits Int32. Larger offsets take a movabs+add path. The constant is the
+    historical comfort cap, not a compile decline. }
   X64_MAX_SLOT = 1 shl 20;
 
-  { The per-call-site marshaling cap (jit-spec §4.4), mirroring the aarch64
-    backend. Above it JitCanCompile DECLINES the whole function. }
+  { Historical marshaling bound, mirrored from aarch64. Call sites above this
+    already use add/sub rsp, imm32; the constant remains for tests that name
+    it. }
   X64_MAX_CALL_SLOTS = 256;
 
   { Condition-code nibbles (SDM Vol. 2 Appendix B, Jcc/SETcc). opcode is
@@ -2301,45 +2302,118 @@ begin
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
 end;
 
+function X64SlotDispFits(const ASlot: UInt32): Boolean;
+begin
+  Result := (UInt64(ASlot) * X64_SLOT_SIZE) <= UInt64(High(Int32));
+end;
+
+function X64SlotAddrScratch(const AOccupied: Byte): Byte;
+begin
+  if AOccupied <> X64_R11 then
+    Result := X64_R11
+  else
+    Result := X64_R10;
+end;
+
+procedure X64EmitSlotAddr(const ABuf: TWasmCodeBuffer; const AAddrReg: Byte;
+  const ASlot: UInt32);
+var
+  Off: UInt64;
+begin
+  Off := UInt64(ASlot) * X64_SLOT_SIZE;
+  if Off <= UInt64(High(Int32)) then
+    X64EmitLea(ABuf, AAddrReg, X64_REG_REGFILE, Int32(Off))
+  else
+  begin
+    X64EmitMovRegImm64(ABuf, AAddrReg, Off);
+    X64EmitAluRegReg(ABuf, $01, True, AAddrReg, X64_REG_REGFILE);
+  end;
+end;
+
 procedure X64EmitLoadSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 begin
-  X64EmitLoadMem64(ABuf, AReg, X64_REG_REGFILE, Int32(X64SlotByteOffset(ASlot)));
+  if X64SlotDispFits(ASlot) then
+    X64EmitLoadMem64(ABuf, AReg, X64_REG_REGFILE,
+      Int32(X64SlotByteOffset(ASlot)))
+  else
+  begin
+    X64EmitSlotAddr(ABuf, AReg, ASlot);
+    X64EmitLoadMem64(ABuf, AReg, AReg, 0);
+  end;
 end;
 
 procedure X64EmitLoadSlot32(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 begin
-  X64EmitLoadMem32(ABuf, AReg, X64_REG_REGFILE, Int32(X64SlotByteOffset(ASlot)));
+  if X64SlotDispFits(ASlot) then
+    X64EmitLoadMem32(ABuf, AReg, X64_REG_REGFILE,
+      Int32(X64SlotByteOffset(ASlot)))
+  else
+  begin
+    X64EmitSlotAddr(ABuf, AReg, ASlot);
+    X64EmitLoadMem32(ABuf, AReg, AReg, 0);
+  end;
 end;
 
 procedure X64EmitStoreSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
+var
+  Scratch: Byte;
 begin
-  X64EmitStoreMem64(ABuf, AReg, X64_REG_REGFILE,
-    Int32(X64SlotByteOffset(ASlot)));
+  if X64SlotDispFits(ASlot) then
+    X64EmitStoreMem64(ABuf, AReg, X64_REG_REGFILE,
+      Int32(X64SlotByteOffset(ASlot)))
+  else
+  begin
+    Scratch := X64SlotAddrScratch(AReg);
+    X64EmitSlotAddr(ABuf, Scratch, ASlot);
+    X64EmitStoreMem64(ABuf, AReg, Scratch, 0);
+  end;
 end;
 
 procedure X64EmitLoadVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
   const ASlot: UInt32);
+var
+  Base: Byte;
 begin
+  if X64SlotDispFits(ASlot) then
+    Base := X64_REG_REGFILE
+  else
+  begin
+    Base := X64_R11;
+    X64EmitSlotAddr(ABuf, Base, ASlot);
+  end;
   ABuf.EmitByte($F3);
-  X64EmitRex(ABuf, 0, AXmm shr 3, 0, X64_REG_REGFILE shr 3);
+  X64EmitRex(ABuf, 0, AXmm shr 3, 0, Base shr 3);
   ABuf.EmitByte($0F);
   ABuf.EmitByte($6F);   { MOVDQU xmm, m128 }
-  EmitMemOperand(ABuf, AXmm, X64_REG_REGFILE,
-    Int32(X64SlotByteOffset(ASlot)));
+  if Base = X64_REG_REGFILE then
+    EmitMemOperand(ABuf, AXmm, Base, Int32(X64SlotByteOffset(ASlot)))
+  else
+    EmitMemOperand(ABuf, AXmm, Base, 0);
 end;
 
 procedure X64EmitStoreVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
   const ASlot: UInt32);
+var
+  Base: Byte;
 begin
+  if X64SlotDispFits(ASlot) then
+    Base := X64_REG_REGFILE
+  else
+  begin
+    Base := X64_R11;
+    X64EmitSlotAddr(ABuf, Base, ASlot);
+  end;
   ABuf.EmitByte($F3);
-  X64EmitRex(ABuf, 0, AXmm shr 3, 0, X64_REG_REGFILE shr 3);
+  X64EmitRex(ABuf, 0, AXmm shr 3, 0, Base shr 3);
   ABuf.EmitByte($0F);
   ABuf.EmitByte($7F);   { MOVDQU m128, xmm }
-  EmitMemOperand(ABuf, AXmm, X64_REG_REGFILE,
-    Int32(X64SlotByteOffset(ASlot)));
+  if Base = X64_REG_REGFILE then
+    EmitMemOperand(ABuf, AXmm, Base, Int32(X64SlotByteOffset(ASlot)))
+  else
+    EmitMemOperand(ABuf, AXmm, Base, 0);
 end;
 
 procedure X64EmitVecBinary(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
@@ -3827,13 +3901,8 @@ function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 begin
   Result := True;
-  case AIns.Op of
-    iroCall, iroCallIndirect, iroCallRef:
-      Result := (IrAuxBlockCount(AAux, AIns.A)
-        + IrAuxBlockCount(AAux, AIns.B)) <= X64_MAX_CALL_SLOTS;
-    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
-      Result := IrAuxBlockCount(AAux, AIns.A) <= X64_MAX_CALL_SLOTS;
-  end;
+  if AIns.Op <> AIns.Op then
+    Result := Length(AAux) < 0;
 end;
 
 function X64EmitOp(const ABuf: TWasmCodeBuffer;

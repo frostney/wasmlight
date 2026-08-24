@@ -57,6 +57,9 @@ type
     procedure TestSlotOffset;
     procedure TestPredicateCoversWave2;
     procedure TestCallArityFence;
+    procedure TestSpZeroAdjustCopiesSp;
+    procedure TestLargeSlotEncoding;
+    procedure TestCondBranchVeneer;
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
@@ -575,10 +578,8 @@ begin
   Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(False);
 end;
 
-{ The instruction-level half of the predicate (jit-spec §4.4): a call site's
-  argument + result marshaling must fit the backend's native-stack scratch, so
-  an over-wide call declines the whole function rather than reserving a frame
-  its `sub sp,#imm12` cannot encode. Non-call instructions always pass. }
+{ Call-site arity is no longer a compile fence: an over-wide argument block
+  is encoded with a multi-instruction SP adjust. Non-call instructions pass. }
 procedure TArm64Tests.TestCallArityFence;
 var
   Aux: TWasmIrAuxU32;
@@ -603,23 +604,100 @@ begin
   Instr.Op := iroI32Add;
   Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
 
-  { An argument block one past the cap declines. }
+  { An argument block one past the historical short-form cap still compiles. }
   SetLength(Aux, ARM64_MAX_CALL_SLOTS + 2);
   Aux[0] := ARM64_MAX_CALL_SLOTS + 1;
   for I := 1 to ARM64_MAX_CALL_SLOTS + 1 do
     Aux[I] := 0;
   Instr.Op := iroReturnCall;
   Instr.A := 0;
-  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(False);
+  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
 end;
 
-{ The branch-displacement range guard (jit-spec §4.3). Arm64ResolvePatches masks
-  the scaled offset Imm = byteDelta div 4 into imm26 (B) or imm19 (B.cond / CBZ /
-  CBNZ) and raises EWasmJitBranchRange when it does not fit, so an over-large
-  function is transparently interpreted rather than silently mis-encoded.
-  Building a >1 MiB function to exercise the raise is impractical in a unit test
-  (jit-spec §11.4), so the range predicate itself is asserted at its exact
-  two's-complement boundaries — the load-bearing logic the resolver keys on. }
+function Arm64WordAt(const ABuf: TWasmCodeBuffer; const AOffset: Integer): UInt32;
+begin
+  Result := UInt32(ABuf.ByteAt(AOffset))
+    or (UInt32(ABuf.ByteAt(AOffset + 1)) shl 8)
+    or (UInt32(ABuf.ByteAt(AOffset + 2)) shl 16)
+    or (UInt32(ABuf.ByteAt(AOffset + 3)) shl 24);
+end;
+
+{ Slot 2048 is past the short LDR W imm12 (offset 16384 = 4096*4). The emitter
+  must form the address then load from [scratch,#0], not decline. }
+procedure TArm64Tests.TestSpZeroAdjustCopiesSp;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { ADD/SUB #0 must copy SP; a logical MOV would read XZR and yield 0. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitAddImmXAny(Buf, 3, ARM64_REG_SP, 0);
+    Arm64EmitSubImmXAny(Buf, 4, ARM64_REG_SP, 0);
+    Expect<Integer>(Buf.Size).ToBe(8);
+    Expect<UInt32>(Arm64WordAt(Buf, 0)).ToBe(Arm64AddImmX(3, ARM64_REG_SP, 0));
+    Expect<UInt32>(Arm64WordAt(Buf, 4)).ToBe(Arm64SubImmX(4, ARM64_REG_SP, 0));
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestLargeSlotEncoding;
+var
+  Buf: TWasmCodeBuffer;
+  Off: UInt32;
+begin
+  Off := Arm64SlotByteOffset(2048);
+  Expect<Boolean>(Arm64UnsignedOffsetFits(Off, 4)).ToBe(False);
+  Expect<Boolean>(Arm64UnsignedOffsetFits(Arm64SlotByteOffset(2047), 4))
+    .ToBe(True);
+
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitLdrW(Buf, 0, ARM64_REG_REGFILE, Off);
+    Expect<Integer>(Buf.Size).ToBe(8);
+    Expect<UInt32>(Arm64WordAt(Buf, 0))
+      .ToBe(Arm64AddImmXShifted(0, ARM64_REG_REGFILE, Off shr 12));
+    Expect<UInt32>(Arm64WordAt(Buf, 4)).ToBe(Arm64LdrW(0, 0, 0));
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ A CBNZ whose target is one instruction past imm19 is rewritten to CBZ+B
+  rather than raising EWasmJitBranchRange. }
+procedure TArm64Tests.TestCondBranchVeneer;
+var
+  Buf: TWasmCodeBuffer;
+  L: TWasmJitLabel;
+  Site, I: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    L := Buf.NewLabel;
+    Site := Buf.CurrentOffset;
+    Buf.EmitU32(Arm64CbnzWPlaceholder(0));
+    Buf.AddPatch(Site, L, Integer(Arm64CbnzWPlaceholder(0)));
+    for I := 1 to 262143 do
+      Buf.EmitU32($D503201F);
+    Buf.BindLabel(L);
+    Expect<Integer>(Buf.Size).ToBe(1048576);
+    Expect<Boolean>(Arm64SignedImmFits(Buf.PatchDelta(0) div 4, 19)).ToBe(False);
+
+    Arm64ResolvePatches(Buf);
+    Expect<Integer>(Buf.Size).ToBe(1048580);
+    Expect<UInt32>(Arm64WordAt(Buf, 0))
+      .ToBe(Arm64CbzWPlaceholder(0) or (UInt32(2) shl 5));
+    Expect<UInt32>(Arm64WordAt(Buf, 4))
+      .ToBe(Arm64BPlaceholder or UInt32(262144));
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ The branch-displacement range predicate (jit-spec §4.3). imm19 overflow is
+  rewritten to invert+B; imm26 overflow on B/BL remains the fault boundary.
+  The two's-complement edges are asserted here; the cond veneer is a separate
+  test that actually inserts the extra B. }
 procedure TArm64Tests.TestBranchOffsetRangeGuard;
 begin
   { imm19 (conditional branches): signed 19-bit, [-262144, 262143]. }
@@ -1008,8 +1086,14 @@ begin
   Test('slot byte offset is register*8', TestSlotOffset);
   Test('predicate covers waves 2-6 (only EH is declined)',
     TestPredicateCoversWave2);
-  Test('the call-site arity fence declines an over-wide call',
+  Test('the call-site arity predicate admits an over-wide call',
     TestCallArityFence);
+  Test('a zero SP adjust copies SP rather than XZR',
+    TestSpZeroAdjustCopiesSp);
+  Test('a slot past the short LDR W offset uses ADD-scratch',
+    TestLargeSlotEncoding);
+  Test('an out-of-range CBNZ is rewritten to invert+B',
+    TestCondBranchVeneer);
   Test('branch-offset range guard fits imm19/imm26 at the boundaries',
     TestBranchOffsetRangeGuard);
   Test('helper calls and the IR pointer are position-independent',

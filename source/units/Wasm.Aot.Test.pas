@@ -257,6 +257,21 @@ begin
   ]);
 end;
 
+{ 2048 i32 locals — past the historical Arm64 short-form slot cap. }
+function LargeFrameModuleBytes: TWasmBytes;
+begin
+  Result := OneFunc(BLit([$60, $00, $01, $7F]),
+    Cat([
+      BLit([$01]),
+      ULeb(2048),
+      BLit([$7F, $41, 42, $21]),
+      ULeb(2047),
+      BLit([$20]),
+      ULeb(2047),
+      BLit([$0B])
+    ]), 'big');
+end;
+
 type
   TAotTests = class(TTestSuite)
   private
@@ -273,6 +288,7 @@ type
     procedure TestMilestoneAddViaArtifact;
     procedure TestArtifactCodeIsPositionIndependent;
     procedure TestMultiFunctionWithDeclined;
+    procedure TestLargeFrameAllCompiled;
     procedure TestJitAndAotCodeAreByteIdentical;
     procedure TestEpochBumpBeforeAcyclicNativeRecursion;
     procedure TestGuardRejectsWrongIrVersion;
@@ -644,6 +660,43 @@ begin
     FreeAndNil(CompileStore);
     FreeAndNil(CompileLoaded);
     FreeAndNil(CompileEngine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestLargeFrameAllCompiled;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  ParseRes: TWasmAotParseResult;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+begin
+  Bytes_ := LargeFrameModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Expect<Boolean>(Loaded.Ir.Functions[0].RegisterCount >= 2048).ToBe(True);
+    Expect<Boolean>(JitCanCompile(@Loaded.Ir.Functions[0])).ToBe(True);
+    Artifact := AotCompileModule(Store, Loaded);
+    ParseRes := ParseAotArtifact(Artifact, Parsed);
+    Expect<Integer>(Ord(ParseRes)).ToBe(Ord(aprOk));
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(1);
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
+    Expect<Boolean>(Length(Parsed.Funcs[0].Code) > 0).ToBe(True);
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
   end;
 end;
 {$ELSE}
@@ -1039,6 +1092,8 @@ begin
     TestArtifactCodeIsPositionIndependent);
   Test('a whole multi-function module AOT-loads, declined function stays interpreted',
     TestMultiFunctionWithDeclined);
+  Test('a large-frame module records its non-EH function compiled',
+    TestLargeFrameAllCompiled);
   Test('AOT-loaded code is byte-identical to a fresh JIT compilation',
     TestJitAndAotCodeAreByteIdentical);
   Test('an epoch bump before acyclic AOT recursion does not invent a safepoint',

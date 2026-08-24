@@ -177,9 +177,10 @@ type
 function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
 
 { The compile predicate and scope fence (§10.3): True only if the active backend
-  can emit EVERY op in the function AND the frame fits the backend's addressing.
-  False for any un-templated op (EH ops, un-implemented ops), an over-large
-  frame, or an unsupported target — the function then runs interpreted. }
+  can emit EVERY op in the function. False for EH ops / handler tables
+  (issue #32), or an unsupported target — the function then runs interpreted.
+  Frame size and call arity are not declines: both backends encode large
+  slots and large call-scratch frames. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
 { A deliberately narrow proof for the AArch64 native self-call ABI: one
@@ -207,8 +208,9 @@ function JitForceCompile(const AJit: TWasmJitContext;
   (AFn^.RegisterCount, stored so the loader can cross-check the fresh IR). The
   same compilation driver the JIT uses produces these bytes, so AOT-loaded code
   IS the JIT's code. Returns nil (declined) off the backend, for a nil function,
-  or when the emitter cannot fit the branch displacements — the caller records
-  the function un-compiled, exactly as the on-hot JIT would decline it. }
+  or when the function is nil / the host has no backend. An out-of-range
+  branch is relaxed in the backend; a remaining overflow is an internal
+  fault, not a silent decline. }
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes; overload;
@@ -311,15 +313,6 @@ begin
   Result := False;
   if AFn = nil then
     Exit;
-  { The frame must fit the backend's slot addressing (§10.3). }
-  {$IFDEF WASM_JIT_ARM64}
-  if AFn^.RegisterCount > ARM64_MAX_SLOT then
-    Exit;
-  {$ENDIF}
-  {$IFDEF WASM_JIT_X64}
-  if AFn^.RegisterCount > X64_MAX_SLOT then
-    Exit;
-  {$ENDIF}
   { EXCEPTION HANDLING IS NEVER COMPILED (§8.3, §10.2) — and a `try_table`
     emits NO instruction: the validator lowers it to the static handler table
     hanging off the function, so the per-op predicate cannot see it. Before
@@ -330,11 +323,9 @@ begin
     function, which then runs interpreted and catches exactly as before. }
   if Length(AFn^.Handlers) > 0 then
     Exit;
-  { Every op must have a template, and every instruction must be one this
-    template can actually emit (a call site's marshaling has to fit the
-    backend's scratch, §4.4). The FIRST failure declines the whole function —
-    the scope fence that keeps the baseline shippable while op coverage is
-    partial. }
+  { Every op must have a template. The FIRST missing template declines the
+    whole function — today that is only EH (`iroThrow` / `iroThrowRef`).
+    Frame size and call arity are encoded, not declined. }
   for I := 0 to High(AFn^.Code) do
   begin
     {$IFDEF WASM_JIT_ARM64}
@@ -2280,11 +2271,9 @@ begin
     live record layout (O-J5, WasmJitOffsets) so a store-layout change is caught
     rather than miscompiled. The prologue reloads the LIVE Store.Epoch at
     StoreEpoch and captures the SHARED per-invocation snapshot at
-    StoreEpochSnapshot (jit-spec §6). A function whose branch displacements
-    overflow the A64 immediate fields raises EWasmJitBranchRange from the patch
-    resolver; catch it, drop the half-built buffer, and DECLINE — the function
-    then stays interpreted, which is always correct (jit-spec §4.3). Any other
-    exception is a genuine internal fault and propagates. }
+    StoreEpochSnapshot (jit-spec §6). Conditional branches that miss imm19
+    are rewritten to invert+B in the resolver. A remaining B/BL overflow
+    is an internal fault, not a decline. }
   try
     FBuffers[N] := JitCompileToBuffer(FStore.Funcs[AAddr].Instance.Ir, Fn,
       FStore.Funcs[AAddr].Instance.Ir.FuncImportCount +
@@ -2293,12 +2282,11 @@ begin
       WasmJitOffsets(FStore).StoreEpochSnapshot,
       WasmJitOffsets(FStore).StoreJitHelperTable);
   except
-    on EWasmJitBranchRange do
+    on E: EWasmJitBranchRange do
     begin
-      { JitCompileToBuffer already freed the buffer before re-raising. }
       SetLength(FBuffers, N);
-      Result := False;
-      Exit;
+      raise EWasmInternal.CreateFmt(
+        'internal: branch range after veneer: %s', [E.Message]);
     end;
   end;
 
@@ -2423,11 +2411,9 @@ begin
       WasmJitOffsets(AStore).StoreEpochSnapshot,
       WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
   except
-    { A function whose branch displacements overflow the backend's immediate
-      fields is declined (nil), exactly as ForceCompile declines it; it is then
-      recorded un-compiled in the artifact and runs interpreted at load. }
-    on EWasmJitBranchRange do
-      Exit;
+    on E: EWasmJitBranchRange do
+      raise EWasmInternal.CreateFmt(
+        'internal: branch range after veneer: %s', [E.Message]);
   end;
   try
     Result := Buf.SnapshotBytes;

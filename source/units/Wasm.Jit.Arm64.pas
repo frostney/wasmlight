@@ -99,12 +99,9 @@ type
     unit's interface without a circular use. }
   PWasmIrInstr = ^TWasmIrInstr;
 
-  { A branch displacement that does not fit its A64 immediate field (imm26 for
-    B, imm19 for B.cond/CBZ/CBNZ). Raised by Arm64ResolvePatches so the driver
-    ABANDONS the compile and leaves the function interpreted (always correct)
-    rather than silently truncating the offset into a wrong jump. A distinct
-    class so the driver swallows ONLY this — a genuinely over-large function —
-    and lets every other internal error surface loudly (jit-spec §4.3). }
+  { A B/BL displacement that does not fit imm26 after any cond/CBZ veneer.
+    B.cond/CBZ/CBNZ overflow is rewritten in place (invert + inserted B).
+    Remaining imm26 overflow is an internal fault, not a silent decline. }
   EWasmJitBranchRange = class(EWasmError);
 
   { Per-instruction native-shape words handed over by the driver's
@@ -189,6 +186,7 @@ const
   ARM64_REG_IRBASE = 23;   { x23 = @Fn^.Code[0], the IR-code base (entry arg x2) }
   ARM64_REG_HELPERTABLE = 24;  { x24 = the per-process helper-table base }
   ARM64_REG_MEMORY = 25;   { x25 = one memory instance, or proven-stable Base }
+  ARM64_REG_ADDR = 8;      { x8: large-offset address / huge-imm scratch }
   ARM64_REG_T0 = 9;        { x9/w9 scratch }
   ARM64_REG_T1 = 10;       { x10/w10 scratch }
   ARM64_REG_T2 = 11;       { x11/w11 scratch }
@@ -218,18 +216,15 @@ const
   ARM64_SLOT_SIZE = 8;
 
   { A scaled unsigned-offset LDR/STR imm12 field is 12 bits: the largest
-    encodable slot index is bounded by the tightest scale (a 32-bit access
-    scales the byte offset by 4, so imm12 = slot*8 div 4 = slot*2). Beyond this
-    the driver declines the function (JitCanCompile) and it runs interpreted —
-    always correct. }
+    slot index the short form encodes is bounded by the tightest scale (a
+    32-bit access scales the byte offset by 4, so imm12 = slot*8 div 4 =
+    slot*2). Larger slots take the ADD-scratch path; this is an encoding
+    threshold, not a compile decline. }
   ARM64_MAX_SLOT = 2047;
 
-  { The per-call-site marshaling cap (jit-spec §4.4). A compiled call reserves
-    (args + results) slots of native-stack scratch with a single
-    `sub sp,sp,#imm12`, and a pending tail call copies its argument slots into
-    a fixed thread-local buffer — so both are bounded. A call site above the
-    cap makes JitCanCompile DECLINE the whole function, which then runs
-    interpreted (always correct). Comfortably above real function arities. }
+  { Historical single-`sub sp,#imm12` marshaling bound. Call sites above this
+    use a multi-instruction SP adjust; the constant remains as the short-form
+    threshold and for tests that name it. }
   ARM64_MAX_CALL_SLOTS = 256;
 
   { AArch64 condition codes (C1.2.4). Only the ones the relop templates use. }
@@ -390,9 +385,17 @@ function Arm64MovkX(const ARd: Byte; const AImm16: UInt16; const AHw: Byte): UIn
   `mov Xd, sp` (imm 0) and the scratch-slice address `add Xd, sp, #off`, and
   with ARd = ARn = ARM64_REG_SP it grows/shrinks the call scratch. }
 function Arm64AddImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
+{ ADD Xd,Xn,#imm12,LSL#12 — the high half of a two-instruction large add. }
+function Arm64AddImmXShifted(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 { SUB Xd,Xn,#imm12 (unsigned immediate, no shift). Used as
   `sub sp, sp, #frame` to reserve the call-marshaling scratch (§4.4). }
 function Arm64SubImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
+function Arm64SubImmXShifted(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
+{ ADD/SUB (extended register), UXTX, so Rd/Rn may be SP. }
+function Arm64AddExtX(const ARd, ARn, ARm: Byte): UInt32;
+function Arm64SubExtX(const ARd, ARn, ARm: Byte): UInt32;
+{ True when AByteOffset is a multiple of AScale and the scaled imm12 fits. }
+function Arm64UnsignedOffsetFits(const AByteOffset, AScale: UInt32): Boolean;
 { SUBS Xd,Xn,#imm12, setting NZCV for a fused budget decrement/test. }
 function Arm64SubsImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 
@@ -444,6 +447,10 @@ procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
+procedure Arm64EmitAddImmXAny(const ABuf: TWasmCodeBuffer;
+  const ARd, ARn: Byte; const AImm: UInt32);
+procedure Arm64EmitSubImmXAny(const ABuf: TWasmCodeBuffer;
+  const ARd, ARn: Byte; const AImm: UInt32);
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitBlTo(const ABuf: TWasmCodeBuffer;
   const ATarget: TWasmJitLabel);
@@ -617,12 +624,11 @@ procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
 
-{ The INSTRUCTION-level half of the compile predicate (§4.4). Arm64CanEmitOp
-  answers "is there a template for this op"; this answers "can this particular
-  instruction's template be emitted", which for the call family means "does the
-  call site's argument + result marshaling fit ARM64_MAX_CALL_SLOTS". True for
-  every non-call op. The driver calls BOTH per instruction; either False
-  declines the whole function, which then runs interpreted. }
+{ The INSTRUCTION-level half of the compile predicate. Arm64CanEmitOp answers
+  "is there a template for this op"; this answers "can this particular
+  instruction's template be emitted". Call-site arity is no longer a decline:
+  large argument/result blocks take a multi-instruction SP adjust. Remaining
+  False values are reserved for a future shape the template cannot emit. }
 function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -3187,10 +3193,42 @@ begin
     or ARd;
 end;
 
+function Arm64AddImmXShifted(const ARd, ARn: Byte;
+  const AImm12: UInt32): UInt32;
+begin
+  Result := $91400000 or ((AImm12 and $FFF) shl 10) or (UInt32(ARn) shl 5)
+    or ARd;
+end;
+
 function Arm64SubImmX(const ARd, ARn: Byte; const AImm12: UInt32): UInt32;
 begin
   Result := $D1000000 or ((AImm12 and $FFF) shl 10) or (UInt32(ARn) shl 5)
     or ARd;
+end;
+
+function Arm64SubImmXShifted(const ARd, ARn: Byte;
+  const AImm12: UInt32): UInt32;
+begin
+  Result := $D1400000 or ((AImm12 and $FFF) shl 10) or (UInt32(ARn) shl 5)
+    or ARd;
+end;
+
+function Arm64AddExtX(const ARd, ARn, ARm: Byte): UInt32;
+begin
+  { ADD Xd|SP, Xn|SP, Xm, UXTX (C6.2.4). Bit 21 marks the extended form;
+    option=011 (UXTX) at bits 15-13. Rd/Rn = 31 encode SP. }
+  Result := $8B206000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64SubExtX(const ARd, ARn, ARm: Byte): UInt32;
+begin
+  Result := $CB206000 or (UInt32(ARm) shl 16) or (UInt32(ARn) shl 5) or ARd;
+end;
+
+function Arm64UnsignedOffsetFits(const AByteOffset, AScale: UInt32): Boolean;
+begin
+  Result := (AScale <> 0) and ((AByteOffset mod AScale) = 0)
+    and ((AByteOffset div AScale) <= $FFF);
 end;
 
 function Arm64SubsImmX(const ARd, ARn: Byte;
@@ -3310,40 +3348,177 @@ end;
 {  emit primitives                                                       }
 { ===================================================================== }
 
+procedure Arm64EmitFormAddr(const ABuf: TWasmCodeBuffer; const ARd, ARn: Byte;
+  const AOffset: UInt32);
+var
+  Hi, Lo: UInt32;
+  Scratch: Byte;
+begin
+  if AOffset = 0 then
+  begin
+    { ADD Xd,Xn,#0 copies SP when Rn/Rd is 31; ORR-as-MOV would read XZR. }
+    if ARd <> ARn then
+      ABuf.EmitU32(Arm64AddImmX(ARd, ARn, 0));
+    Exit;
+  end;
+  if AOffset <= $FFF then
+  begin
+    ABuf.EmitU32(Arm64AddImmX(ARd, ARn, AOffset));
+    Exit;
+  end;
+  if ((AOffset and $FFF) = 0) and ((AOffset shr 12) <= $FFF) then
+  begin
+    ABuf.EmitU32(Arm64AddImmXShifted(ARd, ARn, AOffset shr 12));
+    Exit;
+  end;
+  if AOffset <= $FFFFFF then
+  begin
+    Hi := AOffset shr 12;
+    Lo := AOffset and $FFF;
+    ABuf.EmitU32(Arm64AddImmXShifted(ARd, ARn, Hi));
+    if Lo <> 0 then
+      ABuf.EmitU32(Arm64AddImmX(ARd, ARd, Lo));
+    Exit;
+  end;
+  Scratch := ARM64_REG_ADDR;
+  if (ARd = Scratch) or (ARn = Scratch) then
+    Scratch := ARM64_REG_T2;
+  if (ARd = Scratch) or (ARn = Scratch) then
+    Scratch := ARM64_REG_T1;
+  Arm64EmitLoadImm32(ABuf, Scratch, AOffset);
+  ABuf.EmitU32(Arm64AddExtX(ARd, ARn, Scratch));
+end;
+
+procedure Arm64EmitAddImmXAny(const ABuf: TWasmCodeBuffer;
+  const ARd, ARn: Byte; const AImm: UInt32);
+begin
+  Arm64EmitFormAddr(ABuf, ARd, ARn, AImm);
+end;
+
+procedure Arm64EmitSubImmXAny(const ABuf: TWasmCodeBuffer;
+  const ARd, ARn: Byte; const AImm: UInt32);
+var
+  Hi, Lo: UInt32;
+  Scratch: Byte;
+begin
+  if AImm = 0 then
+  begin
+    if ARd <> ARn then
+      ABuf.EmitU32(Arm64SubImmX(ARd, ARn, 0));
+    Exit;
+  end;
+  if AImm <= $FFF then
+  begin
+    ABuf.EmitU32(Arm64SubImmX(ARd, ARn, AImm));
+    Exit;
+  end;
+  if ((AImm and $FFF) = 0) and ((AImm shr 12) <= $FFF) then
+  begin
+    ABuf.EmitU32(Arm64SubImmXShifted(ARd, ARn, AImm shr 12));
+    Exit;
+  end;
+  if AImm <= $FFFFFF then
+  begin
+    Hi := AImm shr 12;
+    Lo := AImm and $FFF;
+    ABuf.EmitU32(Arm64SubImmXShifted(ARd, ARn, Hi));
+    if Lo <> 0 then
+      ABuf.EmitU32(Arm64SubImmX(ARd, ARd, Lo));
+    Exit;
+  end;
+  Scratch := ARM64_REG_ADDR;
+  if (ARd = Scratch) or (ARn = Scratch) then
+    Scratch := ARM64_REG_T2;
+  if (ARd = Scratch) or (ARn = Scratch) then
+    Scratch := ARM64_REG_T1;
+  Arm64EmitLoadImm32(ABuf, Scratch, AImm);
+  ABuf.EmitU32(Arm64SubExtX(ARd, ARn, Scratch));
+end;
+
+function Arm64StoreAddrScratch(const ARt: Byte): Byte;
+begin
+  if ARt <> ARM64_REG_ADDR then
+    Result := ARM64_REG_ADDR
+  else
+    Result := ARM64_REG_T2;
+end;
+
 procedure Arm64EmitLdrW(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 begin
-  ABuf.EmitU32(Arm64LdrW(ARt, ARn, AByteOffset));
+  if Arm64UnsignedOffsetFits(AByteOffset, 4) then
+    ABuf.EmitU32(Arm64LdrW(ARt, ARn, AByteOffset))
+  else
+  begin
+    Arm64EmitFormAddr(ABuf, ARt, ARn, AByteOffset);
+    ABuf.EmitU32(Arm64LdrW(ARt, ARt, 0));
+  end;
 end;
 
 procedure Arm64EmitLdrX(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 begin
-  ABuf.EmitU32(Arm64LdrX(ARt, ARn, AByteOffset));
+  if Arm64UnsignedOffsetFits(AByteOffset, 8) then
+    ABuf.EmitU32(Arm64LdrX(ARt, ARn, AByteOffset))
+  else
+  begin
+    Arm64EmitFormAddr(ABuf, ARt, ARn, AByteOffset);
+    ABuf.EmitU32(Arm64LdrX(ARt, ARt, 0));
+  end;
 end;
 
 procedure Arm64EmitStrW(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
+var
+  Scratch: Byte;
 begin
-  ABuf.EmitU32(Arm64StrW(ARt, ARn, AByteOffset));
+  if Arm64UnsignedOffsetFits(AByteOffset, 4) then
+    ABuf.EmitU32(Arm64StrW(ARt, ARn, AByteOffset))
+  else
+  begin
+    Scratch := Arm64StoreAddrScratch(ARt);
+    Arm64EmitFormAddr(ABuf, Scratch, ARn, AByteOffset);
+    ABuf.EmitU32(Arm64StrW(ARt, Scratch, 0));
+  end;
 end;
 
 procedure Arm64EmitStrX(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
+var
+  Scratch: Byte;
 begin
-  ABuf.EmitU32(Arm64StrX(ARt, ARn, AByteOffset));
+  if Arm64UnsignedOffsetFits(AByteOffset, 8) then
+    ABuf.EmitU32(Arm64StrX(ARt, ARn, AByteOffset))
+  else
+  begin
+    Scratch := Arm64StoreAddrScratch(ARt);
+    Arm64EmitFormAddr(ABuf, Scratch, ARn, AByteOffset);
+    ABuf.EmitU32(Arm64StrX(ARt, Scratch, 0));
+  end;
 end;
 
 procedure Arm64EmitLdrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 begin
-  ABuf.EmitU32(Arm64LdrQ(ARt, ARn, AByteOffset));
+  if Arm64UnsignedOffsetFits(AByteOffset, 16) then
+    ABuf.EmitU32(Arm64LdrQ(ARt, ARn, AByteOffset))
+  else
+  begin
+    Arm64EmitFormAddr(ABuf, ARM64_REG_ADDR, ARn, AByteOffset);
+    ABuf.EmitU32(Arm64LdrQ(ARt, ARM64_REG_ADDR, 0));
+  end;
 end;
 
 procedure Arm64EmitStrQ(const ABuf: TWasmCodeBuffer; const ARt, ARn: Byte;
   const AByteOffset: UInt32);
 begin
-  ABuf.EmitU32(Arm64StrQ(ARt, ARn, AByteOffset));
+  if Arm64UnsignedOffsetFits(AByteOffset, 16) then
+    ABuf.EmitU32(Arm64StrQ(ARt, ARn, AByteOffset))
+  else
+  begin
+    Arm64EmitFormAddr(ABuf, ARM64_REG_ADDR, ARn, AByteOffset);
+    ABuf.EmitU32(Arm64StrQ(ARt, ARM64_REG_ADDR, 0));
+  end;
 end;
 
 procedure Arm64EmitRet(const ABuf: TWasmCodeBuffer);
@@ -3553,34 +3728,50 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
 var
   I: Integer;
   P: TWasmJitPatch;
-  Base, Instr: UInt32;
+  Base, Instr, Inverted: UInt32;
   Delta, Imm: Integer;
 begin
-  for I := 0 to ABuf.PatchCount - 1 do
+  { Kind 0 means a consumed overflow site that was rewritten in place. New B
+    veneers are appended and resolved in the same walk. }
+  I := 0;
+  while I < ABuf.PatchCount do
   begin
     P := ABuf.GetPatch(I);
+    if P.Kind = 0 then
+    begin
+      Inc(I);
+      Continue;
+    end;
     Base := UInt32(P.Kind);
-    Delta := ABuf.PatchDelta(I);   { signed byte displacement, multiple of 4 }
+    Delta := ABuf.PatchDelta(I);
     Imm := Delta div 4;
     if (Base and $7C000000) = $14000000 then
     begin
-      { B/BL: imm26 in bits [25:0]. An overflowing displacement would silently
-        wrap into a wrong jump; refuse it so the function stays interpreted. }
       if not Arm64SignedImmFits(Imm, 26) then
         raise EWasmJitBranchRange.CreateFmt(
           'JIT: B/BL displacement %d does not fit imm26', [Delta]);
       Instr := Base or (UInt32(Imm) and $03FFFFFF);
+      ABuf.PatchU32(P.SiteOffset, Instr);
+    end
+    else if Arm64SignedImmFits(Imm, 19) then
+    begin
+      Instr := Base or ((UInt32(Imm) and $7FFFF) shl 5);
+      ABuf.PatchU32(P.SiteOffset, Instr);
     end
     else
     begin
-      { B.cond / CBZ / CBNZ: imm19 in bits [23:5]. Same range guard, tighter
-        field (imm19 = +-1 MiB of code). }
-      if not Arm64SignedImmFits(Imm, 19) then
-        raise EWasmJitBranchRange.CreateFmt(
-          'JIT: conditional-branch displacement %d does not fit imm19', [Delta]);
-      Instr := Base or ((UInt32(Imm) and $7FFFF) shl 5);
+      { Invert the 4-byte conditional so it skips an inserted B, which then
+        carries the original target with imm26 reach. }
+      if (Base and $FF000010) = $54000000 then
+        Inverted := (Base and $FFFFFFF0) or ((Base xor 1) and $F)
+      else
+        Inverted := Base xor $01000000;
+      ABuf.InsertU32(P.SiteOffset + 4, Arm64BPlaceholder);
+      ABuf.PatchU32(P.SiteOffset, Inverted or (UInt32(2) shl 5));
+      ABuf.AddPatch(P.SiteOffset + 4, P.Target, Integer(Arm64BPlaceholder));
+      ABuf.SetPatchKind(I, 0);
     end;
-    ABuf.PatchU32(P.SiteOffset, Instr);
+    Inc(I);
   end;
 end;
 
@@ -5071,7 +5262,7 @@ begin
   else
     FrameBytes := Arm64CallFrameBytes(ArgN, ResN);
 
-  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  Arm64EmitSubImmXAny(ABuf, ARM64_REG_SP, ARM64_REG_SP, FrameBytes);
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
 
@@ -5090,8 +5281,8 @@ begin
         begin
           Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
           ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
-          ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
-          ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, StateOffset));
+          Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, ArgBytes);
+          Arm64EmitAddImmXAny(ABuf, 4, ARM64_REG_SP, StateOffset);
           if (ArgN = 1) and (ResN = 1) then
             Arm64EmitCallHelper(ABuf, aohDirectCallPrepareScalar)
           else
@@ -5131,7 +5322,7 @@ begin
         ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
-        ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+        Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, ArgBytes);
         Arm64EmitCallHelper(ABuf, aohCall);
         ABuf.BindLabel(DoneLabel);
       end;
@@ -5142,19 +5333,19 @@ begin
           slot and let the helper narrow it by the table's address type. }
         LdX(ABuf, 2, AIns.Dest);
         ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, 0));
-        ABuf.EmitU32(Arm64AddImmX(4, ARM64_REG_SP, ArgBytes));
+        Arm64EmitAddImmXAny(ABuf, 4, ARM64_REG_SP, ArgBytes);
         Arm64EmitCallHelper(ABuf, aohCallIndirect);
       end;
   else
     { iroCallRef: the funcref operand rides in Dest. }
     LdX(ABuf, 1, AIns.Dest);
     ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
-    ABuf.EmitU32(Arm64AddImmX(3, ARM64_REG_SP, ArgBytes));
+    Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, ArgBytes);
     Arm64EmitCallHelper(ABuf, aohCallRef);
   end;
 
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
-  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  Arm64EmitAddImmXAny(ABuf, ARM64_REG_SP, ARM64_REG_SP, FrameBytes);
   if UseNativeLeaf then
     ABuf.BindLabel(NativeDone);
 end;
@@ -5173,7 +5364,7 @@ begin
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   FrameBytes := Arm64CallFrameBytes(ArgN, 0);
 
-  ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  Arm64EmitSubImmXAny(ABuf, ARM64_REG_SP, ARM64_REG_SP, FrameBytes);
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
 
@@ -5201,7 +5392,7 @@ begin
     Arm64EmitCallHelper(ABuf, aohReturnCallRef);
   end;
 
-  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
+  Arm64EmitAddImmXAny(ABuf, ARM64_REG_SP, ARM64_REG_SP, FrameBytes);
   Arm64EmitEpilogue(ABuf);
 end;
 
@@ -5531,16 +5722,11 @@ end;
 function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 begin
+  { Call-site arity is encoded with a multi-instruction SP adjust; no
+    instruction shape declines a valid IR function. }
   Result := True;
-  case AIns.Op of
-    iroCall, iroCallIndirect, iroCallRef:
-      Result := (IrAuxBlockCount(AAux, AIns.A)
-        + IrAuxBlockCount(AAux, AIns.B)) <= ARM64_MAX_CALL_SLOTS;
-    { A tail call marshals arguments only — the callee's results are this
-      frame's, so there is no result block to size. }
-    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
-      Result := IrAuxBlockCount(AAux, AIns.A) <= ARM64_MAX_CALL_SLOTS;
-  end;
+  if AIns.Op <> AIns.Op then
+    Result := Length(AAux) < 0;
 end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;

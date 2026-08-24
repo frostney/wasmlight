@@ -183,15 +183,13 @@ begin
     begin
       Code := JitStageFunctionBytes(AStore, Ir, Fn,
         Ir.FuncImportCount + UInt32(I), EntryOffset, RegCount);
-      if Length(Code) > 0 then
-      begin
-        Funcs[I].Compiled := True;
-        Funcs[I].Code := Code;
-        Funcs[I].EntryOffset := UInt32(EntryOffset);
-        Funcs[I].RegisterCount := RegCount;
-      end;
-      { Length(Code) = 0 here means the backend declined late (e.g. branch
-        range) — recorded un-compiled, run interpreted at load. }
+      if Length(Code) = 0 then
+        raise EWasmInternal.CreateFmt(
+          'internal: compilable function %d staged empty code', [I]);
+      Funcs[I].Compiled := True;
+      Funcs[I].Code := Code;
+      Funcs[I].EntryOffset := UInt32(EntryOffset);
+      Funcs[I].RegisterCount := RegCount;
     end;
   end;
 

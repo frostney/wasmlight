@@ -386,11 +386,13 @@ different.
   handling are inherited rather than re-derived. It emits the epoch check
   at every back-edge and keeps live references discoverable, honouring the
   same safepoint obligations as the interpreter. It carries the full
-  non-EH op set; a function that throws or hosts a `try_table` handler is
-  declined and stays interpreted, and compiled and interpreted functions
-  interoperate transparently across the seam (a throw from a compiled
-  callee reaches an outer interpreted handler, and a cross-tier tail call
-  stays O(1)).
+  non-EH op set. The remaining compile declines are an unsupported target
+  (no backend) and exception handling — a function that throws or hosts a
+  `try_table` handler stays interpreted. Large register files, wide calls,
+  and out-of-range conditional branches are encoded, not declined.
+  Compiled and interpreted functions interoperate transparently across the
+  seam (a throw from a compiled callee reaches an outer interpreted
+  handler, and a cross-tier tail call stays O(1)).
 - **The AOT compiler** (`Wasm.Aot`, `Wasm.Aot.Artifact`) runs the same
   backends ahead of time, emitting **position-independent** code — helper
   calls go through a per-process indirect table and the IR base arrives in
