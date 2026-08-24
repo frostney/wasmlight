@@ -1,4 +1,4 @@
-{ Unit suite for Wasm.Engine.Callbacks — connector thunk lifetimes,
+{ Unit suite for Wasm.Connector.Callbacks — connector thunk lifetimes,
   queued delivery, and the deferred-failure boundary (issue #45).
 
   Every module is assembled through Wasm.Wat.Assembler and loaded through
@@ -18,7 +18,7 @@
 
   Spec pin: wasm-mcp 0.2.16, spec/main
   d7b37e4170d8315f2f1283aed4e8076591a9a333 (ADR-0004). }
-program Wasm.Engine.Callbacks.Test;
+program Wasm.Connector.Callbacks.Test;
 
 {$I Shared.inc}
 {$POINTERMATH ON}
@@ -32,7 +32,7 @@ uses
   TestingPascalLibrary,
   Wasm.Core,
   Wasm.Engine,
-  Wasm.Engine.Callbacks,
+  Wasm.Connector.Callbacks,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values,
   Wasm.Wat.Assembler;
@@ -607,7 +607,7 @@ begin
 end;
 
 begin
-  TestRunnerProgram.AddSuite(TCallbackTests.Create('Wasm.Engine.Callbacks'));
+  TestRunnerProgram.AddSuite(TCallbackTests.Create('Wasm.Connector.Callbacks'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

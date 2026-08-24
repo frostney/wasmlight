@@ -1,4 +1,4 @@
-{ Wasm.Engine.Callbacks — target-ABI callback thunks, lifetimes, and
+{ Wasm.Connector.Callbacks — target-ABI callback thunks, lifetimes, and
   deferred failures for native connectors (issue #45, ADR-0008 / ADR-0015).
 
   Native libraries such as SDL and raylib call C function pointers. This
@@ -34,7 +34,7 @@
   d7b37e4170d8315f2f1283aed4e8076591a9a333 (ADR-0004). Guest invocation
   reuses Engine.Call / InterpInvoke; no new Core 3 rule is interpreted
   here. }
-unit Wasm.Engine.Callbacks;
+unit Wasm.Connector.Callbacks;
 
 {$I Shared.inc}
 

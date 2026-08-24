@@ -46,7 +46,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
 | Host surface | `Wasm.Wasi.*`, `Wasm.Run` | deny-by-default WASI preview1 host and the `wasmlight run` driver; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
-| Embedding API | `Wasm.Engine`, `Wasm.Engine.Callbacks` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots; target-ABI callback thunks with retained/scoped/queued lifetimes | **shipped** |
+| Embedding API | `Wasm.Engine`, `Wasm.Connector.Callbacks` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots; target-ABI callback thunks with retained/scoped/queued lifetimes | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
 | Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
@@ -453,7 +453,7 @@ boundary is drawn.
   facade never sees a memory's base pointer. It re-exports the collector's
   host-root API (contract HOST-1) so a host holding a reference across an
   allocation can root it, and declares `EWasmExit`.
-- **`Wasm.Engine.Callbacks`** hands out target-ABI `cdecl` function
+- **`Wasm.Connector.Callbacks`** hands out target-ABI `cdecl` function
   pointers that re-enter a guest through `Call`. Retained is the default;
   `[Scoped]` dies with `EndScope`; `[Queued]` copies a void notification
   from a foreign thread and delivers it on the store thread. A guest
