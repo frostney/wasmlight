@@ -216,44 +216,68 @@ begin
     ULeb(AIndex)]);
 end;
 
-{ A four-function module for the Wave-2 multi-function + declined proof
-  (aot-spec §7.3):
-    f0 "add"            (i32 i32)->i32  local.get0 local.get1 i32.add   [leaf, compiled]
+{ A five-function module for the multi-function + declined proof
+  (aot-spec §7.3). Handler tables now compile, so the declined fixture is an
+  over-wide call (257 arguments — one past ARM64_MAX_CALL_SLOTS /
+  X64_MAX_CALL_SLOTS) that both backends refuse:
+    f0 "add"            (i32 i32)->i32  local.get0 local.get1 i32.add   [compiled]
     f1 "addcaller"      (i32 i32)->i32  local.get0 local.get1 call 0    [compiled -> compiled]
-    f2 "declined"       ()->i32         block (try_table (catch_all) empty-body) i32.const 7
-                                        [DECLINED: owns a try_table handler table (EH),
-                                         so JitCanCompile refuses it — runs interpreted,
-                                         returns 7 with no throw]
-    f3 "declinedcaller" ()->i32         call 2                          [compiled -> DECLINED/interpreted]
-  It needs no tag section: catch_all references a label, not a tag, and nothing
-  throws — so f2 simply runs its empty try body and returns 7. The point is the
-  compiled/interpreted mix: f1 (compiled) calls f0 (compiled), and f3 (compiled)
-  calls f2 (interpreted), all across the CompiledEntry seam. }
-function MultiFuncModuleBytes: TWasmBytes;
+    f2 $wide            (i32×257)->i32  i32.const 7                     [compiled leaf]
+    f3 "declined"       ()->i32         call $wide with 257 zeros       [DECLINED]
+    f4 "declinedcaller" ()->i32         call 3                          [compiled -> interpreted]
+  f1 (compiled) calls f0 (compiled), and f4 (compiled) calls f3 (interpreted). }
+function RepeatByte(const AByte: Byte; const ACount: Integer): TWasmBytes;
 var
-  Type0, Type1: TWasmBytes;
-  Body0, Body1, Body2, Body3: TWasmBytes;
+  I: Integer;
+begin
+  SetLength(Result, ACount);
+  for I := 0 to ACount - 1 do
+    Result[I] := AByte;
+end;
+
+function RepeatBytes(const AItem: TWasmBytes; const ACount: Integer): TWasmBytes;
+var
+  I, J, N: Integer;
+begin
+  SetLength(Result, Length(AItem) * ACount);
+  N := 0;
+  for I := 1 to ACount do
+    for J := 0 to High(AItem) do
+    begin
+      Result[N] := AItem[J];
+      Inc(N);
+    end;
+end;
+
+function MultiFuncModuleBytes: TWasmBytes;
+const
+  WIDE_ARITY = 257;
+var
+  Type0, Type1, TypeWide: TWasmBytes;
+  Body0, Body1, BodyWide, BodyDeclined, BodyCaller: TWasmBytes;
 begin
   Type0 := BLit([$60, $02, $7F, $7F, $01, $7F]);   { (i32 i32) -> i32 }
   Type1 := BLit([$60, $00, $01, $7F]);             { () -> i32 }
+  TypeWide := Cat([BLit([$60]), ULeb(WIDE_ARITY), RepeatByte($7F, WIDE_ARITY),
+    BLit([$01, $7F])]);
   Body0 := BLit([$00, $20, $00, $20, $01, $6A, $0B]);
   Body1 := BLit([$00, $20, $00, $20, $01, $10, $00, $0B]);
-  { $00 locals; $02 $40 block void; $1F $40 try_table void; $01 catch count;
-    $02 $00 catch_all -> label0 (the block); $0B end try_table; $0B end block;
-    $41 $07 i32.const 7; $0B end func. }
-  Body2 := BLit([$00, $02, $40, $1F, $40, $01, $02, $00, $0B, $0B, $41, $07, $0B]);
-  Body3 := BLit([$00, $10, $02, $0B]);
+  BodyWide := BLit([$00, $41, $07, $0B]);
+  BodyDeclined := Cat([BLit([$00]), RepeatBytes(BLit([$41, $00]), WIDE_ARITY),
+    BLit([$10, $02, $0B])]);
+  BodyCaller := BLit([$00, $10, $03, $0B]);
   Result := Cat([
     BLit(WASM_HEADER),
-    Sect(1, VecOf([Type0, Type1])),
-    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$01]), BLit([$01])])),
+    Sect(1, VecOf([Type0, Type1, TypeWide])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$02]), BLit([$01]),
+      BLit([$01])])),
     Sect(7, VecOf([
       FuncExport('add', 0),
       FuncExport('addcaller', 1),
-      FuncExport('declined', 2),
-      FuncExport('declinedcaller', 3)])),
-    Sect(10, VecOf([CodeEntry(Body0), CodeEntry(Body1), CodeEntry(Body2),
-      CodeEntry(Body3)]))
+      FuncExport('declined', 3),
+      FuncExport('declinedcaller', 4)])),
+    Sect(10, VecOf([CodeEntry(Body0), CodeEntry(Body1), CodeEntry(BodyWide),
+      CodeEntry(BodyDeclined), CodeEntry(BodyCaller)]))
   ]);
 end;
 
@@ -572,16 +596,16 @@ begin
     CompileStore := TWasmStore.Create(CompileEngine);
     Artifact := AotCompileModule(CompileStore, CompileLoaded);
 
-    { The whole module serialized: four records, f2 (EH) declined, the rest
-      compiled. A declined record carries no code. }
+    { Five records: f3 (over-wide call) declined, the rest compiled. }
     ParseRes := ParseAotArtifact(Artifact, Parsed);
     Expect<Integer>(Ord(ParseRes)).ToBe(Ord(aprOk));
-    Expect<Integer>(Length(Parsed.Funcs)).ToBe(4);
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(5);
     Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
     Expect<Boolean>(Parsed.Funcs[1].Compiled).ToBe(True);
-    Expect<Boolean>(Parsed.Funcs[2].Compiled).ToBe(False);
-    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(True);
-    Expect<Integer>(Length(Parsed.Funcs[2].Code)).ToBe(0);
+    Expect<Boolean>(Parsed.Funcs[2].Compiled).ToBe(True);
+    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(False);
+    Expect<Boolean>(Parsed.Funcs[4].Compiled).ToBe(True);
+    Expect<Integer>(Length(Parsed.Funcs[3].Code)).ToBe(0);
 
     { --- LOAD into a fresh store --- }
     Imports.Funcs := nil;
@@ -623,13 +647,13 @@ begin
       .ToBe(InterpResult1(Bytes_, 'addcaller', [Params[0], Params[1]]));
     Expect<Integer>(Res[0].I32).ToBe(42);
 
-    { declined(): interpreted f2 -> 7. }
+    { declined(): interpreted f3 -> 7. }
     Res[0].Bits := High(UInt64);
     InterpInvoke(Store, Declined, nil, @Res[0]);
     Expect<UInt64>(Res[0].Bits).ToBe(InterpResult1(Bytes_, 'declined', []));
     Expect<Integer>(Res[0].I32).ToBe(7);
 
-    { declinedcaller(): compiled f3 calls DECLINED/interpreted f2 across the
+    { declinedcaller(): compiled f4 calls DECLINED/interpreted f3 across the
       seam -> 7 (compiled<->interpreted interop). }
     Res[0].Bits := High(UInt64);
     InterpInvoke(Store, DeclinedCaller, nil, @Res[0]);

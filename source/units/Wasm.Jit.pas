@@ -51,12 +51,10 @@
   `return_call*` and the frame replacement has to run in a LOOP rather than a
   native call to keep tail calls O(1) (§4.5) — the frame is still built and torn
   down by the shared Wasm.Interp helpers, so the hand-off contract above is
-  unchanged. (2) The predicate gains two EH fences: a function carrying a
-  `try_table` handler table declines (JitCanCompile), and — where the store has
-  tags at all — a function containing a CALL declines (ForceCompile). Both exist
-  because exception delivery is an explicit unwind over the activation stack
-  that cannot pass a tier-seam frame; see the comment on the second fence for
-  the interp-side change that would retire them.
+  unchanged. (2) Handler tables and `throw` / `throw_ref` compile. Matching
+  stays in UnwindException (tag store-address, eh-spec §2.3/§4). Direct
+  compiled-to-compiled calls still decline handler-bearing and throwing
+  functions so each keeps its own InvokeCompiled seam.
 
   TIERING. The baseline compiles on-hot in principle (§4.2), but the milestone
   and the differential harness FORCE compilation (§11.1): JitForceCompile
@@ -267,9 +265,15 @@ begin
   Result := False;
   if AFn = nil then
     Exit;
+  { A handler-bearing or throwing function needs its own InvokeCompiled seam
+    so a matched clause can resume at a landing pad without returning through
+    a popped native frame. Tail calls already decline this path. }
+  if Length(AFn^.Handlers) > 0 then
+    Exit;
   for I := 0 to High(AFn^.Code) do
     if AFn^.Code[I].Op in
-      [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef] then
+      [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef,
+       iroThrow, iroThrowRef] then
       Exit;
   Result := True;
 end;
@@ -320,16 +324,10 @@ begin
   if AFn^.RegisterCount > X64_MAX_SLOT then
     Exit;
   {$ENDIF}
-  { EXCEPTION HANDLING IS NEVER COMPILED (§8.3, §10.2) — and a `try_table`
-    emits NO instruction: the validator lowers it to the static handler table
-    hanging off the function, so the per-op predicate cannot see it. Before
-    Wave 3 that was invisible (a handler-bearing function is only interesting
-    when something inside it can throw, which needs a call), but a compiled
-    body consults no handler table, so an exception thrown under it would
-    escape a try_table the interpreter catches. Any handler declines the
-    function, which then runs interpreted and catches exactly as before. }
-  if Length(AFn^.Handlers) > 0 then
-    Exit;
+  { Handler tables compile: throw / throw_ref have templates, and
+    UnwindException scans the same IR table the interpreter uses (tag
+    store-address matching, eh-spec §2.3/§4). Native scalar fast paths still
+    decline handlers — they have no helper/seam to resume a clause. }
   { Every op must have a template, and every instruction must be one this
     template can actually emit (a call site's marshaling has to fit the
     backend's scratch, §4.4). The FIRST failure declines the whole function —
@@ -507,6 +505,9 @@ var
   NativeCoreLabel: TWasmJitLabel;
   NativeExhaustedLabel: TWasmJitLabel;
   NativeExternalLabel: TWasmJitLabel;
+  EhTableLabel: TWasmJitLabel;
+  EhEndLabel: TWasmJitLabel;
+  HasHandlers: Boolean;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -1925,6 +1926,25 @@ begin
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
+    HasHandlers := Length(AFn^.Handlers) > 0;
+    if HasHandlers then
+    begin
+      EhTableLabel := Buf.NewLabel;
+      EhEndLabel := Buf.NewLabel;
+    end
+    else
+    begin
+      EhTableLabel := 0;
+      EhEndLabel := 0;
+    end;
+    {$IFDEF WASM_JIT_ARM64}
+    Arm64BeginEhEmit(HasHandlers, EhTableLabel, EhEndLabel,
+      UInt32(Length(AFn^.Code)));
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    X64BeginEhEmit(HasHandlers, EhTableLabel, EhEndLabel,
+      UInt32(Length(AFn^.Code)));
+    {$ENDIF}
     if UseNativeScalarCore then
     begin
       NativeCoreLabel := Buf.NewLabel;
@@ -1958,9 +1978,16 @@ begin
           end;
       end;
     end;
+    for I := 0 to High(AFn^.HandlerClauses) do
+      MarkTarget(AFn^.HandlerClauses[I].TargetInstr);
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
+    if HasHandlers then
+      { A landing pad is reached by the EH jump table, not a fall-through.
+        Host-register cache would observe stale slots after ResumeAtClause
+        writes the payload (eh-spec §2.3). }
+      UseStaticCache := False;
     if UseNativeScalarCore then
     begin
       { x26 is unavailable to the shared native core cache: recursion pins its
@@ -2074,6 +2101,13 @@ begin
     end;
     {$ENDIF}
 
+    {$IFDEF WASM_JIT_ARM64}
+    Arm64EmitEhResumeCheck(Buf);
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    X64EmitEhResumeCheck(Buf);
+    {$ENDIF}
+
     for I := 0 to High(AFn^.Code) do
     begin
       if Targets[I] then
@@ -2163,6 +2197,15 @@ begin
       Arm64EmitLoadImm32(Buf, 0, UInt32(Ord(wtkStackExhausted)));
       Arm64EmitCallHelper(Buf, aohTrapKind);
     end;
+    if HasHandlers then
+    begin
+      Buf.BindLabel(EhEndLabel);
+      if UseExtendedFrame then
+        Arm64EmitEpilogueExtended(Buf)
+      else
+        Arm64EmitEpilogue(Buf);
+    end;
+    Arm64EmitEhTable(Buf, Length(AFn^.Code));
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
@@ -2172,6 +2215,12 @@ begin
       X64EmitMovRegImm32(Buf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
       X64EmitCallHelper(Buf, aohTrapKind);
     end;
+    if HasHandlers then
+    begin
+      Buf.BindLabel(EhEndLabel);
+      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
+    end;
+    X64EmitEhTable(Buf, Length(AFn^.Code));
     X64ResolvePatches(Buf);
     {$ENDIF}
     { AOT staging (aot-spec §3.2) stops HERE, before MakeExecutable: the caller
@@ -2269,9 +2318,10 @@ begin
     catch) across the native barrier to the enclosing invocation's seam catch, continuing the
     search for a handler further out (Wasm.Interp.UnwindException). So a compiled
     call-bearing function may correctly sit between a throw and its handler, and
-    more functions compile (compiled=N goes up). Fence 1 (JitCanCompile declines
-    a function that OWNS a try_table handler table, since its handlers are not in
-    machine code) and the iroThrow/iroThrowRef decline STAY. }
+    more functions compile (compiled=N goes up). Fence 1 is retired: handler
+    tables and throw / throw_ref now compile; UnwindException still matches by
+    tag store-address. Handler-bearing and throwing functions decline only
+    JitCanDirectCall so they keep an InvokeCompiled seam. }
   {$IFDEF WASM_JIT_BACKEND}
   N := Length(FBuffers);
   SetLength(FBuffers, N + 1);
