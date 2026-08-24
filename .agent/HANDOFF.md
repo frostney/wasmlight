@@ -1,5 +1,186 @@
 # Handoff
 
+Updated: 2026-08-24 (roadmap and GitHub records created)
+
+## Proposed 0.2.0 native compiler and connectors
+
+- APPROVED on 2026-08-24: the complete version plan is `0.2.0` strict native
+  compiler/connectors/cross-compilation/Homebrew; `0.3.0` Win64; `0.4.0`
+  i386 Windows; `0.5.0` portable C/Nim/C#/Rust/Go/Python embedding SDKs;
+  `0.6.0` independently judged non-network WASI Preview 1; and `0.7.0`
+  operational observability. The approved 62 bounded issues were created
+  through the project-local `create-issue` workflow.
+- `ROADMAP-260824.md` records the approved evidence, architecture, dependency
+  shape, issue catalog, and canonical GitHub links. Six milestones were
+  created without due dates: `0.2.0` #29–#46 (18), `0.3.0` #47–#53 (7),
+  `0.4.0` #54–#61 (8), `0.5.0` #62–#77 (16), `0.6.0` #78–#85 (8), and
+  `0.7.0` #86–#90 (5). A live API audit found no missing milestone
+  assignments, `enhancement` labels, or required creator-attribution notes.
+  A transient GitHub 504 during the first batch was recovered by rereading
+  live state and resuming with exact-title duplicate checks; no duplicate was
+  created. No release, commit, or pull request was created.
+
+- Refreshed this worktree by fast-forwarding the clean detached head to exact
+  `origin/main@0d0c8ffd79067bae85b9d8d927cfab7c9b558753` before rechecking the
+  design against current source.
+- The next release is `0.2.0`, not `0.1.1`. The accepted compiler direction is
+  `wasmlight compile`: it produces a native executable by compiling every Wasm
+  function ahead of time. Compilation fails if any function cannot be
+  compiled; the generated executable contains neither the interpreter nor the
+  JIT compiler.
+- A connector is declarative C-ABI binding data, not Pascal or C source. It
+  maps named Wasm imports to explicitly approved symbols in dynamic native
+  libraries and is validated and embedded at compile time. TinyCC and
+  per-connector source compilation are not part of the direction.
+- Connector libraries are `.dylib`, `.so`, or `.dll` deployment dependencies.
+  A library written in Pascal is eligible when it exports a stable `cdecl` C
+  ABI. Statically linking arbitrary native objects or providing custom adapter
+  logic belongs to a Pascal embedder using `Wasm.Engine`, not to
+  `wasmlight compile`.
+- The existing deny-by-default `TWasmLinker` / `TWasmHostFunc` seam is the
+  source-level integration point. The GocciaScript comparison establishes the
+  intended mechanism: declarative signatures become ABI placement plans that
+  call through precompiled Pascal/assembly gates; no source compiler or
+  `libffi` is required.
+- Created issues cover connector declaration and import validation, the C-ABI
+  plan/call engine, guest-memory lifting/lowering and opaque handles,
+  dynamic-library capability and link errors, embedded connector plans, and
+  direct embedding documentation/examples.
+- Connector memory semantics are explicit: `copy-in`, `copy-out`, and `inout`
+  transfers; plus a scoped zero-copy borrow when performance requires it. A
+  borrow is bounds-checked through the existing memory chokepoint, lasts only
+  for one synchronous native call, and forbids callback/re-entry or retention.
+  Raw native pointers never enter the guest; persistent native resources cross
+  the boundary as validated opaque handles.
+- The connector language uses a constrained C# P/Invoke shape chosen for
+  regularity and AI-agent familiarity. A static class marked `[Connector]`
+  contains structs, enums, delegates, and `extern` methods. `[DllImport]`
+  selects the native library and `EntryPoint` aliases the guest-visible method
+  name to a different native symbol. Braces and semicolons follow ordinary C#
+  syntax consistently.
+- This is not C# and invokes no C# compiler. The Pascal implementation accepts
+  only connector declarations and a fixed attribute/type vocabulary; method
+  bodies, properties, inheritance, arbitrary generics, expressions, control
+  flow, and allocation are outside the language. It lowers declarations to
+  ABI plans plus ahead-of-time native call and callback thunks.
+- The earlier proposed one-way connector restriction was rejected: callbacks
+  are first-class delegate declarations. Same-thread callbacks can use the
+  engine's existing nested host-to-guest invocation support; foreign-thread
+  delivery remains a separate design boundary under ADR-0008.
+- `EntryPoint` performs name aliasing only. Guest and native signatures must be
+  compatible after fixed, familiar P/Invoke-style marshalling attributes such
+  as `[MarshalAs]`, `[In]`, and `[Out]`. Argument-reordering expressions, call
+  composition, hidden state, and an adapter expression language are excluded;
+  those needs use direct embedding.
+- A callback is direct and same-thread by default. A delegate marked
+  `[Queued]` may be invoked from a foreign thread: its arguments are copied
+  into connector-owned queue storage and the guest callback runs later on the
+  store thread. Queued callbacks must return `void` and cannot contain `ref`,
+  `out`, or borrowed memory. Foreign-thread callbacks requiring a synchronous
+  result or buffer mutation remain direct-embedding work under ADR-0008.
+- Delegate arguments are retained for the connector's lifetime by default;
+  identical delegate/function-reference pairs are deduplicated. `[Scoped]`
+  marks a callback that the native function guarantees cannot escape that one
+  call. Queued callbacks are necessarily retained, and connector teardown
+  invalidates every callback thunk before releasing the rooted guest function
+  references.
+- No guest failure unwinds through native C frames. A callback that encounters
+  `EWasmTrap`, `EWasmException`, or `EWasmExit` returns the native result type's
+  deterministic zero value and retains the exact failure. Once the native call
+  returns, the connector rethrows it unchanged on Pascal ground; when no
+  connector call is active, it surfaces at the next connector boundary. The
+  DSL has no configurable error expressions.
+- Connector selection is explicit and repeatable:
+  `wasmlight compile app.wasm --connector one.wlc --connector two.wlc -o app`.
+  `.wlc` is the Wasmlight Connector Language extension. There is no discovery,
+  registry lookup, network fetch, or import-triggered loading. Every guest
+  import resolves exactly once or compilation fails; unused declarations and
+  their libraries are stripped, and the resolved connector plan is embedded
+  immutably in the executable.
+- The first `wasmlight compile` release supports all-to-all cross-compilation
+  across the four 64-bit UNIX targets: AArch64 or x86-64 on macOS/Linux.
+  Unsupported targets fail explicitly; every successful output remains full
+  AOT and interpreter-free.
+- This is an initial delivery boundary, not the permanent target boundary.
+  Windows and 32-bit native compilation are required follow-ons. The current
+  governed matrix names them precisely as `x86_64-win64` and `i386-win32`.
+  Win64 can extend the x64 emitter but needs the Win64 ABI, executable/runtime
+  memory path, PE packaging, and Windows trap handling. i386 requires a new
+  machine-code backend and 32-bit ABI while retaining the explicit-bounds
+  memory strategy from ADR-0010.
+- The complete native-compile target matrix is AArch64 and x86-64 on macOS and
+  Linux, followed by x86-64 Windows and i386 Windows. Win64 precedes i386 in
+  the portability sequence because it can reuse the x64 emitter. ARM32 and
+  i386 Linux are explicitly out of scope: their device populations do not
+  justify the additional backends and validation matrix.
+- Current project docs still describe wasmlight as not being a compiler;
+  update the vision/roadmap only with the finalized, confirmation-gated plan
+  rather than documenting unshipped work as current behavior.
+- Fresh roadmap evidence at `origin/main@0d0c8ffd7906`: GitHub has one release
+  (`0.1.0`), no milestones, three issues (one open), and 24 merged pull
+  requests. The 90-day raw rate is 1.87 merges/week; the repository-age rate
+  is 13.9/week. Only two issue-linked deliveries exist, with 52-minute and
+  196-minute issue-created-to-merge times, so the plan supports dependency
+  ordering and bounded PR counts but not calendar dates.
+- `wasmlight compile` assembles its output from a prebuilt, interpreter-free
+  Pascal runtime shell for the host target, embedding the validated module,
+  complete native code, and immutable connector plan. This avoids requiring a
+  system compiler or linker while retaining startup validation and runtime
+  helpers. It does not emit object files or invoke a platform linker.
+- WASI configuration is compile-time configuration. `wasmlight compile`
+  embeds an immutable capability set in the executable; the executable has no
+  Wasmlight control arguments and every invocation argument belongs to the
+  guest. It never expands its permissions from ambient process state.
+- Compile-time `--dir GUEST=HOST` grants preserve absolute host paths exactly;
+  relative host paths resolve against the generated executable's directory at
+  run time so an application bundle can be relocated. `--env K=V` embeds the
+  literal value and is explicitly not a secret-delivery mechanism.
+- Connector library lookup is deterministic and application-local. A bare
+  `DllImport` name receives the platform filename convention and resolves
+  beside the executable; relative paths also resolve there, while absolute
+  paths remain literal. The runtime does not search the working directory,
+  `PATH`, `LD_LIBRARY_PATH`, or equivalent ambient paths.
+- Confirmation packet to present next: `0.2.0` delivers strict full-AOT native
+  executables, the runtime shell, immutable capabilities, and `.wlc`
+  connectors on 64-bit macOS/Linux; `0.3.0` extends that product to
+  x86_64-win64; `0.4.0` adds the new i386-win32 backend and product path. The
+  previously planned peer gaps are also part of the versioned plan:
+  `0.5.0` completes and governs the public embedding surface, `0.6.0` completes
+  non-network WASI Preview 1 behind `wasi-testsuite`, and `0.7.0` adds
+  operational observability. Component Model re-entry follows those milestones;
+  threads remain a separate demand-led programme.
+- Cross-compilation is requested as part of this programme. The source-level
+  prerequisite is to separate target code emission from host execution:
+  `Wasm.Jit` currently selects exactly one backend through host CPU/OS defines,
+  while `Wasm.Aot` derives architecture and ABI fingerprints from the live
+  host/store. Target selection and target ABI descriptors are foundational in
+  `0.2.0`: every shipped compiler host emits every released target through
+  `--target` (defaulting to the host). The four 64-bit Unix targets land in
+  `0.2.0`, Win64 joins the all-host target set in `0.3.0`, and i386 Windows in
+  `0.4.0`. Runtime shells for every released target ship with the compiler, so
+  no external compiler, linker, SDK, or interpreter is needed.
+- Cross-language embedding is a further confirmed gap. `Wasm.Engine` currently
+  exposes Pascal classes, managed strings/arrays, and Pascal exceptions, so it
+  is not itself a stable foreign-function boundary. Accepted `0.5.0` shape:
+  complete the Pascal embedding facade, place one versioned C ABI over it using
+  opaque handles, fixed-width values, explicit status/error objects, user-data
+  callbacks, and no exceptions across the boundary; ship `libwasmlight`, a C
+  header/examples, and first-party bindings for Nim, C#, Rust, Go, and Python.
+  Every binding consumes the same C ABI and language-neutral conformance kit
+  rather than adding runtime behavior or a language-specific engine.
+- Ecosystem registry publication is lower priority. Initial distribution uses
+  the existing `frostney/homebrew-tap`, whose current `lwpt` and GocciaScript
+  formulae install checksum-pinned macOS/Linux release archives. `0.2.0` adds
+  wasmlight platform archives and a tap formula for the compiler plus bundled
+  runtime shells; `0.5.0` extends the SDK archive/formula with
+  `libwasmlight`, the C header, and the C/Nim/C#/Rust/Go/Python bindings.
+  NuGet, crates.io, Nimble, Go-module, and PyPI publication remains a later
+  distribution increment rather than a milestone exit criterion.
+- Windows distribution uses checksum-verified `.zip` assets from the same
+  GitHub release. Homebrew is the primary macOS/Linux installation channel,
+  while the GitHub archives are the canonical cross-platform artifacts from
+  which the tap formula also installs.
+
 Updated: 2026-08-24 (Wave 15 continuation; x64 fixed-array access accepted)
 
 ## Wave 15 continuation — x64 fixed-array access ACCEPTED
@@ -2123,7 +2304,8 @@ cache-flush, predicate↔template completeness, layering. Found + FIXED:
    codegen; machine-register allocation (needs per-safepoint liveness
    maps). All behind the compile predicate / measured, never required for
    correctness (the interpreter is the tier of record).
-7. User decision standing: NO GitHub issues until the roadmap is done.
+7. The roadmap is approved and GitHub milestones/issues #29–#90 are created;
+   the next explicit execution action is `/milestone-rush 0.2.0`.
 8. Local hygiene: builds drop gitignored .o/.ppu into
    .lwpt/modules/testing/, breaking a LOCAL `lwpt install --frozen`
    (fresh CI clone unaffected). `rm` them if frozen complains.
