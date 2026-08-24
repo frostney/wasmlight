@@ -123,6 +123,12 @@ interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Shell catalog**:
+The installed, versioned index of runtime-shell templates. Target selection
+resolves a triple to exactly one compatible catalog entry or fails; it does
+not search ambient paths or the network.
+_Avoid_: sysroot, toolchain, SDK, target cache
+
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. The executable cannot expand this set at run time, and its
