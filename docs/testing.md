@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-four suites today, 1,224 tests, all green.
+  independent programs. Forty-five suites today, 1,238 tests, all green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
