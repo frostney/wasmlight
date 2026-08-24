@@ -20,9 +20,10 @@ Updated: 2026-08-24 (PR #19-onwards retrospective follow-through)
   action register: known-good-route PR #54 is merged; issue #23 remains a
   provider-neutral external-review follow-up deferred until after 0.2.0; no
   interim Definition of Done change was made.
-- Current branch is `codex/harden-optimization-gates` from exact green main.
-  Next: publish issue #25 as a draft PR, add its final link through the report
-  renderer, rerun report and repository gates, then wait exact-head PR CI.
+- Draft PR #27 publishes issue #25 from `codex/harden-optimization-gates`,
+  which began at exact green main. Its final link is now included through the
+  report renderer. Next: wait for the follow-up commit's exact-head PR CI and
+  mark the pull request ready only after all checks and review threads converge.
 
 Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
 
