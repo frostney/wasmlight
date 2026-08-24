@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-four suites today, 1,224 tests, all green.
+  independent programs. Forty-five suites today, 1,237 tests, all green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -120,6 +120,7 @@ instead.
 | `Wasm.Jit.X64.Test` | The x86-64 backend at the byte level: ModRM/REX/immediate encodings cross-checked against the Intel SDM, the pin map (six callee-saved registers), and the per-op templates — gated on `CPUX86_64`. |
 | `Wasm.Jit.Test` | The JIT driver and the differential proof: `JitCanCompile`'s scope fence, compile-to-buffer, and the arch-agnostic behaviour checks (integer/i64 arithmetic, div/rem traps, float NaN discipline, relops, select, calls and O(1) tail calls) asserted equal to the interpreter, gated on `WASM_JIT_BACKEND` so a no-backend leg still builds. |
 | `Wasm.Aot.Artifact.Test` | The `.waot` format: header read/write round-trip, the FNV-1a module hash and self-checksum, and each guard (magic, AOT version, IR version, target arch, ABI fingerprint, module hash) rejecting with its own distinct reason. |
+| `Wasm.Package.Elf.Test` | Linux ELF runtime-shell packaging: both `aarch64-linux` and `x86_64-linux` from a host with no linker, deterministic append-plus-trailer output, `PT_LOAD` extents left inside the original template, and distinct rejects for a machine mismatch, damaged payload, truncated trailer, or already-packaged file. Templates are the documented placeholder `ET_EXEC` (issue #34 is not required). A matching Linux host execs the packaged placeholder to exit 0. |
 | `Wasm.Aot.Test` | The AOT layer end to end: compile a module to an artifact, load it into a fresh store (re-validating first), and prove the wired-up executable memory is byte-identical to a fresh JIT compile — plus a multi-function module and a declined-function case, gated on a live backend. |
 | `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
 | `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |

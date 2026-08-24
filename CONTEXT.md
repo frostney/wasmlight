@@ -123,6 +123,13 @@ interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Shell template**:
+The unfilled runtime shell for one released target, before a payload is
+attached. Linux templates are packaged by appending the payload after the
+last ELF file byte
+([ADR-0016](docs/adr/0016-elf-shells-append-the-payload.md)).
+_Avoid_: stub, blank binary, empty executable
+
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. The executable cannot expand this set at run time, and its

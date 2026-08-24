@@ -87,6 +87,14 @@ structures plus a disassembler, with no validation logic in it — which is
 also why the IR module carries its own index-space snapshots instead of
 pointing back at `TWasmModule`.
 
+`Wasm.Package.Elf` also sits beside the library: it packages a Linux
+`aarch64-linux` or `x86_64-linux` runtime-shell template with an opaque
+payload by appending bytes and a trailer, with no host linker
+([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md),
+[ADR-0016](adr/0016-elf-shells-append-the-payload.md)). The interpreter-free
+shell, the native-executable payload format, and `wasmlight compile` are
+not shipped; the packager's tests use a documented placeholder template.
+
 `Wasm.Wast`, `Wasm.Wast.Values`, `Wasm.Wast.Runner`, and the six
 `Wasm.Wat.*` units sit beside the library rather than in this stack: they
 are the conformance harness ([roadmap.md](roadmap.md), Track C).
