@@ -1,5 +1,34 @@
 # Handoff
 
+Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
+
+## Issue #24 — restore i386-win32 builds and PR coverage
+
+- Started from freshly fetched `origin/main@0553507` in isolated branch
+  `codex/fix-i386-pr-ci`; the pre-existing dirty retrospective worktree was not
+  touched.
+- Replaced the artificial multi-gigabyte `TArm64GcAllocArray` declaration with
+  a typed `^TWasmGcAllocShape` pointer. The unit already enables pointer math,
+  so existing indexed reads retain their behavior without declaring an array
+  the 32-bit compiler cannot represent.
+- Copied the existing `i386-win32` Windows target from post-merge CI into the
+  PR matrix and updated the workflow comment to describe both Windows targets.
+- Draft PR #26's first i386 run proved the pointer repair: all 44 test programs
+  compiled and the build completed 3/3. It then exposed one runtime-only test
+  defect in `TestInlineStructNewFastPathWords`: the test hard-coded 64-bit host
+  record offsets and reported a misleading final-word expectation after the
+  first mismatch. The test now retains the full hard-pinned 64-bit sequence,
+  derives only host-layout immediate words on `CPU32`, and compares every word
+  directly. No suite or assertion is skipped on i386.
+- Local evidence on macOS/Arm64: frozen install; focused Arm64/JIT suites 2/2;
+  format 91/91; generated-agent check; development build 3/3; full tests 44/44;
+  `actionlint` clean with the pre-existing SC2005 warning ignored; diff check.
+- Draft PR #26's follow-up i386 job passed at `f5fe6a3`: build 3/3, all 44
+  tests compiled and passed, CLI positive/negative smoke checks passed, and
+  the pinned interpreter corpus completed with `errors=0`, `pass=65838`, and
+  `staged=0`. The final handoff-only commit still requires exact-head CI before
+  the PR can be marked ready.
+
 Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
 
 ## Runtime optimization skill retro follow-up — adopted

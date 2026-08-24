@@ -32,9 +32,11 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Interp,
   Wasm.Ir,
   Wasm.Jit.Arm64,
   Wasm.Jit.CodeBuffer,
+  Wasm.Runtime.Gc,
   Wasm.Runtime.Store;
 
 type
@@ -844,7 +846,12 @@ var
   SlowLbl, DoneLbl: TWasmJitLabel;
   I: Integer;
   W: UInt32;
+  ExpectedWords: array[0 .. High(FastPathWords)] of UInt32;
   Words: TWasmBytes;
+  {$IFDEF CPU32}
+  FO: TWasmJitFrameOffsets;
+  GO: TWasmJitGcOffsets;
+  {$ENDIF}
 begin
   Buf := TWasmCodeBuffer.Create;
   try
@@ -865,14 +872,51 @@ begin
     Words := Buf.SnapshotBytes;
     Expect<NativeUInt>(NativeUInt(Length(Words)) div 4)
       .ToBe(NativeUInt(Length(FastPathWords)));
-    W := 0;
+    for I := 0 to High(FastPathWords) do
+      ExpectedWords[I] := FastPathWords[I];
+    {$IFDEF CPU32}
+    { The Arm64 emitter remains portable on interpreter-only 32-bit hosts,
+      where its host-record offsets differ from the executable 64-bit layout.
+      Keep the fixed instruction sequence pinned while deriving only those
+      words whose immediates deliberately describe the host layout. }
+    FO := WasmJitFrameOffsets;
+    GO := WasmJitGcHeapOffsets;
+    ExpectedWords[1] := Arm64LdrX(ARM64_REG_CACHE0, ARM64_REG_T0,
+      UInt32(FO.CtxDepth));
+    ExpectedWords[3] := Arm64LdrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(FO.CtxActs));
+    ExpectedWords[4] := Arm64MovzW(ARM64_REG_T0,
+      UInt16(FO.ActStride), 0);
+    ExpectedWords[6] := Arm64LdrX(ARM64_REG_CACHE0, ARM64_REG_CACHE0,
+      UInt32(FO.ActInstance));
+    ExpectedWords[10] := Arm64LdrX(ARM64_REG_T2, ARM64_REG_T1,
+      UInt32(GO.HeapFFree0));
+    ExpectedWords[13] := Arm64StrX(ARM64_REG_CACHE0, ARM64_REG_T1,
+      UInt32(GO.HeapFFree0));
+    ExpectedWords[15] := Arm64LdrX(ARM64_REG_T0, ARM64_REG_T1,
+      UInt32(GO.HeapMarkState));
+    ExpectedWords[18] := Arm64LdrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.BlockBase));
+    ExpectedWords[21] := Arm64LdrX(ARM64_REG_T0, ARM64_REG_T0,
+      UInt32(GO.BlockAllocated));
+    ExpectedWords[30] := Arm64LdrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.HeapBytesLive));
+    ExpectedWords[32] := Arm64StrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.HeapBytesLive));
+    ExpectedWords[33] := Arm64LdrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.HeapBytesAllocated));
+    ExpectedWords[35] := Arm64StrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.HeapBytesAllocated));
+    ExpectedWords[36] := Arm64LdrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.HeapObjectCount));
+    ExpectedWords[38] := Arm64StrX(ARM64_REG_T1, ARM64_REG_T0,
+      UInt32(GO.HeapObjectCount));
+    {$ENDIF}
     for I := 0 to High(FastPathWords) do
     begin
       Move(Words[I * 4], W, 4);
-      if (W <> FastPathWords[I]) and (I < High(FastPathWords)) then
-        Break;
+      Expect<UInt32>(W).ToBe(ExpectedWords[I]);
     end;
-    Expect<UInt32>(W).ToBe(FastPathWords[High(FastPathWords)]);
   finally
     Buf.Free;
   end;

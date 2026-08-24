@@ -132,8 +132,7 @@ type
     Fields: array[0..15] of TWasmGcAllocField;
   end;
 
-  TArm64GcAllocArray = array[0..$FFFFFF] of TWasmGcAllocShape;
-  PArm64GcAllocArray = ^TArm64GcAllocArray;
+  PArm64GcAllocArray = ^TWasmGcAllocShape;
 
   { The store-relative offsets the fast path cannot probe itself (FHeap is
     private to Wasm.Runtime.Store); computed once per staged function from
