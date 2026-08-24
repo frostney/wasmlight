@@ -1,5 +1,24 @@
 # Handoff
 
+Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
+
+## Issue #24 — restore i386-win32 builds and PR coverage
+
+- Started from freshly fetched `origin/main@0553507` in isolated branch
+  `codex/fix-i386-pr-ci`; the pre-existing dirty retrospective worktree was not
+  touched.
+- Replaced the artificial multi-gigabyte `TArm64GcAllocArray` declaration with
+  a typed `^TWasmGcAllocShape` pointer. The unit already enables pointer math,
+  so existing indexed reads retain their behavior without declaring an array
+  the 32-bit compiler cannot represent.
+- Copied the existing `i386-win32` Windows target from post-merge CI into the
+  PR matrix and updated the workflow comment to describe both Windows targets.
+- Local evidence on macOS/Arm64: frozen install; focused Arm64/JIT suites 2/2;
+  format 91/91; generated-agent check; development build 3/3; full tests 44/44;
+  `actionlint` clean with the pre-existing SC2005 warning ignored; diff check.
+  Exact i386 compilation, tests, smoke, and interpreter conformance await the
+  new PR job on the published exact head.
+
 Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
 
 ## Runtime optimization skill retro follow-up — adopted

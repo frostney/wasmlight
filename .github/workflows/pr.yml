@@ -4,8 +4,8 @@ name: PR
 # push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
 #   pr.yml — every PR: install --frozen + format --check + build + test
-#            on one Linux, one macOS, and one Windows runner. The
-#            Windows leg is here rather than post-merge because the
+#            on one Linux, one macOS, and both Windows targets. The
+#            Windows legs are here rather than post-merge because the
 #            {$IFDEF WINDOWS} paths never compile on the other legs.
 #   ci.yml — push to main only: the full per-arch platform matrix.
 #
@@ -82,6 +82,12 @@ jobs:
             lwpt-archive: zip
             fpc-install: installer
             fpc-win-target: x86_64-win64
+            exe: .exe
+          - runner: windows-latest
+            lwpt-asset: windows-x86
+            lwpt-archive: zip
+            fpc-install: installer
+            fpc-win-target: i386-win32
             exe: .exe
     runs-on: ${{ matrix.runner }}
     defaults:
