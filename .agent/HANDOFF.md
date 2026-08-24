@@ -1,5 +1,51 @@
 # Handoff
 
+Updated: 2026-08-24 (Wave 15 continuation; x64 fixed-array access accepted)
+
+## Wave 15 continuation — x64 fixed-array access ACCEPTED
+
+- Continued from exact green `origin/main@a1e565488507767a4db6bff19c73f60e645edb72`.
+  The accepted measured branch is `optimize/w15-x64-array` in worktree
+  `/Users/jstein/.t3/worktrees/wasmlight/w15-x64-array`; its local, unpushed
+  commit is `e160f6fc11ba548d57e5b16d2875e82bd17dd511`
+  (`perf(jit): emit fixed array access natively on x64`). Only
+  `Wasm.Jit.X64.pas`, `Wasm.Jit.X64.Test.pas`, and `Wasm.Jit.Test.pas` changed.
+- The x64 emitter now handles validated fixed scalar array get/set sites with
+  direct null, kind, and unsigned bounds checks followed by scaled addressing
+  and canonical scalar loads/stores. Ineligible shapes retain runtime dispatch;
+  no address is baked, and reference stores retain the current empty write-
+  barrier contract. Differential tests cover the compiled fresh-store null
+  path and byte-shape tests pin canonicalization plus null/kind/bounds order.
+- A checksum-pinned, host-locked B-C-C-B on emulated Linux/x86-64 measured the
+  self-checking 20-million-access target at 4467.419 -> 376.304 ms forward
+  (-91.58%) and 4492.286 -> 375.101 ms reverse (-91.65%), with no range
+  overlap. The representative GC workload improved about 29.7%. Across all 11
+  guard workloads, no candidate range was wholly slower and no apparent
+  regression exceeded 3%; the largest positive deltas were startup +1.85%,
+  memory-load +1.30%, and host-call +1.14%, all overlapping noise.
+- Final correctness passed independently on macOS/Arm64 and Linux/x86-64:
+  frozen install, format/agent/diff checks, clean dev and release builds, all
+  44 tests, and the exact 257-script pinned corpus on interpreter/JIT/AOT at
+  65,188 pass, 0 fail, 0 skip, 0 staged. Compiled counts were 0/8703/8703 on
+  Arm64 and 0/8704/8704 on x64. The evidence manifest contains 164 entries and
+  hashes to `fac4735b05c8fe96fe7014a08754b5281533703f81689157ca97eb19597bc894`.
+- Durable evidence is under
+  `/Users/jstein/.t3/evidence/wasmlight/w15-x64-array-a1e5654-container`.
+  The stable measurement replacement was an Ubuntu Noble linux/amd64 Docker
+  container under OrbStack, explicitly emulated rather than native x64. It was
+  stopped after the evidence lock and manifest were verified, and was retained
+  for reproducibility. The two diagnostic replacement VMs remain stopped; no
+  VM or container was deleted.
+- This x64-only win does not change the latest macOS/Arm64 Wasmtime comparison:
+  direct calls remain the largest measured gap at 2.73x, followed by memory-
+  store at 1.31x and SIMD at 1.28x. A later wave should re-profile calls from a
+  fresh main; do not retry either rejected Wave 15 direct-call mechanism
+  without new profile evidence.
+- Publication was requested through `/create-pr` on 2026-08-24. Next: open the
+  draft pull request, wait for exact-head CI, and mark it ready only when every
+  applicable check is green. No merge is authorized. Do not rerun paid
+  evaluation or claim native-x64 timing from this emulated environment.
+
 Updated: 2026-08-24 (PR #19-onwards retrospective follow-through)
 
 ## Issue #25 — harden optimization-wave gates

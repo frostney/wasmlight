@@ -397,6 +397,12 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
 procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AShape: UInt64;
   var ACache: TX64RegCache);
+{ Fixed-type scalar array access. A kind mismatch takes the unchanged helper
+  route so the runtime's internal invariant remains authoritative; null and
+  bounds traps are emitted in their original order on the native path. }
+procedure X64EmitGcArrayAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AInsIndex: UInt32; const AShape: UInt64;
+  var ACache: TX64RegCache);
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
@@ -428,6 +434,10 @@ uses
 procedure X64EmitScalarMemory(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAddr64,
   AUsePinnedMemory: Boolean); forward;
+procedure X64EmitAluRegImm8(const ABuf: TWasmCodeBuffer;
+  const ASubop: Byte; const AWide: Boolean; const AReg, AImm: Byte); forward;
+procedure X64EmitLeaIndexed(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase, AIndex, AScale: Byte; const ADisp: Int32); forward;
 procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
   const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
   AResult64: Boolean); forward;
@@ -577,6 +587,104 @@ begin
   end;
 end;
 
+procedure X64EmitGcArrayAccess(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AInsIndex: UInt32; const AShape: UInt64;
+  var ACache: TX64RegCache);
+var
+  ObjSlot, IndexSlot: UInt32;
+  Width, Scale: Byte;
+  Signed: Boolean;
+  NonNull, KindFallback, InBounds, Done: TWasmJitLabel;
+begin
+  Width := Byte((AShape shr 8) and $FF);
+  Signed := (AShape and 2) <> 0;
+  case Width of
+    1: Scale := 0;
+    2: Scale := 1;
+    4: Scale := 2;
+  else
+    Scale := 3;
+  end;
+  if AIns.Op = iroArraySet then
+  begin
+    ObjSlot := AIns.Dest;
+    IndexSlot := AIns.A;
+  end
+  else
+  begin
+    ObjSlot := AIns.A;
+    IndexSlot := AIns.B;
+  end;
+
+  X64CachedLoad(ABuf, ACache, X64_RAX, ObjSlot);
+  X64CachedLoad(ABuf, ACache, X64_RCX, IndexSlot);
+  { The index is an i32. Canonicalize it before 64-bit address generation so
+    stale high slot bits cannot turn an in-bounds unsigned index into a wild
+    host address. }
+  X64EmitAluRegReg(ABuf, $89, False, X64_RCX, X64_RCX);
+  NonNull := ABuf.NewLabel;
+  KindFallback := ABuf.NewLabel;
+  InBounds := ABuf.NewLabel;
+  Done := ABuf.NewLabel;
+
+  X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);
+  X64EmitJccTo(ABuf, X64_CC_NE, UInt32(NonNull));
+  X64EmitMovRegImm32(ABuf, X64_ARG0,
+    UInt32(Ord(wtkNullArrayReference)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(NonNull);
+
+  { Preserve ResolveElement's null -> layout/kind -> bounds order. The kind
+    mismatch is validator-unreachable, so the cold helper call exists only to
+    retain its exact EWasmInternal invariant rather than inventing a backend
+    error path. Header kind bits are masked in place; no runtime address is
+    baked into the emitted code. }
+  X64EmitLoadMem32(ABuf, X64_RDX, X64_RAX, 0);
+  X64EmitAluRegImm8(ABuf, 4, False, X64_RDX,
+    Byte(WASM_OBJ_KIND_MASK shl WASM_OBJ_KIND_SHIFT));
+  X64EmitAluRegImm8(ABuf, 7, False, X64_RDX,
+    Byte(Ord(wokArray) shl WASM_OBJ_KIND_SHIFT));
+  X64EmitJccTo(ABuf, X64_CC_NE, UInt32(KindFallback));
+
+  X64EmitLoadMem32(ABuf, X64_RDX, X64_RAX,
+    WASM_ARRAY_LENGTH_OFFSET);
+  X64EmitAluRegReg(ABuf, $39, False, X64_RCX, X64_RDX);
+  X64EmitJccTo(ABuf, X64_CC_B, UInt32(InBounds));
+  X64EmitMovRegImm32(ABuf, X64_ARG0,
+    UInt32(Ord(wtkArrayOutOfBounds)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(InBounds);
+  X64EmitLeaIndexed(ABuf, X64_RAX, X64_RAX, X64_RCX, Scale,
+    WASM_ARRAY_ELEMS_OFFSET);
+
+  if AIns.Op = iroArraySet then
+  begin
+    X64CachedLoad(ABuf, ACache, X64_RDX, AIns.B);
+    X64EmitStoreScalar(ABuf, X64_RDX, X64_RAX, Width);
+    { The v1 barrier is deliberately empty and a store cannot collect, so the
+      direct reference write has the same visibility semantics as ArraySet.
+      A non-empty future barrier must make reference shapes decline here or
+      gain a dedicated PIC helper before it changes collector policy. }
+  end
+  else
+  begin
+    X64EmitLoadScalar(ABuf, X64_RDX, X64_RAX, Width, Signed, Width = 8);
+    X64CachedStore(ABuf, ACache, X64_RDX, AIns.Dest);
+  end;
+  X64EmitJmpTo(ABuf, UInt32(Done));
+
+  ABuf.BindLabel(KindFallback);
+  { ResolveElement raises before consulting index/value on this path. Publish
+    the already-loaded object so X64RtDispatch observes the exact ref even if
+    its source slot currently lives only in the dynamic cache. }
+  X64EmitStoreSlot64(ABuf, X64_RAX, ObjSlot);
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_REGFILE);
+  X64EmitIrInsPtr(ABuf, X64_ARG2, AInsIndex);
+  X64EmitCallHelper(ABuf, aohRtDispatch);
+  ABuf.BindLabel(Done);
+end;
+
 function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
@@ -595,10 +703,13 @@ begin
     Exit;
   end;
   if (AGcShapes <> nil) and
-    ((AGcShapes[AInsIndex] and 1) <> 0) and
-    ((AGcShapes[AInsIndex] and 4) = 0) then
+    ((AGcShapes[AInsIndex] and 1) <> 0) then
   begin
-    X64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+    if (AGcShapes[AInsIndex] and 4) <> 0 then
+      X64EmitGcArrayAccess(ABuf, AIns, AInsIndex,
+        AGcShapes[AInsIndex], ACache)
+    else
+      X64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
     Exit;
   end;
   case AIns.Op of
@@ -1932,6 +2043,42 @@ begin
   if NeedSib then
     { scale=0, index=100 (none), base=BaseLow. }
     ABuf.EmitByte((4 shl 3) or BaseLow);
+  if ModB = 1 then
+    ABuf.EmitByte(Byte(ADisp))
+  else if ModB = 2 then
+    ABuf.EmitU32(UInt32(ADisp));
+end;
+
+procedure X64EmitAluRegImm8(const ABuf: TWasmCodeBuffer;
+  const ASubop: Byte; const AWide: Boolean; const AReg, AImm: Byte);
+begin
+  { Group-1 immediate ALU: 83 /subop ib. The immediate is sign-extended by
+    x86-64; callers here use only non-negative values below 128. }
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  ABuf.EmitByte($83);
+  EmitModRMReg(ABuf, ASubop, AReg);
+  ABuf.EmitByte(AImm);
+end;
+
+procedure X64EmitLeaIndexed(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase, AIndex, AScale: Byte; const ADisp: Int32);
+var
+  BaseLow, ModB: Byte;
+begin
+  { LEA r64,[base + index*(1 shl scale) + disp] = 8D /r with a SIB byte.
+    The array path uses rcx as the index, never rsp's reserved no-index code. }
+  BaseLow := ABase and 7;
+  if (ADisp = 0) and (BaseLow <> 5) then
+    ModB := 0
+  else if (ADisp >= -128) and (ADisp <= 127) then
+    ModB := 1
+  else
+    ModB := 2;
+  X64EmitRex(ABuf, 1, ADest shr 3, AIndex shr 3, ABase shr 3);
+  ABuf.EmitByte($8D);
+  ABuf.EmitByte((ModB shl 6) or ((ADest and 7) shl 3) or 4);
+  ABuf.EmitByte(((AScale and 3) shl 6) or
+    ((AIndex and 7) shl 3) or BaseLow);
   if ModB = 1 then
     ABuf.EmitByte(Byte(ADisp))
   else if ModB = 2 then
