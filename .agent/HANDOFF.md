@@ -23,8 +23,11 @@ Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
 - Local evidence on macOS/Arm64: frozen install; focused Arm64/JIT suites 2/2;
   format 91/91; generated-agent check; development build 3/3; full tests 44/44;
   `actionlint` clean with the pre-existing SC2005 warning ignored; diff check.
-  Exact i386 compilation, tests, smoke, and interpreter conformance must be
-  reconfirmed by the PR job after the follow-up is pushed.
+- Draft PR #26's follow-up i386 job passed at `f5fe6a3`: build 3/3, all 44
+  tests compiled and passed, CLI positive/negative smoke checks passed, and
+  the pinned interpreter corpus completed with `errors=0`, `pass=65838`, and
+  `staged=0`. The final handoff-only commit still requires exact-head CI before
+  the PR can be marked ready.
 
 Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
 
