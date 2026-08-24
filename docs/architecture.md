@@ -45,7 +45,7 @@ Read bottom-up; each layer may use only the layers below it.
 
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run` | deny-by-default WASI preview1 host and the `wasmlight run` driver; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Connector.Memory` | deny-by-default WASI preview1 host, the `wasmlight run` driver, and connector copy-in/out/inout, scoped borrows, and opaque handles; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
@@ -180,6 +180,14 @@ is an `EWasmError` subtype so the trampoline carries it out, but a distinct
 sibling — neither a trap nor a `throw` — so a host classifies it exactly;
 `wasmlight run` maps it to the process exit code and everything else is an
 error.
+
+A further host-surface sibling, `EWasmConnectorError`, is declared in
+`Wasm.Connector.Memory`. It is a connector-contract failure — a stale
+opaque handle, a retained or live scoped borrow used to re-enter the
+guest or to participate in a callback, or a nil host buffer — not a
+guest memory fault. Out-of-range connector copies and borrows still
+raise `EWasmTrap` with `out of bounds memory access`, the same message
+the chokepoint uses for every memory strategy.
 
 `EWasmException` is a **sibling of `EWasmTrap`, not a subclass** — both
 under `EWasmError`, but a host discriminates between a trap and an escaped
@@ -453,6 +461,16 @@ boundary is drawn.
   facade never sees a memory's base pointer. It re-exports the collector's
   host-root API (contract HOST-1) so a host holding a reference across an
   allocation can root it, and declares `EWasmExit`.
+- **`Wasm.Connector.Memory`** is the connector memory primitive
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)):
+  copy-in, copy-out, and inout buffers with explicit bounds; a scoped
+  synchronous borrow through the same overflow-safe chokepoint pre-check;
+  and a per-store opaque-handle table. A borrowed view cannot be used
+  after `Release`, cannot call back into the guest, and cannot
+  participate in a callback. Raw native pointers never become guest
+  values; a dropped or never-issued handle fails with
+  `EWasmConnectorError`. The `.wlc` parser and C-ABI call engine are
+  not this unit.
 - **`Wasm.Wasi.*`** is the deny-by-default host module, wired entirely over
   `Wasm.Engine`. The capability model is the point: a bare config grants
   stdio + clock + random and nothing else — no environment, no filesystem,
