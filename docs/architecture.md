@@ -33,9 +33,11 @@
   from a Pascal host or from `wasmlight run` (Track F). The JIT and AOT are
   a 64-bit-UNIX acceleration (two backends, aarch64 and x86-64); on Windows
   and 32-bit targets the runtime is interpreter-only and still fully
-  conformant. [roadmap.md](roadmap.md) is the honest picture of what
-  remains — broader optimizing-compiler work and cross-platform CI
-  validation, not any missing behaviour.
+  conformant.   [roadmap.md](roadmap.md) is the honest picture of what
+  remains: the planned native-compiler spine
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)),
+  broader optimizing-compiler work, and later platform and host-surface
+  releases. Nothing in v1 Core 3 behaviour is staged.
 
 ## Layering
 
