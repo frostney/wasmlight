@@ -115,6 +115,17 @@ The immutable set of connector bindings selected and resolved for one compiled
 executable. It contains only bindings required by that executable's imports.
 _Avoid_: connector manifest, registry, dependency graph
 
+**Call plan**:
+The register and stack placement of one native C signature on a target C ABI
+(AAPCS64, Apple's AAPCS64 variant, or SysV x86-64). It is data produced before
+any call; an incompatible plan is a link failure.
+_Avoid_: calling convention, marshalling table, FFI recipe
+
+**Application-local library**:
+A dynamic library resolved beside the executable, or at a literal absolute
+path. Ambient search paths are not part of the name.
+_Avoid_: shared object, plugin, system library
+
 **Runtime shell**:
 The prebuilt, interpreter-free Pascal executable template into which
 `wasmlight compile` embeds a validated module, complete native code, and its
