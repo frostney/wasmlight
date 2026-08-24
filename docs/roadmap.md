@@ -88,28 +88,40 @@
   CI has now passed all six configured targets; the four 64-bit UNIX legs
   proved interpreter/JIT/AOT tally identity and the Windows legs proved the
   interpreter.
-- **Next sequence:** release `0.1.0`, then complete and govern the embedding
-  surface (`0.2.0`), independently judge and finish non-network WASI Preview 1
-  (`0.3.0`), and add operational observability (`0.4.0`). The source-verified
-  comparison, accepted decisions, and sizing evidence are in the
-  [2026-08-15 roadmap review](../ROADMAP-260815.md).
-- **No dates.** Seven merged pull requests provide an initial delivery sample,
+- **`0.1.0` has shipped.** The next product spine is native application
+  compilation: `wasmlight compile` produces a complete native executable
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). That
+  command is planned, not shipped. Merged work after `0.1.0` — JIT/GC
+  performance, CI hardening, and documentation — folds into `0.2.0` rather
+  than a `0.1.1` patch.
+- **Next sequence:** `0.2.0` strict native compiler, connectors,
+  64-bit Unix cross-compilation, and Homebrew; `0.3.0` Win64 native
+  compilation; `0.4.0` i386 Windows native compilation; `0.5.0` portable C,
+  Nim, C#, Rust, Go, and Python embedding SDKs; `0.6.0` independently judged
+  non-network WASI Preview 1; `0.7.0` operational observability. The
+  source-verified comparison, accepted decisions, and issue catalog are in
+  the [2026-08-24 roadmap review](../ROADMAP-260824.md). External review
+  automation ([#23](https://github.com/frostney/wasmlight/issues/23)) is
+  skipped for `0.2.0`.
+- **No dates.** Twenty-five merged pull requests provide a delivery sample,
   but the observed rate varies too widely to support a calendar commitment.
   Releases remain ordered by dependency and exit criteria.
 
 ## Confidence
 
 The original A-J plan was anchored on counted specification surface because
-the repository had no pull-request delivery history. It now has seven merged
-pull requests, but still no issue-created-to-merge sample and no release
-cadence. The observed rates range from 0.54 pull requests per week over 90 days
-to 17.3 during the short active burst; PR-open-to-merge time omits most
-investigation and implementation. Those data support bounded sequencing, not
-dates. Re-anchor after four issue-linked roadmap pull requests have merged.
+the repository had no pull-request delivery history. It now has twenty-five
+merged pull requests and one published release, but only two issue-linked
+deliveries and no compiler-implementation sample. The observed rates range
+from 1.94 pull requests per week over 90 days to 14.8 during the twelve-day
+active span; PR-open-to-merge time omits most investigation and
+implementation. Those data support bounded sequencing, not dates. Re-anchor
+after four issue-linked `0.2.0` implementation pull requests have merged.
 
-The current throughput calculations, source-level peer comparison, and
-confidence limits are recorded in the
-[2026-08-15 roadmap review](../ROADMAP-260815.md).
+The current throughput calculations, source-level comparison, and confidence
+limits are recorded in the
+[2026-08-24 roadmap review](../ROADMAP-260824.md). The 2026-08-15 review
+remains the historical A-J close-out.
 
 Spec counts below come from `wasm-mcp` at pinned `spec/main`
 `d7b37e4170d8315f2f1283aed4e8076591a9a333`; testsuite counts from
@@ -671,24 +683,37 @@ Wasmtime-anchored rather than a neutral conformance bar.
 
 ## Post-v1 version plan
 
-- **`0.1.0`: pinned-Core-3 baseline.** Changelog-first release of the shipped
-  runtime; no new runtime behavior.
-- **`0.2.0`: complete and governable embedding.** Public table/tag coverage,
-  instance composition, resource policy, epoch configuration, and ordinary
-  JIT policy.
-- **`0.3.0`: independently judged WASI Preview 1.** Wire `wasi-testsuite`, then
-  complete the 19 missing non-network functions. Sockets remain a later,
-  separately approved capability slice over pre-granted handles.
-- **`0.4.0`: operational runtime.** Name-aware guest stacks, profiler maps,
-  and structured statistics. Async hosting remains deferred to the Component
-  Model re-entry so the runtime designs one suspension mechanism.
-- **After `0.4.0`: Components and current WASI.** Re-enter only after a fresh
-  ADR proves a reproducible target, independent enough oracle, stable Canonical
-  ABI, and deny-by-default capability model. Threads remain a separate,
-  demand-led programme because they reverse ADR-0008.
+- **`0.1.0`: pinned-Core-3 baseline — shipped.** Changelog-first release of
+  the shipped runtime.
+- **`0.2.0`: native compiler and connectors.** Strict all-or-fail
+  `wasmlight compile`, interpreter-free runtime shells, declarative `.wlc`
+  connectors, all-to-all 64-bit Unix cross-compilation, release archives,
+  and Homebrew. Issues [#29](https://github.com/frostney/wasmlight/issues/29)–[#46](https://github.com/frostney/wasmlight/issues/46).
+  The compile contract is [ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md).
+- **`0.3.0`: Win64 native compilation.** Extend strict compilation,
+  connectors, and distribution to `x86_64-win64`. Issues
+  [#47](https://github.com/frostney/wasmlight/issues/47)–[#53](https://github.com/frostney/wasmlight/issues/53).
+- **`0.4.0`: i386 Windows native compilation.** Add the `i386-win32`
+  backend, connectors, and distribution. Issues
+  [#54](https://github.com/frostney/wasmlight/issues/54)–[#61](https://github.com/frostney/wasmlight/issues/61).
+- **`0.5.0`: portable embedding SDKs.** Complete the Pascal facade and ship
+  C, Nim, C#, Rust, Go, and Python bindings over `libwasmlight`. Issues
+  [#62](https://github.com/frostney/wasmlight/issues/62)–[#77](https://github.com/frostney/wasmlight/issues/77).
+- **`0.6.0`: independently judged WASI Preview 1.** Wire `wasi-testsuite`,
+  then complete the 19 missing non-network functions. Sockets remain a
+  later, separately approved capability slice over pre-granted handles.
+  Issues [#78](https://github.com/frostney/wasmlight/issues/78)–[#85](https://github.com/frostney/wasmlight/issues/85).
+- **`0.7.0`: operational runtime.** Name-aware guest stacks, profiler maps,
+  and structured statistics. Async hosting remains deferred to the
+  Component Model re-entry so the runtime designs one suspension mechanism.
+  Issues [#86](https://github.com/frostney/wasmlight/issues/86)–[#90](https://github.com/frostney/wasmlight/issues/90).
+- **After `0.7.0`: Components and current WASI.** Re-enter only after a
+  fresh ADR proves a reproducible target, independent enough oracle, stable
+  Canonical ABI, and deny-by-default capability model. Threads remain a
+  separate, demand-led programme because they reverse ADR-0008.
 
-The detailed source evidence, dependency graph, sizing, and accepted decisions
-are in the [2026-08-15 roadmap review](../ROADMAP-260815.md).
+The detailed source evidence, dependency graph, sizing, and accepted
+decisions are in the [2026-08-24 roadmap review](../ROADMAP-260824.md).
 
 ## Not planned
 

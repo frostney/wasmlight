@@ -119,7 +119,8 @@ _Avoid_: connector manifest, registry, dependency graph
 The prebuilt, interpreter-free Pascal executable template into which
 `wasmlight compile` embeds a validated module, complete native code, and its
 connector plan. It retains validation and runtime helpers but contains no
-interpreter or JIT compiler.
+interpreter or JIT compiler
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
 **Compiled capability set**:
