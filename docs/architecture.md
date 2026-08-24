@@ -404,6 +404,13 @@ different.
   validated module — otherwise the run falls back to the interpreter. The
   artifact is a per-module perf cache bound by hash, never a trust bypass.
 
+The compile path uses a different container, `Wasm.Native.Payload`: a
+versioned, checksummed section directory that carries the original module,
+complete native code, the connector plan, and the compiled capability set,
+bound to one module hash and one target-shell hash. It is not a `.waot`
+cache and has no interpreter fallback. The read/write API is shipped;
+`wasmlight compile` that embeds the payload is not.
+
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the
 interpreter, the tier of record, runs alone; that leg is unaccelerated but

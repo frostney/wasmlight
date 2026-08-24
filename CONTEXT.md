@@ -24,6 +24,13 @@ A Component Model artifact: a WIT-described unit wrapping one or more core
 modules behind typed, language-neutral interfaces.
 _Avoid_: module, package, bundle
 
+**Native executable payload**:
+The self-describing byte container embedded in a compiled native executable:
+the original module, complete native code, the connector plan, and the
+compiled capability set, bound to one module and one target shell
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: .waot, AOT artifact, cache, bundle
+
 **Instance**:
 A module joined to its imports and its store-side state. Instantiation is
 where linking fails, distinct from decoding and validation.
