@@ -181,6 +181,11 @@ sibling — neither a trap nor a `throw` — so a host classifies it exactly;
 `wasmlight run` maps it to the process exit code and everything else is an
 error.
 
+`EWasmAotError` is another host-surface sibling, declared in `Wasm.Aot`: a
+strict whole-module compile refused a function (or the target). It is not a
+trap and not a decode/validation failure. The fallback `.waot` cache path
+does not raise it; declined functions stay uncompiled there.
+
 `EWasmException` is a **sibling of `EWasmTrap`, not a subclass** — both
 under `EWasmError`, but a host discriminates between a trap and an escaped
 exception. It is the exception route made distinct from the trap route:
@@ -403,6 +408,10 @@ different.
   fingerprint, module hash, and self-checksum all match the freshly
   validated module — otherwise the run falls back to the interpreter. The
   artifact is a per-module perf cache bound by hash, never a trust bypass.
+  `AotCompileModuleStrict` is a distinct all-or-fail entry point: every
+  defined function must have native code or compilation raises
+  `EWasmAotError` (function index and decline kind) and publishes nothing.
+  The cache path stays fallback-capable.
 
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the

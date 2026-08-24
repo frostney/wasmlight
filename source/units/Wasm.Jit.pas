@@ -168,6 +168,20 @@ type
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
     const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
+  { Why JitCanCompile would refuse AFn. jdNone means the function is inside
+    the current fence; every other value is the first failing check, in the
+    same order JitCanCompile walks. AOT's strict path uses this so a decline
+    names the reason instead of collapsing to "not compiled". }
+  TWasmJitDecline = (
+    jdNone,
+    jdNoBackend,
+    jdNilFunction,
+    jdFrameTooLarge,
+    jdExceptionHandling,
+    jdUnsupportedOp,
+    jdUnsupportedInstr
+  );
+
 { Register the JIT on AStore: allocate the code cache and point the store's
   JitInvokeCompiled hook at JitDispatch, leaving TierInvoke on the interpreter
   (§4.1 — the interpreter stays the entry dispatcher; the JIT is reached through
@@ -175,6 +189,8 @@ type
   store. Idempotent-ish: a second call returns a fresh context and re-points the
   hook; normal use is once per store. }
 function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
+
+function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
 
 { The compile predicate and scope fence (§10.3): True only if the active backend
   can emit EVERY op in the function AND the frame fits the backend's addressing.
@@ -301,24 +317,23 @@ end;
 
 { --- the predicate (§10.3) ----------------------------------------------- }
 
-function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
+function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
 {$IFDEF WASM_JIT_BACKEND}
 var
   I: Integer;
 {$ENDIF}
 begin
   {$IFDEF WASM_JIT_BACKEND}
-  Result := False;
   if AFn = nil then
-    Exit;
+    Exit(jdNilFunction);
   { The frame must fit the backend's slot addressing (§10.3). }
   {$IFDEF WASM_JIT_ARM64}
   if AFn^.RegisterCount > ARM64_MAX_SLOT then
-    Exit;
+    Exit(jdFrameTooLarge);
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   if AFn^.RegisterCount > X64_MAX_SLOT then
-    Exit;
+    Exit(jdFrameTooLarge);
   {$ENDIF}
   { EXCEPTION HANDLING IS NEVER COMPILED (§8.3, §10.2) — and a `try_table`
     emits NO instruction: the validator lowers it to the static handler table
@@ -329,7 +344,7 @@ begin
     escape a try_table the interpreter catches. Any handler declines the
     function, which then runs interpreted and catches exactly as before. }
   if Length(AFn^.Handlers) > 0 then
-    Exit;
+    Exit(jdExceptionHandling);
   { Every op must have a template, and every instruction must be one this
     template can actually emit (a call site's marshaling has to fit the
     backend's scratch, §4.4). The FIRST failure declines the whole function —
@@ -339,23 +354,28 @@ begin
   begin
     {$IFDEF WASM_JIT_ARM64}
     if not Arm64CanEmitOp(AFn^.Code[I].Op) then
-      Exit;
+      Exit(jdUnsupportedOp);
     if not Arm64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit;
+      Exit(jdUnsupportedInstr);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     if not X64CanEmitOp(AFn^.Code[I].Op) then
-      Exit;
+      Exit(jdUnsupportedOp);
     if not X64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit;
+      Exit(jdUnsupportedInstr);
     {$ENDIF}
   end;
-  Result := True;
+  Result := jdNone;
   {$ELSE}
   { No backend for this target: everything runs interpreted (§2.2). AFn is a
     const param, so an unused one on this leg draws no warning. }
-  Result := False;
+  Result := jdNoBackend;
   {$ENDIF}
+end;
+
+function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
+begin
+  Result := JitCompileDecline(AFn) = jdNone;
 end;
 
 function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;

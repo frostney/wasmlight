@@ -123,6 +123,15 @@ interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Strict compilation**:
+All-or-fail ahead-of-time compilation of every defined guest function. A
+successful result contains native code for each function; any predicate,
+backend, range, or target decline fails with a structured non-trap error and
+publishes no output. Distinct from `.waot` cache generation, which may record
+declined functions for interpreter fallback
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: full AOT, forced AOT, trusted compile
+
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. The executable cannot expand this set at run time, and its
