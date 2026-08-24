@@ -59,7 +59,8 @@ uses
   Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 { --- byte-assembly helpers (mirrors Wasm.Jit.Test) ---------------------- }
 
@@ -279,6 +280,8 @@ type
     procedure TestGuardRejectsWrongArch;
     procedure TestGuardRejectsCorruptChecksum;
     procedure TestGuardRejectsModuleHashMismatch;
+    procedure TestHostTargetMatchesDefaultCompile;
+    procedure TestForeignOsDescriptorFingerprintRejected;
   end;
 
 function TAotTests.ExportAddr(const AInstance: TWasmModuleInstance;
@@ -1031,6 +1034,100 @@ begin
 end;
 {$ENDIF}
 
+procedure TAotTests.TestHostTargetMatchesDefaultCompile;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  DefaultArt, HostArt: TWasmBytes;
+  DefaultParsed, HostParsed: TWasmAotArtifact;
+begin
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  try
+    DefaultArt := AotCompileModule(Store, Loaded);
+    HostArt := AotCompileModule(Store, Loaded, WasmTargetHost);
+    Expect<Integer>(Ord(ParseAotArtifact(DefaultArt, DefaultParsed)))
+      .ToBe(Ord(aprOk));
+    Expect<Integer>(Ord(ParseAotArtifact(HostArt, HostParsed)))
+      .ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(DefaultParsed.Header.TargetArch))
+      .ToBe(Integer(AotHostArch));
+    Expect<UInt64>(DefaultParsed.Header.AbiFingerprint).ToBe(
+      WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost)));
+    Expect<UInt64>(HostParsed.Header.AbiFingerprint).ToBe(
+      DefaultParsed.Header.AbiFingerprint);
+  finally
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestForeignOsDescriptorFingerprintRejected;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Foreign: TWasmTarget;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Jit: TWasmJitContext;
+  Res: TWasmAotLoadResult;
+begin
+  Foreign := WasmTargetOf(WasmTargetHost.Arch,
+    TWasmTargetOs(Ord(wtoDarwin) + Ord(wtoLinux) - Ord(WasmTargetHost.Os)));
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  Jit := nil;
+  try
+    Artifact := AotCompileModule(Store, Loaded, Foreign);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(Parsed.Header.TargetArch)).ToBe(Integer(AotHostArch));
+    Expect<UInt64>(Parsed.Header.AbiFingerprint).ToBe(
+      WasmTargetAbiFingerprint(WasmTargetAbi(Foreign)));
+    Expect<Boolean>(
+      Parsed.Header.AbiFingerprint <> WasmAotAbiFingerprint(Store)).ToBe(True);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, Res);
+    Expect<Integer>(Ord(Res)).ToBe(Ord(alrAbiMismatch));
+    Expect<Boolean>(Jit = nil).ToBe(True);
+  finally
+    FreeAndNil(Jit);
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
 procedure TAotTests.SetupTests;
 begin
   Test('AOT-compiled i32.add loads from the artifact and matches the interpreter',
@@ -1051,6 +1148,10 @@ begin
     TestGuardRejectsCorruptChecksum);
   Test('an artifact loaded against a different module is rejected (moduleHash)',
     TestGuardRejectsModuleHashMismatch);
+  Test('an explicit host target stamps the same descriptor fingerprint',
+    TestHostTargetMatchesDefaultCompile);
+  Test('a foreign-OS same-arch artifact is rejected on ABI fingerprint',
+    TestForeignOsDescriptorFingerprintRejected);
 end;
 
 begin

@@ -55,6 +55,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Module model | `Wasm.Module` | decoded module: populated entity lists, with unparsed payloads kept as spans | **shipped** |
 | Decode | `Wasm.Decoder` | binary → module model | **shipped** |
 | Primitives | `Wasm.Binary` | bounds-checked cursor, LEB128, little-endian reads | **shipped** |
+| Native target | `Wasm.Target` | host-independent 64-bit Unix triples and ABI descriptors ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); emission consumes a requested target, executable memory stays host-gated | **shipped** |
 | Vocabulary | `Wasm.Core` | value/heap/reference types, section ids and their prescribed order, tiers, error hierarchy | **shipped** |
 
 The Decode layer is one unit in the table and five behind it:
@@ -380,7 +381,9 @@ different.
 
 - **The baseline JIT** (`Wasm.Jit` driver, `Wasm.Jit.CodeBuffer` W^X code
   buffer, and the two backends `Wasm.Jit.Arm64` / `Wasm.Jit.X64`) compiles
-  a function to native code the first time it runs. The design choice that
+  a function to native code the first time it runs. Byte emission consumes
+  a requested `Wasm.Target` descriptor; executable-memory allocation and
+  native invocation stay host-gated. The design choice that
   makes it cheap: the compiled frame *is* the interpreter's frame, so the
   GC stack map, the tail-call frame replacement, and stack-exhaustion
   handling are inherited rather than re-derived. It emits the epoch check
@@ -395,14 +398,16 @@ different.
   backends ahead of time, emitting **position-independent** code — helper
   calls go through a per-process indirect table and the IR base arrives in
   a pinned register, so nothing absolute is baked — and serializes it to a
-  `.waot` artifact. `run --aot` loads the artifact in a fresh process for
-  instant startup; it is not a re-JIT (the loaded executable memory is
-  byte-identical to a fresh compile). The **security invariant**: AOT
-  always re-decodes and re-validates the module, and the artifact's code is
-  used only if its magic, AOT version, IR version, target arch, ABI
-  fingerprint, module hash, and self-checksum all match the freshly
-  validated module — otherwise the run falls back to the interpreter. The
-  artifact is a per-module perf cache bound by hash, never a trust bypass.
+  `.waot` artifact. Target architecture and ABI fingerprints come from the
+  selected `Wasm.Target` descriptor, not from host CPU/OS defines or live
+  `SizeOf`; `run --aot` still loads only a host-arch, host-ABI artifact and
+  maps it executable through the host-gated code buffer. The **security
+  invariant**: AOT always re-decodes and re-validates the module, and the
+  artifact's code is used only if its magic, AOT version, IR version,
+  target arch, ABI fingerprint, module hash, and self-checksum all match
+  the freshly validated module — otherwise the run falls back to the
+  interpreter. The artifact is a per-module perf cache bound by hash,
+  never a trust bypass.
 
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the

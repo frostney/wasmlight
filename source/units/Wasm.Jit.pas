@@ -112,7 +112,8 @@ uses
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 type
   PWasmIrFunctionRec = ^TWasmIrFunction;
@@ -220,6 +221,17 @@ function JitStageFunctionBytes(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes; overload;
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32; const ATarget: TWasmTarget;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
+
+{ True when the requested target's ISA can be emitted and AFn passes the
+  host compile predicate. Foreign-OS same-arch targets are emittable;
+  foreign-ISA targets decline until both backends are runtime-selectable. }
+function JitCanEmitForTarget(const AFn: PWasmIrFunctionRec;
+  const ATarget: TWasmTarget): Boolean;
 
 implementation
 
@@ -2401,13 +2413,31 @@ begin
     ARegisterCount);
 end;
 
+function JitCanEmitForTarget(const AFn: PWasmIrFunctionRec;
+  const ATarget: TWasmTarget): Boolean;
+begin
+  Result := WasmTargetCanEmit(ATarget) and JitCanCompile(AFn);
+end;
+
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes;
+begin
+  Result := JitStageFunctionBytes(AStore, AIr, AFn, AFuncIdx, WasmTargetHost,
+    AEntryOffset, ARegisterCount);
+end;
+
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32; const ATarget: TWasmTarget;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
 {$IFDEF WASM_JIT_BACKEND}
 var
   Buf: TWasmCodeBuffer;
+  Abi: TWasmTargetAbi;
+  EpochOffset, SnapshotOffset, HelperTableOffset: NativeUInt;
 {$ENDIF}
 begin
   Result := nil;
@@ -2416,12 +2446,17 @@ begin
   if AFn = nil then
     Exit;
   ARegisterCount := AFn^.RegisterCount;
+  if not WasmTargetCanEmit(ATarget) then
+    Exit;
   {$IFDEF WASM_JIT_BACKEND}
+  if AStore = nil then;   { offsets come from ATarget, not the live store }
+  Abi := WasmTargetAbi(ATarget);
+  EpochOffset := NativeUInt(Abi.Layout.StoreEpoch);
+  SnapshotOffset := NativeUInt(Abi.Layout.StoreEpochSnapshot);
+  HelperTableOffset := NativeUInt(Abi.Layout.StoreJitHelperTable);
   try
     Buf := JitCompileToBuffer(AIr, AFn, AFuncIdx,
-      WasmJitOffsets(AStore).StoreEpoch,
-      WasmJitOffsets(AStore).StoreEpochSnapshot,
-      WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
+      EpochOffset, SnapshotOffset, HelperTableOffset, { AFinalize } False);
   except
     { A function whose branch displacements overflow the backend's immediate
       fields is declined (nil), exactly as ForceCompile declines it; it is then
