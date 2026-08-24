@@ -30,7 +30,9 @@ uses
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
   Wasm.Jit.X64,
-  Wasm.Runtime.Store;
+  Wasm.Runtime.Gc,
+  Wasm.Runtime.Store,
+  Wasm.Runtime.Traps;
 
 type
   TX64Tests = class(TTestSuite)
@@ -66,6 +68,7 @@ type
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestGcFieldAccessBytes;
+    procedure TestGcArrayAccessBytes;
 
     procedure TestExecPlaceholder;
   end;
@@ -691,6 +694,96 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestGcArrayAccessBytes;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  CanonPos, NullPos, KindPos, BoundsPos: Integer;
+
+  function FindSeq(const AExpected: array of Byte): Integer;
+  var
+    I, J: Integer;
+    Match: Boolean;
+  begin
+    Result := -1;
+    if Buf.Size < Length(AExpected) then
+      Exit;
+    for I := 0 to Buf.Size - Length(AExpected) do
+    begin
+      Match := True;
+      for J := 0 to High(AExpected) do
+        if Buf.ByteAt(I + J) <> AExpected[J] then
+        begin
+          Match := False;
+          Break;
+        end;
+      if Match then
+        Exit(I);
+    end;
+  end;
+
+  function HasSeq(const AExpected: array of Byte): Boolean;
+  begin
+    Result := FindSeq(AExpected) >= 0;
+  end;
+
+begin
+  { array.get_s i8: kind is checked before an unsigned bounds comparison;
+    the final address uses the canonicalized i32 index and MOVSX. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64InitRegCache(Cache);
+    X64EmitGcArrayAccess(Buf,
+      MakeIrInstr(iroArrayGetS, 2, 0, 1, 0), 7,
+      1 or 2 or 4 or (UInt64(1) shl 8) or
+        (UInt64(WASM_ARRAY_ELEMS_OFFSET) shl 16), Cache);
+    X64ResolvePatches(Buf);
+    CanonPos := FindSeq([$89, $C9]);
+    NullPos := FindSeq([$BF, Byte(Ord(wtkNullArrayReference)), $00, $00, $00,
+      $41, $FF, $17]);
+    KindPos := FindSeq([$8B, $10, $83, $E2, $1C, $83, $FA, $04]);
+    BoundsPos := FindSeq([$8B, $50, $08, $39, $D1, $0F, $82]);
+    Expect<Boolean>((CanonPos >= 0) and (CanonPos < NullPos) and
+      (NullPos < KindPos) and (KindPos < BoundsPos)).ToBe(True);
+    Expect<Boolean>(HasSeq([$48, $8D, $44, $08, $10,
+      $0F, $BE, $10])).ToBe(True);
+    Expect<Boolean>(HasSeq([$41, $FF, $57,
+      Byte(Ord(aohRtDispatch) * 8)])).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { array.get_u i16 zero-extends from a scale-two element address. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64InitRegCache(Cache);
+    X64EmitGcArrayAccess(Buf,
+      MakeIrInstr(iroArrayGetU, 2, 0, 1, 0), 8,
+      1 or 4 or (UInt64(2) shl 8) or
+        (UInt64(WASM_ARRAY_ELEMS_OFFSET) shl 16), Cache);
+    X64ResolvePatches(Buf);
+    Expect<Boolean>(HasSeq([$48, $8D, $44, $48, $10,
+      $0F, $B7, $10])).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { array.set i8 stores only the source's low byte. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64InitRegCache(Cache);
+    X64EmitGcArrayAccess(Buf,
+      MakeIrInstr(iroArraySet, 0, 1, 2, 0), 9,
+      1 or 4 or (UInt64(1) shl 8) or
+        (UInt64(WASM_ARRAY_ELEMS_OFFSET) shl 16), Cache);
+    X64ResolvePatches(Buf);
+    Expect<Boolean>(HasSeq([$48, $8D, $44, $08, $10])).ToBe(True);
+    Expect<Boolean>(HasSeq([$88, $10])).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestSlotOffset;
 begin
   Expect<UInt32>(X64SlotByteOffset(0)).ToBe(0);
@@ -788,6 +881,8 @@ begin
     TestStaticCacheKeepsShiftResult);
   Test('numeric GC fields use baked native x64 loads and stores',
     TestGcFieldAccessBytes);
+  Test('fixed scalar arrays use native x64 loads and stores',
+    TestGcArrayAccessBytes);
   Test('executable proof is gated to a real x86-64 host', TestExecPlaceholder);
 end;
 

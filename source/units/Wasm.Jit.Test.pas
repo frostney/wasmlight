@@ -3412,6 +3412,8 @@ begin
   FDiffThreshold := 0;
   Expect<Boolean>(DiffFresh(GcRefArrayModuleBytes, 'visible', []))
     .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<Boolean>(DiffFresh(GcRefArrayModuleBytes, 'nullset', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
   Expect<string>(TrapMessageOf(GcRefArrayModuleBytes, 'nullset', []))
     .ToBe('null array reference');
   Expect<Boolean>(DiffFresh(GcRefArrayModuleBytes, 'dirty', []))
