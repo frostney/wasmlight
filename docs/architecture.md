@@ -87,6 +87,17 @@ structures plus a disassembler, with no validation logic in it — which is
 also why the IR module carries its own index-space snapshots instead of
 pointing back at `TWasmModule`.
 
+`Wasm.MachO` and `Wasm.Sha256` also sit beside the runtime stack: they
+are the Mach-O packager for `aarch64-darwin` and `x86_64-darwin` runtime
+shells ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)).
+`WriteMachOShellTemplate` / `PackageMachORuntimeShell` emit a thin
+`MH_EXECUTE` with the compile payload in `__WSHL,__payload` and a
+linker-style ad-hoc CodeDirectory. They do not invoke a compiler or
+linker, and they do not decode wasm. The payload bytes are a documented
+placeholder until the interpreter-free shell program and the product
+record layout land; integrity is the signature, not a second checksum
+scheme.
+
 `Wasm.Wast`, `Wasm.Wast.Values`, `Wasm.Wast.Runner`, and the six
 `Wasm.Wat.*` units sit beside the library rather than in this stack: they
 are the conformance harness ([roadmap.md](roadmap.md), Track C).

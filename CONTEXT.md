@@ -123,6 +123,13 @@ interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Runtime-shell payload section**:
+The Mach-O section `__WSHL,__payload` where the packager places the compile
+payload. The bytes are opaque until the product record layout lands; an
+altered section fails the embedded ad-hoc CodeDirectory
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: overlay, resource fork, post-signature trailer
+
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. The executable cannot expand this set at run time, and its
