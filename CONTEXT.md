@@ -125,8 +125,10 @@ _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
-native executable. The executable cannot expand this set at run time, and its
-invocation arguments belong entirely to the guest.
+native executable. Relative host directories resolve from the executable
+directory; absolute host paths stay literal; invocation arguments belong
+entirely to the guest; environment values are embedded literally and are
+not secrets. The executable cannot expand this set at run time.
 _Avoid_: runtime configuration, ambient permissions, launcher options
 
 **Entry point alias**:

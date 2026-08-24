@@ -91,9 +91,10 @@
 - **`0.1.0` has shipped.** The next product spine is native application
   compilation: `wasmlight compile` produces a complete native executable
   ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). That
-  command is planned, not shipped. Merged work after `0.1.0` — JIT/GC
-  performance, CI hardening, and documentation — folds into `0.2.0` rather
-  than a `0.1.1` patch.
+  command is planned, not shipped. The compiled capability-set model
+  (`Wasm.Compile.Capabilities`) is a shipped library unit the command will
+  consume. Merged work after `0.1.0` — JIT/GC performance, CI hardening,
+  and documentation — folds into `0.2.0` rather than a `0.1.1` patch.
 - **Next sequence:** `0.2.0` strict native compiler, connectors,
   64-bit Unix cross-compilation, and Homebrew; `0.3.0` Win64 native
   compilation; `0.4.0` i386 Windows native compilation; `0.5.0` portable C,

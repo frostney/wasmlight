@@ -25,6 +25,7 @@ uses
 
   Wasm.Aot,
   Wasm.Aot.Artifact,
+  Wasm.Compile.Capabilities,
   Wasm.Core,
   Wasm.Decoder,
   Wasm.Engine,
@@ -431,22 +432,10 @@ end;
 function AddDirPreopen(const AConfig: TWasmWasiConfig; const ASpec: string;
   out AError: string): Boolean;
 var
-  EqPos: Integer;
   GuestPath, HostPath: string;
 begin
-  EqPos := Pos('=', ASpec);
-  if EqPos <= 1 then
-  begin
-    AError := 'invalid --dir "' + ASpec + '": expected GUEST=HOST';
+  if not TryParseCompiledDirSpec(ASpec, GuestPath, HostPath, AError) then
     Exit(False);
-  end;
-  GuestPath := Copy(ASpec, 1, EqPos - 1);
-  HostPath := Copy(ASpec, EqPos + 1, MaxInt);
-  if HostPath = '' then
-  begin
-    AError := 'invalid --dir "' + ASpec + '": HOST path is empty';
-    Exit(False);
-  end;
   AConfig.AddPreopenDir(GuestPath, HostPath, WASM_RUN_DIR_RIGHTS);
   Result := True;
 end;
