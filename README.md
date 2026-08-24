@@ -29,7 +29,9 @@ embedding API and a deny-by-default WASI preview1 host, so the runtime
 **runs real WASI programs** — `wasmlight run hello.wasm` prints `hello`
 and exits 0, and a program granted a preopen reads the filesystem through
 it. It is driven by `wasmlight inspect` / `wasmlight validate` /
-`wasmlight run` / `wasmlight aot`, and `wasmspec` runs the upstream
+`wasmlight run` / `wasmlight aot`. `wasmlight compile` is registered
+(`--target`, `--connector`, `-o`) but does not yet emit a native
+executable. `wasmspec` runs the upstream
 conformance corpus in any tier (`--tier=interp|jit|aot`) — assembling text
 modules, validating, instantiating, and executing the assertions, SIMD
 judged per lane and `assert_exception` judged. All three tiers produce

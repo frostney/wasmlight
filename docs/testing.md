@@ -3,7 +3,8 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-four suites today, 1,224 tests, all green.
+  independent programs. Forty-five suites today, including the
+  `wasmlight compile` CLI contract; the other suites remain green.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -126,6 +127,7 @@ instead.
 | `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
 | `Wasm.Wasi.Test` | The host module, hermetically: captured stdio buffers instead of real fds, an injected fixed clock and deterministic random source, and temp-dir preopens for the filesystem — args/environ, `fd_write`/`read`/`seek`/`close`, `clock_time_get`, `random_get`, and `path_open` plus the wave-2 file ops. The deny-by-default negatives carry the weight: a fabricated fd is `weBadf`, an ungranted clock or an absent preopen is `weNotCapable`, and a path that is absolute, escapes via `..`, or escapes via a symlink is `weNotCapable` before any OS call. |
 | `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
+| `Wasm.Compile.Test` | The `wasmlight compile` driver: registry-owned `-o` / `--target` / `--connector` help, flag-shaped option values, host-default and explicit released targets, and distinct decode / validation / link / connector / strict-compile / packaging / I/O failures that never write an executable or fall back to `.waot`. Native emission is not claimed. |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and
