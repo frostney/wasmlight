@@ -207,7 +207,10 @@ jobs:
           fi
           if [ "${{ matrix.jit }}" = "true" ]; then
             if command -v nm >/dev/null 2>&1; then
-              if nm -a "$SHELL_BIN" | grep -Ei 'JitCanCompile|JitStageFunctionBytes|JitForceCompile|JitCompileToBuffer|InterpTierInvoke'; then
+              # Live symbols only. `nm -a` also prints DWARF names from
+              # helper units the shell links for frames/traps; those are
+              # not interpreter dispatch or JIT compile entry points.
+              if nm "$SHELL_BIN" | grep -Ei 'JitCanCompile|JitStageFunctionBytes|JitForceCompile|JitCompileToBuffer|InterpTierInvoke'; then
                 echo "::error::runtime shell contains interpreter dispatch or JIT compiler symbols"
                 exit 1
               fi
