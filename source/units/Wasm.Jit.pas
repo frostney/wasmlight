@@ -2437,6 +2437,7 @@ function JitStageFunctionBytes(const AStore: TWasmStore;
 var
   Buf: TWasmCodeBuffer;
   Abi: TWasmTargetAbi;
+  JO: TWasmJitOffsets;
   EpochOffset, SnapshotOffset, HelperTableOffset: NativeUInt;
 {$ENDIF}
 begin
@@ -2449,11 +2450,23 @@ begin
   if not WasmTargetCanEmit(ATarget) then
     Exit;
   {$IFDEF WASM_JIT_BACKEND}
-  if AStore = nil then;   { offsets come from ATarget, not the live store }
-  Abi := WasmTargetAbi(ATarget);
-  EpochOffset := NativeUInt(Abi.Layout.StoreEpoch);
-  SnapshotOffset := NativeUInt(Abi.Layout.StoreEpochSnapshot);
-  HelperTableOffset := NativeUInt(Abi.Layout.StoreJitHelperTable);
+  { Host emission uses the live store offsets ForceCompile bakes, so a
+    compiler-profile layout shift cannot miscompile the running binary.
+    A requested foreign target consumes the published descriptor. }
+  if WasmTargetEqual(ATarget, WasmTargetHost) and (AStore <> nil) then
+  begin
+    JO := WasmJitOffsets(AStore);
+    EpochOffset := JO.StoreEpoch;
+    SnapshotOffset := JO.StoreEpochSnapshot;
+    HelperTableOffset := JO.StoreJitHelperTable;
+  end
+  else
+  begin
+    Abi := WasmTargetAbi(ATarget);
+    EpochOffset := NativeUInt(Abi.Layout.StoreEpoch);
+    SnapshotOffset := NativeUInt(Abi.Layout.StoreEpochSnapshot);
+    HelperTableOffset := NativeUInt(Abi.Layout.StoreJitHelperTable);
+  end;
   try
     Buf := JitCompileToBuffer(AIr, AFn, AFuncIdx,
       EpochOffset, SnapshotOffset, HelperTableOffset, { AFinalize } False);

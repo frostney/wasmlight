@@ -133,10 +133,11 @@ _Avoid_: host triple, platform string, LLVM target
 **Target ABI descriptor**:
 The published pointer size, object format, calling convention, page size,
 and runtime-shell layout offsets for one target triple. Artifact
-fingerprints and baked runtime offsets come from this descriptor, not from
-`SizeOf` or the live host layout
+fingerprints and foreign-target baked offsets come from this descriptor,
+not from `SizeOf`. Host-native JIT/AOT still bake the live store so a
+compiler-profile layout shift cannot crash the running binary
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-_Avoid_: host ABI, live layout, process fingerprint
+_Avoid_: host ABI, process fingerprint
 
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a

@@ -27,10 +27,11 @@
   host; executable-memory allocation and native invocation stay
   host-gated in Wasm.Jit.CodeBuffer.
 
-  The published LP64 Unix layout is a table of the offsets the compiling
-  tiers bake. Host tests pin every field against the live Pascal records
-  on each 64-bit Unix CI leg; a field reorder turns those tests red
-  before a miscompile ships. Fingerprint folding lives here so AOT does
+  The published LP64 Unix layout is a table of the offsets a foreign
+  target's emission bakes. Host-native JIT/AOT still read the live
+  store so a compiler-profile layout shift cannot crash the running
+  binary; host tests pin every field against those live records on
+  each 64-bit Unix CI leg. Fingerprint folding lives here so AOT does
   not re-measure SizeOf at compile or load on a supported target.
 
   Depends on Wasm.Core alone. }

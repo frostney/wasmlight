@@ -399,9 +399,12 @@ different.
   calls go through a per-process indirect table and the IR base arrives in
   a pinned register, so nothing absolute is baked — and serializes it to a
   `.waot` artifact. Target architecture and ABI fingerprints come from the
-  selected `Wasm.Target` descriptor, not from host CPU/OS defines or live
-  `SizeOf`; `run --aot` still loads only a host-arch, host-ABI artifact and
-  maps it executable through the host-gated code buffer. The **security
+  selected `Wasm.Target` descriptor, not from host CPU/OS defines; host-
+  native emission still bakes the live store so release and debug binaries
+  cannot miscompile themselves, while a requested foreign target consumes
+  the published descriptor. `run --aot` still loads only a host-arch,
+  host-ABI artifact and maps it executable through the host-gated code
+  buffer. The **security
   invariant**: AOT always re-decodes and re-validates the module, and the
   artifact's code is used only if its magic, AOT version, IR version,
   target arch, ABI fingerprint, module hash, and self-checksum all match
