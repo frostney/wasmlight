@@ -98,6 +98,67 @@ A Pascal routine exposed to a module as an import. The only channel
 through which a guest can affect anything outside its own linear memory.
 _Avoid_: native function, callback, external, syscall
 
+**Connector**:
+A declarative binding from a module import to a function exported through a
+native library's C ABI. Its guest-visible name may alias a different native
+entry point; custom host logic belongs in an embedder.
+_Avoid_: adapter, wrapper, plugin, native module
+
+**Connector language**:
+The declaration-only language in which connectors describe data shapes,
+external functions, aliases, and callbacks. It resembles C# P/Invoke but has
+no general-purpose behaviour.
+_Avoid_: C#, C# subset, scripting language, configuration file
+
+**Connector plan**:
+The immutable set of connector bindings selected and resolved for one compiled
+executable. It contains only bindings required by that executable's imports.
+_Avoid_: connector manifest, registry, dependency graph
+
+**Runtime shell**:
+The prebuilt, interpreter-free Pascal executable template into which
+`wasmlight compile` embeds a validated module, complete native code, and its
+connector plan. It retains validation and runtime helpers but contains no
+interpreter or JIT compiler.
+_Avoid_: launcher, stub, wrapper executable, bundled runtime
+
+**Compiled capability set**:
+The immutable WASI permissions and values embedded by `wasmlight compile` in a
+native executable. The executable cannot expand this set at run time, and its
+invocation arguments belong entirely to the guest.
+_Avoid_: runtime configuration, ambient permissions, launcher options
+
+**Entry point alias**:
+A connector method whose guest-visible name differs from its native symbol.
+The two signatures remain compatible after the method's declared marshalling.
+_Avoid_: adapter, wrapper, function mapping
+
+**Queued callback**:
+A native callback whose copied notification is delivered later on the store's
+owning thread. It has no synchronous result or borrowed-memory access.
+_Avoid_: asynchronous callback, background callback, cross-thread call
+
+**Retained callback**:
+A callback whose native entry remains valid for the connector's lifetime.
+Connector callbacks are retained unless their declaration marks them scoped.
+_Avoid_: persistent callback, global callback, owned callback
+
+**Deferred callback failure**:
+A guest failure held at a native callback boundary and surfaced unchanged once
+native execution returns. The native caller receives the result type's zero
+value while the failure is pending.
+_Avoid_: swallowed error, native exception, callback error code
+
+**Scoped borrow**:
+A bounds-checked view of guest memory granted to a connector only for one
+synchronous host call. It cannot be retained or used across guest re-entry.
+_Avoid_: raw pointer, memory pointer, shared buffer
+
+**Opaque handle**:
+A guest-visible reference that a connector resolves to a native resource
+without exposing its address or representation.
+_Avoid_: pointer, address, native reference
+
 **Capability**:
 An explicitly granted host permission — a preopened directory, a clock, an
 environment variable. Deny-by-default: a guest gets exactly what the
@@ -111,6 +172,18 @@ _Avoid_: client, sandbox, user code, the wasm
 **Embedder**:
 The Pascal program that owns a store and grants its capabilities.
 _Avoid_: host application, consumer, user (a user is a person)
+
+**Embedding ABI**:
+The versioned C calling-convention surface exported by `libwasmlight`. It is
+the sole foreign-language boundary over the Pascal embedding facade and uses
+opaque handles, fixed-width values, explicit errors, and user-data callbacks.
+_Avoid_: C API, foreign runtime, language runtime
+
+**Language binding**:
+A thin, idiomatic package that exposes the embedding ABI to one language
+without reimplementing runtime behavior. First-party bindings share one
+language-neutral conformance kit.
+_Avoid_: runtime port, alternate engine, connector
 
 **Canonical ABI**:
 The Component Model's rules for lowering component types onto core
