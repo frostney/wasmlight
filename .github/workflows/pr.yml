@@ -216,6 +216,26 @@ jobs:
             echo "::error::a non-module was accepted"; exit 1
           fi
 
+      # One archive per Unix compiler host: layout, MANIFEST, checksums, and
+      # ELF/Mach-O shell structure. Compile gates run only when
+      # `wasmlight compile` exists — cross-emission is structural, native
+      # execution is host-only (not a 16-cell matrix). Windows is a later
+      # release and has no 0.2.0 archive.
+      - name: Pack and verify release archive
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas \
+            --compiler ./build/wasmlight \
+            --out "$RUNNER_TEMP/distro" \
+            --synthesize-catalog
+          ARCHIVE="$(ls "$RUNNER_TEMP/distro"/wasmlight-*-*.tar.gz)"
+          CHECKSUMS="$(ls "$RUNNER_TEMP/distro"/wasmlight-*-checksums.txt)"
+          instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
+            --archive "$ARCHIVE" \
+            --checksums "$CHECKSUMS" \
+            --compiler ./build/wasmlight
+
       # The upstream conformance corpus is the project's strongest oracle.
       # It is fetched at a PINNED commit (never vendored — tests/spec/testsuite
       # is gitignored; the SHA lives in tests/spec/testsuite.commit so the

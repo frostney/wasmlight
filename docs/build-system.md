@@ -32,7 +32,9 @@ Do not invoke `fpc` directly; the one supported form is
 | `wasmbench` | `source/apps/wasmbench.pas` | `build/wasmbench` |
 
 Test programs are not `[build]` targets — `lwpt test` discovers, compiles,
-and runs `source/units/*.Test.pas` independently.
+and runs `source/units/*.Test.pas` independently. Release archives are
+packed by `scripts/pack-release.pas` after `lwpt build`; they are not a
+`[build]` entry. See [deployment.md](deployment.md).
 
 ## Compiler settings
 
