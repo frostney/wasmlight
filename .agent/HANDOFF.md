@@ -1,5 +1,29 @@
 # Handoff
 
+Updated: 2026-08-24 (PR #19-onwards retrospective follow-through)
+
+## Issue #25 — harden optimization-wave gates
+
+- PR #26 merged the issue #24 i386 repair as `54b81e9`; exact push-to-main CI
+  run 32698758975 passed all six targets. Issue #25 began only after that gate
+  completed successfully.
+- `.agents/skills/optimize-runtime/SKILL.md` now requires exact fetched-main
+  push CI before branching, the 257-script pinned-core glob and exact
+  65,188/0/0 signature on macOS/Arm64 and Linux/x86-64, and durable retained
+  evidence outside VM `/tmp` before VM state changes.
+- Fresh exact-main pinned-core evidence is byte-identical across interpreter,
+  JIT, and AOT: macOS/Arm64 records compiled counts 0/8703/8703 under
+  `/Users/jstein/.t3/evidence/wasmlight/pr25-54b81e9/macos-arm64`; Linux/x86-64
+  records 0/8704/8704 under `/home/jstein/pr25-evidence/54b81e9/linux-x64`.
+  Every tier reports files=257, errors=0, pass=65188, fail=0, skip=0, staged=0.
+- The expanded PR #19-onwards retrospective is committed with the confirmed
+  action register: known-good-route PR #54 is merged; issue #23 remains a
+  provider-neutral external-review follow-up deferred until after 0.2.0; no
+  interim Definition of Done change was made.
+- Current branch is `codex/harden-optimization-gates` from exact green main.
+  Next: publish issue #25 as a draft PR, add its final link through the report
+  renderer, rerun report and repository gates, then wait exact-head PR CI.
+
 Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
 
 ## Issue #24 — restore i386-win32 builds and PR coverage
@@ -26,8 +50,8 @@ Updated: 2026-08-24 (issue #24 i386 pre-merge repair)
 - Draft PR #26's follow-up i386 job passed at `f5fe6a3`: build 3/3, all 44
   tests compiled and passed, CLI positive/negative smoke checks passed, and
   the pinned interpreter corpus completed with `errors=0`, `pass=65838`, and
-  `staged=0`. The final handoff-only commit still requires exact-head CI before
-  the PR can be marked ready.
+  `staged=0`. Final exact-head PR CI passed, PR #26 merged as `54b81e9`, and
+  the next six-target push-to-main CI run passed.
 
 Updated: 2026-08-23 (Wave 14 x64 numeric struct-field access accepted)
 
