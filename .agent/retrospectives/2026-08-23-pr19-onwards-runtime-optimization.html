@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime optimization PRs #19–#22 retrospective</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      --page: #f3f4f6;
+      --surface: #ffffff;
+      --surface-muted: #f7f8fb;
+      --text: #172033;
+      --muted: #526078;
+      --border: #d9deea;
+      --accent: #3659d9;
+      --accent-soft: #eef2ff;
+      --accent-text: #263b8f;
+      --success: #17613a;
+      --success-soft: #e7f6ec;
+      --warning: #7a4b00;
+      --warning-soft: #fff4d6;
+      --prototype: #6b3ca0;
+      --prototype-soft: #f3eafa;
+      --code: #172033;
+      --code-text: #f7f8fb;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--page); color: var(--text); line-height: 1.5; }
+    main { width: min(1120px, calc(100% - 32px)); margin: 48px auto; }
+    header { margin-bottom: 28px; }
+    h1 { margin: 0; font-size: clamp(2rem, 5vw, 4rem); letter-spacing: -0.04em; line-height: 1.05; }
+    h2, h3 { line-height: 1.25; }
+    .subtitle, .summary, .caption { color: var(--muted); }
+    .subtitle { font-size: 1.1rem; }
+    .summary { max-width: 76ch; }
+    .shared-section, .evidence, .recommendation, .report-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 18px;
+      box-shadow: 0 12px 36px rgb(41 53 78 / 10%); margin: 24px 0; padding: 28px;
+    }
+    .report-card > .evidence { background: var(--surface-muted); box-shadow: none; padding: 18px; }
+    .report-card > h2, .recommendation h2 { margin: 8px 0; }
+    .item-number, .recommendation-label { color: var(--accent); font-size: .78rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .impact { max-width: 76ch; font-size: 1.08rem; }
+    button, .button-link {
+      align-items: center; background: var(--accent-soft); border: 1px solid #c7d2fe; border-radius: 8px;
+      color: var(--accent-text); cursor: pointer; display: inline-flex; font: inherit; min-height: 44px;
+      padding: 8px 12px; text-decoration: none;
+    }
+    button:hover, .button-link:hover { filter: brightness(.97); }
+    button:focus-visible, .button-link:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    button[aria-pressed="true"] { background: var(--accent); color: white; }
+    .state-controls, .deep-actions, .diagram-controls { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; }
+    .states, .tradeoffs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 16px 0 24px; }
+    .states section, .tradeoff, .scores, .uncertainty { background: var(--surface-muted); border-radius: 12px; min-width: 0; padding: 18px; }
+    .states h3, .tradeoff h3, .scores h3, .uncertainty h3, .evidence h2, .evidence h3 { margin-top: 0; }
+    pre { overflow: auto; background: var(--code); color: var(--code-text); border-radius: 9px; padding: 14px; }
+    img { display: block; max-width: 100%; border-radius: 9px; }
+    .caption { font-size: .86rem; }
+    .tradeoff ul, .evidence ul { margin-bottom: 0; padding-left: 1.25rem; }
+    .tradeoff li + li, .evidence-item + .evidence-item { margin-top: 8px; }
+    .tradeoff-pros { border-top: 4px solid var(--success); }
+    .tradeoff-cons { border-top: 4px solid var(--warning); }
+    .uncertainty { margin: 18px 0; border-left: 4px solid var(--warning); }
+    .evidence ul { list-style: none; padding: 0; }
+    .evidence-item { border-top: 1px solid var(--border); padding-top: 14px; }
+    .evidence-item:first-child { border-top: 0; padding-top: 0; }
+    .evidence-item p { margin-bottom: 0; }
+    .classification { border-radius: 999px; display: inline-block; font-size: .75rem; font-weight: 750; margin-right: 8px; padding: 3px 8px; }
+    .classification-observed { background: var(--success-soft); color: var(--success); }
+    .classification-proposed { background: var(--accent-soft); color: var(--accent-text); }
+    .classification-prototype { background: var(--prototype-soft); color: var(--prototype); }
+    .table-wrap { max-width: 100%; }
+    table { border-collapse: collapse; table-layout: fixed; width: 100%; }
+    th, td { border-bottom: 1px solid var(--border); overflow-wrap: anywhere; padding: 10px; text-align: left; vertical-align: top; }
+    th:first-child { width: 58%; }
+    .score-total th, .score-total td { border-top: 2px solid var(--text); font-weight: 800; }
+    details { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 18px; }
+    summary { cursor: pointer; font-weight: 750; padding: 8px 0; }
+    .prompt { background: var(--accent-soft); border-radius: 9px; padding: 12px; }
+    .mechanism-diagram { margin: 24px 0; }
+    .mechanism-diagram svg { background: var(--surface-muted); border-radius: 12px; width: 100%; }
+    .diagram-node rect { fill: var(--surface); stroke: #7c8bb1; stroke-width: 2; transition: fill .2s, stroke .2s; }
+    .diagram-node text, .diagram-edge text { fill: currentColor; font-size: 14px; text-anchor: middle; }
+    .diagram-edge line { stroke: #7c8bb1; stroke-width: 2; }
+    .diagram-edge polygon { fill: #7c8bb1; }
+    .diagram-node.is-active rect { fill: #dbe4ff; stroke: var(--accent); stroke-width: 4; }
+    .diagram-edge.is-active line { stroke: var(--accent); stroke-width: 5; }
+    .diagram-controls { margin-top: 10px; }
+    .recommendation { border-top: 6px solid var(--accent); }
+    .sr-only { clip: rect(0, 0, 0, 0); clip-path: inset(50%); height: 1px; overflow: hidden; position: absolute; white-space: nowrap; width: 1px; }
+    [hidden] { display: none !important; }
+    @media (max-width: 720px) {
+      main { margin-top: 28px; }
+      .states, .tradeoffs { grid-template-columns: 1fr; }
+      .shared-section, .evidence, .recommendation, .report-card { padding: 20px; }
+      th, td { padding: 8px 5px; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #0d1320; --surface: #151d2d; --surface-muted: #101827; --text: #eef2ff;
+        --muted: #aab6cf; --border: #2c3850; --accent: #8ea6ff; --accent-soft: #202c4b;
+        --accent-text: #dbe4ff; --success: #8cd9a8; --success-soft: #173c2a;
+        --warning: #f2c66d; --warning-soft: #453716; --prototype: #d8a9ff;
+        --prototype-soft: #3a2850; --code: #080d17; --code-text: #f7f8fb;
+      }
+      button, .button-link { border-color: #43537a; }
+      button[aria-pressed="true"] { color: #101827; }
+      .diagram-node.is-active rect { fill: #263b8f; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header><h1>Runtime optimization PRs #19–#22 retrospective</h1><p class="subtitle">Waves 11–14, confirmed follow-ups, and the optimization-gate delivery PR</p><p class="summary">PRs #19–#21 delivered large, repeatable Arm64 and x64 runtime gains, and PR #22 tightened measurement discipline. The retrospective then routed four corrections: i386 repair and pre-merge coverage are delivered with green integrated main; the shared waiter repair is delivered; provider-neutral external-review enforcement is deliberately deferred until after 0.2.0; and optimization-gate hardening is published in draft PR #27.</p></header>
+    <section class="evidence"><h2>Shared evidence</h2><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/19">PR #19 — Wave 11</a></div><p>Arm64 inline struct.new free-list hits improved the local GC workload by 39.9% in both B-C-C-B orders.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/20">PR #20 — Waves 12 and 13</a></div><p>Native Arm64 fixed-array access improved GC by 42.77%/44.57%; adjacent vector-result fusion improved SIMD by 33.25%/33.85%.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/21#issuecomment-5388483637">PR #21 — Wave 14</a></div><p>Native x64 numeric struct-field access improved CI GC from 179.265 to 136.219 ms, 31.6% faster.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/22">PR #22 — workflow hardening</a></div><p>The local optimization skill now requires release-binary hashes, immediate-predecessor comparisons, host-load checks, and retained rejected-experiment evidence.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/actions/runs/32668890808">Integrated-main CI</a></div><p>All four merge commits from #19 through #22 failed the same i386 Windows compile at Wasm.Jit.Arm64.pas:135.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/issues/25">Confirmed decisions</a></div><p>The maintainer selected immediate i386 repair, an active optimization-gate follow-up, and provider-neutral external-review enforcement after 0.2.0 without an interim Definition of Done change.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/actions/runs/32698758975">Restored integrated main</a></div><p>PR #26 merged the i386 repair and pre-merge matrix leg; exact merged main completed all six targets successfully in CI run 32698758975.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span>Cross-architecture pinned-core completion</div><p>At merged-main 54b81e9, macOS/aarch64 and Linux/x86-64 each produced 257 files, 65,188 pass, 0 fail, 0 skip, and 0 staged in interpreter, JIT, and AOT; JIT/AOT compiled counts were 8,703 on Arm64 and 8,704 on x64.</p></li></ul></section>
+    
+      <section class="shared-section" aria-labelledby="__report-rubric-heading">
+        <h2 id="__report-rubric-heading">Comparison rubric</h2>
+        <div class="table-wrap"><table><caption class="sr-only">Comparison criteria and weights</caption>
+          <thead><tr><th scope="col">Criterion</th><th scope="col">Weight</th></tr></thead>
+          <tbody><tr><th scope="row">Delivery impact</th><td>40%</td></tr><tr><th scope="row">Evidence confidence</th><td>30%</td></tr><tr><th scope="row">Actionability</th><td>30%</td></tr></tbody>
+        </table></div>
+      </section>
+    
+      <article class="report-card" id="action-status-register" aria-labelledby="__report-item-heading-1">
+        <div class="item-number">Impact 1</div>
+        <h2 id="__report-item-heading-1">Confirmed action and status register</h2>
+        <p class="impact">Timestamped at 2026-08-24T07:55:28Z: i386 and waiter repairs are delivered, optimization-gate hardening is published in draft PR #27 with cross-architecture evidence, and provider-neutral external-review enforcement remains deferred until after 0.2.0.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-1" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-1" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-1" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-1" data-states><section data-state="before"><h3>Before</h3><p>At retrospective confirmation: repair i386 before another wave; harden pinned-core, green-main, and durable-evidence gates next; repair the shared waiter before another delivery; preserve external review in the Definition of Done while deferring automation until after 0.2.0.</p><p class="caption">Confirmed action set</p></section><section data-state="after"><h3>After</h3><p>Delivered: wasmlight #24 via merged PR #26 and green exact-main CI 32698758975; known-good-route #53 via merged PR #54. In delivery: wasmlight #25 through draft PR #27, with both generated-code architecture tallies complete. Deferred: wasmlight #23 until after 0.2.0, with no provider preselected and no interim DEFINITION_OF_DONE.md change.</p><p class="caption">Live status at 2026-08-24T07:55:28Z</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>The hard dependency for issue #25 is satisfied by exact-tip integrated CI</li><li>The external-review route preserves the existing policy without prematurely selecting a provider</li><li>Every follow-up has a durable issue or delivery pull request</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>Issue #25 and draft PR #27 remain open pending exact-head delivery checks</li><li>Issue #23 remains deliberately unenforced until the post-0.2.0 work begins</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>5/5</td><td>40.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>5/5</td><td>30.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>100.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        
+        <section class="evidence"><h3>Evidence</h3><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/issues/23">External review route — wasmlight #23</a></div><p>Open and deferred until after 0.2.0; evaluate and select a provider against exact-head, finding, thread, and status requirements. No provider is preselected.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/26">i386 route — wasmlight #24 and PR #26</a></div><p>Issue closed through merged PR #26; full integrated main is green in run 32698758975.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/27">Optimization gates — wasmlight #25 and PR #27</a></div><p>Open and in delivery through draft PR #27. The skill, durable report, and final cross-architecture evidence are included in that pull request.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/known-good-route/pull/54">Waiter route — known-good-route #53 and PR #54</a></div><p>The stale-status terminality repair was ready at confirmation and is now merged through PR #54.</p></li></ul></section>
+        
+        <details><summary>Deep dive</summary><p>Use the linked issues, delivery pull requests, and exact-main run to reconcile the action sequence and the current issue #25 publication record.</p><p class="prompt"><strong>Continue with the user:</strong> Converge PR #27 at its exact head; keep issue #23 deferred until after 0.2.0.</p><div class="deep-actions"><button type="button" data-copy-prompt="Converge PR #27 at its exact head; keep issue #23 deferred until after 0.2.0.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="performance-series" aria-labelledby="__report-item-heading-2">
+        <div class="item-number">Impact 2</div>
+        <h2 id="__report-item-heading-2">Three performance PRs delivered material gains</h2>
+        <p class="impact">PRs #19–#21 successively removed Arm64 allocation, Arm64 array/SIMD, and x64 struct-field costs. Every accepted change had repeatable target measurements, representative guards, focused differentials, and cross-tier identity evidence.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-2" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-2" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-2" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-2" data-states><section data-state="before"><h3>Before</h3><p>Wave 11 Arm64 GC was 76.209/76.511 ms. Wave 12 GC was 43.551/43.631 ms. Wave 13 SIMD was 8.602/8.809 ms. Wave 14 x64 CI GC was 179.265 ms.</p><p class="caption">Immediate predecessors under each wave&#x27;s retained schedule</p></section><section data-state="after"><h3>After</h3><p>Wave 11 GC reached 45.780/45.773 ms. Wave 12 GC reached 24.925/24.182 ms. Wave 13 SIMD reached 5.742/5.827 ms. Wave 14 x64 CI GC reached 136.219 ms.</p><p class="caption">Accepted candidates; lower is better</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>All four target deltas repeated in forward and reverse order</li><li>The accepted mechanisms stayed inside the validated IR and existing tier seam</li><li>Arm64 GC reached or beat Wasmtime on its diagnostic after PR #20</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>Arm64 direct calls remained about 2.4x Wasmtime after the series</li><li>x64 CI GC remained 2.40x Wasmtime after PR #21</li><li>The three performance PRs added 1,457 lines and removed 32 across 17 changed-file slots, including handoff growth</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>5/5</td><td>40.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>4/5</td><td>24.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>94.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        <section class="uncertainty"><h3>Remaining uncertainty</h3><p>The x64 developer host was virtualized amd64 over Arm; the independent Azure x64 result confirms direction but not the same absolute timings.</p></section>
+        
+        
+        <details><summary>Deep dive</summary><p>Compare each accepted mechanism, its exact B-C-C-B schedule, guards, and remaining Wasmtime-normalized gap.</p><p class="prompt"><strong>Continue with the user:</strong> Retain PRs #19–#21 as accepted performance work and use only fresh green-main profiles to select the next bottleneck.</p><div class="deep-actions"><button type="button" data-copy-prompt="Retain PRs #19–#21 as accepted performance work and use only fresh green-main profiles to select the next bottleneck.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="evidence-gated-correction" aria-labelledby="__report-item-heading-3">
+        <div class="item-number">Impact 3</div>
+        <h2 id="__report-item-heading-3">Differential gates and bounded reviews prevented worse code</h2>
+        <p class="impact">Inside the scoped waves, review and runtime differentials caught five material defects before acceptance, while six measured experiments were reverted because they regressed or overlapped noise.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-3" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-3" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-3" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-3" data-states><section data-state="before"><h3>Before</h3><p>PR #19&#x27;s first allocation emitter had a bad MADD encoding and overwrote the free-list link; its first published head also failed x64 compilation. PR #20&#x27;s first array and SIMD candidates could lose a dirty cached value or a live value produced by local.tee.</p><p class="caption">Defects in candidate or draft states</p></section><section data-state="after"><h3>After</h3><p>Focused recycled-cell, dirty-cache, fresh-store tee, byte-shape, and cross-platform tests pinned the repairs. Four PR #20 and two PR #21 experiments were fully reverted after unfavorable measurements.</p><p class="caption">Accepted source excluded known defects and losing candidates</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>Black-box differentials caught behavior the corpus did not exercise</li><li>Parallel lanes were isolated and performance windows serialized</li><li>Negative evidence narrows future search and prevents repeated mechanisms</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>Independent review was internal to the workstream, not a submitted PR review</li><li>Exact subagent active time, token use, compactions, and inference counts were not retained</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>5/5</td><td>40.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>3/5</td><td>18.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>88.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        <section class="uncertainty"><h3>Remaining uncertainty</h3><p>Worker terminal summaries and handoff records survive, but full agent telemetry does not, so aggregate model effort cannot be reconstructed honestly.</p></section>
+        
+        
+        <details><summary>Deep dive</summary><p>Trace the five caught defects, six rejected mechanisms, and the regression test that closes each correctness hole.</p><p class="prompt"><strong>Continue with the user:</strong> Keep bounded review lanes, fresh-store differentials, and serialized rejection gates as permanent optimization practice.</p><div class="deep-actions"><button type="button" data-copy-prompt="Keep bounded review lanes, fresh-store differentials, and serialized rejection gates as permanent optimization practice.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="corpus-contract" aria-labelledby="__report-item-heading-4">
+        <div class="item-number">Impact 4</div>
+        <h2 id="__report-item-heading-4">Pinned-core correction is proven on both generated-code architectures</h2>
+        <p class="impact">PRs #19 and #20 used the recursive 288-file diagnostic as completion evidence. Issue #25 now has exact merged-main pinned-core results for interpreter, JIT, and AOT on macOS/aarch64 and Linux/x86-64.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-4" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-4" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-4" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-4" data-states><section data-state="before"><h3>Before</h3><p>Current optimize-runtime commands pass tests/spec/testsuite without a top-level glob and require only byte identity plus zero errors. Proposal and legacy subdirectories therefore enter the result.</p><p class="caption">Current repository-local skill at PR #22</p></section><section data-state="after"><h3>After</h3><p>At merged-main 54b81e9, all three tiers on both architectures report 257 files, 65,188 pass, 0 fail, 0 skip, 0 staged. Arm64 compiled counts are interp 0 / JIT 8,703 / AOT 8,703; x64 counts are interp 0 / JIT 8,704 / AOT 8,704.</p><p class="caption">Observed final cross-architecture signature</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>PR #19/#20 tier identity remains meaningful despite the broader diagnostic scope</li><li>The exact expected tally is now reproduced on both generated-code architectures</li><li>Accepted binaries and raw outputs are retained outside volatile VM temporary storage</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>The repository skill and durable report remain in delivery through draft PR #27</li><li>The first Linux setup used stale LWPT 0.4.0 and was rejected rather than treated as completion evidence</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>5/5</td><td>40.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>5/5</td><td>30.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>100.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        
+        <section class="evidence"><h3>Evidence</h3><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span>Observed commands</div><p>The skill uses tests/spec/testsuite; Wave 14 used the top-level 257-script corpus and obtained 65,188/0/0.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/27">Delivery — wasmlight PR #27</a></div><p>Draft PR #27 changes the skill&#x27;s three commands to the pinned-core glob and requires the exact tally on both generated-code architectures.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span>macOS/aarch64 final evidence</div><p>Durable path /Users/jstein/.t3/evidence/wasmlight/pr25-54b81e9/macos-arm64; release binary SHA-256 starts 02cb39da; all three tiers match the exact stable signature.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span>Linux/x86-64 final evidence</div><p>Durable VM path /home/jstein/pr25-evidence/54b81e9/linux-x64; release binary SHA-256 starts aae7bb52; accepted run used checksum-recorded LWPT 0.6.0 and pinned de54fd27 corpus.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span>Rejected Linux preparation</div><p>The first stale-LWPT 0.4.0 setup was rejected and preserved under linux-x64-attempt-1-wrong-lwpt; it is not accepted validation evidence.</p></li></ul></section>
+        
+        <details><summary>Deep dive</summary><p>Inspect the recursive residue, the top-level pinned-core contract, shell glob behavior, and exact-tally assertion wording.</p><p class="prompt"><strong>Continue with the user:</strong> Converge PR #27&#x27;s exact pinned-core gate before the next optimization wave.</p><div class="deep-actions"><button type="button" data-copy-prompt="Converge PR #27&#x27;s exact pinned-core gate before the next optimization wave.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="measurement-hardening" aria-labelledby="__report-item-heading-5">
+        <div class="item-number">Impact 5</div>
+        <h2 id="__report-item-heading-5">PR #22 codified measurement lessons, but CI ignored its docs-only scope</h2>
+        <p class="impact">PR #22 turned recurring release/dev, stale-baseline, host-load, and rejected-evidence mistakes into explicit workflow checks. Its own body correctly said runtime benchmarks were not applicable, yet required PR CI still spent 327 runner-seconds comparing byte-identical runtime source.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-5" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-5" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-5" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-5" data-states><section data-state="before"><h3>Before</h3><p>Earlier work had twice mixed development and release binaries, compared against a non-immediate predecessor, and accepted host-contaminated schedules only after manual diagnosis.</p><p class="caption">Recurring measurement-validity hazards recorded in the handoff</p></section><section data-state="after"><h3>After</h3><p>The skill now requires binary hashes, immediate-predecessor baselines, host-load inspection, and mechanism-plus-measurement records for every rejected experiment.</p><p class="caption">Merged PR #22 safeguards</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>The safeguards directly target observed failure modes</li><li>Rejected evidence is now part of the workflow contract</li><li>PR #22 was small: 35 additions and 7 deletions across two documentation files</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>At PR #22, the skill still lacked green-main and durable-VM-storage preflights; issue #25 closes both gaps</li><li>The runtime comparison consumed about half of PR #22&#x27;s 655 aggregate runner-seconds without runtime changes</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>4/5</td><td>32.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>4/5</td><td>24.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>86.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        <section class="uncertainty"><h3>Remaining uncertainty</h3><p>Skipping a required check by path needs a stable success-reporting design; a missing check must not block protected delivery later.</p></section>
+        
+        
+        <details><summary>Deep dive</summary><p>Review the exact PR #22 safeguards and whether runtime-comparison should cheaply no-op when no runtime or benchmark inputs changed.</p><p class="prompt"><strong>Continue with the user:</strong> Keep PR #22&#x27;s safeguards; consider a successful no-op path for non-runtime changes rather than removing the required check.</p><div class="deep-actions"><button type="button" data-copy-prompt="Keep PR #22&#x27;s safeguards; consider a successful no-op path for non-runtime changes rather than removing the required check.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="i386-gate-escape" aria-labelledby="__report-item-heading-6">
+        <div class="item-number">Impact 6</div>
+        <h2 id="__report-item-heading-6">One i386 defect survived four consecutive merges</h2>
+        <p class="impact">PR #19 introduced TArm64GcAllocArray as a 16,777,216-element static array. FPC 3.2.2 on i386 reports Data element too large. PR CI omitted i386, so #19, #20, #21, and #22 were green before merge and red immediately afterward.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-6" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-6" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-6" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-6" data-states><section data-state="before"><h3>Before</h3><p>Main at PR #18 was green. PR #19&#x27;s final configured Linux, macOS Arm64, and Windows x64 checks passed after its x64 portability repair.</p><p class="caption">Last green main and apparently green PR head</p></section><section data-state="after"><h3>After</h3><p>After the four historical failures, issue #24 was delivered by merged PR #26. PR CI now includes i386-win32, and full integrated main run 32698758975 completed successfully across all six targets.</p><p class="caption">Resolved on merged main</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>The defect is deterministic, localized, and attributed to PR #19</li><li>The maintainer has confirmed repair and pre-merge i386 coverage as mandatory</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>A supported interpreter-only 32-bit target remained broken across four merge commits</li><li>Three later PRs started or merged after red-main evidence existed</li><li>Before issue #25, optimize-runtime checked a fresh main commit but not that commit&#x27;s full CI health</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>5/5</td><td>40.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>5/5</td><td>30.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>100.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        
+        <section class="evidence"><h3>Evidence</h3><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span>Repeated failure</div><p>All four main runs fail Wasm.Jit.Arm64.pas:135; the latest has 42 tests pass and two JIT suites fail to compile.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/pull/26">Delivered route — issue #24 / PR #26</a></div><p>The typed-pointer repair and existing i386 Windows PR leg merged; exact-main CI run 32698758975 is green.</p></li></ul></section>
+        
+        <section class="mechanism-diagram" data-diagram data-steps="[{&quot;label&quot;: &quot;Last green main&quot;, &quot;highlights&quot;: [&quot;base&quot;]}, {&quot;label&quot;: &quot;PR #19 escape&quot;, &quot;highlights&quot;: [&quot;deliver19&quot;, &quot;pr19&quot;, &quot;escape19&quot;, &quot;main19&quot;]}, {&quot;label&quot;: &quot;PR #20 repeats&quot;, &quot;highlights&quot;: [&quot;deliver20&quot;, &quot;pr20&quot;, &quot;escape20&quot;, &quot;main20&quot;]}, {&quot;label&quot;: &quot;PR #21 repeats&quot;, &quot;highlights&quot;: [&quot;deliver21&quot;, &quot;pr21&quot;, &quot;escape21&quot;, &quot;main21&quot;]}, {&quot;label&quot;: &quot;PR #22 repeats&quot;, &quot;highlights&quot;: [&quot;deliver22&quot;, &quot;pr22&quot;, &quot;escape22&quot;, &quot;main22&quot;]}]">
+          <h3>PR-green to main-red sequence</h3>
+          <svg viewBox="0 0 720 450" role="img" aria-label="PR-green to main-red sequence">
+            <defs><marker id="__report-arrow-6" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" /></marker></defs>
+            <g class="diagram-edge" data-element-id="deliver19"><line x1="120" y1="75" x2="360" y2="75" marker-end="url(#__report-arrow-6)" /><text x="240" y="67">Wave 11</text></g><g class="diagram-edge" data-element-id="escape19"><line x1="360" y1="75" x2="600" y2="75" marker-end="url(#__report-arrow-6)" /><text x="480" y="67">i386 only post-merge</text></g><g class="diagram-edge" data-element-id="deliver20"><line x1="600" y1="75" x2="120" y2="195" marker-end="url(#__report-arrow-6)" /><text x="360" y="127">Wave 12/13</text></g><g class="diagram-edge" data-element-id="escape20"><line x1="120" y1="195" x2="360" y2="195" marker-end="url(#__report-arrow-6)" /><text x="240" y="187">same failure</text></g><g class="diagram-edge" data-element-id="deliver21"><line x1="360" y1="195" x2="600" y2="195" marker-end="url(#__report-arrow-6)" /><text x="480" y="187">Wave 14</text></g><g class="diagram-edge" data-element-id="escape21"><line x1="600" y1="195" x2="120" y2="315" marker-end="url(#__report-arrow-6)" /><text x="360" y="247">same failure</text></g><g class="diagram-edge" data-element-id="deliver22"><line x1="120" y1="315" x2="360" y2="315" marker-end="url(#__report-arrow-6)" /><text x="240" y="307">skill hardening</text></g><g class="diagram-edge" data-element-id="escape22"><line x1="360" y1="315" x2="600" y2="315" marker-end="url(#__report-arrow-6)" /><text x="480" y="307">same failure</text></g>
+            <g class="diagram-node" data-element-id="base"><rect x="32" y="47" width="176" height="56" rx="12" /><text x="120" y="80">PR #18 main green</text></g><g class="diagram-node" data-element-id="pr19"><rect x="272" y="47" width="176" height="56" rx="12" /><text x="360" y="80">#19 PR green</text></g><g class="diagram-node" data-element-id="main19"><rect x="512" y="47" width="176" height="56" rx="12" /><text x="600" y="80">#19 main i386 red</text></g><g class="diagram-node" data-element-id="pr20"><rect x="32" y="167" width="176" height="56" rx="12" /><text x="120" y="200">#20 PR green</text></g><g class="diagram-node" data-element-id="main20"><rect x="272" y="167" width="176" height="56" rx="12" /><text x="360" y="200">#20 main i386 red</text></g><g class="diagram-node" data-element-id="pr21"><rect x="512" y="167" width="176" height="56" rx="12" /><text x="600" y="200">#21 PR green</text></g><g class="diagram-node" data-element-id="main21"><rect x="32" y="287" width="176" height="56" rx="12" /><text x="120" y="320">#21 main i386 red</text></g><g class="diagram-node" data-element-id="pr22"><rect x="272" y="287" width="176" height="56" rx="12" /><text x="360" y="320">#22 PR green</text></g><g class="diagram-node" data-element-id="main22"><rect x="512" y="287" width="176" height="56" rx="12" /><text x="600" y="320">#22 main i386 red</text></g>
+          </svg>
+          <div class="diagram-controls" aria-label="Diagram playback controls">
+            <button type="button" data-diagram-action="play">Play</button>
+            <button type="button" data-diagram-action="pause">Pause</button>
+            <button type="button" data-diagram-action="step">Step</button>
+            <button type="button" data-diagram-action="reset">Reset</button>
+            <span data-diagram-status role="status">Ready</span>
+          </div>
+        </section>
+        <details><summary>Deep dive</summary><p>Review the minimal 32-bit-safe shape representation, focused compile regression, PR-matrix reuse, and a green-main preflight for optimization work.</p><p class="prompt"><strong>Continue with the user:</strong> Retain PR #26&#x27;s i386 pre-merge coverage and require exact-tip integrated-main success before future waves.</p><div class="deep-actions"><a class="button-link" href="https://github.com/frostney/wasmlight/actions/runs/32698758975">Open deep-dive chat</a><button type="button" data-copy-prompt="Retain PR #26&#x27;s i386 pre-merge coverage and require exact-tip integrated-main success before future waves.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="review-policy-gap" aria-labelledby="__report-item-heading-7">
+        <div class="item-number">Impact 7</div>
+        <h2 id="__report-item-heading-7">All four PRs bypassed the documented external-review gate</h2>
+        <p class="impact">PRs #19–#22 were opened as drafts, later marked ready, and squash-merged with zero review requests and zero submitted reviews. DEFINITION_OF_DONE says a PR is opened ready and external review completes and is triaged before merge; GitHub has no protection or ruleset enforcing that policy.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-7" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-7" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-7" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-7" data-states><section data-state="before"><h3>Before</h3><p>Ready-to-merge windows were 18m36s for #19, 25m22s for #20, 1m25s for #21, and 5m15s for #22. No review request event appears in any timeline.</p><p class="caption">Observed forge lifecycle</p></section><section data-state="after"><h3>After</h3><p>Confirmed temporary decision: keep DEFINITION_OF_DONE.md unchanged; after 0.2.0, evaluate and select an external review provider against exact-head, finding, thread, and status requirements, then connect and enforce it. No provider is preselected.</p><p class="caption">Provider-neutral route recorded in issue #23</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>Internal review and focused tests were productive</li><li>Every final PR head had its configured checks green</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>The documented policy currently overstates actual assurance</li><li>No forge mechanism prevents a one-minute ready-to-merge transition</li><li>Enforcement is intentionally deferred until after 0.2.0</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>4/5</td><td>32.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>3/5</td><td>18.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>80.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        
+        <section class="evidence"><h3>Evidence</h3><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/issues/23">Deferred provider-neutral route — wasmlight #23</a></div><p>The existing external-review policy remains; provider evaluation and enforcement begin after 0.2.0, with no provider preselected.</p></li></ul></section>
+        
+        <details><summary>Deep dive</summary><p>Compare the four timelines, DOD language, internal reviews, and practical GitHub enforcement options.</p><p class="prompt"><strong>Continue with the user:</strong> Keep issue #23 deferred until after 0.2.0 and preserve the current Definition of Done in the interim.</p><div class="deep-actions"><button type="button" data-copy-prompt="Keep issue #23 deferred until after 0.2.0 and preserve the current Definition of Done in the interim.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="waiter-contradiction" aria-labelledby="__report-item-heading-8">
+        <div class="item-number">Impact 8</div>
+        <h2 id="__report-item-heading-8">PR #21 CI was successful but the delivery waiter never terminated</h2>
+        <p class="impact">GitHub returned conclusion=SUCCESS and completedAt for the freshness job while status remained IN_PROGRESS. The shared waiter made 83 observations over 21m24s and added about 15m36s after the last PR job completed before manual inspection marked the PR ready.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-8" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-8" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-8" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-8" data-states><section data-state="before"><h3>Before</h3><p>The PR workflow and all jobs were completed successfully by 21:11:09Z. The freshness check&#x27;s own completedAt was 21:04:33Z.</p><p class="caption">Workflow-level terminal evidence</p></section><section data-state="after"><h3>After</h3><p>Known-good-route issue #53 was delivered by PR #54, adding GraphQL and REST regression coverage and treating recognized terminal conclusion plus completion timestamp as terminal despite stale status.</p><p class="caption">Shared waiter repair delivered</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>No missing or failing check was bypassed</li><li>The contradictory GitHub response and helper condition are reproducible</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>Delivery went silent and required user intervention</li><li>Wasmlight must refresh its vendored shared skill through the normal source-first route before relying on the correction</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>4/5</td><td>32.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>5/5</td><td>30.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>92.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        
+        <section class="evidence"><h3>Evidence</h3><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/known-good-route/issues/53">Known-good-route issue #53</a></div><p>The production stale-status shape and required GraphQL/REST behavior were recorded upstream.</p></li><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/known-good-route/pull/54">Known-good-route PR #54</a></div><p>Ready at action-set confirmation and now merged with green checks.</p></li></ul></section>
+        
+        <details><summary>Deep dive</summary><p>Inspect terminal normalization precedence and add a fixture for SUCCESS plus completedAt plus stale IN_PROGRESS.</p><p class="prompt"><strong>Continue with the user:</strong> Consume the delivered source-skill repair through the repository&#x27;s normal managed-skill update route when needed.</p><div class="deep-actions"><a class="button-link" href="https://github.com/frostney/known-good-route/pull/54">Open deep-dive chat</a><button type="button" data-copy-prompt="Consume the delivered source-skill repair through the repository&#x27;s normal managed-skill update route when needed.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="evidence-durability" aria-labelledby="__report-item-heading-9">
+        <div class="item-number">Impact 9</div>
+        <h2 id="__report-item-heading-9">Most raw evidence still depends on temporary storage</h2>
+        <p class="impact">PR #20 and Arm64 PR #21 raw schedules remain under macOS /tmp today, while an earlier x64 VM /tmp baseline is already gone. Wave 14&#x27;s accepted x64 evidence survived because it was rebuilt under /home after a VM stop erased the first preparation.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-9" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-9" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-9" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-9" data-states><section data-state="before"><h3>Before</h3><p>Wave 12/13 and Arm64 Wave 14 paths point to /tmp. Wave 14&#x27;s first x64 checkout, toolchain, and baseline also lived under VM /tmp and disappeared after stop/start.</p><p class="caption">Volatile evidence convention</p></section><section data-state="after"><h3>After</h3><p>Accepted x64 evidence was rebuilt under /home/jstein/w14-x64-field. Active issue #25 now requires readable, hash-verified baseline/candidate binaries and raw measurements outside VM /tmp before any VM pause or stop.</p><p class="caption">Observed recovery plus active durability gate</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>No erased data was accepted as evidence</li><li>Current PR #20 and Arm64 Wave 14 /tmp files are still inspectable</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>A host reboot or cleanup can erase most retained schedules</li><li>Before issue #25, the optimization skill did not require durable storage before stopping a VM</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>3/5</td><td>24.0</td></tr><tr><th scope="row">Evidence confidence</th><td>5/5</td><td>30.0</td></tr><tr><th scope="row">Actionability</th><td>5/5</td><td>30.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>84.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        
+        <section class="evidence"><h3>Evidence</h3><ul><li class="evidence-item"><div><span class="classification classification-observed">Observed</span><a href="https://github.com/frostney/wasmlight/issues/25">Durable-evidence route — wasmlight #25</a></div><p>The active issue requires retained binaries, hashes, and raw accepted/rejected measurements outside VM /tmp before state changes.</p></li></ul></section>
+        
+        <details><summary>Deep dive</summary><p>Decide the durable host/VM location, retention minimum, and whether raw data should be summarized or archived after merge.</p><p class="prompt"><strong>Continue with the user:</strong> Complete issue #25&#x27;s durable-evidence preflight before the next benchmark VM lifecycle.</p><div class="deep-actions"><button type="button" data-copy-prompt="Complete issue #25&#x27;s durable-evidence preflight before the next benchmark VM lifecycle.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="lifecycle-capacity" aria-labelledby="__report-item-heading-10">
+        <div class="item-number">Impact 10</div>
+        <h2 id="__report-item-heading-10">The 19-hour scope mixed productive waves with large unclassified gaps</h2>
+        <p class="impact">From PR #19&#x27;s first code commit to PR #22&#x27;s merge, 19h03m elapsed; from PR #19 creation to PR #22 merge, 13h03m elapsed. CI consumed 1h48m15s of aggregate runner time, split almost evenly between PR and post-merge workflows, but only about 42m58s of overlapped workflow wall time.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-10" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-10" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-10" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-10" data-states><section data-state="before"><h3>Before</h3><p>PR #19&#x27;s first code commit preceded PR creation by 6h00m20s. Its first PR CI failure preceded the repair commit by 5h47m05s. Available evidence cannot distinguish unattended pause, separate sessions, or active off-forge work in those intervals.</p><p class="caption">Largest elapsed gaps; not attributed as model working time</p></section><section data-state="after"><h3>After</h3><p>PR creation-to-merge was 6h16m53s (#19), 30m48s (#20), 23m51s (#21), and 11m16s (#22). Final ready-to-merge waits totalled 50m38s; #21 additionally lost 15m36s to the waiter contradiction.</p><p class="caption">Observable delivery timing</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>CI fan-out kept runner work mostly off the serial critical path</li><li>PR #20–#22 publication cycles were compact</li><li>Three performance waves and one workflow correction landed within the scope</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>PR #19 dominated calendar time with two long unclassified gaps</li><li>Four doomed post-merge i386 runs consumed 54m30s aggregate runner time</li><li>No Milestone Rush ledger or complete agent telemetry exists for exact active-time accounting</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>3/5</td><td>24.0</td></tr><tr><th scope="row">Evidence confidence</th><td>4/5</td><td>24.0</td></tr><tr><th scope="row">Actionability</th><td>3/5</td><td>18.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>66.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        <section class="uncertainty"><h3>Remaining uncertainty</h3><p>Commit, PR, and workflow timestamps are exact; human/model active time and off-screen pauses are not observable and are intentionally not inferred.</p></section>
+        
+        
+        <details><summary>Deep dive</summary><p>Separate critical path, masked parallel CI, ready waits, post-merge resource use, and unavailable agent telemetry.</p><p class="prompt"><strong>Continue with the user:</strong> Treat the long PR #19 gaps as unclassified context unless additional session telemetry becomes available.</p><div class="deep-actions"><button type="button" data-copy-prompt="Treat the long PR #19 gaps as unclassified context unless additional session telemetry becomes available.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+      <article class="report-card" id="next-runtime-frontier" aria-labelledby="__report-item-heading-11">
+        <div class="item-number">Impact 11</div>
+        <h2 id="__report-item-heading-11">The next runtime frontier is measurable but not yet authorized</h2>
+        <p class="impact">After PR #20, Arm64 direct calls remained the sole 1.43x goal miss at roughly 2.4x Wasmtime; six rejected call/memory/SIMD mechanisms narrowed the search. After PR #21, x64 GC still measured 2.40x Wasmtime and fixed-array access is the leading analogue, subject to a fresh profile.</p>
+        
+        <div class="state-controls" aria-label="Before and After view">
+          <button type="button" data-state-view="before" aria-controls="__report-states-11" aria-pressed="false">Before</button>
+          <button type="button" data-state-view="after" aria-controls="__report-states-11" aria-pressed="false">After</button>
+          <button type="button" data-state-view="both" aria-controls="__report-states-11" aria-pressed="true">Both</button>
+        </div><div class="states" id="__report-states-11" data-states><section data-state="before"><h3>Before</h3><p>Arm64 call remained 2.42x Wasmtime at Wave 14 baseline. x64 numeric struct-field helper crossings were measured at roughly 142 ns each before PR #21.</p><p class="caption">Residual measured bottlenecks</p></section><section data-state="after"><h3>After</h3><p>Two more Arm64 call instruction-selection variations lost in Wave 14. Main is green again after PR #26, and issue #25&#x27;s cross-architecture conformance and evidence gates are now published in draft PR #27 as the active prerequisite to any fresh optimization profile.</p><p class="caption">Narrower future search space</p></section></div>
+        <div class="tradeoffs"><section class="tradeoff tradeoff-pros"><h3>Pros</h3><ul><li>Rejected mechanisms make the next profile more focused</li><li>The Arm64 array design offers a bounded x64 analogue</li></ul></section><section class="tradeoff tradeoff-cons"><h3>Cons</h3><ul><li>Issue #25&#x27;s workflow gates remain pending delivery through PR #27</li><li>No new optimization should be selected from stale profiles</li></ul></section></div>
+        
+        <section class="scores"><h3>Scores</h3>
+          <div class="table-wrap"><table><caption class="sr-only">Criterion scores and weighted total</caption>
+            <thead><tr><th scope="col">Criterion</th><th scope="col">Score</th><th scope="col">Weighted</th></tr></thead>
+            <tbody><tr><th scope="row">Delivery impact</th><td>3/5</td><td>24.0</td></tr><tr><th scope="row">Evidence confidence</th><td>4/5</td><td>24.0</td></tr><tr><th scope="row">Actionability</th><td>3/5</td><td>18.0</td></tr><tr class="score-total"><th scope="row">Weighted total</th><td></td><td>66.0/100</td></tr></tbody>
+          </table></div>
+        </section>
+        <section class="uncertainty"><h3>Remaining uncertainty</h3><p>Merged-main profiles have not yet established whether x64 array access or allocation dominates after PR #21.</p></section>
+        
+        
+        <details><summary>Deep dive</summary><p>Review the rejected call hypotheses and the profile needed to rank x64 array versus allocation work.</p><p class="prompt"><strong>Continue with the user:</strong> Report the residual frontier now; do not begin another optimization wave until PR #27 is delivered and main is freshly profiled.</p><div class="deep-actions"><button type="button" data-copy-prompt="Report the residual frontier now; do not begin another optimization wave until PR #27 is delivered and main is freshly profiled.">Copy discussion prompt</button><span data-copy-status role="status"></span></div></details>
+      </article>
+    
+      <section class="recommendation" aria-labelledby="__report-recommendation-heading">
+        <div class="recommendation-label">Recommendation</div>
+        <h2 id="__report-recommendation-heading">Pinned-core correction is proven on both generated-code architectures</h2>
+        <p>The i386 and shared-waiter dependencies are delivered and exact merged main is green. Draft PR #27 is therefore the active route: converge the exact pinned-core, green-main, durable-evidence, and durable-report gates before another optimization wave.</p>
+      </section>
+  </main>
+  <script>
+    document.querySelectorAll('.report-card').forEach((card) => {
+      card.querySelectorAll('[data-state-view]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const view = button.dataset.stateView;
+          card.querySelectorAll('[data-state-view]').forEach((candidate) => {
+            candidate.setAttribute('aria-pressed', String(candidate === button));
+          });
+          card.querySelectorAll('[data-state]').forEach((state) => {
+            state.hidden = view !== 'both' && state.dataset.state !== view;
+          });
+        });
+      });
+    });
+
+    const copyPromptText = async (prompt) => {
+      try {
+        if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+        await navigator.clipboard.writeText(prompt);
+        return true;
+      } catch (_) {
+        let area = null;
+        try {
+          area = document.createElement('textarea');
+          area.value = prompt;
+          area.style.position = 'fixed';
+          area.style.opacity = '0';
+          area.setAttribute('aria-hidden', 'true');
+          document.body.appendChild(area);
+          area.select();
+          return document.execCommand('copy') === true;
+        } catch (_) {
+          return false;
+        } finally {
+          if (area) area.remove();
+        }
+      }
+    };
+
+    document.querySelectorAll('[data-copy-prompt]').forEach((copy) => {
+      copy.addEventListener('click', async () => {
+        const status = copy.parentElement.querySelector('[data-copy-status]');
+        status.textContent = 'Copying…';
+        const copied = await copyPromptText(copy.dataset.copyPrompt);
+        status.textContent = copied ? 'Copied' : 'Copy failed';
+      });
+    });
+
+    document.querySelectorAll('[data-diagram]').forEach((diagram) => {
+      const steps = JSON.parse(diagram.dataset.steps);
+      const status = diagram.querySelector('[data-diagram-status]');
+      let current = -1;
+      let timer = null;
+      const show = (index) => {
+        current = index;
+        const step = current >= 0 ? steps[current] : null;
+        diagram.querySelectorAll('[data-element-id]').forEach((element) => {
+          element.classList.toggle('is-active', Boolean(step && step.highlights.includes(element.dataset.elementId)));
+        });
+        status.textContent = step ? `${current + 1}/${steps.length}: ${step.label}` : 'Ready';
+      };
+      const pause = () => { if (timer) clearInterval(timer); timer = null; };
+      diagram.querySelector('[data-diagram-action="play"]').addEventListener('click', () => {
+        pause();
+        show((current + 1) % steps.length);
+        timer = setInterval(() => show((current + 1) % steps.length), 1200);
+      });
+      diagram.querySelector('[data-diagram-action="pause"]').addEventListener('click', pause);
+      diagram.querySelector('[data-diagram-action="step"]').addEventListener('click', () => { pause(); show((current + 1) % steps.length); });
+      diagram.querySelector('[data-diagram-action="reset"]').addEventListener('click', () => { pause(); show(-1); });
+    });
+  </script>
+</body>
+</html>
