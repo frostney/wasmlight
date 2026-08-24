@@ -94,14 +94,16 @@ procedure NativeInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
 
 implementation
 
+{$IFDEF WASM_JIT_BACKEND}
 uses
   {$IFDEF WASM_JIT_ARM64}
-  Wasm.Jit.Arm64,
+  Wasm.Jit.Arm64
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
-  Wasm.Jit.X64,
+  Wasm.Jit.X64
   {$ENDIF}
-  SysUtils;
+  ;
+{$ENDIF}
 
 function NativeHostArch: Byte;
 begin
