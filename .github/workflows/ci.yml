@@ -188,6 +188,44 @@ jobs:
             echo "::error::a non-module was accepted"; exit 1
           fi
 
+      - name: runtime-shell audit
+        run: |
+          set -euo pipefail
+          SHELL_BIN=./build/wasmlight-shell${{ matrix.exe }}
+          test -x "$SHELL_BIN"
+          set +e
+          "$SHELL_BIN" >/tmp/shell-empty.out 2>/tmp/shell-empty.err
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::empty shell template exited 0"; exit 1
+          fi
+          if ! grep -q 'no embedded module' /tmp/shell-empty.err; then
+            echo "::error::empty shell template did not report a missing module"
+            cat /tmp/shell-empty.err
+            exit 1
+          fi
+          if [ "${{ matrix.jit }}" = "true" ]; then
+            if command -v nm >/dev/null 2>&1; then
+              if nm -a "$SHELL_BIN" | grep -Ei 'JitCanCompile|JitStageFunctionBytes|JitForceCompile|JitCompileToBuffer|InterpTierInvoke'; then
+                echo "::error::runtime shell contains interpreter dispatch or JIT compiler symbols"
+                exit 1
+              fi
+            fi
+            if command -v otool >/dev/null 2>&1; then
+              DEPS=$(otool -L "$SHELL_BIN")
+            elif command -v ldd >/dev/null 2>&1; then
+              DEPS=$(ldd "$SHELL_BIN")
+            else
+              DEPS=""
+            fi
+            if printf '%s\n' "$DEPS" | grep -Ei 'libclang|libzig|libwasmer|zig'; then
+              echo "::error::runtime shell links a host compiler, linker, or foreign runtime"
+              echo "$DEPS"
+              exit 1
+            fi
+          fi
+
       # The upstream conformance corpus is the project's strongest oracle,
       # fetched at a PINNED commit (tests/spec/testsuite is gitignored; the SHA
       # lives in tests/spec/testsuite.commit for reproducibility). The
