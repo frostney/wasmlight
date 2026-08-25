@@ -23,6 +23,7 @@ program Wasm.Shell.Test;
 {$ENDIF}
 
 uses
+  Classes,
   SysUtils,
 
   TestingPascalLibrary,
@@ -68,6 +69,16 @@ const
     '  (memory (export "memory") 1)' + sLineBreak +
     '  (func (export "_start") (call $proc_exit (i32.const 42))))';
 
+  CALL_EXIT_WAT =
+    '(module' + sLineBreak +
+    '  (import "wasi_snapshot_preview1" "proc_exit"' + sLineBreak +
+    '    (func $proc_exit (param i32)))' + sLineBreak +
+    '  (memory (export "memory") 1)' + sLineBreak +
+    '  (func $inc (param i32) (result i32)' + sLineBreak +
+    '    (i32.add (local.get 0) (i32.const 1)))' + sLineBreak +
+    '  (func (export "_start")' + sLineBreak +
+    '    (call $proc_exit (call $inc (i32.const 41)))))';
+
   NO_START_WAT =
     '(module (memory (export "memory") 1))';
 
@@ -91,6 +102,7 @@ type
     function CapturedStdout: string;
     function BuildNative(const ABytes: TWasmBytes): TWasmBytes;
     function PayloadForWat(const AWat: string): TWasmBytes;
+    function WriteTempPayload(const ABytes: TWasmBytes): string;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -111,6 +123,10 @@ type
     procedure TestTrapNativeOrClosed;
     procedure TestAddExitNativeOrClosed;
     procedure TestProcExitNativeOrClosed;
+    procedure TestCallNativeOrClosed;
+    procedure TestMissingPayloadFile;
+    procedure TestIncompletePayloadFile;
+    procedure TestHelloViaPayloadFile;
   end;
 
 procedure TShellTests.BeforeEach;
@@ -164,6 +180,21 @@ var
 begin
   Module := AssembleWatText(AWat);
   Result := WriteShellPayload(Module, BuildNative(Module), nil, nil);
+end;
+
+function TShellTests.WriteTempPayload(const ABytes: TWasmBytes): string;
+var
+  Stream: TFileStream;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir) +
+    'wasmlight-shell-' + IntToStr(GetTickCount64) + '.wshl';
+  Stream := TFileStream.Create(Result, fmCreate);
+  try
+    if Length(ABytes) > 0 then
+      Stream.WriteBuffer(ABytes[0], Length(ABytes));
+  finally
+    Stream.Free;
+  end;
 end;
 
 procedure TShellTests.TestEmptyPayload;
@@ -388,6 +419,82 @@ begin
   Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
 end;
 
+procedure TShellTests.TestCallNativeOrClosed;
+var
+  Res: TWasmShellResult;
+begin
+  { wasm-to-wasm call through native entries: $inc then proc_exit. }
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellBytes(PayloadForWat(CALL_EXIT_WAT), FConfig);
+  {$IFDEF WASM_JIT_BACKEND}
+  if JitExecMemSupported then
+  begin
+    Expect<Integer>(Res.ExitCode).ToBe(42);
+    Exit;
+  end;
+  {$ENDIF}
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+end;
+
+procedure TShellTests.TestMissingPayloadFile;
+var
+  Res: TWasmShellResult;
+  Missing: string;
+begin
+  Missing := IncludeTrailingPathDelimiter(GetTempDir) +
+    'wasmlight-shell-missing-' + IntToStr(GetTickCount64) + '.wshl';
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellFile(Missing, FConfig);
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('not found', Res.Diagnostic) > 0).ToBe(True);
+end;
+
+procedure TShellTests.TestIncompletePayloadFile;
+var
+  Module, Payload: TWasmBytes;
+  Path: string;
+  Res: TWasmShellResult;
+begin
+  Module := AssembleWatText(HELLO_WAT);
+  Payload := WriteShellPayload(Module, nil, nil, nil);
+  Path := WriteTempPayload(Payload);
+  try
+    FConfig := TWasmWasiConfig.Create;
+    Res := RunShellFile(Path, FConfig);
+    Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+    Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+    Expect<Boolean>(CapturedStdout = '').ToBe(True);
+  finally
+    DeleteFile(Path);
+  end;
+end;
+
+procedure TShellTests.TestHelloViaPayloadFile;
+var
+  Path: string;
+  Res: TWasmShellResult;
+begin
+  Path := WriteTempPayload(PayloadForWat(HELLO_WAT));
+  try
+    FConfig := TWasmWasiConfig.Create;
+    Res := RunShellFile(Path, FConfig);
+    {$IFDEF WASM_JIT_BACKEND}
+    if JitExecMemSupported then
+    begin
+      Expect<Integer>(Res.ExitCode).ToBe(0);
+      Expect<Boolean>(CapturedStdout = 'hello' + #10).ToBe(True);
+      Exit;
+    end;
+    {$ENDIF}
+    Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+    Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+    Expect<Boolean>(CapturedStdout = '').ToBe(True);
+  finally
+    DeleteFile(Path);
+  end;
+end;
+
 procedure TShellTests.SetupTests;
 begin
   Test('an empty payload is the unfilled template', TestEmptyPayload);
@@ -414,6 +521,13 @@ begin
     TestAddExitNativeOrClosed);
   Test('proc_exit(42) through native _start, or fails closed',
     TestProcExitNativeOrClosed);
+  Test('a wasm-to-wasm call runs natively, or fails closed',
+    TestCallNativeOrClosed);
+  Test('a missing payload file is rejected', TestMissingPayloadFile);
+  Test('an incomplete payload file is EWasmLinkError, not interpreted',
+    TestIncompletePayloadFile);
+  Test('hello through a payload file runs natively, or fails closed',
+    TestHelloViaPayloadFile);
 end;
 
 begin

@@ -227,6 +227,21 @@ end;
 {$ENDIF}
 {$ENDIF}
 
+function NativeCanDirectCall(const AFn: TWasmIrFunction): Boolean;
+var
+  I: Integer;
+begin
+  { Mirrors Wasm.Jit.JitCanDirectCall without importing that unit: the
+    shell must not retain JitCanCompile / JitStageFunctionBytes. A nil
+    CompiledDirectEntry falls back to the generic compiled path. }
+  Result := False;
+  for I := 0 to High(AFn.Code) do
+    if AFn.Code[I].Op in
+      [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef] then
+      Exit;
+  Result := True;
+end;
+
 procedure NativeTierInvoke(const AStore: TWasmStore;
   const AFuncAddr: TWasmFuncAddr; const AParams, AResults: PWasmValue);
 var
@@ -236,6 +251,10 @@ begin
   AStore.CheckThread;
   Ctx := InterpContextFor(AStore);
   RetKind := ConsumeJitSeamReentry;
+  { Same consume as InterpTierInvoke: drop a leftover tail-target flag so a
+    module start cannot leak it into the subsequent `_start` invoke. The
+    shell has no interpreted callee to bounce to. }
+  ConsumeTierTailTarget;
   if AStore.Heap.CurrentFrame = nil then
   begin
     Ctx^.Depth := 0;
@@ -378,6 +397,9 @@ begin
         Native.Free;
         Exit;
       end;
+      if NativeCanDirectCall(Ir.Functions[Rec^.FuncIrIndex]) then
+        AStore.Funcs[Addr].CompiledDirectEntry :=
+          AStore.Funcs[Addr].CompiledEntry;
       Covered[Rec^.FuncIrIndex] := True;
     end;
 

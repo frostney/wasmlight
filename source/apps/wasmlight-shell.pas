@@ -28,7 +28,6 @@ uses
   {$IFDEF UNIX}
   cthreads,
   {$ENDIF}
-  Classes,
   SysUtils,
 
   Wasm.Core,
@@ -42,30 +41,6 @@ begin
   Result := nil;
 end;
 
-function ReadPayloadFile(const APath: string; out ABytes: TWasmBytes;
-  out AError: string): Boolean;
-var
-  Stream: TFileStream;
-begin
-  ABytes := nil;
-  AError := '';
-  Result := False;
-  try
-    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
-    try
-      SetLength(ABytes, Stream.Size);
-      if Stream.Size > 0 then
-        Stream.ReadBuffer(ABytes[0], Stream.Size);
-      Result := True;
-    finally
-      Stream.Free;
-    end;
-  except
-    on E: Exception do
-      AError := E.Message;
-  end;
-end;
-
 var
   Payload: TWasmBytes;
   Config: TWasmWasiConfig;
@@ -74,10 +49,11 @@ var
   Res: TWasmShellResult;
   Guest: array of string;
   I, GuestStart: Integer;
-  Err: string;
+  AttachPath: string;
 begin
   Payload := EmbeddedPayload;
   GuestStart := 1;
+  AttachPath := '';
   if Length(Payload) = 0 then
   begin
     if ParamCount < 1 then
@@ -86,11 +62,7 @@ begin
         '-shell: runtime shell has no embedded module');
       Halt(WASM_SHELL_EXIT_ERROR);
     end;
-    if not ReadPayloadFile(ParamStr(1), Payload, Err) then
-    begin
-      WriteLn(ErrOutput, PROGRAM_NAME + '-shell: ' + Err);
-      Halt(WASM_SHELL_EXIT_ERROR);
-    end;
+    AttachPath := ParamStr(1);
     GuestStart := 2;
   end;
 
@@ -107,7 +79,10 @@ begin
     Config.Stdout := OsOut;
     Config.Stderr := OsErr;
     Config.SetArgv(Guest);
-    Res := RunShellBytes(Payload, Config);
+    if AttachPath <> '' then
+      Res := RunShellFile(AttachPath, Config)
+    else
+      Res := RunShellBytes(Payload, Config);
   finally
     Config.Free;
     OsIn.Free;

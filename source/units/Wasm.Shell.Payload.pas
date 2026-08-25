@@ -77,15 +77,12 @@ begin
 end;
 
 function CopyRange(const ABytes: TWasmBytes; const AOff, ALen: NativeUInt): TWasmBytes;
-var
-  I: NativeUInt;
 begin
   Result := nil;
   if ALen = 0 then
     Exit;
   SetLength(Result, ALen);
-  for I := 0 to ALen - 1 do
-    Result[I] := ABytes[AOff + I];
+  Move(ABytes[AOff], Result[0], ALen);
 end;
 
 procedure WriteU16LE(var ABytes: TWasmBytes; const AOff: NativeUInt;
@@ -121,7 +118,7 @@ function WriteShellPayload(const AModule, ANative, AConnector,
   ACapability: TWasmBytes): TWasmBytes;
 var
   ModLen, NatLen, ConLen, CapLen, Total: NativeUInt;
-  I: NativeUInt;
+  Off: NativeUInt;
 begin
   Result := nil;
   ModLen := NativeUInt(Length(AModule));
@@ -143,19 +140,18 @@ begin
   WriteU32LE(Result, 12, UInt32(NatLen));
   WriteU32LE(Result, 16, UInt32(ConLen));
   WriteU32LE(Result, 20, UInt32(CapLen));
+  Off := NativeUInt(WSHL_HEADER_SIZE);
   if ModLen > 0 then
-    for I := 0 to ModLen - 1 do
-      Result[NativeUInt(WSHL_HEADER_SIZE) + I] := AModule[I];
+    Move(AModule[0], Result[Off], ModLen);
+  Off := Off + ModLen;
   if NatLen > 0 then
-    for I := 0 to NatLen - 1 do
-      Result[NativeUInt(WSHL_HEADER_SIZE) + ModLen + I] := ANative[I];
+    Move(ANative[0], Result[Off], NatLen);
+  Off := Off + NatLen;
   if ConLen > 0 then
-    for I := 0 to ConLen - 1 do
-      Result[NativeUInt(WSHL_HEADER_SIZE) + ModLen + NatLen + I] := AConnector[I];
+    Move(AConnector[0], Result[Off], ConLen);
+  Off := Off + ConLen;
   if CapLen > 0 then
-    for I := 0 to CapLen - 1 do
-      Result[NativeUInt(WSHL_HEADER_SIZE) + ModLen + NatLen + ConLen + I] :=
-        ACapability[I];
+    Move(ACapability[0], Result[Off], CapLen);
 end;
 
 function ParseShellPayload(const ABytes: TWasmBytes;

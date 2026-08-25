@@ -439,7 +439,7 @@ Pascal helper frame spans the native callee. Delicate or unsupported operations
 continue through the exact shared helpers. The code-generation plan is a side
 table over the validated IR, so no optimization rewrites or re-validates it.
 
-`wasmspec` is the third shipped program: it runs the `.wast` corpus through
+`wasmspec` is a shipped program: it runs the `.wast` corpus through
 `Wasm.Wast.Runner`, which assembles text modules, decodes, validates,
 instantiates, and executes assertions through the interpreter — SIMD judged
 per lane and `assert_exception` judged (Track H), so the `staged` column is
