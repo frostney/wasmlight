@@ -19,10 +19,10 @@ program wasmlight_shell;
 
 {$I Shared.inc}
 
-{ The build entry also passes -dWASM_RUNTIME_SHELL. Engine uses that to omit
-  RegisterInterpreter / InterpInvoke so GNU ld cannot keep InterpTierInvoke
-  (Darwin already dead-strips it). A program-file {$DEFINE} does not reach
-  units; do not put the define in Shared.inc. }
+(* The build entry passes -dWASM_RUNTIME_SHELL so Wasm.Engine omits
+   RegisterInterpreter / InterpInvoke. GNU ld otherwise keeps InterpTierInvoke;
+   Darwin already dead-strips it. A program-file DEFINE does not reach units.
+   Do not put this define in Shared.inc. *)
 {$DEFINE WASM_RUNTIME_SHELL}
 
 uses
