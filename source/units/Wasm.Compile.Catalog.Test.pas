@@ -25,6 +25,7 @@ type
     function MakeEntry(const AId: TWasmTargetId; const AVersion: string;
       const AFileName: string; const ABytes: TWasmBytes): TWasmShellEntry;
     function WriteReleaseCatalog(const ARoot: string): TWasmShellCatalog;
+    procedure ExpectEmptyEntry(const AEntry: TWasmShellEntry);
   public
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -44,9 +45,11 @@ type
     procedure TestUnknownTargetFailsBeforeCatalog;
     procedure TestMissingCatalogIsMissingShell;
     procedure TestMissingTargetIsMissingShell;
+    procedure TestMissingShellFileIsMissing;
     procedure TestDuplicateCatalogEntryRejected;
     procedure TestStaleVersionRejected;
     procedure TestMismatchedArchRejected;
+    procedure TestSelectMismatchedMetadata;
     procedure TestCorruptMagicRejected;
     procedure TestCorruptChecksumRejected;
     procedure TestEscapingFileNameRejected;
@@ -183,6 +186,13 @@ begin
   WriteText(IncludeTrailingPathDelimiter(ARoot) + SHELL_CATALOG_FILENAME,
     WriteShellCatalogText(Entries));
   Expect<Integer>(Ord(LoadShellCatalog(ARoot, Result))).ToBe(Ord(slrOk));
+end;
+
+procedure TCatalogTests.ExpectEmptyEntry(const AEntry: TWasmShellEntry);
+begin
+  Expect<string>(AEntry.Triple).ToBe('');
+  Expect<string>(AEntry.ShellPath).ToBe('');
+  Expect<Integer>(Ord(AEntry.Target)).ToBe(Ord(wtiNone));
 end;
 
 procedure TCatalogTests.BeforeEach;
@@ -359,6 +369,7 @@ begin
   Expect<Integer>(Ord(Res)).ToBe(Ord(ssrUnknownTarget));
   Expect<string>(FormatSelectError(Res, 'riscv64-linux')
     ).ToBe('target: unknown target "riscv64-linux"');
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestMissingCatalogIsMissingShell;
@@ -368,6 +379,7 @@ var
 begin
   Res := ResolveShell(FTempDir, 'aarch64-linux', Entry);
   Expect<Integer>(Ord(Res)).ToBe(Ord(ssrMissingShell));
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestMissingTargetIsMissingShell;
@@ -387,6 +399,25 @@ begin
     WriteShellCatalogText(Entries));
   Res := ResolveShell(FTempDir, 'x86_64-linux', Entry);
   Expect<Integer>(Ord(Res)).ToBe(Ord(ssrMissingShell));
+  ExpectEmptyEntry(Entry);
+end;
+
+procedure TCatalogTests.TestMissingShellFileIsMissing;
+var
+  Entries: TWasmShellEntries;
+  Bytes_: TWasmBytes;
+  Entry: TWasmShellEntry;
+  Res: TWasmShellSelectResult;
+begin
+  Bytes_ := SampleShell('absent');
+  SetLength(Entries, 1);
+  Entries[0] := MakeEntry(wtiAArch64Linux, PROGRAM_VERSION, 'aarch64-linux.shell',
+    Bytes_);
+  WriteText(IncludeTrailingPathDelimiter(FTempDir) + SHELL_CATALOG_FILENAME,
+    WriteShellCatalogText(Entries));
+  Res := ResolveShell(FTempDir, 'aarch64-linux', Entry);
+  Expect<Integer>(Ord(Res)).ToBe(Ord(ssrMissingShell));
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestDuplicateCatalogEntryRejected;
@@ -408,6 +439,7 @@ begin
     Catalog))).ToBe(Ord(slrDuplicateTarget));
   Expect<Integer>(Ord(ResolveShell(FTempDir, 'aarch64-linux', Entry))
     ).ToBe(Ord(ssrDuplicateShell));
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestStaleVersionRejected;
@@ -425,6 +457,7 @@ begin
     WriteShellCatalogText(Entries));
   Expect<Integer>(Ord(ResolveShell(FTempDir, 'aarch64-linux', Entry))
     ).ToBe(Ord(ssrStaleShell));
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestMismatchedArchRejected;
@@ -442,6 +475,28 @@ begin
     'checksum cbf29ce484222325' + #10;
   Expect<Integer>(Ord(ParseShellCatalogText(Text, Catalog))
     ).ToBe(Ord(slrCorruptCatalog));
+end;
+
+procedure TCatalogTests.TestSelectMismatchedMetadata;
+var
+  Catalog: TWasmShellCatalog;
+  Entry: TWasmShellEntry;
+  Bytes_: TWasmBytes;
+begin
+  Bytes_ := SampleShell('mismatch');
+  WriteBytes(IncludeTrailingPathDelimiter(FTempDir) + 'aarch64-linux.shell',
+    Bytes_);
+  Catalog.Root := FTempDir;
+  Catalog.FormatVersion := SHELL_CATALOG_FORMAT;
+  SetLength(Catalog.Entries, 1);
+  Catalog.Entries[0] := MakeEntry(wtiAArch64Linux, PROGRAM_VERSION,
+    'aarch64-linux.shell', Bytes_);
+  Catalog.Entries[0].Arch := wtaX64;
+  Catalog.Entries[0].ShellPath := IncludeTrailingPathDelimiter(FTempDir) +
+    'aarch64-linux.shell';
+  Expect<Integer>(Ord(SelectShell(Catalog, 'aarch64-linux', Entry))
+    ).ToBe(Ord(ssrMismatchedShell));
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestCorruptMagicRejected;
@@ -474,6 +529,7 @@ begin
     WriteShellCatalogText(Entries));
   Expect<Integer>(Ord(ResolveShell(FTempDir, 'aarch64-linux', Entry))
     ).ToBe(Ord(ssrCorruptShell));
+  ExpectEmptyEntry(Entry);
 end;
 
 procedure TCatalogTests.TestEscapingFileNameRejected;
@@ -533,12 +589,20 @@ end;
 
 procedure TCatalogTests.TestSelectErrorMessages;
 begin
+  Expect<string>(FormatSelectError(ssrUnknownTarget, 'riscv64-linux')
+    ).ToBe('target: unknown target "riscv64-linux"');
   Expect<string>(FormatSelectError(ssrMissingShell, 'x86_64-darwin')
     ).ToBe('target: no runtime shell for "x86_64-darwin"');
+  Expect<string>(FormatSelectError(ssrDuplicateShell, 'aarch64-linux')
+    ).ToBe('target: duplicate runtime shell for "aarch64-linux"');
   Expect<string>(FormatSelectError(ssrStaleShell, 'aarch64-linux')
     ).ToBe('target: stale runtime shell for "aarch64-linux"');
+  Expect<string>(FormatSelectError(ssrMismatchedShell, 'aarch64-linux')
+    ).ToBe('target: mismatched runtime shell for "aarch64-linux"');
   Expect<string>(FormatSelectError(ssrCorruptCatalog, 'aarch64-linux')
     ).ToBe('target: corrupt shell catalog');
+  Expect<string>(FormatSelectError(ssrCorruptShell, 'x86_64-linux')
+    ).ToBe('target: corrupt runtime shell for "x86_64-linux"');
 end;
 
 procedure TCatalogTests.SetupTests;
@@ -567,11 +631,15 @@ begin
   Test('a missing catalog is a missing shell', TestMissingCatalogIsMissingShell);
   Test('a catalog without the requested target is missing',
     TestMissingTargetIsMissingShell);
+  Test('a catalog entry whose file is absent is missing',
+    TestMissingShellFileIsMissing);
   Test('duplicate catalog entries fail before selection',
     TestDuplicateCatalogEntryRejected);
   Test('a stale compiler version is rejected', TestStaleVersionRejected);
   Test('arch/os/format that disagree with the triple are corrupt',
     TestMismatchedArchRejected);
+  Test('SelectShell reports mismatched metadata with a distinct reason',
+    TestSelectMismatchedMetadata);
   Test('a bad catalog magic is corrupt', TestCorruptMagicRejected);
   Test('a checksum mismatch is a corrupt shell', TestCorruptChecksumRejected);
   Test('a catalog file that escapes the root is rejected',

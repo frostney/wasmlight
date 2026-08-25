@@ -815,7 +815,10 @@ begin
     Exit(ssrMismatchedShell);
   end;
   if AEntry.Version <> PROGRAM_VERSION then
+  begin
+    ClearEntry(AEntry);
     Exit(ssrStaleShell);
+  end;
   Result := VerifyShellFile(AEntry);
   if Result <> ssrOk then
     ClearEntry(AEntry);
