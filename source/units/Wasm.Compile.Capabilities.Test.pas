@@ -93,6 +93,7 @@ type
     procedure SetupTests; override;
 
     procedure TestDefaultDeniesFilesystemAndEnv;
+    procedure TestApplyEmptySetIsDenyByDefault;
     procedure TestParseDirAndEnv;
     procedure TestParseDirAndEnvRejects;
     procedure TestFrozenCannotGrow;
@@ -298,6 +299,42 @@ begin
   end;
 end;
 
+procedure TCompileCapabilitiesTests.TestApplyEmptySetIsDenyByDefault;
+var
+  Caps: TWasmCompiledCapabilities;
+  Config: TWasmWasiConfig;
+  Probe: TWasiProbe;
+  Err: string;
+  OpenedFd: UInt32;
+begin
+  Caps := TWasmCompiledCapabilities.Create;
+  Config := TWasmWasiConfig.Create;
+  Probe := TWasiProbe.Create;
+  try
+    Expect<Integer>(Caps.PreopenCount).ToBe(0);
+    Expect<Integer>(Caps.EnvCount).ToBe(0);
+    Expect<Boolean>(Caps.ApplyToConfig(Config,
+      IncludeTrailingPathDelimiter(GetTempDir) + 'app', [], Err)).ToBe(True);
+    Expect<Boolean>(Caps.Frozen).ToBe(True);
+    Expect<Integer>(Length(Config.Preopens)).ToBe(0);
+    Expect<Integer>(Length(Config.Env)).ToBe(0);
+    Expect<Integer>(Length(Config.Argv)).ToBe(1);
+    Expect<Boolean>(Config.Argv[0] = 'app').ToBe(True);
+    Expect<Boolean>(Config.Stdin <> nil).ToBe(True);
+    Expect<Boolean>(Config.Stdout <> nil).ToBe(True);
+    Expect<Boolean>(Config.Stderr <> nil).ToBe(True);
+    Expect<Boolean>(Config.Clock <> nil).ToBe(True);
+    Expect<Boolean>(Config.Random <> nil).ToBe(True);
+    Probe.Open(Config);
+    Expect<UInt32>(Probe.EnvironCount).ToBe(0);
+    Expect<Int32>(Probe.PathOpen(3, 'x', OpenedFd)).ToBe(Ord(weBadf));
+  finally
+    Probe.Free;
+    Config.Free;
+    Caps.Free;
+  end;
+end;
+
 procedure TCompileCapabilitiesTests.TestParseDirAndEnv;
 var
   Caps: TWasmCompiledCapabilities;
@@ -310,6 +347,8 @@ begin
 
   Expect<Boolean>(TryParseCompiledEnvSpec('KEY=a=b', KeyValue, Err)).ToBe(True);
   Expect<Boolean>(KeyValue = 'KEY=a=b').ToBe(True);
+  Expect<Boolean>(TryParseCompiledEnvSpec('KEY=', KeyValue, Err)).ToBe(True);
+  Expect<Boolean>(KeyValue = 'KEY=').ToBe(True);
 
   Caps := TWasmCompiledCapabilities.Create;
   try
@@ -397,11 +436,10 @@ end;
 
 procedure TCompileCapabilitiesTests.TestRelativeHostIgnoresCwd;
 var
-  Cwd, Other, ExeDir, Resolved, Err: string;
+  Other, ExeDir, Resolved, Err: string;
   Saved: string;
 begin
   Saved := GetCurrentDir;
-  Cwd := MakeTempDir('wasmlight_caps_cwd_');
   Other := MakeTempDir('wasmlight_caps_other_');
   ExeDir := MakeTempDir('wasmlight_caps_exe_');
   try
@@ -413,7 +451,6 @@ begin
     Expect<Boolean>(Pos(Other, Resolved) = 0).ToBe(True);
   finally
     SetCurrentDir(Saved);
-    RemoveTree(Cwd);
     RemoveTree(Other);
     RemoveTree(ExeDir);
   end;
@@ -709,6 +746,8 @@ procedure TCompileCapabilitiesTests.SetupTests;
 begin
   Test('a default set grants no directories and no environment',
     TestDefaultDeniesFilesystemAndEnv);
+  Test('applying an empty set is deny-by-default WASI with no process env',
+    TestApplyEmptySetIsDenyByDefault);
   Test('GUEST=HOST and KEY=VALUE parse into the compiled set',
     TestParseDirAndEnv);
   Test('malformed dir and env specs are rejected',

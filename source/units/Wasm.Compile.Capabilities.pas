@@ -37,10 +37,10 @@ uses
   Wasm.Wasi.Types;
 
 const
-  { Directory rights granted to a compiled preopen. Same bundle as
-    WASM_RUN_DIR_RIGHTS so a compiled `--dir` is observationally identical
+  { Directory rights granted to a compiled preopen. Aliases the shared
+    preopen bundle so a compiled `--dir` is observationally identical
     to `wasmlight run --dir`. }
-  WASM_COMPILED_DIR_RIGHTS: TWasmWasiRights = UInt64($1FFFFFFF);
+  WASM_COMPILED_DIR_RIGHTS: TWasmWasiRights = WASM_PREOPEN_DIR_RIGHTS;
 
 type
   { One compiled preopen, stored as the compile-time GUEST=HOST pair. HostPath
