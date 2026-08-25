@@ -3,11 +3,12 @@
   `wasmlight compile <module.wasm> -o <executable>` is the native-application
   command: validate once, compile every guest function, and emit a complete
   interpreter-free executable. Sibling work still owns the strict AOT API,
-  runtime shells, payload format, and connector language. This unit wires
-  the command contract around those stages so the CLI, `--target`, and
-  `--connector` exist and fail with structured diagnostics rather than
-  silently falling back to a `.waot` cache, the JIT, the interpreter,
-  ambient discovery, or the network.
+  runtime shells, and payload format. Selected `--connector` files are
+  parsed through `Wasm.Connector`; resolution and embedding remain later
+  work. This unit wires the command contract around those stages so the
+  CLI, `--target`, and `--connector` exist and fail with structured
+  diagnostics rather than silently falling back to a `.waot` cache, the
+  JIT, the interpreter, ambient discovery, or the network.
 
   It is a THIN driver over the shipped decode/validate path, adding no tier
   logic and never publishing output until every stage succeeds:
@@ -20,8 +21,8 @@
                            distinct.
     3. Connectors        — explicit `--connector` paths only. A selected
                            file that cannot be read, a duplicate path, or
-                           the not-yet-available connector language is
-                           EWasmConnectorError.
+                           malformed `.wlc` is EWasmConnectorError from
+                           Wasm.Connector. Resolution is later work.
     4. Link              — deny-by-default: any import is an
                            EWasmLinkError until compiled WASI (#40) and
                            connector resolution (#42) exist.
@@ -63,15 +64,10 @@ const
   WASM_COMPILE_TARGET_I386_WIN32 = 'i386-win32';
 
 type
-  { A connector-selection failure: a missing, duplicate, or unreadable
-    `--connector` path, or the connector language not being available yet.
-    A SIBLING of EWasmLinkError, not a subclass — link is "this import is
-    unsatisfied"; this is "the selected connector cannot be used". }
-  EWasmConnectorError = class(EWasmError);
-
   { A strict-compile decline: a function could not be compiled, or the
     all-or-fail AOT entry is not available yet. Not a trap and not a
-    `.waot` decline record. }
+    `.waot` decline record. Connector failures use Wasm.Connector's
+    EWasmConnectorError — this unit does not redeclare it. }
   EWasmCompileError = class(EWasmError);
 
   { Runtime-shell / target-packaging failure, including an unreleased or
@@ -152,6 +148,7 @@ procedure PackageCompilePayload(const ATarget: string);
 implementation
 
 uses
+  Wasm.Connector,
   Wasm.Module,
   Wasm.Runtime.Traps;
 
@@ -341,6 +338,20 @@ begin
   Result := False;
 end;
 
+function ReadConnectorSource(const APath: string): string;
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then
+      Stream.ReadBuffer(Result[1], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
 procedure CheckConnectors(const AConnectors: array of string);
 var
   I, J: Integer;
@@ -358,11 +369,18 @@ begin
     if not FileExists(Path) then
       raise EWasmConnectorError.Create('cannot read connector "' +
         Path + '"');
+    try
+      { Parse for validity. Resolution and unused-declaration stripping
+        belong to issue #42; the document is discarded here. }
+      ParseConnector(ReadConnectorSource(Path));
+    except
+      on E: EWasmConnectorError do
+        raise;
+      on E: EStreamError do
+        raise EWasmConnectorError.Create('cannot read connector "' +
+          Path + '"');
+    end;
   end;
-
-  if Length(AConnectors) > 0 then
-    raise EWasmConnectorError.Create(
-      'connector language is not yet available');
 end;
 
 procedure CheckLink(const ALoaded: TWasmLoadedModule);

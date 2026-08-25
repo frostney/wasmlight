@@ -200,13 +200,14 @@ source, raised by the wat assembler with upstream's canonical prefixes: a
 `assert_malformed` over a text operand keys on this class where over a
 binary operand it keys on `EWasmDecodeError`.
 
-`Wasm.Compile` adds three further compile-surface siblings under
-`EWasmError`: `EWasmConnectorError` (a selected connector cannot be
-used), `EWasmCompileError` (strict compile declined or is not available),
-and `EWasmPackagingError` (target or runtime-shell packaging). They are
-not guest faults and are not subclasses of `EWasmLinkError` or
-`EWasmTrap`. Output I/O stays `EStreamError` so a write failure is not
-folded into those classes.
+`Wasm.Connector` defines `EWasmConnectorError` (a sibling of
+`EWasmTextError`, carrying `Line`/`Column`) for malformed `.wlc` source
+and for a selected connector that cannot be read. `Wasm.Compile` adds two
+further compile-surface siblings under `EWasmError`: `EWasmCompileError`
+(strict compile declined or is not available) and `EWasmPackagingError`
+(target or runtime-shell packaging). They are not guest faults and are
+not subclasses of `EWasmLinkError` or `EWasmTrap`. Output I/O stays
+`EStreamError` so a write failure is not folded into those classes.
 
 ## What is shipped today
 

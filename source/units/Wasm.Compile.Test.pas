@@ -1,8 +1,8 @@
 { Unit suite for Wasm.Compile — the `wasmlight compile` core (ADR-0015).
 
-  The command is wired before the strict AOT, connector language, and
-  runtime-shell work land: these tests prove the CLI contract and the
-  structured failure stages, not a shipped native executable. Every module
+  The command is wired before the strict AOT and runtime-shell work
+  land: these tests prove the CLI contract, selected-connector parse,
+  and the structured failure stages, not a shipped native executable. Every module
   is assembled from wat through the shipped assembler. Output paths are
   temp files that must stay absent (or unchanged) after a failed compile.
   No network, no `.waot` fallback, no interpreter/JIT execution. }
@@ -17,6 +17,7 @@ uses
   CLI.Options,
   TestingPascalLibrary,
   Wasm.Compile,
+  Wasm.Connector,
   Wasm.Core,
   Wasm.Wat.Assembler;
 
@@ -78,7 +79,8 @@ type
     procedure TestRepeatableConnectors;
     procedure TestDuplicateConnectorIsError;
     procedure TestMissingConnectorFileIsError;
-    procedure TestConnectorStubFailsWithoutLinking;
+    procedure TestValidConnectorDoesNotSatisfyImports;
+    procedure TestMalformedConnectorIsParseError;
     procedure TestDecodeFailure;
     procedure TestValidationFailure;
     procedure TestImportWithoutConnectorIsLinkError;
@@ -375,20 +377,23 @@ end;
 
 procedure TCompileTests.TestRepeatableConnectors;
 var
+  Res: TWasmCompileResult;
   Request: TWasmCompileRequest;
   One, Two: string;
 begin
   One := IncludeTrailingPathDelimiter(FTempDir) + 'one.wlc';
   Two := IncludeTrailingPathDelimiter(FTempDir) + 'two.wlc';
-  WriteUtf8File(One, 'connector one');
-  WriteUtf8File(Two, 'connector two');
-  Request := NewRequest('');
+  WriteUtf8File(One, '// first connector' + sLineBreak);
+  WriteUtf8File(Two, '// second connector' + sLineBreak);
+  Request := NewRequest(WASM_COMPILE_TARGET_AARCH64_DARWIN);
   SetLength(Request.Connectors, 2);
   Request.Connectors[0] := One;
   Request.Connectors[1] := Two;
-  Expect<Integer>(Length(Request.Connectors)).ToBe(2);
-  Expect<string>(Request.Connectors[0]).ToBe(One);
-  Expect<string>(Request.Connectors[1]).ToBe(Two);
+  Res := CompileModuleBytes(AssembleWatText(EMPTY_WAT), Request);
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmCompileError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('EWasmConnectorError', Res.Diagnostic) > 0).ToBe(False);
+  Expect<Boolean>(OutputExists).ToBe(False);
   DeleteFile(One);
   DeleteFile(Two);
 end;
@@ -400,7 +405,7 @@ var
   One: string;
 begin
   One := IncludeTrailingPathDelimiter(FTempDir) + 'dup.wlc';
-  WriteUtf8File(One, 'connector');
+  WriteUtf8File(One, '// duplicate connector' + sLineBreak);
   Request := NewRequest(WASM_COMPILE_TARGET_AARCH64_DARWIN);
   SetLength(Request.Connectors, 2);
   Request.Connectors[0] := One;
@@ -429,25 +434,48 @@ begin
   Expect<Boolean>(OutputExists).ToBe(False);
 end;
 
-procedure TCompileTests.TestConnectorStubFailsWithoutLinking;
+procedure TCompileTests.TestValidConnectorDoesNotSatisfyImports;
 var
   Res: TWasmCompileResult;
   Request: TWasmCompileRequest;
   Connector: string;
 begin
-  { A module with an import AND a named connector must fail as a connector
-    error, not a link error: the user selected a connector, so that stage
-    owns the failure until the language exists. }
+  { Parsing a selected connector does not resolve guest imports; that is
+    issue #42. Until then an import stays an EWasmLinkError. }
   Connector := IncludeTrailingPathDelimiter(FTempDir) + 'env.wlc';
-  WriteUtf8File(Connector, 'not yet a connector language');
+  WriteUtf8File(Connector,
+    'static class Env {' + sLineBreak +
+    '  [DllImport("env")]' + sLineBreak +
+    '  static extern void foo();' + sLineBreak +
+    '}' + sLineBreak);
   Request := NewRequest(WASM_COMPILE_TARGET_AARCH64_DARWIN);
   SetLength(Request.Connectors, 1);
   Request.Connectors[0] := Connector;
   Res := CompileModuleBytes(AssembleWatText(IMPORT_WAT), Request);
   Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('"env"."foo"', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('EWasmConnectorError', Res.Diagnostic) > 0).ToBe(False);
+  Expect<Boolean>(OutputExists).ToBe(False);
+  DeleteFile(Connector);
+end;
+
+procedure TCompileTests.TestMalformedConnectorIsParseError;
+var
+  Res: TWasmCompileResult;
+  Request: TWasmCompileRequest;
+  Connector: string;
+begin
+  Connector := IncludeTrailingPathDelimiter(FTempDir) + 'bad.wlc';
+  WriteUtf8File(Connector,
+    'static class C { [DllImport("x")] static extern int f() { return 1; } }');
+  Request := NewRequest(WASM_COMPILE_TARGET_AARCH64_DARWIN);
+  SetLength(Request.Connectors, 1);
+  Request.Connectors[0] := Connector;
+  Res := CompileModuleBytes(AssembleWatText(EMPTY_WAT), Request);
+  Expect<Integer>(Res.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('EWasmConnectorError', Res.Diagnostic) > 0).ToBe(True);
-  Expect<Boolean>(Pos('connector language is not yet available',
-    Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos(MSG_WLC_METHOD_BODY, Res.Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(False);
   Expect<Boolean>(OutputExists).ToBe(False);
   DeleteFile(Connector);
@@ -636,13 +664,16 @@ begin
     TestUnreleasedTargetFailsAsPackaging);
   Test('flag-shaped -o and --connector values are kept',
     TestFlagShapedOutputAndConnectorValues);
-  Test('repeatable --connector records every path', TestRepeatableConnectors);
+  Test('repeatable --connector parses every selected file',
+    TestRepeatableConnectors);
   Test('a duplicate --connector is a connector error',
     TestDuplicateConnectorIsError);
   Test('a missing --connector file is a connector error',
     TestMissingConnectorFileIsError);
-  Test('a selected connector fails before link',
-    TestConnectorStubFailsWithoutLinking);
+  Test('a parsed connector does not satisfy imports',
+    TestValidConnectorDoesNotSatisfyImports);
+  Test('a malformed --connector file is a connector error',
+    TestMalformedConnectorIsParseError);
   Test('garbage bytes are a decode error', TestDecodeFailure);
   Test('an ill-typed module is a validation error', TestValidationFailure);
   Test('an import without a connector is a link error',
