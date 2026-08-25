@@ -22,6 +22,7 @@ uses
   CLI.Options,
   CLI.Parser,
 
+  Wasm.Abi,
   Wasm.Aot,
   Wasm.Binary,
   Wasm.Core,
@@ -29,6 +30,7 @@ uses
   Wasm.Engine,
   Wasm.Jit,
   Wasm.Module,
+  Wasm.Native.Call,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values,
   Wasm.Wat.Assembler;
@@ -40,13 +42,14 @@ const
   DEFAULT_MEMORY_ITERATIONS = 10000000;
   DEFAULT_NUMERIC_ITERATIONS = 1000000;
   DEFAULT_SIMD_ITERATIONS = 1000000;
+  DEFAULT_HOSTCALL_ITERATIONS = 1000000;
   DEFAULT_SAMPLES = 1;
 
 type
   TExecutionTier = (etInterp, etJit, etAot);
   TExecutionTiers = set of TExecutionTier;
   TBenchmarkWorkload = (bwDecode, bwLeb128, bwStartup, bwLoop, bwFib,
-    bwMemory, bwMemoryVarying, bwNumeric, bwSimd);
+    bwMemory, bwMemoryVarying, bwNumeric, bwSimd, bwHostCall);
   TBenchmarkWorkloads = set of TBenchmarkWorkload;
   TInt64Samples = array of Int64;
 
@@ -165,6 +168,11 @@ begin
   end;
 end;
 
+function BenchAddI32(A, B: Int32): Int32; cdecl;
+begin
+  Result := A + B;
+end;
+
 procedure Report(const AName: string; const AIterations: Int64;
   const ABytesEach: Int64; const AElapsedMs: Int64);
 var
@@ -186,6 +194,34 @@ begin
 
   WriteLn(Format('%-24s %10d iter %8d ms %12.1f ns/op %10.1f MiB/s',
     [AName, AIterations, AElapsedMs, NsPerOp, MbPerSec]));
+end;
+
+procedure BenchHostCall(const AIterations: Integer);
+var
+  Plan: TWasmAbiPlan;
+  Ret: TWasmAbiValue;
+  I: Integer;
+  Started: Int64;
+  Sum: Int64;
+begin
+  if not NativeCallSupported then
+  begin
+    WriteLn(Format('%-24s (skipped: native calls are 64-bit Unix only)',
+      ['host call']));
+    Exit;
+  end;
+  Plan := PlanCall(AbiHostTarget, AbiSignature([AbiI32, AbiI32], AbiI32));
+  ApplyNativeCall(Plan, @BenchAddI32, [AbiValueI32(1), AbiValueI32(2)], Ret);
+  Sum := AbiValueAsI32(Ret);
+  Started := GetTickCount64;
+  for I := 1 to AIterations do
+  begin
+    ApplyNativeCall(Plan, @BenchAddI32, [AbiValueI32(I), AbiValueI32(1)], Ret);
+    Inc(Sum, AbiValueAsI32(Ret));
+  end;
+  Report('host call', AIterations, 8, GetTickCount64 - Started);
+  if Sum = 0 then
+    WriteLn('host call produced a zero accumulator');
 end;
 
 procedure BenchDecodeModule(const AIterations: Integer);
@@ -870,6 +906,8 @@ begin
     AWorkloads := [bwNumeric]
   else if AValue = 'simd' then
     AWorkloads := [bwSimd]
+  else if (AValue = 'host-call') or (AValue = 'hostcall') then
+    AWorkloads := [bwHostCall]
   else
     Result := False;
 end;
@@ -895,19 +933,19 @@ var
   WorkloadOpt, TierOpt: TStringOption;
   IterationsOpt, ExecutionIterationsOpt, FibInputOpt,
     MemoryIterationsOpt, NumericIterationsOpt, SimdIterationsOpt,
-    SamplesOpt: TIntegerOption;
+    HostCallIterationsOpt, SamplesOpt: TIntegerOption;
   Workloads: TBenchmarkWorkloads;
   Tiers: TExecutionTiers;
   Iterations, ExecutionIterations, FibInput, MemoryIterations,
-    NumericIterations, SimdIterations,
+    NumericIterations, SimdIterations, HostCallIterations,
     SampleCount: Integer;
   WorkloadValue, TierValue: string;
 begin
   Options := TOptionList.Create;
   try
     WorkloadOpt := Options.AddString('workload',
-      'all|decode|leb128|startup|loop|fib|memory|memory-varying|numeric|simd ' +
-      '(default: all)');
+      'all|decode|leb128|startup|loop|fib|memory|memory-varying|numeric|simd|' +
+      'host-call (default: all)');
     TierOpt := Options.AddString('tier',
       'all|interp|jit|aot for execution workloads (default: all)');
     IterationsOpt := Options.AddInteger('iterations',
@@ -926,6 +964,9 @@ begin
     SimdIterationsOpt := Options.AddInteger('simd-iterations',
       'SIMD loop iterations per tier (default: ' +
       IntToStr(DEFAULT_SIMD_ITERATIONS) + ')');
+    HostCallIterationsOpt := Options.AddInteger('host-call-iterations',
+      'Native C-ABI call-plan iterations (default: ' +
+      IntToStr(DEFAULT_HOSTCALL_ITERATIONS) + ')');
     SamplesOpt := Options.AddInteger('samples',
       'Samples per execution workload and tier (default: ' +
       IntToStr(DEFAULT_SAMPLES) + ')');
@@ -951,6 +992,8 @@ begin
     NumericIterations := NumericIterationsOpt.ValueOr(
       DEFAULT_NUMERIC_ITERATIONS);
     SimdIterations := SimdIterationsOpt.ValueOr(DEFAULT_SIMD_ITERATIONS);
+    HostCallIterations := HostCallIterationsOpt.ValueOr(
+      DEFAULT_HOSTCALL_ITERATIONS);
     SampleCount := SamplesOpt.ValueOr(DEFAULT_SAMPLES);
     WorkloadValue := LowerCase(WorkloadOpt.ValueOr('all'));
     TierValue := LowerCase(TierOpt.ValueOr('all'));
@@ -1002,6 +1045,12 @@ begin
       ExitCode := 1;
       Exit;
     end;
+    if HostCallIterations <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --host-call-iterations must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
     if SampleCount <= 0 then
     begin
       WriteLn(ErrOutput, 'wasmbench: --samples must be positive');
@@ -1038,6 +1087,8 @@ begin
     if bwSimd in Workloads then
       BenchExecution('simd', BENCH_SIMD_WAT, SimdIterations, SimdIterations,
         0, SampleCount, Tiers);
+    if bwHostCall in Workloads then
+      BenchHostCall(HostCallIterations);
   finally
     Options.Free;
   end;

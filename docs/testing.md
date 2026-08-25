@@ -3,13 +3,14 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Fifty-seven suites today, including compiled WASI
+  independent programs. Sixty suites today, including compiled WASI
   capability-set coverage, the `wasmlight compile` CLI contract,
   catalog-discovery coverage, the native executable payload format, the
   Connector language lexer, parser, and resolve suites, `Wasm.Target.Test`,
   the runtime-shell payload and startup suites, Linux ELF runtime-shell
-  packager coverage, and the Mach-O packager and SHA-256 known-answer
-  suites.
+  packager coverage, the Mach-O packager and SHA-256 known-answer
+  suites, and 64-bit Unix C-ABI call-plan, local-library, and call-gate
+  coverage.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -132,6 +133,9 @@ instead.
 | `Wasm.Package.Elf.Test` | Linux ELF runtime-shell packaging: both `aarch64-linux` and `x86_64-linux` from a host with no linker, deterministic append-plus-trailer output, the template prefix copied unchanged, `PT_LOAD` extents left inside the original template, and the trailer field order pinned from the raw bytes. Distinct rejects for a machine mismatch, ELF32/endian/`ET_REL`/missing `PT_LOAD`, damaged payload, truncated extent, already-packaged file, nonzero reserved bytes, or an unknown target. Templates are the documented placeholder `ET_EXEC` (issue #34 is not required); an `ET_DYN` stand-in and an empty payload also package. A matching Linux host execs the packaged placeholder to exit 0. |
 | `Wasm.Native.Payload.Test` | The embedded native-executable payload: header and required-record round-trip, the FNV-1a module/shell/section hashes and self-checksum, and each structural reject (truncated header, bad magic, incompatible version, overflowing counts, checksum, identity mismatch, duplicate/missing/unknown section, bad section hash, empty function code, oversized code length, entryOffset past code, and directory offset/size boundaries) with literal bytes beside the assertion. |
 | `Wasm.Aot.Test` | The AOT layer end to end: compile a module to an artifact, load it into a fresh store (re-validating first), and prove the wired-up executable memory is byte-identical to a fresh JIT compile — plus a multi-function module, a large-frame module, and declined-function cases, gated on a live backend. Strict whole-module compile: success requires every defined function native; predicate, target, range, and backend declines raise `EWasmAotError`; a failed compile leaves no partial output; the `.waot` cache path still records declined functions. |
+| `Wasm.Abi.Test` | 64-bit Unix C-ABI call plans: LP64 layout, AAPCS64 scalar/HFA/B.4/x8 placement, Apple AAPCS64 natural stack packing, SysV register/stack/MEMORY-return placement, and pointer-view as an integer class — every target judged on every host. |
+| `Wasm.Native.Load.Test` | Application-local library resolution: platform filename beside the executable, relative join, literal absolute path, `..` escape, a cwd decoy ignored, and missing library as `EWasmLinkError`. |
+| `Wasm.Native.Call.Test` | Precompiled call gates: Pascal `cdecl` scalars/stack/aggregates/pointer-views, C and Pascal fixture libraries observationally identical on scalars, stack, pairs, HFAs, pointer-views, and large aggregates, missing symbol as `EWasmLinkError`; live calls gated to 64-bit Unix. |
 | `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
 | `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |
 | `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
