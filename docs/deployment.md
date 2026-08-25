@@ -79,10 +79,11 @@ instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas \
   --compiler ./build/wasmlight --out dist --catalog build/shells
 instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
   --archive dist/wasmlight-<version>-<display>.tar.gz \
-  --checksums dist/wasmlight-<version>-checksums.txt \
-  --compiler ./build/wasmlight
+  --checksums dist/wasmlight-<version>-checksums.txt
 ```
 
+Same-host verify runs `--version` (and compile gates, when present) on the
+packed compiler. `--compiler` is only a foreign-host fallback.
 `--synthesize-catalog` builds structural placeholder shells so the packer
 and verifier can run before live shells exist. `--require-compile` makes
 the compile gates mandatory.

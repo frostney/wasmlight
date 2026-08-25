@@ -216,32 +216,31 @@ var
   Bytes: TBytes;
   Stream: TFileStream;
   Machine: LongWord;
+  I: Integer;
+  Shell: TWasmDistroShell;
+  Wrong: string;
 begin
   Root := TempRoot;
   DistroSynthesizeCatalog(Root);
-  Stream := TFileStream.Create(DistroJoin(Root, DistroShellRelPath('x86_64-linux')),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    SetLength(Bytes, Stream.Size);
-    Stream.ReadBuffer(Bytes[0], Length(Bytes));
-  finally
-    Stream.Free;
+  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  begin
+    Shell := DistroShell(I);
+    Stream := TFileStream.Create(DistroJoin(Root, DistroShellRelPath(Shell.Triple)),
+      fmOpenRead or fmShareDenyWrite);
+    try
+      SetLength(Bytes, Stream.Size);
+      Stream.ReadBuffer(Bytes[0], Length(Bytes));
+    finally
+      Stream.Free;
+    end;
+    Expect<Integer>(Ord(DistroClassifyImage(Bytes, Machine))).ToBe(Ord(Shell.Image));
+    Expect<Boolean>(DistroImageMatchesShell(Bytes, Shell.Triple)).ToBe(True);
+    if I = DISTRO_SHELL_COUNT - 1 then
+      Wrong := DistroShell(0).Triple
+    else
+      Wrong := DistroShell(I + 1).Triple;
+    Expect<Boolean>(DistroImageMatchesShell(Bytes, Wrong)).ToBe(False);
   end;
-  Expect<Integer>(Ord(DistroClassifyImage(Bytes, Machine))).ToBe(Ord(wdiElf64));
-  Expect<Boolean>(DistroImageMatchesShell(Bytes, 'x86_64-linux')).ToBe(True);
-  Expect<Boolean>(DistroImageMatchesShell(Bytes, 'aarch64-linux')).ToBe(False);
-
-  Stream := TFileStream.Create(DistroJoin(Root, DistroShellRelPath('aarch64-darwin')),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    SetLength(Bytes, Stream.Size);
-    Stream.ReadBuffer(Bytes[0], Length(Bytes));
-  finally
-    Stream.Free;
-  end;
-  Expect<Integer>(Ord(DistroClassifyImage(Bytes, Machine))).ToBe(Ord(wdiMachO64));
-  Expect<Boolean>(DistroImageMatchesShell(Bytes, 'aarch64-darwin')).ToBe(True);
-  Expect<Boolean>(DistroImageMatchesShell(Bytes, 'x86_64-darwin')).ToBe(False);
 end;
 
 procedure TDistroTests.TestSwappedShellImage;
@@ -301,6 +300,9 @@ begin
   Expect<Boolean>(Status.IsOk).ToBe(True);
   Status := DistroChecksumsCoverArchives('0.2.0', Parsed);
   Expect<Boolean>(Status.IsOk).ToBe(True);
+  SetLength(Parsed, Length(Parsed) - 1);
+  Status := DistroChecksumsCoverArchives('0.2.0', Parsed);
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsChecksumMismatch));
 end;
 
 procedure TDistroTests.TestChecksumsRejectPath;
@@ -322,6 +324,7 @@ begin
     '  compile   Emit a native executable' + sLineBreak)).ToBe(True);
   Expect<Boolean>(DistroHelpListsCompile(
     '  aot        Ahead-of-time compile a module' + sLineBreak)).ToBe(False);
+  Expect<Boolean>(DistroHelpListsCompile('compile'#9'Emit a native executable')).ToBe(True);
   Expect<Boolean>(DistroUnknownCompileCommand(
     'wasmlight: unknown command: compile')).ToBe(True);
 end;
@@ -335,7 +338,7 @@ begin
   Test('a partial shell list is incomplete', TestRejectIncompleteCatalog);
   Test('an unknown shell triple is rejected', TestRejectUnknownShell);
   Test('a duplicated shell triple is rejected', TestRejectDuplicateShell);
-  Test('synthesized shells carry the target ELF or Mach-O magic', TestElfAndMachOMagic);
+  Test('every synthesized shell carries its ELF or Mach-O magic', TestElfAndMachOMagic);
   Test('a swapped shell image fails structural validation', TestSwappedShellImage);
   Test('a complete tree validates and a version mismatch does not', TestValidateTree);
   Test('AppleDouble names are forbidden in an archive tree', TestForbiddenAppleDouble);

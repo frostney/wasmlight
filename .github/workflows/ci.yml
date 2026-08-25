@@ -205,8 +205,7 @@ jobs:
           CHECKSUMS="$(ls "$RUNNER_TEMP/distro"/wasmlight-*-checksums.txt)"
           instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
             --archive "$ARCHIVE" \
-            --checksums "$CHECKSUMS" \
-            --compiler ./build/wasmlight
+            --checksums "$CHECKSUMS"
 
       # The upstream conformance corpus is the project's strongest oracle,
       # fetched at a PINNED commit (tests/spec/testsuite is gitignored; the SHA

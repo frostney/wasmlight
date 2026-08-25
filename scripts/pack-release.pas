@@ -221,6 +221,8 @@ begin
       Halt(2);
     end;
     Randomize;
+    Compiler := ExpandFileName(Compiler);
+    OutDir := ExpandFileName(OutDir);
     if not FileExists(Compiler) then
     begin
       WriteLn(ErrOutput, 'pack-release: compiler not found: ', Compiler);
@@ -244,7 +246,10 @@ begin
 
     CatalogKind := wdcLive;
     if ArgValue('catalog', CatalogDir) then
-      CatalogKind := wdcLive
+    begin
+      CatalogDir := ExpandFileName(CatalogDir);
+      CatalogKind := wdcLive;
+    end
     else if HasFlag('synthesize-catalog') then
     begin
       CatalogDir := IncludeTrailingPathDelimiter(GetTempDir) +
@@ -278,7 +283,12 @@ begin
     end;
     ForceDirectories(Stage);
     CopyFileTo(Compiler, DistroJoin(Stage, DISTRO_COMPILER_NAME));
-    RunTool('chmod', ['0755', DistroJoin(Stage, DISTRO_COMPILER_NAME)], Output);
+    if not RunTool('chmod', ['0755', DistroJoin(Stage, DISTRO_COMPILER_NAME)], Output) then
+    begin
+      WriteLn(ErrOutput, 'pack-release: chmod 0755 failed for ',
+        DistroJoin(Stage, DISTRO_COMPILER_NAME));
+      Halt(1);
+    end;
     if DirectoryExists(DistroJoin(CatalogDir, DISTRO_SHELL_ROOT)) then
       CopyTree(DistroJoin(CatalogDir, DISTRO_SHELL_ROOT),
         DistroJoin(Stage, DISTRO_SHELL_ROOT))

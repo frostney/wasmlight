@@ -152,7 +152,7 @@ lwpt test              # co-located unit suites
 ./build/wasmspec [--tier=interp|jit|aot] <script.wast|dir>...  # run .wast conformance scripts (assemble, validate, execute) in a chosen tier
 ./build/wasmbench                          # component benchmarks (measurement only)
 instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas --compiler ./build/wasmlight --out dist [--catalog DIR | --synthesize-catalog]  # pack one host archive + checksums line
-instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas --archive FILE --checksums FILE [--compiler PATH]  # verify layout, checksums, structure; compile gates when compile exists
+instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas --archive FILE --checksums FILE [--compiler PATH]  # verify layout, checksums, packed compiler; compile gates when compile exists
 ```
 
 ## Checking the spec

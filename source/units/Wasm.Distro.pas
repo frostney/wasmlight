@@ -821,7 +821,7 @@ begin
     begin
       Line := Trim(Lines[I]);
       if (Copy(Line, 1, 8) = 'compile ') or (Line = 'compile') or
-        (Copy(Line, 1, 7) = 'compile'#9) then
+        (Copy(Line, 1, 8) = 'compile'#9) then
         Exit(True);
     end;
   finally

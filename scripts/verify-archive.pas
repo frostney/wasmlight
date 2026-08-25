@@ -5,8 +5,10 @@ program VerifyArchive;
   layout, ELF/Mach-O structure, and — when `wasmlight compile` exists —
   native execution plus cross-target structural emission.
 
-  Cross-emission never executes a foreign binary. That is the 4-host
-  structural check, not a 16-cell execution matrix. }
+  Same-host verification always runs the compiler inside the archive.
+  `--compiler` is only a foreign-host fallback (the packed binary cannot
+  execute). Cross-emission never executes a foreign binary. That is the
+  4-host structural check, not a 16-cell execution matrix. }
 
 {$mode delphi}{$H+}
 
@@ -255,8 +257,8 @@ begin
 end;
 
 var
-  Archive, Checksums, Version, Compiler, Work, Output, UnpackRoot,
-    CatalogLabel: string;
+  Archive, Checksums, Version, Compiler, HostCompiler, Work, Output,
+    UnpackRoot, CatalogLabel: string;
   RequireCompile: Boolean;
   Status: TWasmDistroResult;
   Manifest: TWasmDistroManifest;
@@ -283,13 +285,19 @@ begin
       Fail('archive not found: ' + Archive);
     if not FileExists(Checksums) then
       Fail('checksums not found: ' + Checksums);
+    Archive := ExpandFileName(Archive);
+    Checksums := ExpandFileName(Checksums);
     ArgValue('version', Version);
-    ArgValue('compiler', Compiler);
+    ArgValue('compiler', HostCompiler);
+    if HostCompiler <> '' then
+      HostCompiler := ExpandFileName(HostCompiler);
     RequireCompile := HasFlag('require-compile');
     Randomize;
     if not ArgValue('work', Work) then
       Work := IncludeTrailingPathDelimiter(GetTempDir) +
-        'wasmlight-verify-' + IntToHex(Random(MaxInt), 8);
+        'wasmlight-verify-' + IntToHex(Random(MaxInt), 8)
+    else
+      Work := ExpandFileName(Work);
     ForceDirectories(Work);
 
     VerifyChecksum(Archive, Checksums);
@@ -326,16 +334,19 @@ begin
       ' host=', Manifest.HostTriple, ' catalog=', CatalogLabel);
     VerifyManifestHashes(UnpackRoot, Manifest);
 
-    if Compiler <> '' then
+    { The packed binary is what a download installs. A `--compiler`
+      override would let a broken archive pass against the workspace
+      build, so same-host checks always use the unpacked compiler. }
+    Compiler := DistroJoin(UnpackRoot, DISTRO_COMPILER_NAME);
+    if DistroCurrentHost(NativeHost) and (NativeHost.Triple = Manifest.HostTriple) then
       VerifyNativeCompiler(Compiler, Manifest.Version)
-    else
+    else if HostCompiler <> '' then
     begin
-      Compiler := DistroJoin(UnpackRoot, DISTRO_COMPILER_NAME);
-      if DistroCurrentHost(NativeHost) and (NativeHost.Triple = Manifest.HostTriple) then
-        VerifyNativeCompiler(Compiler, Manifest.Version)
-      else
-        WriteLn('verify-archive: skipped native --version (foreign host archive)');
-    end;
+      Compiler := HostCompiler;
+      VerifyNativeCompiler(Compiler, Manifest.Version);
+    end
+    else
+      WriteLn('verify-archive: skipped native --version (foreign host archive)');
 
     if CompilerHasCompile(Compiler) then
       VerifyCompileGates(Compiler, Work)
