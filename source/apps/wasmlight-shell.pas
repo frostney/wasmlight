@@ -19,9 +19,10 @@ program wasmlight_shell;
 
 {$I Shared.inc}
 
-{ Visible to every unit compiled into this program. Engine uses it to omit
+{ The build entry also passes -dWASM_RUNTIME_SHELL. Engine uses that to omit
   RegisterInterpreter / InterpInvoke so GNU ld cannot keep InterpTierInvoke
-  (Darwin already dead-strips it). Do not set this in Shared.inc. }
+  (Darwin already dead-strips it). A program-file {$DEFINE} does not reach
+  units; do not put the define in Shared.inc. }
 {$DEFINE WASM_RUNTIME_SHELL}
 
 uses

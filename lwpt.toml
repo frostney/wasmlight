@@ -23,8 +23,11 @@ wasmbench = { source = "source/apps/wasmbench.pas", output = "build/wasmbench" }
 wasmspec = { source = "source/apps/wasmspec.pas", output = "build/wasmspec" }
 # Interpreter-free runtime-shell template (#34). Smart-link so unused
 # interpreter-dispatch and JIT-emit routines from helper units are not
-# retained; the shell never calls those entry points.
-wasmlight-shell = { source = "source/apps/wasmlight-shell.pas", output = "build/wasmlight-shell", flags = ["-CX", "-XX"] }
+# retained; the shell never calls those entry points. `-dWASM_RUNTIME_SHELL`
+# is required so Wasm.Engine omits RegisterInterpreter / InterpInvoke —
+# a program-file {$DEFINE} does not reach units, and GNU ld keeps
+# InterpTierInvoke unless that uses-clause is gone.
+wasmlight-shell = { source = "source/apps/wasmlight-shell.pas", output = "build/wasmlight-shell", flags = ["-CX", "-XX", "-dWASM_RUNTIME_SHELL"] }
 
 # stamp-version derives source/units/Version.inc from this manifest's
 # [package].version, consumed by Wasm.Core's `{$I Version.inc}`. The
