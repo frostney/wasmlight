@@ -68,7 +68,8 @@ uses
   Wasm.Runtime.Store,
   Wasm.Runtime.Traps,
   Wasm.Runtime.Values,
-  Wasm.Validator;
+  Wasm.Validator,
+  Wasm.Wat.Assembler;
 
 const
   JIT_BACKEND_AVAILABLE = {$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF};
@@ -1680,6 +1681,8 @@ type
     procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
+    procedure TestLargeRegisterFileCompiles;
+    procedure TestWideCallCompiles;
     procedure TestCompiledCatchPayload;
     procedure TestCompiledCatchAll;
     procedure TestCompiledCatchRef;
@@ -3330,6 +3333,50 @@ begin
     [MakeValueI32(7)])).ToBe('');
 end;
 
+function LargeRegisterFileModuleBytes: TWasmBytes;
+var
+  Text: string;
+  I: Integer;
+begin
+  Text := '(module (func (export "big") (result i32)';
+  for I := 1 to 2048 do
+    Text := Text + ' (local i32)';
+  Text := Text + ' (local.set 2047 (i32.const 42)) (local.get 2047)))';
+  Result := AssembleWatText(Text);
+end;
+
+function WideCallModuleBytes: TWasmBytes;
+var
+  Text: string;
+  I: Integer;
+begin
+  Text := '(module (func $f';
+  for I := 0 to 256 do
+    Text := Text + ' (param i32)';
+  Text := Text + ' (result i32) (local.get 256))';
+  Text := Text + ' (func (export "wide") (result i32)';
+  for I := 0 to 256 do
+    Text := Text + ' (i32.const ' + IntToStr(I) + ')';
+  Text := Text + ' (call $f)))';
+  Result := AssembleWatText(Text);
+end;
+
+procedure TJitTests.TestLargeRegisterFileCompiles;
+begin
+  { The historical Arm64 short-form slot cap was 2047. A 2048-local i32
+    frame must compile and match the interpreter. }
+  Expect<Boolean>(DiffFresh(LargeRegisterFileModuleBytes, 'big', []))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestWideCallCompiles;
+begin
+  { The historical call-scratch cap was 256 slots. A 257-parameter call
+    must compile and return the last argument. }
+  Expect<Boolean>(DiffFresh(WideCallModuleBytes, 'wide', []))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 procedure TJitTests.TestCompiledCatchPayload;
 begin
   Expect<Boolean>(DiffModule(CompiledCatchPayloadModuleBytes, 'caught', []))
@@ -3894,6 +3941,10 @@ begin
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',
     TestThrowAcrossCompiledFrameCaught);
+  Test('a 2048-local frame compiles and matches the interpreter',
+    TestLargeRegisterFileCompiles);
+  Test('a 257-parameter call compiles and matches the interpreter',
+    TestWideCallCompiles);
   Test('compiled catch delivers the tag payload', TestCompiledCatchPayload);
   Test('compiled catch_all swallows any tag', TestCompiledCatchAll);
   Test('compiled catch_ref delivers a non-null exnref', TestCompiledCatchRef);

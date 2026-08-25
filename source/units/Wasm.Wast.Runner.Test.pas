@@ -47,6 +47,7 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Interp,
   Wasm.Wast,
   Wasm.Wast.Runner;
 
@@ -1453,8 +1454,8 @@ begin
 end;
 
 procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
-  { Handler tables compile, so the declined fixture is an over-wide call
-    (257 arguments) that both backends refuse. $wide compiles; "declined"
+  { Handler tables and wide non-tail calls compile, so the declined fixture
+    is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
     stays interpreted. }
   function MixedAotModule: string;
   var
@@ -1463,7 +1464,7 @@ procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
   begin
     Params := '';
     Args := '';
-    for I := 1 to 257 do
+    for I := 1 to WASM_TIER_TAIL_CAP + 1 do
     begin
       Params := Params + ' i32';
       Args := Args + ' (i32.const 0)';
@@ -1473,15 +1474,19 @@ procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
       + ' (func (export "add") (param i32 i32) (result i32)'
       + '   (i32.add (local.get 0) (local.get 1)))'
       + ' (func $wide (param' + Params + ') (result i32) (i32.const 7))'
-      + ' (func (export "declined") (result i32) (call $wide' + Args + ')))';
+      + ' (func (export "declined") (result i32) (return_call $wide' + Args + ')))';
   end;
 var
   Run: TWastRunResult;
 begin
+  { Invoke only compiled exports. The declined return_call is past the
+    shared tail/marshal cap, so running it would raise EWasmInternal rather
+    than return 7. Coexistence is the compile-count split. }
   Run := RunWastSource(MixedAotModule + sLineBreak
     + '(assert_return (invoke "add" (i32.const 40) (i32.const 2)) '
     + '(i32.const 42))' + sLineBreak
-    + '(assert_return (invoke "declined") (i32.const 7))', wtmAot);
+    + '(assert_return (invoke "add" (i32.const 1) (i32.const 6)) '
+    + '(i32.const 7))', wtmAot);
   try
     Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');

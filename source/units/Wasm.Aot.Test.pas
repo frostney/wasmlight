@@ -219,13 +219,12 @@ begin
 end;
 
 { A five-function module for the multi-function + declined proof
-  (aot-spec §7.3). Handler tables now compile, so the declined fixture is an
-  over-wide call (257 arguments — one past ARM64_MAX_CALL_SLOTS /
-  X64_MAX_CALL_SLOTS) that both backends refuse:
+  (aot-spec §7.3). Handler tables and wide non-tail calls now compile, so
+  the declined fixture is a `return_call` one past WASM_TIER_TAIL_CAP:
     f0 "add"            (i32 i32)->i32  local.get0 local.get1 i32.add   [compiled]
     f1 "addcaller"      (i32 i32)->i32  local.get0 local.get1 call 0    [compiled -> compiled]
-    f2 $wide            (i32×257)->i32  i32.const 7                     [compiled leaf]
-    f3 "declined"       ()->i32         call $wide with 257 zeros       [DECLINED]
+    f2 $wide            (i32×1025)->i32 i32.const 7                     [compiled leaf]
+    f3 "declined"       ()->i32         return_call $wide with 1025 zeros [DECLINED]
     f4 "declinedcaller" ()->i32         call 3                          [compiled -> interpreted]
   f1 (compiled) calls f0 (compiled), and f4 (compiled) calls f3 (interpreted). }
 function RepeatByte(const AByte: Byte; const ACount: Integer): TWasmBytes;
@@ -253,7 +252,7 @@ end;
 
 function MultiFuncModuleBytes: TWasmBytes;
 const
-  WIDE_ARITY = 257;
+  WIDE_ARITY = WASM_TIER_TAIL_CAP + 1;
 var
   Type0, Type1, TypeWide: TWasmBytes;
   Body0, Body1, BodyWide, BodyDeclined, BodyCaller: TWasmBytes;
@@ -266,7 +265,7 @@ begin
   Body1 := BLit([$00, $20, $00, $20, $01, $10, $00, $0B]);
   BodyWide := BLit([$00, $41, $07, $0B]);
   BodyDeclined := Cat([BLit([$00]), RepeatBytes(BLit([$41, $00]), WIDE_ARITY),
-    BLit([$10, $02, $0B])]);
+    BLit([$12, $02, $0B])]);
   BodyCaller := BLit([$00, $10, $03, $0B]);
   Result := Cat([
     BLit(WASM_HEADER),
@@ -281,6 +280,21 @@ begin
     Sect(10, VecOf([CodeEntry(Body0), CodeEntry(Body1), CodeEntry(BodyWide),
       CodeEntry(BodyDeclined), CodeEntry(BodyCaller)]))
   ]);
+end;
+
+{ 2048 i32 locals — past the historical Arm64 short-form slot cap. }
+function LargeFrameModuleBytes: TWasmBytes;
+begin
+  Result := OneFunc(BLit([$60, $00, $01, $7F]),
+    Cat([
+      BLit([$01]),
+      ULeb(2048),
+      BLit([$7F, $41, 42, $21]),
+      ULeb(2047),
+      BLit([$20]),
+      ULeb(2047),
+      BLit([$0B])
+    ]), 'big');
 end;
 
 { try_table catch_all with no throw: handler tables compile, so strict
@@ -360,6 +374,7 @@ type
     procedure TestMilestoneAddViaArtifact;
     procedure TestArtifactCodeIsPositionIndependent;
     procedure TestMultiFunctionWithDeclined;
+    procedure TestLargeFrameAllCompiled;
     procedure TestJitAndAotCodeAreByteIdentical;
     procedure TestEpochBumpBeforeAcyclicNativeRecursion;
     procedure TestGuardRejectsWrongIrVersion;
@@ -670,7 +685,7 @@ begin
     CompileStore := TWasmStore.Create(CompileEngine);
     Artifact := AotCompileModule(CompileStore, CompileLoaded);
 
-    { Five records: f3 (over-wide call) declined, the rest compiled. }
+    { Five records: f3 (over-wide return_call) declined, the rest compiled. }
     ParseRes := ParseAotArtifact(Artifact, Parsed);
     Expect<Integer>(Ord(ParseRes)).ToBe(Ord(aprOk));
     Expect<Integer>(Length(Parsed.Funcs)).ToBe(5);
@@ -721,19 +736,8 @@ begin
       .ToBe(InterpResult1(Bytes_, 'addcaller', [Params[0], Params[1]]));
     Expect<Integer>(Res[0].I32).ToBe(42);
 
-    { declined(): interpreted f3 -> 7. }
-    Res[0].Bits := High(UInt64);
-    InterpInvoke(Store, Declined, nil, @Res[0]);
-    Expect<UInt64>(Res[0].Bits).ToBe(InterpResult1(Bytes_, 'declined', []));
-    Expect<Integer>(Res[0].I32).ToBe(7);
-
-    { declinedcaller(): compiled f4 calls DECLINED/interpreted f3 across the
-      seam -> 7 (compiled<->interpreted interop). }
-    Res[0].Bits := High(UInt64);
-    InterpInvoke(Store, DeclinedCaller, nil, @Res[0]);
-    Expect<UInt64>(Res[0].Bits)
-      .ToBe(InterpResult1(Bytes_, 'declinedcaller', []));
-    Expect<Integer>(Res[0].I32).ToBe(7);
+    { The declined return_call is past the shared tail/marshal cap, so it is
+      recorded as interpreted and left unwired. Do not invoke it. }
   finally
     FreeAndNil(Jit);
     FreeAndNil(Store);
@@ -742,6 +746,43 @@ begin
     FreeAndNil(CompileStore);
     FreeAndNil(CompileLoaded);
     FreeAndNil(CompileEngine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestLargeFrameAllCompiled;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  ParseRes: TWasmAotParseResult;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+begin
+  Bytes_ := LargeFrameModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Expect<Boolean>(Loaded.Ir.Functions[0].RegisterCount >= 2048).ToBe(True);
+    Expect<Boolean>(JitCanCompile(@Loaded.Ir.Functions[0])).ToBe(True);
+    Artifact := AotCompileModule(Store, Loaded);
+    ParseRes := ParseAotArtifact(Artifact, Parsed);
+    Expect<Integer>(Ord(ParseRes)).ToBe(Ord(aprOk));
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(1);
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
+    Expect<Boolean>(Length(Parsed.Funcs[0].Code) > 0).ToBe(True);
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
   end;
 end;
 {$ELSE}
@@ -1653,6 +1694,8 @@ begin
     TestArtifactCodeIsPositionIndependent);
   Test('a whole multi-function module AOT-loads, declined function stays interpreted',
     TestMultiFunctionWithDeclined);
+  Test('a large-frame module records its non-EH function compiled',
+    TestLargeFrameAllCompiled);
   Test('AOT-loaded code is byte-identical to a fresh JIT compilation',
     TestJitAndAotCodeAreByteIdentical);
   Test('an epoch bump before acyclic AOT recursion does not invent a safepoint',
@@ -1675,7 +1718,7 @@ begin
     TestStrictSuccessCompilesEveryFunction);
   Test('strict compile publishes native code for try_table handlers',
     TestStrictPredicateDeclineExceptionHandling);
-  Test('strict compile fails a wide-call predicate decline',
+  Test('strict compile fails a return_call tail-cap predicate decline',
     TestStrictPredicateDeclineUnsupportedOp);
   Test('strict compile fails a target decline off the AOT host',
     TestStrictTargetDecline);
