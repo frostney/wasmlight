@@ -50,6 +50,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
 | Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), the immutable compiled capability set, and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
+| Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
 | Native executable payload | `Wasm.Native.Payload` | versioned embedded-executable container (original module, complete native code, connector plan, capability set), distinct from the `.waot` cache | **shipped** (read/write API); `wasmlight compile` that embeds it is not |
@@ -543,6 +544,16 @@ boundary is drawn.
   134, an uncaught exception to 1, a decode/validate/link failure to 1. It
   is factored out of the program entry point so it is unit-testable with
   injected streams, never touching real stdio.
+- **`Wasm.Connector` / `Wasm.Connector.Resolve`** are compile-time linking,
+  not a runtime host. `ParseConnector` turns `.wlc` into declaration
+  records. `ResolveConnectorPlan` matches each non-built-in import exactly
+  once by connector class, method name, and the wasm signature after fixed
+  marshalling, treats `EntryPoint` as a native-symbol alias only, and
+  strips unused libraries and types. Failures are `EWasmLinkError`. The
+  plan is the immutable input later compile work embeds; resolve does not
+  load a library. See [connector-language.md](connector-language.md) and
+  [connector-resolve.md](connector-resolve.md).
+
 - **`Wasm.Compile.Capabilities`** is the immutable compiled WASI capability
   set ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)):
   the directories, environment, and guest-argument policy a generated
@@ -556,15 +567,15 @@ boundary is drawn.
 
 ### Target-shell discovery
 
-`Wasm.Compile.Catalog` is the installed-catalog reader the planned
-`wasmlight compile` path will use. A catalog root contains a `catalog`
-index and the shell files it names. `ResolveShell` maps a target triple
-onto exactly one compatible entry — matching version, arch, OS, format,
-and FNV-1a-64 checksum — or fails with a distinct reason. The host triple
-is only the default spelling; it is not a separate emission path, and the
-reader never searches PATH, HOME, or the network
-([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). The
-compile command itself is still planned.
+`Wasm.Compile.Catalog` is the installed-catalog reader `wasmlight compile`
+uses. A catalog root contains a `catalog` index and the shell files it
+names. `ResolveShell` maps a target triple onto exactly one compatible
+entry — matching version, arch, OS, format, and FNV-1a-64 checksum — or
+fails with a distinct reason. The host triple is only the default
+spelling; it is not a separate emission path, and the reader never
+searches PATH, HOME, or the network
+([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). Native
+executable emission is not shipped.
 
 ## Related documents
 
@@ -572,4 +583,6 @@ compile command itself is still planned.
 - [Code style](code-style.md) — including the hot-path RTL policy
 - [Testing](testing.md) — the test tiers and the spec testsuite
 - [CONTEXT.md](../CONTEXT.md) — canonical glossary
+- [Connector language](connector-language.md) — `.wlc` grammar and `ParseConnector`
+- [Connector resolve](connector-resolve.md) — unique import matching and the stripped plan
 - [docs/adr/](adr/) — architectural decisions

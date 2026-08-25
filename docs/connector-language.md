@@ -15,7 +15,10 @@
 
 This section describes the grammar the parser accepts today.
 `wasmlight compile --connector` selects and parses `.wlc` files through
-`ParseConnector`; import resolution and embedding remain later work.
+`ParseConnector`. Import matching and unused-declaration stripping are
+`ResolveConnectorPlan` in `Wasm.Connector.Resolve`
+([connector-resolve.md](connector-resolve.md)); embedding remains later
+work.
 
 A file is a sequence of static classes. Each class may contain structs,
 enums, delegates, and `static extern` methods. Braces and semicolons

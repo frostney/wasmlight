@@ -5,9 +5,9 @@
   accepts only static classes, structs, enums, delegates, and `extern`
   methods, plus the fixed attribute vocabulary. Method bodies,
   properties, inheritance, generics, expressions, control flow, and
-  allocation are outside the language (issue #41). Resolution, alias
-  matching, and unused-declaration stripping belong to issue #42; this
-  model keeps every parsed declaration.
+  allocation are outside the language (issue #41). This model keeps every
+  parsed declaration; `Wasm.Connector.Resolve` matches guest imports and
+  strips unused bindings.
 
   EWasmConnectorError is a sibling of EWasmTextError, never a subclass of
   EWasmDecodeError: connector malformedness is a claim about `.wlc` source,

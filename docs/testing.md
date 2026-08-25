@@ -3,11 +3,11 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Fifty-six suites today, including compiled WASI
+  independent programs. Fifty-seven suites today, including compiled WASI
   capability-set coverage, the `wasmlight compile` CLI contract,
   catalog-discovery coverage, the native executable payload format, the
-  Connector language lexer and parser suites, `Wasm.Target.Test`, the
-  runtime-shell payload and startup suites, Linux ELF runtime-shell
+  Connector language lexer, parser, and resolve suites, `Wasm.Target.Test`,
+  the runtime-shell payload and startup suites, Linux ELF runtime-shell
   packager coverage, and the Mach-O packager and SHA-256 known-answer
   suites.
 - Unit suites are co-located with the unit they cover and carry the
@@ -142,6 +142,7 @@ instead.
 | `Wasm.Compile.Catalog.Test` | Installed runtime-shell discovery: the four released 64-bit Unix triples, catalog write/parse, FNV-1a-64 checksums, host-default selection through the same path as an explicit triple, release-completeness, and the negative catalog cases (missing, duplicate, stale, mismatched, corrupt, escaping paths). |
 | `Wasm.Connector.Lexer.Test` | The Connector-language tokenizer: punctuation, identifiers, strings, integers, comment trivia, one-token peek, Unix/Windows/classic-Mac newlines, and the unclosed-string / unclosed-comment / illegal-character faults with 1-based positions. |
 | `Wasm.Connector.Test` | `ParseConnector` and the declaration model: static classes, structs, enums, delegates, and `extern` methods; `DllImport` / `EntryPoint` / `MarshalAs` / `In` / `Out` / `Scoped` / `Queued`; unused declarations retained; and a literal-snippet rejection for every excluded construct (method bodies, properties, inheritance, generics, expressions, control flow, allocation). |
+| `Wasm.Connector.Resolve.Test` | Unique import matching into a stripped connector plan: `EntryPoint` aliases the native symbol only, unused libraries/types/classes drop out, built-in WASI imports need no declaration, and missing, duplicate, incompatible, ambiguous, non-function, and unsupported-type bindings raise `EWasmLinkError`. |
 | `Wasm.Shell.Payload.Test` | The temporary runtime-shell envelope: empty and non-empty section round-trips, and malformed cases spelled as literal bytes (bad magic, truncated header/body, unknown version, trailing bytes). |
 | `Wasm.Shell.Test` | The interpreter-free startup path: decode and validation keep their error classes, an incomplete or stale native image is `EWasmLinkError` with no interpreter fallback, connector/capability stubs reject non-empty values, and a valid image runs `_start` through native entries on a 64-bit UNIX host (hello, trap, `17+25` then `proc_exit(42)`). |
 
