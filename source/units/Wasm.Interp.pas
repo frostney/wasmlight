@@ -284,6 +284,7 @@ function ConsumeJitSeamReentry: TWasmRetKind;
   target so that target's Run may BOUNCE a cross-tier tail back to the loop
   (O(1)) rather than nesting a native invocation. }
 procedure MarkTierTailTarget;
+function ConsumeTierTailTarget: Boolean;
 
 { The unwind entry point, exposed so a seam catch can CONTINUE the unwind in its
   own native context after a rtCompiledSeam hop (Fix A). AThrowFrame is True only
