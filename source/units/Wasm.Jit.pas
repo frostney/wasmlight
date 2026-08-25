@@ -51,12 +51,10 @@
   `return_call*` and the frame replacement has to run in a LOOP rather than a
   native call to keep tail calls O(1) (§4.5) — the frame is still built and torn
   down by the shared Wasm.Interp helpers, so the hand-off contract above is
-  unchanged. (2) The predicate gains two EH fences: a function carrying a
-  `try_table` handler table declines (JitCanCompile), and — where the store has
-  tags at all — a function containing a CALL declines (ForceCompile). Both exist
-  because exception delivery is an explicit unwind over the activation stack
-  that cannot pass a tier-seam frame; see the comment on the second fence for
-  the interp-side change that would retire them.
+  unchanged. (2) Handler tables and `throw` / `throw_ref` compile. Matching
+  stays in UnwindException (tag store-address, eh-spec §2.3/§4). Direct
+  compiled-to-compiled calls still decline handler-bearing and throwing
+  functions so each keeps its own InvokeCompiled seam.
 
   TIERING. The baseline compiles on-hot in principle (§4.2), but the milestone
   and the differential harness FORCE compilation (§11.1): JitForceCompile
@@ -112,7 +110,8 @@ uses
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 type
   PWasmIrFunctionRec = ^TWasmIrFunction;
@@ -168,6 +167,20 @@ type
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
     const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
+  { Why JitCanCompile would refuse AFn. jdNone means the function is inside
+    the current fence; every other value is the first failing check, in the
+    same order JitCanCompile walks. AOT's strict path uses this so a decline
+    names the reason instead of collapsing to "not compiled". }
+  TWasmJitDecline = (
+    jdNone,
+    jdNoBackend,
+    jdNilFunction,
+    jdFrameTooLarge,
+    jdExceptionHandling,
+    jdUnsupportedOp,
+    jdUnsupportedInstr
+  );
+
 { Register the JIT on AStore: allocate the code cache and point the store's
   JitInvokeCompiled hook at JitDispatch, leaving TierInvoke on the interpreter
   (§4.1 — the interpreter stays the entry dispatcher; the JIT is reached through
@@ -176,10 +189,13 @@ type
   hook; normal use is once per store. }
 function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
 
+function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
+
 { The compile predicate and scope fence (§10.3): True only if the active backend
-  can emit EVERY op in the function AND the frame fits the backend's addressing.
-  False for any un-templated op (EH ops, un-implemented ops), an over-large
-  frame, or an unsupported target — the function then runs interpreted. }
+  can emit EVERY op in the function. False for EH ops / handler tables
+  (issue #32), an unsupported target, or a return_call* past WASM_TIER_TAIL_CAP
+  — the function then runs interpreted. Frame size and non-tail call arity
+  are encoded: both backends form large slots and large call-scratch frames. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
 { A deliberately narrow proof for the AArch64 native self-call ABI: one
@@ -207,8 +223,9 @@ function JitForceCompile(const AJit: TWasmJitContext;
   (AFn^.RegisterCount, stored so the loader can cross-check the fresh IR). The
   same compilation driver the JIT uses produces these bytes, so AOT-loaded code
   IS the JIT's code. Returns nil (declined) off the backend, for a nil function,
-  or when the emitter cannot fit the branch displacements — the caller records
-  the function un-compiled, exactly as the on-hot JIT would decline it. }
+  or when the function is nil / the host has no backend. An out-of-range
+  branch is relaxed in the backend; a remaining overflow is an internal
+  fault, not a silent decline. }
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AFn: PWasmIrFunctionRec; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes; overload;
@@ -220,6 +237,17 @@ function JitStageFunctionBytes(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes; overload;
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32; const ATarget: TWasmTarget;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
+
+{ True when the requested target's ISA can be emitted and AFn passes the
+  host compile predicate. Foreign-OS same-arch targets are emittable;
+  foreign-ISA targets decline until both backends are runtime-selectable. }
+function JitCanEmitForTarget(const AFn: PWasmIrFunctionRec;
+  const ATarget: TWasmTarget): Boolean;
 
 implementation
 
@@ -267,9 +295,15 @@ begin
   Result := False;
   if AFn = nil then
     Exit;
+  { A handler-bearing or throwing function needs its own InvokeCompiled seam
+    so a matched clause can resume at a landing pad without returning through
+    a popped native frame. Tail calls already decline this path. }
+  if Length(AFn^.Handlers) > 0 then
+    Exit;
   for I := 0 to High(AFn^.Code) do
     if AFn^.Code[I].Op in
-      [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef] then
+      [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef,
+       iroThrow, iroThrowRef] then
       Exit;
   Result := True;
 end;
@@ -301,61 +335,50 @@ end;
 
 { --- the predicate (§10.3) ----------------------------------------------- }
 
-function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
+function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
 {$IFDEF WASM_JIT_BACKEND}
 var
   I: Integer;
 {$ENDIF}
 begin
   {$IFDEF WASM_JIT_BACKEND}
-  Result := False;
   if AFn = nil then
-    Exit;
-  { The frame must fit the backend's slot addressing (§10.3). }
-  {$IFDEF WASM_JIT_ARM64}
-  if AFn^.RegisterCount > ARM64_MAX_SLOT then
-    Exit;
-  {$ENDIF}
-  {$IFDEF WASM_JIT_X64}
-  if AFn^.RegisterCount > X64_MAX_SLOT then
-    Exit;
-  {$ENDIF}
-  { EXCEPTION HANDLING IS NEVER COMPILED (§8.3, §10.2) — and a `try_table`
-    emits NO instruction: the validator lowers it to the static handler table
-    hanging off the function, so the per-op predicate cannot see it. Before
-    Wave 3 that was invisible (a handler-bearing function is only interesting
-    when something inside it can throw, which needs a call), but a compiled
-    body consults no handler table, so an exception thrown under it would
-    escape a try_table the interpreter catches. Any handler declines the
-    function, which then runs interpreted and catches exactly as before. }
-  if Length(AFn^.Handlers) > 0 then
-    Exit;
+    Exit(jdNilFunction);
+  { Handler tables compile: throw / throw_ref have templates, and
+    UnwindException scans the same IR table the interpreter uses (tag
+    store-address matching, eh-spec §2.3/§4). Native scalar fast paths still
+    decline handlers — they have no helper/seam to resume a clause. }
   { Every op must have a template, and every instruction must be one this
-    template can actually emit (a call site's marshaling has to fit the
-    backend's scratch, §4.4). The FIRST failure declines the whole function —
-    the scope fence that keeps the baseline shippable while op coverage is
-    partial. }
+    template can actually emit. Frame size and non-tail call arity are
+    encoded, not declined. The remaining fence is a `return_call*` whose
+    argument block exceeds the shared tail channel, or an op with no
+    template. }
   for I := 0 to High(AFn^.Code) do
   begin
     {$IFDEF WASM_JIT_ARM64}
     if not Arm64CanEmitOp(AFn^.Code[I].Op) then
-      Exit;
+      Exit(jdUnsupportedOp);
     if not Arm64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit;
+      Exit(jdUnsupportedInstr);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     if not X64CanEmitOp(AFn^.Code[I].Op) then
-      Exit;
+      Exit(jdUnsupportedOp);
     if not X64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit;
+      Exit(jdUnsupportedInstr);
     {$ENDIF}
   end;
-  Result := True;
+  Result := jdNone;
   {$ELSE}
   { No backend for this target: everything runs interpreted (§2.2). AFn is a
     const param, so an unused one on this leg draws no warning. }
-  Result := False;
+  Result := jdNoBackend;
   {$ENDIF}
+end;
+
+function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
+begin
+  Result := JitCompileDecline(AFn) = jdNone;
 end;
 
 function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
@@ -507,6 +530,9 @@ var
   NativeCoreLabel: TWasmJitLabel;
   NativeExhaustedLabel: TWasmJitLabel;
   NativeExternalLabel: TWasmJitLabel;
+  EhTableLabel: TWasmJitLabel;
+  EhEndLabel: TWasmJitLabel;
+  HasHandlers: Boolean;
   {$IFDEF WASM_JIT_ARM64}
   ArmCache: TArm64RegCache;
   {$ENDIF}
@@ -1925,6 +1951,25 @@ begin
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
       Buf.NewLabel;
+    HasHandlers := Length(AFn^.Handlers) > 0;
+    if HasHandlers then
+    begin
+      EhTableLabel := Buf.NewLabel;
+      EhEndLabel := Buf.NewLabel;
+    end
+    else
+    begin
+      EhTableLabel := 0;
+      EhEndLabel := 0;
+    end;
+    {$IFDEF WASM_JIT_ARM64}
+    Arm64BeginEhEmit(HasHandlers, EhTableLabel, EhEndLabel,
+      UInt32(Length(AFn^.Code)));
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    X64BeginEhEmit(HasHandlers, EhTableLabel, EhEndLabel,
+      UInt32(Length(AFn^.Code)));
+    {$ENDIF}
     if UseNativeScalarCore then
     begin
       NativeCoreLabel := Buf.NewLabel;
@@ -1958,9 +2003,16 @@ begin
           end;
       end;
     end;
+    for I := 0 to High(AFn^.HandlerClauses) do
+      MarkTarget(AFn^.HandlerClauses[I].TargetInstr);
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
+    if HasHandlers then
+      { A landing pad is reached by the EH jump table, not a fall-through.
+        Host-register cache would observe stale slots after ResumeAtClause
+        writes the payload (eh-spec §2.3). }
+      UseStaticCache := False;
     if UseNativeScalarCore then
     begin
       { x26 is unavailable to the shared native core cache: recursion pins its
@@ -2074,6 +2126,13 @@ begin
     end;
     {$ENDIF}
 
+    {$IFDEF WASM_JIT_ARM64}
+    Arm64EmitEhResumeCheck(Buf);
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    X64EmitEhResumeCheck(Buf);
+    {$ENDIF}
+
     for I := 0 to High(AFn^.Code) do
     begin
       if Targets[I] then
@@ -2163,6 +2222,15 @@ begin
       Arm64EmitLoadImm32(Buf, 0, UInt32(Ord(wtkStackExhausted)));
       Arm64EmitCallHelper(Buf, aohTrapKind);
     end;
+    if HasHandlers then
+    begin
+      Buf.BindLabel(EhEndLabel);
+      if UseExtendedFrame then
+        Arm64EmitEpilogueExtended(Buf)
+      else
+        Arm64EmitEpilogue(Buf);
+    end;
+    Arm64EmitEhTable(Buf, Length(AFn^.Code));
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
@@ -2172,6 +2240,12 @@ begin
       X64EmitMovRegImm32(Buf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
       X64EmitCallHelper(Buf, aohTrapKind);
     end;
+    if HasHandlers then
+    begin
+      Buf.BindLabel(EhEndLabel);
+      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
+    end;
+    X64EmitEhTable(Buf, Length(AFn^.Code));
     X64ResolvePatches(Buf);
     {$ENDIF}
     { AOT staging (aot-spec §3.2) stops HERE, before MakeExecutable: the caller
@@ -2269,9 +2343,10 @@ begin
     catch) across the native barrier to the enclosing invocation's seam catch, continuing the
     search for a handler further out (Wasm.Interp.UnwindException). So a compiled
     call-bearing function may correctly sit between a throw and its handler, and
-    more functions compile (compiled=N goes up). Fence 1 (JitCanCompile declines
-    a function that OWNS a try_table handler table, since its handlers are not in
-    machine code) and the iroThrow/iroThrowRef decline STAY. }
+    more functions compile (compiled=N goes up). Fence 1 is retired: handler
+    tables and throw / throw_ref now compile; UnwindException still matches by
+    tag store-address. Handler-bearing and throwing functions decline only
+    JitCanDirectCall so they keep an InvokeCompiled seam. }
   {$IFDEF WASM_JIT_BACKEND}
   N := Length(FBuffers);
   SetLength(FBuffers, N + 1);
@@ -2280,11 +2355,9 @@ begin
     live record layout (O-J5, WasmJitOffsets) so a store-layout change is caught
     rather than miscompiled. The prologue reloads the LIVE Store.Epoch at
     StoreEpoch and captures the SHARED per-invocation snapshot at
-    StoreEpochSnapshot (jit-spec §6). A function whose branch displacements
-    overflow the A64 immediate fields raises EWasmJitBranchRange from the patch
-    resolver; catch it, drop the half-built buffer, and DECLINE — the function
-    then stays interpreted, which is always correct (jit-spec §4.3). Any other
-    exception is a genuine internal fault and propagates. }
+    StoreEpochSnapshot (jit-spec §6). Conditional branches that miss imm19
+    are rewritten to invert+B in the resolver. A remaining B/BL overflow
+    is an internal fault, not a decline. }
   try
     FBuffers[N] := JitCompileToBuffer(FStore.Funcs[AAddr].Instance.Ir, Fn,
       FStore.Funcs[AAddr].Instance.Ir.FuncImportCount +
@@ -2293,12 +2366,11 @@ begin
       WasmJitOffsets(FStore).StoreEpochSnapshot,
       WasmJitOffsets(FStore).StoreJitHelperTable);
   except
-    on EWasmJitBranchRange do
+    on E: EWasmJitBranchRange do
     begin
-      { JitCompileToBuffer already freed the buffer before re-raising. }
       SetLength(FBuffers, N);
-      Result := False;
-      Exit;
+      raise EWasmInternal.CreateFmt(
+        'internal: branch range after veneer: %s', [E.Message]);
     end;
   end;
 
@@ -2401,13 +2473,32 @@ begin
     ARegisterCount);
 end;
 
+function JitCanEmitForTarget(const AFn: PWasmIrFunctionRec;
+  const ATarget: TWasmTarget): Boolean;
+begin
+  Result := WasmTargetCanEmit(ATarget) and JitCanCompile(AFn);
+end;
+
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes;
+begin
+  Result := JitStageFunctionBytes(AStore, AIr, AFn, AFuncIdx, WasmTargetHost,
+    AEntryOffset, ARegisterCount);
+end;
+
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32; const ATarget: TWasmTarget;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
 {$IFDEF WASM_JIT_BACKEND}
 var
   Buf: TWasmCodeBuffer;
+  Abi: TWasmTargetAbi;
+  JO: TWasmJitOffsets;
+  EpochOffset, SnapshotOffset, HelperTableOffset: NativeUInt;
 {$ENDIF}
 begin
   Result := nil;
@@ -2416,18 +2507,33 @@ begin
   if AFn = nil then
     Exit;
   ARegisterCount := AFn^.RegisterCount;
+  if not WasmTargetCanEmit(ATarget) then
+    Exit;
   {$IFDEF WASM_JIT_BACKEND}
+  { Host emission uses the live store offsets ForceCompile bakes, so a
+    compiler-profile layout shift cannot miscompile the running binary.
+    A requested foreign target consumes the published descriptor. }
+  if WasmTargetEqual(ATarget, WasmTargetHost) and (AStore <> nil) then
+  begin
+    JO := WasmJitOffsets(AStore);
+    EpochOffset := JO.StoreEpoch;
+    SnapshotOffset := JO.StoreEpochSnapshot;
+    HelperTableOffset := JO.StoreJitHelperTable;
+  end
+  else
+  begin
+    Abi := WasmTargetAbi(ATarget);
+    EpochOffset := NativeUInt(Abi.Layout.StoreEpoch);
+    SnapshotOffset := NativeUInt(Abi.Layout.StoreEpochSnapshot);
+    HelperTableOffset := NativeUInt(Abi.Layout.StoreJitHelperTable);
+  end;
   try
     Buf := JitCompileToBuffer(AIr, AFn, AFuncIdx,
-      WasmJitOffsets(AStore).StoreEpoch,
-      WasmJitOffsets(AStore).StoreEpochSnapshot,
-      WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
+      EpochOffset, SnapshotOffset, HelperTableOffset, { AFinalize } False);
   except
-    { A function whose branch displacements overflow the backend's immediate
-      fields is declined (nil), exactly as ForceCompile declines it; it is then
-      recorded un-compiled in the artifact and runs interpreted at load. }
-    on EWasmJitBranchRange do
-      Exit;
+    on E: EWasmJitBranchRange do
+      raise EWasmInternal.CreateFmt(
+        'internal: branch range after veneer: %s', [E.Message]);
   end;
   try
     Result := Buf.SnapshotBytes;

@@ -21,6 +21,10 @@ cli = { source = "frostney/lwpt", version = "^0.6.0", include = ["packages/cli/*
 wasmlight = { source = "source/apps/wasmlight.pas", output = "build/wasmlight" }
 wasmbench = { source = "source/apps/wasmbench.pas", output = "build/wasmbench" }
 wasmspec = { source = "source/apps/wasmspec.pas", output = "build/wasmspec" }
+# Interpreter-free runtime-shell template (#34). Smart-link so unused
+# interpreter-dispatch and JIT-emit routines from helper units are not
+# retained; the shell never calls those entry points.
+wasmlight-shell = { source = "source/apps/wasmlight-shell.pas", output = "build/wasmlight-shell", flags = ["-CX", "-XX"] }
 
 # stamp-version derives source/units/Version.inc from this manifest's
 # [package].version, consumed by Wasm.Core's `{$I Version.inc}`. The
