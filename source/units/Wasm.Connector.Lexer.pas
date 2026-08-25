@@ -146,6 +146,10 @@ procedure TWlcLexer.SkipLineComment;
 begin
   while not Eof and (Cursor <> #10) and (Cursor <> #13) do
     Advance;
+  { Advance folds CR+LF into one newline, so a Windows `//` line is consumed
+    here rather than left for later trivia. }
+  if not Eof then
+    Advance;
 end;
 
 procedure TWlcLexer.SkipBlockComment(const AOpenLine, AOpenColumn: Integer);

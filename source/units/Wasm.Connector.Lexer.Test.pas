@@ -149,6 +149,8 @@ end;
 procedure TWlcLexerTests.TestCommentsAreTrivia;
 begin
   Expect<string>(Signature('a // hide' + #10 + 'b')).ToBe('id:a id:b eof');
+  Expect<string>(Signature('a // hide' + #13#10 + 'b')).ToBe('id:a id:b eof');
+  Expect<string>(Signature('a // hide' + #13 + 'b')).ToBe('id:a id:b eof');
   Expect<string>(Signature('a /* hide */ b')).ToBe('id:a id:b eof');
 end;
 
