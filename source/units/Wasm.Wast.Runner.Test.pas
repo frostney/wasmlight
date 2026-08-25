@@ -47,6 +47,7 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Interp,
   Wasm.Wast,
   Wasm.Wast.Runner;
 
@@ -1453,34 +1454,46 @@ begin
 end;
 
 procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
-const
-  { A compilable "add" and a DECLINED "declined" (it owns a try_table handler
-    table, which JitCanCompile — and so AOT — refuses). The try body is empty and
-    nothing throws, so "declined" simply returns 7 interpreted. Under --tier=aot
-    the artifact records "add" compiled and "declined" declined, and the load
-    wires only "add": compiled AOT code and interpreted code coexist behind the
-    seam within one instance, and both invokes return the right value. }
-  MODULE_AOT_MIXED =
-    '(module'
-    + ' (func (export "add") (param i32 i32) (result i32)'
-    + '   (i32.add (local.get 0) (local.get 1)))'
-    + ' (func (export "declined") (result i32)'
-    + '   (block $h (try_table (catch_all $h)))'
-    + '   (i32.const 7)))';
+  { Handler tables and wide non-tail calls compile, so the declined fixture
+    is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
+    stays interpreted. }
+  function MixedAotModule: string;
+  var
+    I: Integer;
+    Params, Args: string;
+  begin
+    Params := '';
+    Args := '';
+    for I := 1 to WASM_TIER_TAIL_CAP + 1 do
+    begin
+      Params := Params + ' i32';
+      Args := Args + ' (i32.const 0)';
+    end;
+    Result :=
+      '(module'
+      + ' (func (export "add") (param i32 i32) (result i32)'
+      + '   (i32.add (local.get 0) (local.get 1)))'
+      + ' (func $wide (param' + Params + ') (result i32) (i32.const 7))'
+      + ' (func (export "declined") (result i32) (return_call $wide' + Args + ')))';
+  end;
 var
   Run: TWastRunResult;
 begin
-  Run := RunWastSource(MODULE_AOT_MIXED + sLineBreak
+  { Invoke only compiled exports. The declined return_call is past the
+    shared tail/marshal cap, so running it would raise EWasmInternal rather
+    than return 7. Coexistence is the compile-count split. }
+  Run := RunWastSource(MixedAotModule + sLineBreak
     + '(assert_return (invoke "add" (i32.const 40) (i32.const 2)) '
     + '(i32.const 42))' + sLineBreak
-    + '(assert_return (invoke "declined") (i32.const 7))', wtmAot);
+    + '(assert_return (invoke "add" (i32.const 1) (i32.const 6)) '
+    + '(i32.const 7))', wtmAot);
   try
     Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
     Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
     {$IFDEF WASM_JIT_BACKEND}
-    { Exactly one function AOT-loaded ("add"); "declined" stays interpreted. }
-    Expect<Integer>(Run.CompiledFuncCount).ToBe(1);
+    { "add" and $wide AOT-loaded; "declined" stays interpreted. }
+    Expect<Integer>(Run.CompiledFuncCount).ToBe(2);
     {$ELSE}
     Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
     {$ENDIF}
