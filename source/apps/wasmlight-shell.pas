@@ -19,10 +19,10 @@ program wasmlight_shell;
 
 {$I Shared.inc}
 
-{ Visible to every unit compiled into this program. Engine uses it to omit
-  RegisterInterpreter / InterpInvoke so GNU ld cannot keep InterpTierInvoke
-  (Darwin already dead-strips it). Do not set this in Shared.inc. }
-{$DEFINE WASM_RUNTIME_SHELL}
+(* The build entry passes -dWASM_RUNTIME_SHELL so Wasm.Engine omits
+   RegisterInterpreter / InterpInvoke. GNU ld otherwise keeps InterpTierInvoke;
+   Darwin already dead-strips it. A program-file DEFINE does not reach units,
+   so this file must not declare one. Do not put this define in Shared.inc. *)
 
 uses
   {$IFDEF UNIX}

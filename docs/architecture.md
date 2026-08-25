@@ -477,7 +477,6 @@ never interpreted. `.waot` remains the fallback-capable cache for
 and capability slots is a temporary seam until the product payload
 is embedded; the compile command is not shipped.
 
-
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the
 interpreter, the tier of record, runs alone; that leg is unaccelerated but
