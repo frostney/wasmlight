@@ -187,6 +187,16 @@ declined functions for interpreter fallback
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: full AOT, forced AOT, trusted compile
 
+**Release archive**:
+A checksum-pinned per-host tarball that contains the compiler for that
+host and every runtime shell published with the release. The 0.2.0 set is
+the four 64-bit Unix hosts; Windows archives are later releases.
+_Avoid_: bottle, installer package, SDK
+
+**Checksum manifest**:
+The GNU SHA-256 file published beside the release archives, named
+`wasmlight-<version>-checksums.txt`, listing each archive basename.
+_Avoid_: signature file, lockfile, provenance attestation
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. Relative host directories resolve from the executable

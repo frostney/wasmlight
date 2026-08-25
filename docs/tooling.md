@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | FPC | 3.2.2 (brew / apt / choco) | compiler, Delphi mode via `source/units/Shared.inc` |
 | lwpt | 0.6.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball; pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
-| InstantFPC | ships with FPC | runs `scripts/stamp-version.pas` as a build hook |
+| InstantFPC | ships with FPC | runs `scripts/stamp-version.pas` as a build hook, and the release pack/verify scripts |
 | Lefthook | ≥ 1.5 | pre-commit formatter + agent-reference hooks (`lefthook install`) |
 | markdownlint-cli2 | latest | blocking docs gate |
 | git-cliff | latest | changelog generation from Conventional Commits |
@@ -44,6 +44,10 @@ lwpt test              # discovers source/units/*.Test.pas
 ./build/wasmlight-shell [<payload.wshl> [guest-args...]]  # runtime-shell template
 ./build/wasmbench      # execution workloads and tiers (measurement only)
 # isolate with --workload loop|fib|memory|numeric|simd|startup and --tier
+instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas \
+  --compiler ./build/wasmlight --out dist --synthesize-catalog
+instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
+  --archive dist/wasmlight-*-*.tar.gz --checksums dist/wasmlight-*-checksums.txt
 npx markdownlint-cli2 "**/*.md"   # docs gate, config .markdownlint-cli2.jsonc
 ```
 
@@ -64,7 +68,8 @@ Never hand-edit any of these; change the input and re-run the owner.
 
 - **`.github/workflows/pr.yml`** — every PR: `install --frozen` →
   `format --check` + `agents --check` → `build` → `test` on Linux, macOS,
-  and Windows runners, plus blocking markdownlint and runtime-comparison jobs.
+  and Windows runners, plus Unix pack/verify of the host release archive,
+  blocking markdownlint, and runtime-comparison jobs.
   The comparison builds base and PR release binaries, measures both on one
   runner against checksum-pinned cached peers, uploads raw samples, and updates
   a sticky PR comment. Execution is required; timing deltas are informational
