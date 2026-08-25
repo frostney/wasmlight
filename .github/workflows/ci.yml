@@ -209,21 +209,8 @@ jobs:
           # fallback. Valid image (64-bit UNIX) runs _start natively.
           PY=python3
           if ! command -v python3 >/dev/null 2>&1; then PY=python; fi
-          "$PY" -c '
-import pathlib, struct, sys
-mod = bytes.fromhex(
-    "0061736d01000000"
-    "010401600000"
-    "03020100"
-    "0503010001"
-    "071302066d656d6f72790200065f73746172740000"
-    "0a040102000b"
-)
-pathlib.Path(sys.argv[1]).write_bytes(mod)
-nat = b"" if sys.argv[2] == "-" else pathlib.Path(sys.argv[2]).read_bytes()
-header = b"WSH1" + struct.pack("<HHIIII", 1, 0, len(mod), len(nat), 0, 0)
-pathlib.Path(sys.argv[3]).write_bytes(header + mod + nat)
-' "$RUNNER_TEMP/shell-cmd.wasm" - "$RUNNER_TEMP/shell-incomplete.wshl"
+          "$PY" -c 'import pathlib, struct, sys; mod = bytes.fromhex("0061736d01000000010401600000030201000503010001071302066d656d6f72790200065f737461727400000a040102000b"); nat = b"" if sys.argv[2] == "-" else pathlib.Path(sys.argv[2]).read_bytes(); pathlib.Path(sys.argv[1]).write_bytes(mod); pathlib.Path(sys.argv[3]).write_bytes(b"WSH1" + struct.pack("<HHIIII", 1, 0, len(mod), len(nat), 0, 0) + mod + nat)' \
+            "$RUNNER_TEMP/shell-cmd.wasm" - "$RUNNER_TEMP/shell-incomplete.wshl"
           set +e
           "$SHELL_BIN" "$RUNNER_TEMP/shell-incomplete.wshl" \
             >"$RUNNER_TEMP/shell-incomplete.out" \
@@ -248,14 +235,9 @@ pathlib.Path(sys.argv[3]).write_bytes(header + mod + nat)
               -o "$RUNNER_TEMP/shell-cmd.waot"
             PY=python3
           if ! command -v python3 >/dev/null 2>&1; then PY=python; fi
-          "$PY" -c '
-import pathlib, struct, sys
-mod = pathlib.Path(sys.argv[1]).read_bytes()
-nat = pathlib.Path(sys.argv[2]).read_bytes()
-header = b"WSH1" + struct.pack("<HHIIII", 1, 0, len(mod), len(nat), 0, 0)
-pathlib.Path(sys.argv[3]).write_bytes(header + mod + nat)
-' "$RUNNER_TEMP/shell-cmd.wasm" "$RUNNER_TEMP/shell-cmd.waot" \
-              "$RUNNER_TEMP/shell-complete.wshl"
+          "$PY" -c 'import pathlib, struct, sys; mod = pathlib.Path(sys.argv[1]).read_bytes(); nat = pathlib.Path(sys.argv[2]).read_bytes(); pathlib.Path(sys.argv[3]).write_bytes(b"WSH1" + struct.pack("<HHIIII", 1, 0, len(mod), len(nat), 0, 0) + mod + nat)' \
+            "$RUNNER_TEMP/shell-cmd.wasm" "$RUNNER_TEMP/shell-cmd.waot" \
+            "$RUNNER_TEMP/shell-complete.wshl"
             set +e
             "$SHELL_BIN" "$RUNNER_TEMP/shell-complete.wshl" \
               >"$RUNNER_TEMP/shell-complete.out" \
