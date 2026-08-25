@@ -83,7 +83,13 @@ canonical vocabulary before planning anything.
   guest-requested exit raised by WASI `proc_exit` — is a further sibling
   under `EWasmError`, declared in `Wasm.Engine`: it is neither a fault nor
   a `throw`, so never fold it into `EWasmTrap` or `EWasmException`; `run`
-  maps it to the process exit code. Internal invariant defects — the
+  maps it to the process exit code. `EWasmConnectorError` — a connector-
+  contract failure (stale opaque handle, retained or live scoped borrow,
+  nil host buffer) declared in `Wasm.Connector.Memory` — is another
+  sibling: not a guest memory fault and not a clean exit, so never fold
+  it into `EWasmTrap`, `EWasmException`, or `EWasmExit`. Out-of-range
+  connector copies and borrows still raise `EWasmTrap` with
+  `out of bounds memory access`. Internal invariant defects — the
   `"internal: ..."` sites on paths the validator's proof makes unreachable —
   raise `EWasmInternal`, a leaf under `EWasmError`: never on a
   module-facing path, and never in place of one of the classes above.

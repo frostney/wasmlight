@@ -65,6 +65,8 @@ type
     procedure TestStaleHandleFailsDeterministically;
     procedure TestHandleIsNotARawPointer;
     procedure TestNilCopyBufferIsConnectorError;
+    procedure TestForeignMemoryIsConnectorError;
+    procedure TestNilInOutHostIsConnectorError;
   end;
 
 { --- fixture ------------------------------------------------------------- }
@@ -529,8 +531,8 @@ begin
   View := FSession.Borrow(FMem32, 32, 4);
   View.Release;
   View.Free;
+  Expect<Boolean>(FSession.BorrowLive).ToBe(False);
   FSession.Call(Fn, NoArgs, NoResults);
-  Expect<Boolean>(True).ToBe(True);
 end;
 
 { --- opaque handles ------------------------------------------------------ }
@@ -626,6 +628,59 @@ begin
   Expect<string>(SrcMsg).ToBe(MSG_CONNECTOR_COPY_SRC_NIL);
 end;
 
+procedure TConnectorMemoryTests.TestForeignMemoryIsConnectorError;
+var
+  OtherEngine: TWasmEngine;
+  OtherStore: TWasmStore;
+  OtherMem: TWasmMemoryRef;
+  Scratch: Byte;
+  CopyMsg, BorrowMsg: string;
+  View: TWasmConnectorBorrow;
+begin
+  OtherEngine := TWasmEngine.Create;
+  OtherStore := TWasmStore.Create(OtherEngine);
+  try
+    OtherMem.Store := OtherStore;
+    OtherMem.Addr := OtherStore.AddMemory(MakeMemType(MakeLimits(watI32, 1)));
+    Scratch := 0;
+    CopyMsg := 'none';
+    try
+      FSession.CopyIn(OtherMem, 0, 1, @Scratch);
+    except
+      on E: EWasmConnectorError do
+        CopyMsg := E.Message;
+    end;
+    BorrowMsg := 'none';
+    View := nil;
+    try
+      View := FSession.Borrow(OtherMem, 0, 1);
+    except
+      on E: EWasmConnectorError do
+        BorrowMsg := E.Message;
+    end;
+    View.Free;
+    Expect<string>(CopyMsg).ToBe(MSG_CONNECTOR_FOREIGN_MEMORY);
+    Expect<string>(BorrowMsg).ToBe(MSG_CONNECTOR_FOREIGN_MEMORY);
+  finally
+    OtherStore.Free;
+    OtherEngine.Free;
+  end;
+end;
+
+procedure TConnectorMemoryTests.TestNilInOutHostIsConnectorError;
+var
+  Msg: string;
+begin
+  Msg := 'none';
+  try
+    TWasmConnectorInOut.Create(FSession, FMem32, 0, 4, nil);
+  except
+    on E: EWasmConnectorError do
+      Msg := E.Message;
+  end;
+  Expect<string>(Msg).ToBe(MSG_CONNECTOR_HOST_NIL);
+end;
+
 { --- registration -------------------------------------------------------- }
 
 procedure TConnectorMemoryTests.SetupTests;
@@ -662,6 +717,10 @@ begin
     TestHandleIsNotARawPointer);
   Test('a nil host buffer on a non-empty copy is a connector error',
     TestNilCopyBufferIsConnectorError);
+  Test('a memory from another store is a connector error',
+    TestForeignMemoryIsConnectorError);
+  Test('a nil inout host buffer is a connector error',
+    TestNilInOutHostIsConnectorError);
 end;
 
 begin

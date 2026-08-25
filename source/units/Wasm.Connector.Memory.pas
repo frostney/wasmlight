@@ -47,6 +47,8 @@ const
   MSG_CONNECTOR_COPY_SRC_NIL = 'copy source is nil';
   MSG_CONNECTOR_FOREIGN_MEMORY = 'memory does not belong to this store';
   MSG_CONNECTOR_HOST_NIL = 'inout host buffer is nil';
+  MSG_CONNECTOR_SESSION_NIL = 'inout session is nil';
+  MSG_CONNECTOR_STORE_NIL = 'connector session store is nil';
 
 type
   { A connector-contract failure: stale handle, retained borrow, re-entry
@@ -218,7 +220,7 @@ constructor TWasmConnectorInOut.Create(const ASession: TWasmConnectorSession;
 begin
   inherited Create;
   if ASession = nil then
-    raise EWasmConnectorError.Create('inout session is nil');
+    raise EWasmConnectorError.Create(MSG_CONNECTOR_SESSION_NIL);
   if (ALength > 0) and (AHost = nil) then
     raise EWasmConnectorError.Create(MSG_CONNECTOR_HOST_NIL);
   FSession := ASession;
@@ -257,7 +259,7 @@ constructor TWasmConnectorSession.Create(const AStore: TWasmStore);
 begin
   inherited Create;
   if AStore = nil then
-    raise EWasmConnectorError.Create('connector session store is nil');
+    raise EWasmConnectorError.Create(MSG_CONNECTOR_STORE_NIL);
   FStore := AStore;
 end;
 
@@ -346,9 +348,9 @@ begin
   CheckMemory(AMem);
   if (ALength > 0) and (ADest = nil) then
     raise EWasmConnectorError.Create(MSG_CONNECTOR_COPY_DEST_NIL);
-  TrapIfOutOfRange(AMem, AOffset, ALength);
-  { MemRead is the overflow-safe copy; a True return is the pre-check we
-    already passed, so this cannot raise and cannot touch Base. }
+  { MemRead owns the overflow-safe pre-check and the MemRangeAt copy, the
+    same path Wasi.GuestReadBytes uses. False is OOB or wrap: raise the
+    chokepoint trap on Pascal ground rather than returning a code. }
   if not MemRead(AMem, AOffset, ALength, ADest) then
     raise EWasmTrap.Create(MSG_TRAP_MEMORY_OUT_OF_BOUNDS);
 end;
@@ -360,7 +362,6 @@ begin
   CheckMemory(AMem);
   if (ALength > 0) and (ASrc = nil) then
     raise EWasmConnectorError.Create(MSG_CONNECTOR_COPY_SRC_NIL);
-  TrapIfOutOfRange(AMem, AOffset, ALength);
   if not MemWrite(AMem, AOffset, ALength, ASrc) then
     raise EWasmTrap.Create(MSG_TRAP_MEMORY_OUT_OF_BOUNDS);
 end;
@@ -388,6 +389,7 @@ end;
 
 function TWasmConnectorSession.BorrowLive: Boolean;
 begin
+  CheckStore;
   Result := FBorrowCount > 0;
 end;
 
