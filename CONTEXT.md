@@ -131,6 +131,12 @@ contains no interpreter or JIT compiler
 The template is shipped; the compile command that populates it is not.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Shell catalog**:
+The installed, versioned index of runtime-shell templates. Target selection
+resolves a triple to exactly one compatible catalog entry or fails; it does
+not search ambient paths or the network.
+_Avoid_: sysroot, toolchain, SDK, target cache
+
 **Runtime-shell payload section**:
 The Mach-O section `__WSHL,__payload` where the packager places the compile
 payload. The bytes are opaque until the product record layout lands; an
