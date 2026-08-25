@@ -15,7 +15,7 @@
     1 magic / 2 aotFormatVer      (structural, in Wasm.Aot.Artifact)
     3 irFormatVer  = IR_FORMAT_VERSION   (ADR-0007 — IR the code was built from)
     4 targetArch   = host arch
-    5 abiFingerprint = live runtime       (§1.4 — same wasmlight build/ABI)
+    5 abiFingerprint = host target descriptor (§1.4 / ADR-0015)
     6 selfChecksum recomputes             (corruption / truncation)
     7 moduleHash   = FNV128(source bytes) (§2.4 — this exact module)
 
@@ -64,7 +64,8 @@ uses
   Wasm.Ir,
   Wasm.Jit,
   Wasm.Jit.CodeBuffer,
-  Wasm.Runtime.Store;
+  Wasm.Runtime.Store,
+  Wasm.Target;
 
 type
   { The load outcome (aot-spec §4.5). alrLoaded means the artifact passed every
@@ -90,17 +91,22 @@ type
   targetArch against this. }
 function AotHostArch: Byte;
 
+{ The AOT target arch id for ATarget. }
+function AotTargetArch(const ATarget: TWasmTarget): Byte;
+
 { Compile every DEFINED function of ALoaded to a `.waot` byte buffer (§3):
   compilable functions (JitCanCompile) are staged to position-independent bytes
   (JitStageFunctionBytes, the JIT's own driver), the rest recorded declined
   (compiled=0, run interpreted at load). Stamps irFormatVer = ALoaded.Ir's
-  version, targetArch = host, abiFingerprint = live runtime, moduleHash =
-  FNV128(source `.wasm` bytes). AStore supplies the record-layout offsets the
-  code bakes (constant across stores of the same build); it need not be the
-  instantiated store. Returns the artifact bytes the caller writes to
+  version, targetArch and abiFingerprint from the selected target descriptor,
+  moduleHash = FNV128(source `.wasm` bytes). The no-target overload compiles
+  for the compiler host. Returns the artifact bytes the caller writes to
   `<name>.waot` (or keeps in memory, as the differential harness does). }
 function AotCompileModule(const AStore: TWasmStore;
-  const ALoaded: TWasmLoadedModule): TWasmBytes;
+  const ALoaded: TWasmLoadedModule): TWasmBytes; overload;
+function AotCompileModule(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const ATarget: TWasmTarget): TWasmBytes; overload;
 
 { The raw-IR form of AotCompileModule for callers that already hold the
   freshly-validated IR and the source bytes and have no TWasmLoadedModule to
@@ -110,7 +116,10 @@ function AotCompileModule(const AStore: TWasmStore;
   so the round-trip's module-hash guard binds artifact to source with no
   redundant second decode. AotCompileModule is a thin wrapper over this. }
 function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
-  const ABytesPtr: PByte; const ABytesLength: NativeUInt): TWasmBytes;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt): TWasmBytes; overload;
+function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget): TWasmBytes; overload;
 
 { Load AArtifact against the freshly-validated ALoaded + its live AInstance in
   AStore, applying every guard (§2.3), and — only if all pass — map each compiled
@@ -138,26 +147,56 @@ function AotLoadAndWireIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
 
 implementation
 
+function AotTargetArch(const ATarget: TWasmTarget): Byte;
+begin
+  case ATarget.Arch of
+    wtaAArch64:
+      Result := WAOT_ARCH_AARCH64;
+    wtaX86_64:
+      Result := WAOT_ARCH_X64;
+  else
+    Result := WAOT_ARCH_UNKNOWN;
+  end;
+end;
+
 function AotHostArch: Byte;
 begin
-  {$IF DEFINED(CPUAARCH64)}
-  Result := WAOT_ARCH_AARCH64;
-  {$ELSEIF DEFINED(CPUX86_64)}
-  Result := WAOT_ARCH_X64;
-  {$ELSE}
-  Result := WAOT_ARCH_UNKNOWN;
-  {$ENDIF}
+  Result := AotTargetArch(WasmTargetHost);
+end;
+
+function AotFingerprintFor(const AStore: TWasmStore;
+  const ATarget: TWasmTarget): UInt64;
+begin
+  if WasmTargetSupported(ATarget) then
+    Result := WasmTargetAbiFingerprint(WasmTargetAbi(ATarget))
+  else
+    Result := WasmAotAbiFingerprint(AStore);
 end;
 
 function AotCompileModule(const AStore: TWasmStore;
   const ALoaded: TWasmLoadedModule): TWasmBytes;
 begin
+  Result := AotCompileModule(AStore, ALoaded, WasmTargetHost);
+end;
+
+function AotCompileModule(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const ATarget: TWasmTarget): TWasmBytes;
+begin
   Result := AotCompileModuleIr(AStore, ALoaded.Ir, ALoaded.BytesPtr,
-    ALoaded.BytesLength);
+    ALoaded.BytesLength, ATarget);
 end;
 
 function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
   const ABytesPtr: PByte; const ABytesLength: NativeUInt): TWasmBytes;
+begin
+  Result := AotCompileModuleIr(AStore, AIr, ABytesPtr, ABytesLength,
+    WasmTargetHost);
+end;
+
+function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget): TWasmBytes;
 var
   Ir: TWasmIrModule;
   Funcs: TWasmAotFuncRecords;
@@ -179,10 +218,10 @@ begin
     Funcs[I].Code := nil;
     Funcs[I].Relocs := nil;    { empty in the unified emitter (§1.2/§1.5) }
     Funcs[I].Compiled := False;
-    if JitCanCompile(Fn) then
+    if JitCanEmitForTarget(Fn, ATarget) then
     begin
       Code := JitStageFunctionBytes(AStore, Ir, Fn,
-        Ir.FuncImportCount + UInt32(I), EntryOffset, RegCount);
+        Ir.FuncImportCount + UInt32(I), ATarget, EntryOffset, RegCount);
       if Length(Code) > 0 then
       begin
         Funcs[I].Compiled := True;
@@ -196,9 +235,9 @@ begin
   end;
 
   Params.IrFormatVer := UInt16(Ir.FormatVersion);
-  Params.TargetArch := AotHostArch;
+  Params.TargetArch := AotTargetArch(ATarget);
   Params.Flags := 0;
-  Params.AbiFingerprint := WasmAotAbiFingerprint(AStore);
+  Params.AbiFingerprint := AotFingerprintFor(AStore, ATarget);
   Params.ModuleHash := WaotHash128(ABytesPtr, ABytesLength);
 
   Result := WriteAotArtifact(Params, Funcs);
