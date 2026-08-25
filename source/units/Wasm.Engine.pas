@@ -351,8 +351,10 @@ procedure CheckStoreThread(const AStore: TWasmStore);
 
 implementation
 
+{$IFNDEF WASM_RUNTIME_SHELL}
 uses
   Wasm.Interp;
+{$ENDIF}
 
 const
   { A linear-memory page is 64 KiB (spec `page-size`). Named locally so the
@@ -745,7 +747,12 @@ end;
 
 procedure EnsureInterpreter(const AStore: TWasmStore);
 begin
+  {$IFDEF WASM_RUNTIME_SHELL}
+  raise EWasmInternal.Create(
+    'internal: runtime shell has no interpreter');
+  {$ELSE}
   RegisterInterpreter(AStore);
+  {$ENDIF}
 end;
 
 function Instantiate(const AStore: TWasmStore; const ALinker: TWasmLinker;
@@ -756,8 +763,12 @@ var
 begin
   if (AStore = nil) or (ALinker = nil) or (AModule = nil) then
     raise EWasmError.Create('instantiate needs a store, linker and module');
-  { Wire the tier once so RunStart / Call have a trampoline. Idempotent. }
+  { Wire the tier once so RunStart / Call have a trampoline. Idempotent.
+    The runtime shell instantiates through InstantiateModule and installs
+    NativeTierInvoke instead — it must not pull InterpTierInvoke. }
+  {$IFNDEF WASM_RUNTIME_SHELL}
   RegisterInterpreter(AStore);
+  {$ENDIF}
   Imports := ALinker.ResolveImports(AModule);
   Inst := InstantiateModule(AStore, AModule.Ir, AModule.BytesPtr,
     AModule.BytesLength, Imports);
@@ -806,7 +817,12 @@ begin
   { Through InterpInvoke (the WasmInvoke trampoline): a trap becomes a
     catchable EWasmTrap, an uncaught throw an EWasmException, proc_exit an
     EWasmExit — all EWasmError, propagated to the caller unchanged. }
+  {$IFDEF WASM_RUNTIME_SHELL}
+  raise EWasmInternal.Create(
+    'internal: runtime shell has no interpreter');
+  {$ELSE}
   InterpInvoke(AFunc.Store, AFunc.Addr, ParamPtr, ResultPtr);
+  {$ENDIF}
 
   for Index := 0 to ResultSlots - 1 do
     AResults[Index] := Results[Index];

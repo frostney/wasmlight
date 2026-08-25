@@ -24,6 +24,13 @@ A Component Model artifact: a WIT-described unit wrapping one or more core
 modules behind typed, language-neutral interfaces.
 _Avoid_: module, package, bundle
 
+**Native executable payload**:
+The self-describing byte container embedded in a compiled native executable:
+the original module, complete native code, the connector plan, and the
+compiled capability set, bound to one module and one target shell
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: .waot, AOT artifact, cache, bundle
+
 **Instance**:
 A module joined to its imports and its store-side state. Instantiation is
 where linking fails, distinct from decoding and validation.
@@ -116,11 +123,12 @@ executable. It contains only bindings required by that executable's imports.
 _Avoid_: connector manifest, registry, dependency graph
 
 **Runtime shell**:
-The prebuilt, interpreter-free Pascal executable template into which
-`wasmlight compile` embeds a validated module, complete native code, and its
-connector plan. It retains validation and runtime helpers but contains no
-interpreter or JIT compiler
+The prebuilt, interpreter-free Pascal executable template (`wasmlight-shell`)
+into which `wasmlight compile` embeds a validated module, complete native
+code, and its connector plan. It retains validation and runtime helpers but
+contains no interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+The template is shipped; the compile command that populates it is not.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
 **Runtime-shell payload section**:
@@ -129,6 +137,13 @@ payload. The bytes are opaque until the product record layout lands; an
 altered section fails the embedded ad-hoc CodeDirectory
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: overlay, resource fork, post-signature trailer
+
+**Shell template**:
+The unfilled runtime shell for one released target, before a payload is
+attached. Linux templates are packaged by appending the payload after the
+last ELF file byte
+([ADR-0016](docs/adr/0016-elf-shells-append-the-payload.md)).
+_Avoid_: stub, blank binary, empty executable
 
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a

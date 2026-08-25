@@ -3,9 +3,11 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-eight suites today (the Mach-O packager and
-  SHA-256 known-answer suites sit beside the runtime suites, as do the
-  Connector language lexer and parser suites), all green.
+  independent programs. Fifty-two suites today, including the native
+  executable payload format, the Connector language lexer and parser
+  suites, the runtime-shell payload and startup suites, Linux ELF
+  runtime-shell packager coverage, and the Mach-O packager and SHA-256
+  known-answer suites.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -124,6 +126,8 @@ instead.
 | `Wasm.Aot.Artifact.Test` | The `.waot` format: header read/write round-trip, the FNV-1a module hash and self-checksum, and each guard (magic, AOT version, IR version, target arch, ABI fingerprint, module hash) rejecting with its own distinct reason. |
 | `Wasm.Sha256.Test` | FIPS 180-4 SHA-256 known-answer vectors (empty, `abc`, the 448-bit block-boundary example) plus a one-byte avalanche check — the digest Apple's CodeDirectory hashes must match. |
 | `Wasm.MachO.Test` | Thin `aarch64-darwin` and `x86_64-darwin` shell templates, payload placement in `__WSHL,__payload`, deterministic packaging, and ad-hoc signature accept/reject (including a flipped payload byte). Fat/ELF/truncated inputs are distinct rejects. Darwin also asks `codesign --verify` on both target templates and, when a thin host executable has header slack, launches a packaged copy and rejects a tampered one. |
+| `Wasm.Package.Elf.Test` | Linux ELF runtime-shell packaging: both `aarch64-linux` and `x86_64-linux` from a host with no linker, deterministic append-plus-trailer output, the template prefix copied unchanged, `PT_LOAD` extents left inside the original template, and the trailer field order pinned from the raw bytes. Distinct rejects for a machine mismatch, ELF32/endian/`ET_REL`/missing `PT_LOAD`, damaged payload, truncated extent, already-packaged file, nonzero reserved bytes, or an unknown target. Templates are the documented placeholder `ET_EXEC` (issue #34 is not required); an `ET_DYN` stand-in and an empty payload also package. A matching Linux host execs the packaged placeholder to exit 0. |
+| `Wasm.Native.Payload.Test` | The embedded native-executable payload: header and required-record round-trip, the FNV-1a module/shell/section hashes and self-checksum, and each structural reject (truncated header, bad magic, incompatible version, overflowing counts, checksum, identity mismatch, duplicate/missing/unknown section, bad section hash, empty function code, oversized code length, entryOffset past code, and directory offset/size boundaries) with literal bytes beside the assertion. |
 | `Wasm.Aot.Test` | The AOT layer end to end: compile a module to an artifact, load it into a fresh store (re-validating first), and prove the wired-up executable memory is byte-identical to a fresh JIT compile — plus a multi-function module and a declined-function case, gated on a live backend. |
 | `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
 | `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |
@@ -132,6 +136,8 @@ instead.
 | `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
 | `Wasm.Connector.Lexer.Test` | The Connector-language tokenizer: punctuation, identifiers, strings, integers, comment trivia, one-token peek, Unix/Windows/classic-Mac newlines, and the unclosed-string / unclosed-comment / illegal-character faults with 1-based positions. |
 | `Wasm.Connector.Test` | `ParseConnector` and the declaration model: static classes, structs, enums, delegates, and `extern` methods; `DllImport` / `EntryPoint` / `MarshalAs` / `In` / `Out` / `Scoped` / `Queued`; unused declarations retained; and a literal-snippet rejection for every excluded construct (method bodies, properties, inheritance, generics, expressions, control flow, allocation). |
+| `Wasm.Shell.Payload.Test` | The temporary runtime-shell envelope: empty and non-empty section round-trips, and malformed cases spelled as literal bytes (bad magic, truncated header/body, unknown version, trailing bytes). |
+| `Wasm.Shell.Test` | The interpreter-free startup path: decode and validation keep their error classes, an incomplete or stale native image is `EWasmLinkError` with no interpreter fallback, connector/capability stubs reject non-empty values, and a valid image runs `_start` through native entries on a 64-bit UNIX host (hello, trap, `17+25` then `proc_exit(42)`). |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and
