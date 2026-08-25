@@ -3,12 +3,11 @@
   The subcommand registry is the single source of truth for the command
   surface: `--help` renders from it, and docs/tooling.md documents it.
   Flags go through the lwpt `cli` package — no hand-rolled ParamStr loops
-  (see AGENTS.md).
+  except the documented `run` pre-scan (see AGENTS.md).
 
-  Shipped surface today is `inspect` and `validate`. `run` arrives with
-  the interpreter tier; until then the command does not exist rather than
-  existing and failing, so `--help` never advertises something the binary
-  cannot do. }
+  `compile` is registered here so the verb, `--target`, and `--connector`
+  exist and fail with structured diagnostics. Native executable emission
+  is not shipped until the remaining ADR-0015 stages land. }
 program wasmlight;
 
 {$I Shared.inc}
@@ -25,6 +24,7 @@ uses
 
   Wasm.Aot,
   Wasm.Aot.Artifact,
+  Wasm.Compile,
   Wasm.Compile.Capabilities,
   Wasm.Core,
   Wasm.Decoder,
@@ -405,6 +405,28 @@ begin
   end;
 end;
 
+{ --- compile ------------------------------------------------------------- }
+
+{ `wasmlight compile <module.wasm> -o <executable> [--target T]
+  [--connector F.wlc]...` — the native-application command (ADR-0015).
+  Parsing is entirely the lwpt cli package: `-o`, `--target`, and
+  repeatable `--connector` are registry options, and `compile --help`
+  renders from them. The heavy lifting lives in Wasm.Compile so it is
+  hermetically unit-testable; this handler only maps the parsed options
+  onto that core and prints the diagnostic. There is no ParamStr
+  pre-scan and no silent fallback to `.waot`, the JIT, or the
+  interpreter. }
+function HandleCompile(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  Res: TWasmCompileResult;
+begin
+  Res := CompileFromOptions(APositionals, AOptions);
+  if Res.Diagnostic <> '' then
+    WriteLn(ErrOutput, ErrPrefix('compile'), Res.Diagnostic);
+  Result := Res.ExitCode;
+end;
+
 { --- run ----------------------------------------------------------------- }
 
 { `wasmlight run [--dir GUEST=HOST]... [--env KEY=VALUE]... <module.wasm>
@@ -714,16 +736,16 @@ end;
 
 function WantsVersion: Boolean;
 var
-  I: Integer;
   A: string;
 begin
+  { Only the first token. Scanning the whole argv would steal a
+    flag-shaped compile/aot value such as `-o -v`. `run` already
+    excludes itself; compile has no guest argv and uses the registry. }
   Result := False;
-  for I := 1 to ParamCount do
-  begin
-    A := ParamStr(I);
-    if (A = '--version') or (A = '-v') or (LowerCase(A) = 'version') then
-      Exit(True);
-  end;
+  if ParamCount < 1 then
+    Exit;
+  A := LowerCase(ParamStr(1));
+  Result := (A = '--version') or (A = '-v') or (A = 'version');
 end;
 
 { True when argv asks for top-level help: no arguments at all, or the
@@ -750,8 +772,10 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   Registry: TSubcommandRegistry;
-  InspectOpts, ValidateOpts, RunOpts, AotOpts: TOptionArray;
+  InspectOpts, ValidateOpts, RunOpts, AotOpts, CompileOpts: TOptionArray;
   AotOutputOpt: TStringOption;
+  CompileOutputOpt, CompileTargetOpt: TStringOption;
+  CompileConnectorOpt: TRepeatableOption;
 begin
   { A `run` invocation forwards its own argv tail to the guest, where `-v` is a
     guest flag, not a request for wasmlight's version. }
@@ -788,6 +812,17 @@ begin
       'Ahead-of-time compile a module to a .waot artifact for instant startup',
       '<module.wasm> [-o <artifact.waot>]',
       @HandleAot, AotOpts));
+
+    { `compile` is the native-executable command (ADR-0015). Options are
+      created by Wasm.Compile so `compile --help` and the unit suite share
+      one definition. Backend stages still fail with structured errors
+      until sibling work lands; the command never falls back to `.waot`. }
+    CompileOpts := CreateCompileOptions(CompileOutputOpt, CompileTargetOpt,
+      CompileConnectorOpt);
+    Registry.Add(TSubcommand.Create('compile',
+      'Compile a module to a native executable (strict; no interpreter fallback)',
+      '<module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...',
+      @HandleCompile, CompileOpts));
 
     { --dir and --env are repeatable and are the ONLY host capabilities `run`
       grants beyond stdio (deny-by-default). --aot/--no-aot select the optional
