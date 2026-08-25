@@ -282,6 +282,7 @@ type
     procedure TestGuardRejectsModuleHashMismatch;
     procedure TestHostTargetMatchesDefaultCompile;
     procedure TestForeignOsDescriptorFingerprintRejected;
+    procedure TestForeignIsaEmissionDeclined;
   end;
 
 function TAotTests.ExportAddr(const AInstance: TWasmModuleInstance;
@@ -1128,6 +1129,69 @@ begin
 end;
 {$ENDIF}
 
+procedure TAotTests.TestForeignIsaEmissionDeclined;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Foreign: TWasmTarget;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Jit: TWasmJitContext;
+  Res: TWasmAotLoadResult;
+  I: Integer;
+  AnyCompiled: Boolean;
+begin
+  Foreign := WasmTargetOf(
+    {$IFDEF CPUAARCH64}wtaX86_64{$ELSE}wtaAArch64{$ENDIF},
+    WasmTargetHost.Os);
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  Jit := nil;
+  try
+    Expect<Boolean>(JitCanEmitForTarget(@Loaded.Ir.Functions[0], Foreign))
+      .ToBe(False);
+    Artifact := AotCompileModule(Store, Loaded, Foreign);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(Parsed.Header.TargetArch))
+      .ToBe(Integer(AotTargetArch(Foreign)));
+    Expect<Boolean>(Parsed.Header.TargetArch <> AotHostArch).ToBe(True);
+    AnyCompiled := False;
+    for I := 0 to High(Parsed.Funcs) do
+      if Parsed.Funcs[I].Compiled then
+        AnyCompiled := True;
+    Expect<Boolean>(AnyCompiled).ToBe(False);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, Res);
+    Expect<Integer>(Ord(Res)).ToBe(Ord(alrArchMismatch));
+    Expect<Boolean>(Jit = nil).ToBe(True);
+  finally
+    FreeAndNil(Jit);
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
 procedure TAotTests.SetupTests;
 begin
   Test('AOT-compiled i32.add loads from the artifact and matches the interpreter',
@@ -1152,6 +1216,8 @@ begin
     TestHostTargetMatchesDefaultCompile);
   Test('a foreign-OS same-arch artifact is rejected on ABI fingerprint',
     TestForeignOsDescriptorFingerprintRejected);
+  Test('a foreign-ISA target stamps the other arch and declines emission',
+    TestForeignIsaEmissionDeclined);
 end;
 
 begin

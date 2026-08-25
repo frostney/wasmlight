@@ -84,9 +84,16 @@ end;
 procedure TTargetTests.TestParseRejectsUnknownTriple;
 var
   Target: TWasmTarget;
+  Abi: TWasmTargetAbi;
 begin
   Expect<Boolean>(WasmTargetParse('i386-unknown-linux-gnu', Target)).ToBe(False);
   Expect<Boolean>(WasmTargetSupported(Target)).ToBe(False);
+  Abi := WasmTargetAbi(Target);
+  Expect<Boolean>(Abi.Triple = '').ToBe(True);
+  Expect<Integer>(Ord(Abi.ObjectFormat)).ToBe(Ord(wofUnknown));
+  Expect<Integer>(Ord(Abi.CallingConvention)).ToBe(Ord(wccUnknown));
+  Expect<Boolean>(Abi.Layout.StoreEpoch = 0).ToBe(True);
+  Expect<Integer>(Integer(Abi.PointerSize)).ToBe(8);
   Expect<Boolean>(WasmTargetParse('aarch64-pc-windows-msvc', Target)).ToBe(False);
   Expect<Boolean>(WasmTargetParse('', Target)).ToBe(False);
 end;
@@ -152,6 +159,9 @@ begin
   Foreign := WasmTargetOf(Host.Arch, OtherOs(Host.Os));
   Expect<Boolean>(WasmTargetCanExecute(Host)).ToBe(True);
   Expect<Boolean>(WasmTargetCanExecute(Foreign)).ToBe(False);
+  Expect<Boolean>(WasmTargetCanExecute(WasmTargetOf(
+    {$IFDEF CPUAARCH64}wtaX86_64{$ELSE}wtaAArch64{$ENDIF},
+    Host.Os))).ToBe(False);
 end;
 
 procedure TTargetTests.TestFingerprintsComeFromTheDescriptor;

@@ -6,8 +6,10 @@
   prevents one compiler binary from describing another released target.
   This unit is the seam those later compile/shell issues consume: every
   supported compiler can construct every 64-bit Unix target descriptor
-  without executing target code, and artifact fingerprints plus baked
-  runtime offsets come from the selected descriptor.
+  without executing target code. Artifact fingerprints and foreign-target
+  baked offsets come from the selected descriptor; host-native JIT/AOT
+  still bake the live store so a compiler-profile layout shift cannot
+  crash the running binary.
 
   THE FIRST RELEASED SET (ADR-0015) is AArch64 and x86-64 on Darwin and
   Linux. Win64 and i386 Windows are later releases; ARM32 and i386 Linux
@@ -42,8 +44,6 @@ unit Wasm.Target;
 interface
 
 uses
-  SysUtils,
-
   Wasm.Core;
 
 const
@@ -216,7 +216,9 @@ function WasmTargetTriple(const ATarget: TWasmTarget): string;
 function WasmTargetEqual(const A, B: TWasmTarget): Boolean;
 
 { Full ABI descriptor. Supported targets receive the published LP64 Unix
-  layout; an unsupported query is zeroed except for Target and WaotArch. }
+  layout. An unsupported query keeps Target, WaotArch, and the published
+  size/revision constants and zeros the layout, object format, calling
+  convention, page size, and triple. }
 function WasmTargetAbi(const ATarget: TWasmTarget): TWasmTargetAbi;
 
 { FNV-1a-64 over the descriptor — identity plus published layout. Does

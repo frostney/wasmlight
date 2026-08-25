@@ -3,8 +3,8 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-six suites today, including the Connector
-  language lexer and parser suites.
+  independent programs. Forty-seven suites today, including the Connector
+  language lexer and parser suites and `Wasm.Target.Test`.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
