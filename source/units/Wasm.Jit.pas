@@ -110,7 +110,8 @@ uses
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 type
   PWasmIrFunctionRec = ^TWasmIrFunction;
@@ -166,6 +167,20 @@ type
   TWasmJitCompiledEntry = procedure(const ARegBase: PWasmValue;
     const AStore: TWasmStore; const AIrBase: PWasmIrInstr); cdecl;
 
+  { Why JitCanCompile would refuse AFn. jdNone means the function is inside
+    the current fence; every other value is the first failing check, in the
+    same order JitCanCompile walks. AOT's strict path uses this so a decline
+    names the reason instead of collapsing to "not compiled". }
+  TWasmJitDecline = (
+    jdNone,
+    jdNoBackend,
+    jdNilFunction,
+    jdFrameTooLarge,
+    jdExceptionHandling,
+    jdUnsupportedOp,
+    jdUnsupportedInstr
+  );
+
 { Register the JIT on AStore: allocate the code cache and point the store's
   JitInvokeCompiled hook at JitDispatch, leaving TierInvoke on the interpreter
   (§4.1 — the interpreter stays the entry dispatcher; the JIT is reached through
@@ -173,6 +188,8 @@ type
   store. Idempotent-ish: a second call returns a fresh context and re-points the
   hook; normal use is once per store. }
 function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
+
+function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
 
 { The compile predicate and scope fence (§10.3): True only if the active backend
   can emit EVERY op in the function AND the frame fits the backend's addressing.
@@ -218,6 +235,17 @@ function JitStageFunctionBytes(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes; overload;
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32; const ATarget: TWasmTarget;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes; overload;
+
+{ True when the requested target's ISA can be emitted and AFn passes the
+  host compile predicate. Foreign-OS same-arch targets are emittable;
+  foreign-ISA targets decline until both backends are runtime-selectable. }
+function JitCanEmitForTarget(const AFn: PWasmIrFunctionRec;
+  const ATarget: TWasmTarget): Boolean;
 
 implementation
 
@@ -305,24 +333,23 @@ end;
 
 { --- the predicate (§10.3) ----------------------------------------------- }
 
-function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
+function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
 {$IFDEF WASM_JIT_BACKEND}
 var
   I: Integer;
 {$ENDIF}
 begin
   {$IFDEF WASM_JIT_BACKEND}
-  Result := False;
   if AFn = nil then
-    Exit;
+    Exit(jdNilFunction);
   { The frame must fit the backend's slot addressing (§10.3). }
   {$IFDEF WASM_JIT_ARM64}
   if AFn^.RegisterCount > ARM64_MAX_SLOT then
-    Exit;
+    Exit(jdFrameTooLarge);
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   if AFn^.RegisterCount > X64_MAX_SLOT then
-    Exit;
+    Exit(jdFrameTooLarge);
   {$ENDIF}
   { Handler tables compile: throw / throw_ref have templates, and
     UnwindException scans the same IR table the interpreter uses (tag
@@ -337,23 +364,28 @@ begin
   begin
     {$IFDEF WASM_JIT_ARM64}
     if not Arm64CanEmitOp(AFn^.Code[I].Op) then
-      Exit;
+      Exit(jdUnsupportedOp);
     if not Arm64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit;
+      Exit(jdUnsupportedInstr);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     if not X64CanEmitOp(AFn^.Code[I].Op) then
-      Exit;
+      Exit(jdUnsupportedOp);
     if not X64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit;
+      Exit(jdUnsupportedInstr);
     {$ENDIF}
   end;
-  Result := True;
+  Result := jdNone;
   {$ELSE}
   { No backend for this target: everything runs interpreted (§2.2). AFn is a
     const param, so an unused one on this leg draws no warning. }
-  Result := False;
+  Result := jdNoBackend;
   {$ENDIF}
+end;
+
+function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
+begin
+  Result := JitCompileDecline(AFn) = jdNone;
 end;
 
 function JitCanNativeScalarSelf(const AFn: PWasmIrFunctionRec;
@@ -2451,13 +2483,32 @@ begin
     ARegisterCount);
 end;
 
+function JitCanEmitForTarget(const AFn: PWasmIrFunctionRec;
+  const ATarget: TWasmTarget): Boolean;
+begin
+  Result := WasmTargetCanEmit(ATarget) and JitCanCompile(AFn);
+end;
+
 function JitStageFunctionBytes(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32; out AEntryOffset: NativeUInt;
   out ARegisterCount: UInt32): TWasmBytes;
+begin
+  Result := JitStageFunctionBytes(AStore, AIr, AFn, AFuncIdx, WasmTargetHost,
+    AEntryOffset, ARegisterCount);
+end;
+
+function JitStageFunctionBytes(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32; const ATarget: TWasmTarget;
+  out AEntryOffset: NativeUInt;
+  out ARegisterCount: UInt32): TWasmBytes;
 {$IFDEF WASM_JIT_BACKEND}
 var
   Buf: TWasmCodeBuffer;
+  Abi: TWasmTargetAbi;
+  JO: TWasmJitOffsets;
+  EpochOffset, SnapshotOffset, HelperTableOffset: NativeUInt;
 {$ENDIF}
 begin
   Result := nil;
@@ -2466,12 +2517,29 @@ begin
   if AFn = nil then
     Exit;
   ARegisterCount := AFn^.RegisterCount;
+  if not WasmTargetCanEmit(ATarget) then
+    Exit;
   {$IFDEF WASM_JIT_BACKEND}
+  { Host emission uses the live store offsets ForceCompile bakes, so a
+    compiler-profile layout shift cannot miscompile the running binary.
+    A requested foreign target consumes the published descriptor. }
+  if WasmTargetEqual(ATarget, WasmTargetHost) and (AStore <> nil) then
+  begin
+    JO := WasmJitOffsets(AStore);
+    EpochOffset := JO.StoreEpoch;
+    SnapshotOffset := JO.StoreEpochSnapshot;
+    HelperTableOffset := JO.StoreJitHelperTable;
+  end
+  else
+  begin
+    Abi := WasmTargetAbi(ATarget);
+    EpochOffset := NativeUInt(Abi.Layout.StoreEpoch);
+    SnapshotOffset := NativeUInt(Abi.Layout.StoreEpochSnapshot);
+    HelperTableOffset := NativeUInt(Abi.Layout.StoreJitHelperTable);
+  end;
   try
     Buf := JitCompileToBuffer(AIr, AFn, AFuncIdx,
-      WasmJitOffsets(AStore).StoreEpoch,
-      WasmJitOffsets(AStore).StoreEpochSnapshot,
-      WasmJitOffsets(AStore).StoreJitHelperTable, { AFinalize } False);
+      EpochOffset, SnapshotOffset, HelperTableOffset, { AFinalize } False);
   except
     { A function whose branch displacements overflow the backend's immediate
       fields is declined (nil), exactly as ForceCompile declines it; it is then

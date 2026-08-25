@@ -61,7 +61,8 @@ uses
   Wasm.Ir,
   Wasm.Runtime.Gc,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 type
   { The interpreter's activation and per-store context, exposed so the
@@ -377,18 +378,15 @@ const
     no such loads but fail closed against a runtime that could emit them. }
   { Revision 16: compiled try_table / throw / throw_ref. Appends aohPublishIp,
     aohEhThrow, and aohEhResumeIndex; compiled frames publish a Native bit
-    the unwinder consults. }
+    the unwinder consults. Must stay equal to WASM_TARGET_ABI_REVISION. }
   AOT_ABI_REVISION = 16;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
-  (aot-spec §1.4): all WasmJitOffsets fields, all WasmJitFrameOffsets fields,
-  SizeOf(TWasmIrInstr) (the pinned-IR-base stride), SizeOf(TWasmValue) (the slot
-  stride), the helper-table slot count, and AOT_ABI_REVISION. The AOT loader
-  recomputes this from the LIVE runtime and rejects an artifact on mismatch —
-  the "same build/ABI" guard beside the IR-version and arch guards. Wave 0
-  ships the compute function; the AOT tier consumes it in Wave 1. Needs a live
-  store because StoreEpoch et al. are measured from the object reference. }
+  (aot-spec §1.4). On a released 64-bit Unix target this is
+  WasmTargetAbiFingerprint of the host descriptor — identity plus the
+  published LP64 layout, not a live SizeOf. Off those hosts the historical
+  live-layout fold is retained so Windows/32-bit cache stamping is unchanged. }
 function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
 
 implementation
@@ -3605,7 +3603,7 @@ end;
 { FNV-1a hashing wraps modulo 2^64 by design, so overflow/range checks must be
   off for the multiply below (they are on project-wide via Shared.inc). }
 {$push}{$Q-}{$R-}
-function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+function WasmAotAbiFingerprintFromLiveRuntime(const AStore: TWasmStore): UInt64;
 var
   H: UInt64;
   JO: TWasmJitOffsets;
@@ -3706,6 +3704,14 @@ begin
   Result := H;
 end;
 {$pop}
+
+function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+begin
+  if WasmTargetSupported(WasmTargetHost) then
+    Result := WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost))
+  else
+    Result := WasmAotAbiFingerprintFromLiveRuntime(AStore);
+end;
 
 procedure InterpTierInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
   const AParams: PWasmValue; const AResults: PWasmValue);
