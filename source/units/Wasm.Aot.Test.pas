@@ -60,7 +60,8 @@ uses
   Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 { --- byte-assembly helpers (mirrors Wasm.Jit.Test) ---------------------- }
 
@@ -328,6 +329,9 @@ type
     procedure TestGuardRejectsWrongArch;
     procedure TestGuardRejectsCorruptChecksum;
     procedure TestGuardRejectsModuleHashMismatch;
+    procedure TestHostTargetMatchesDefaultCompile;
+    procedure TestForeignOsDescriptorFingerprintRejected;
+    procedure TestForeignIsaEmissionDeclined;
     procedure TestStrictSuccessCompilesEveryFunction;
     procedure TestStrictPredicateDeclineExceptionHandling;
     procedure TestStrictPredicateDeclineUnsupportedOp;
@@ -1088,6 +1092,163 @@ begin
 end;
 {$ENDIF}
 
+procedure TAotTests.TestHostTargetMatchesDefaultCompile;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  DefaultArt, HostArt: TWasmBytes;
+  DefaultParsed, HostParsed: TWasmAotArtifact;
+begin
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  try
+    DefaultArt := AotCompileModule(Store, Loaded);
+    HostArt := AotCompileModule(Store, Loaded, WasmTargetHost);
+    Expect<Integer>(Ord(ParseAotArtifact(DefaultArt, DefaultParsed)))
+      .ToBe(Ord(aprOk));
+    Expect<Integer>(Ord(ParseAotArtifact(HostArt, HostParsed)))
+      .ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(DefaultParsed.Header.TargetArch))
+      .ToBe(Integer(AotHostArch));
+    Expect<UInt64>(DefaultParsed.Header.AbiFingerprint).ToBe(
+      WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost)));
+    Expect<UInt64>(HostParsed.Header.AbiFingerprint).ToBe(
+      DefaultParsed.Header.AbiFingerprint);
+  finally
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestForeignOsDescriptorFingerprintRejected;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Foreign: TWasmTarget;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Jit: TWasmJitContext;
+  Res: TWasmAotLoadResult;
+begin
+  Foreign := WasmTargetOf(WasmTargetHost.Arch,
+    TWasmTargetOs(Ord(wtoDarwin) + Ord(wtoLinux) - Ord(WasmTargetHost.Os)));
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  Jit := nil;
+  try
+    Artifact := AotCompileModule(Store, Loaded, Foreign);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(Parsed.Header.TargetArch)).ToBe(Integer(AotHostArch));
+    Expect<UInt64>(Parsed.Header.AbiFingerprint).ToBe(
+      WasmTargetAbiFingerprint(WasmTargetAbi(Foreign)));
+    Expect<Boolean>(
+      Parsed.Header.AbiFingerprint <> WasmAotAbiFingerprint(Store)).ToBe(True);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, Res);
+    Expect<Integer>(Ord(Res)).ToBe(Ord(alrAbiMismatch));
+    Expect<Boolean>(Jit = nil).ToBe(True);
+  finally
+    FreeAndNil(Jit);
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestForeignIsaEmissionDeclined;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Foreign: TWasmTarget;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Jit: TWasmJitContext;
+  Res: TWasmAotLoadResult;
+  I: Integer;
+  AnyCompiled: Boolean;
+begin
+  Foreign := WasmTargetOf(
+    {$IFDEF CPUAARCH64}wtaX86_64{$ELSE}wtaAArch64{$ENDIF},
+    WasmTargetHost.Os);
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  Jit := nil;
+  try
+    Expect<Boolean>(JitCanEmitForTarget(@Loaded.Ir.Functions[0], Foreign))
+      .ToBe(False);
+    Artifact := AotCompileModule(Store, Loaded, Foreign);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(Parsed.Header.TargetArch))
+      .ToBe(Integer(AotTargetArch(Foreign)));
+    Expect<Boolean>(Parsed.Header.TargetArch <> AotHostArch).ToBe(True);
+    AnyCompiled := False;
+    for I := 0 to High(Parsed.Funcs) do
+      if Parsed.Funcs[I].Compiled then
+        AnyCompiled := True;
+    Expect<Boolean>(AnyCompiled).ToBe(False);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, Res);
+    Expect<Integer>(Ord(Res)).ToBe(Ord(alrArchMismatch));
+    Expect<Boolean>(Jit = nil).ToBe(True);
+  finally
+    FreeAndNil(Jit);
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
 procedure TAotTests.TestStrictSuccessCompilesEveryFunction;
 {$IFDEF WASM_JIT_BACKEND}
 var
@@ -1478,6 +1639,12 @@ begin
     TestGuardRejectsCorruptChecksum);
   Test('an artifact loaded against a different module is rejected (moduleHash)',
     TestGuardRejectsModuleHashMismatch);
+  Test('an explicit host target stamps the same descriptor fingerprint',
+    TestHostTargetMatchesDefaultCompile);
+  Test('a foreign-OS same-arch artifact is rejected on ABI fingerprint',
+    TestForeignOsDescriptorFingerprintRejected);
+  Test('a foreign-ISA target stamps the other arch and declines emission',
+    TestForeignIsaEmissionDeclined);
   Test('strict compile succeeds only when every defined function is native',
     TestStrictSuccessCompilesEveryFunction);
   Test('strict compile fails a try_table predicate decline',

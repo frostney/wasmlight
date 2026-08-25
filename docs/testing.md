@@ -3,8 +3,8 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-six suites today, including the Connector
-  language lexer and parser suites.
+  independent programs. Forty-seven suites today, including the Connector
+  language lexer and parser suites and `Wasm.Target.Test`.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -116,6 +116,7 @@ instead.
 | `Wasm.Interp.Numeric.Test` | The numeric leaf functions on raw bit patterns: modulo-2^N integer arithmetic, the trapping conversions, sign extension, and float ops preserving NaN payloads across the call boundary — each case a literal input and expected bits. |
 | `Wasm.Interp.Vector.Test` | The `v128` vector leaf functions on literal 16-byte vectors: lane-wise arithmetic wrapping the lane width, saturating/narrowing clamps, shift counts taken mod the lane width, the per-lane NaN discipline (canonicalise to the positive pattern; `pmin`/`pmax` and `min`/`max` selecting bit-for-bit), swizzle/shuffle lane indexing, and relaxed SIMD reducing to its non-relaxed twin on the deterministic profile (R=0). |
 | `Wasm.Interp.Test` | The dispatch loop over the IR: numeric/parametric/variable/control/call flow, the explicit activation stack with `return_call` replacing the top frame in bounded stack, traps long-jumping to the trampoline as exactly one `EWasmTrap`, the epoch check at loop back-edges, the frame register file zeroed at entry, and exception handling (Track H) — `throw` / `throw_ref` / `try_table` unwinding the activation stack, handler matching by tag store-address, `catch`/`catch_ref`/`catch_all`/`catch_all_ref` binding, and an uncaught throw surfacing as exactly one `EWasmException`. |
+| `Wasm.Target.Test` | Host-independent 64-bit Unix triples and ABI descriptors: every released aarch64/x86_64 Darwin/Linux descriptor constructs without a store or executable mapping, fingerprints fold the selected descriptor rather than `SizeOf`, same-arch foreign-OS targets are emittable but not executable, and the host descriptor is pinned to the live Pascal layout. |
 | `Wasm.Jit.CodeBuffer.Test` | The W^X executable-code buffer: emission and byte layout, the label/patch map resolving forward branches, branch-range overflow raising rather than silently mis-encoding, and the make-executable / cache-flush dance — built on every target, executed only where a backend runs. |
 | `Wasm.Jit.Arm64.Test` | The aarch64 backend at the byte level: the A64 encodings checked numerically, the AAPCS64 prologue/epilogue and pinned callee-saved registers, the epoch back-edge check, and the per-op templates — the arch-specific assertions gated on `CPUAARCH64`. |
 | `Wasm.Jit.X64.Test` | The x86-64 backend at the byte level: ModRM/REX/immediate encodings cross-checked against the Intel SDM, the pin map (six callee-saved registers), and the per-op templates — gated on `CPUX86_64`. |

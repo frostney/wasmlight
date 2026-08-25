@@ -15,7 +15,7 @@
     1 magic / 2 aotFormatVer      (structural, in Wasm.Aot.Artifact)
     3 irFormatVer  = IR_FORMAT_VERSION   (ADR-0007 — IR the code was built from)
     4 targetArch   = host arch
-    5 abiFingerprint = live runtime       (§1.4 — same wasmlight build/ABI)
+    5 abiFingerprint = host target descriptor (§1.4 / ADR-0015)
     6 selfChecksum recomputes             (corruption / truncation)
     7 moduleHash   = FNV128(source bytes) (§2.4 — this exact module)
 
@@ -51,8 +51,8 @@
   d7b37e4170d8315f2f1283aed4e8076591a9a333 (ADR-0004). Depends on
   Wasm.Aot.Artifact (format), Wasm.Jit (driver + helper table + stage/adopt),
   Wasm.Jit.CodeBuffer (host support probe), Wasm.Interp (ABI fingerprint),
-  Wasm.Engine (the loaded module), Wasm.Ir (IR_FORMAT_VERSION), and
-  Wasm.Runtime.Store. }
+  Wasm.Engine (the loaded module), Wasm.Ir (IR_FORMAT_VERSION),
+  Wasm.Target (descriptor fingerprints), and Wasm.Runtime.Store. }
 unit Wasm.Aot;
 
 {$I Shared.inc}
@@ -70,7 +70,8 @@ uses
   Wasm.Ir,
   Wasm.Jit,
   Wasm.Jit.CodeBuffer,
-  Wasm.Runtime.Store;
+  Wasm.Runtime.Store,
+  Wasm.Target;
 
 type
   { The load outcome (aot-spec §4.5). alrLoaded means the artifact passed every
@@ -125,17 +126,22 @@ const
   targetArch against this. }
 function AotHostArch: Byte;
 
+{ The AOT target arch id for ATarget. }
+function AotTargetArch(const ATarget: TWasmTarget): Byte;
+
 { Compile every DEFINED function of ALoaded to a `.waot` byte buffer (§3):
   compilable functions (JitCanCompile) are staged to position-independent bytes
   (JitStageFunctionBytes, the JIT's own driver), the rest recorded declined
   (compiled=0, run interpreted at load). Stamps irFormatVer = ALoaded.Ir's
-  version, targetArch = host, abiFingerprint = live runtime, moduleHash =
-  FNV128(source `.wasm` bytes). AStore supplies the record-layout offsets the
-  code bakes (constant across stores of the same build); it need not be the
-  instantiated store. Returns the artifact bytes the caller writes to
+  version, targetArch and abiFingerprint from the selected target descriptor,
+  moduleHash = FNV128(source `.wasm` bytes). The no-target overload compiles
+  for the compiler host. Returns the artifact bytes the caller writes to
   `<name>.waot` (or keeps in memory, as the differential harness does). }
 function AotCompileModule(const AStore: TWasmStore;
-  const ALoaded: TWasmLoadedModule): TWasmBytes;
+  const ALoaded: TWasmLoadedModule): TWasmBytes; overload;
+function AotCompileModule(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const ATarget: TWasmTarget): TWasmBytes; overload;
 
 { The raw-IR form of AotCompileModule for callers that already hold the
   freshly-validated IR and the source bytes and have no TWasmLoadedModule to
@@ -145,7 +151,10 @@ function AotCompileModule(const AStore: TWasmStore;
   so the round-trip's module-hash guard binds artifact to source with no
   redundant second decode. AotCompileModule is a thin wrapper over this. }
 function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
-  const ABytesPtr: PByte; const ABytesLength: NativeUInt): TWasmBytes;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt): TWasmBytes; overload;
+function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget): TWasmBytes; overload;
 
 { Strict whole-module compile (ADR-0015): every defined function must have
   native code or the call raises EWasmAotError and returns no bytes. Distinct
@@ -240,8 +249,35 @@ begin
       [AFuncIrIndex, Detail]);
 end;
 
+function AotTargetArch(const ATarget: TWasmTarget): Byte;
+begin
+  case ATarget.Arch of
+    wtaAArch64:
+      Result := WAOT_ARCH_AARCH64;
+    wtaX86_64:
+      Result := WAOT_ARCH_X64;
+  else
+    Result := WAOT_ARCH_UNKNOWN;
+  end;
+end;
+
+function AotHostArch: Byte;
+begin
+  Result := AotTargetArch(WasmTargetHost);
+end;
+
+function AotFingerprintFor(const AStore: TWasmStore;
+  const ATarget: TWasmTarget): UInt64;
+begin
+  if WasmTargetSupported(ATarget) then
+    Result := WasmTargetAbiFingerprint(WasmTargetAbi(ATarget))
+  else
+    Result := WasmAotAbiFingerprint(AStore);
+end;
+
 function CompileModuleFunctions(const AStore: TWasmStore;
-  const AIr: TWasmIrModule; const AStrict: Boolean): TWasmAotFuncRecords;
+  const AIr: TWasmIrModule; const ATarget: TWasmTarget;
+  const AStrict: Boolean): TWasmAotFuncRecords;
 var
   Ir: TWasmIrModule;
   I: Integer;
@@ -253,7 +289,8 @@ var
 begin
   Result := nil;
   Ir := AIr;
-  if AStrict and ((AotHostArch = WAOT_ARCH_UNKNOWN) or
+  if AStrict and ((AotTargetArch(ATarget) = WAOT_ARCH_UNKNOWN) or
+    (not WasmTargetCanEmit(ATarget)) or
     (JitCompileDecline(nil) = jdNoBackend)) then
     raise EWasmAotError.CreateDecline(WASM_AOT_NO_FUNC, wadTarget, jdNoBackend);
 
@@ -269,6 +306,8 @@ begin
     Result[I].Compiled := False;
     Code := nil;
     Decline := JitCompileDecline(Fn);
+    if (Decline = jdNone) and not JitCanEmitForTarget(Fn, ATarget) then
+      Decline := jdNoBackend;
     if Decline <> jdNone then
     begin
       if AStrict then
@@ -282,7 +321,7 @@ begin
 
     try
       Code := JitStageFunctionBytes(AStore, Ir, Fn,
-        Ir.FuncImportCount + UInt32(I), EntryOffset, RegCount);
+        Ir.FuncImportCount + UInt32(I), ATarget, EntryOffset, RegCount);
     except
       { A predicate/emitter contradiction is EWasmInternal and must stay
         that class. Bare EWasmError from the code buffer — unbound labels,
@@ -312,41 +351,46 @@ end;
 
 function SerializeCompiled(const AStore: TWasmStore; const AIr: TWasmIrModule;
   const ABytesPtr: PByte; const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget;
   const AFuncs: TWasmAotFuncRecords): TWasmBytes;
 var
   Params: TWasmAotWriteParams;
 begin
   Params.IrFormatVer := UInt16(AIr.FormatVersion);
-  Params.TargetArch := AotHostArch;
+  Params.TargetArch := AotTargetArch(ATarget);
   Params.Flags := 0;
-  Params.AbiFingerprint := WasmAotAbiFingerprint(AStore);
+  Params.AbiFingerprint := AotFingerprintFor(AStore, ATarget);
   Params.ModuleHash := WaotHash128(ABytesPtr, ABytesLength);
   Result := WriteAotArtifact(Params, AFuncs);
-end;
-
-function AotHostArch: Byte;
-begin
-  {$IF DEFINED(CPUAARCH64)}
-  Result := WAOT_ARCH_AARCH64;
-  {$ELSEIF DEFINED(CPUX86_64)}
-  Result := WAOT_ARCH_X64;
-  {$ELSE}
-  Result := WAOT_ARCH_UNKNOWN;
-  {$ENDIF}
 end;
 
 function AotCompileModule(const AStore: TWasmStore;
   const ALoaded: TWasmLoadedModule): TWasmBytes;
 begin
+  Result := AotCompileModule(AStore, ALoaded, WasmTargetHost);
+end;
+
+function AotCompileModule(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const ATarget: TWasmTarget): TWasmBytes;
+begin
   Result := AotCompileModuleIr(AStore, ALoaded.Ir, ALoaded.BytesPtr,
-    ALoaded.BytesLength);
+    ALoaded.BytesLength, ATarget);
 end;
 
 function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
   const ABytesPtr: PByte; const ABytesLength: NativeUInt): TWasmBytes;
 begin
-  Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength,
-    CompileModuleFunctions(AStore, AIr, False));
+  Result := AotCompileModuleIr(AStore, AIr, ABytesPtr, ABytesLength,
+    WasmTargetHost);
+end;
+
+function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget): TWasmBytes;
+begin
+  Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength, ATarget,
+    CompileModuleFunctions(AStore, AIr, ATarget, False));
 end;
 
 function AotCompileModuleStrict(const AStore: TWasmStore;
@@ -361,7 +405,7 @@ function AotCompileModuleIrStrict(const AStore: TWasmStore;
   const ABytesLength: NativeUInt): TWasmBytes;
 begin
   Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength,
-    CompileModuleFunctions(AStore, AIr, True));
+    WasmTargetHost, CompileModuleFunctions(AStore, AIr, WasmTargetHost, True));
 end;
 
 procedure AotPublishArtifact(const APath: string; const ABytes: TWasmBytes);
