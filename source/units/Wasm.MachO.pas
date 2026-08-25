@@ -40,6 +40,7 @@ const
   FAT_MAGIC = UInt32($CAFEBABE);
   FAT_CIGAM = UInt32($BEBAFECA);
   FAT_MAGIC_64 = UInt32($CAFEBABF);
+  FAT_CIGAM_64 = UInt32($BFBAFECA);
 
   CPU_ARCH_ABI64 = UInt32($01000000);
   CPU_TYPE_X86_64 = CPU_ARCH_ABI64 or UInt32(7);
@@ -342,7 +343,8 @@ begin
   if NativeUInt(Length(ABytes)) < 4 then
     Exit(mmrTruncated);
   Magic := RU32(ABytes, 0);
-  if (Magic = FAT_MAGIC) or (Magic = FAT_CIGAM) or (Magic = FAT_MAGIC_64) then
+  if (Magic = FAT_MAGIC) or (Magic = FAT_CIGAM) or (Magic = FAT_MAGIC_64)
+    or (Magic = FAT_CIGAM_64) then
     Exit(mmrUnsupported);
   if NativeUInt(Length(ABytes)) < 8 then
   begin

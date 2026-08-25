@@ -42,6 +42,9 @@ type
     procedure TestRejectNotMachO;
     procedure TestRejectTruncated;
     procedure TestRejectFat;
+    procedure TestRejectEmpty;
+    procedure TestRejectSwappedEndian;
+    procedure TestIdentifierUsesBasename;
     procedure TestEmptyPayloadExtractsEmpty;
     procedure TestTargetNames;
     {$IFDEF DARWIN}
@@ -134,13 +137,20 @@ end;
 procedure TMachOTests.TestPackageDeterministic;
 var
   Tmpl, A, B: TWasmBytes;
+  Targets: array[0..1] of TWasmMachOTarget;
+  T: Integer;
 begin
-  Tmpl := WriteMachOShellTemplate(wmtAarch64Darwin);
-  Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
-    'wasmlight-shell', A))).ToBe(Ord(mmrOk));
-  Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
-    'wasmlight-shell', B))).ToBe(Ord(mmrOk));
-  Expect<Boolean>(BytesEqual(A, B)).ToBe(True);
+  Targets[0] := wmtAarch64Darwin;
+  Targets[1] := wmtX86_64Darwin;
+  for T := 0 to High(Targets) do
+  begin
+    Tmpl := WriteMachOShellTemplate(Targets[T]);
+    Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
+      'wasmlight-shell', A))).ToBe(Ord(mmrOk));
+    Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
+      'wasmlight-shell', B))).ToBe(Ord(mmrOk));
+    Expect<Boolean>(BytesEqual(A, B)).ToBe(True);
+  end;
 end;
 
 procedure TMachOTests.TestRejectAlteredPayload;
@@ -201,17 +211,56 @@ var
   Fat: TWasmBytes;
 begin
   SetLength(Fat, 8);
-  { FAT_CIGAM on disk is the big-endian cafe babe as little-endian bytes
-    CA FE BA BE. }
-  Fat[0] := $CA;
-  Fat[1] := $FE;
-  Fat[2] := $BA;
-  Fat[3] := $BE;
   Fat[4] := 0;
   Fat[5] := 0;
   Fat[6] := 0;
   Fat[7] := 2;
+  { Fat magics are big-endian on disk. RU32 reads them little-endian, so
+    CA FE BA BE is FAT_CIGAM and CA FE BA BF is FAT_CIGAM_64. }
+  Fat[0] := $CA;
+  Fat[1] := $FE;
+  Fat[2] := $BA;
+  Fat[3] := $BE;
   Expect<Integer>(Ord(InspectMachO(Fat, Info))).ToBe(Ord(mmrUnsupported));
+  Fat[3] := $BF;
+  Expect<Integer>(Ord(InspectMachO(Fat, Info))).ToBe(Ord(mmrUnsupported));
+end;
+
+procedure TMachOTests.TestRejectEmpty;
+var
+  Info: TWasmMachOInfo;
+  Out_: TWasmBytes;
+begin
+  Expect<Integer>(Ord(InspectMachO(nil, Info))).ToBe(Ord(mmrEmpty));
+  Expect<Integer>(Ord(PackageMachORuntimeShell(nil, SamplePayload, '',
+    Out_))).ToBe(Ord(mmrEmpty));
+end;
+
+procedure TMachOTests.TestRejectSwappedEndian;
+var
+  Info: TWasmMachOInfo;
+  Swapped: TWasmBytes;
+begin
+  { MH_CIGAM_64 as little-endian bytes: a big-endian 64-bit Mach-O. }
+  SetLength(Swapped, 32);
+  FillChar(Swapped[0], Length(Swapped), 0);
+  Swapped[0] := $FE;
+  Swapped[1] := $ED;
+  Swapped[2] := $FA;
+  Swapped[3] := $CF;
+  Expect<Integer>(Ord(InspectMachO(Swapped, Info))).ToBe(Ord(mmrUnsupported));
+end;
+
+procedure TMachOTests.TestIdentifierUsesBasename;
+var
+  Tmpl, A, B: TWasmBytes;
+begin
+  Tmpl := WriteMachOShellTemplate(wmtX86_64Darwin);
+  Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
+    'wasmlight-shell', A))).ToBe(Ord(mmrOk));
+  Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
+    '/tmp/wasmlight-shell', B))).ToBe(Ord(mmrOk));
+  Expect<Boolean>(BytesEqual(A, B)).ToBe(True);
 end;
 
 procedure TMachOTests.TestEmptyPayloadExtractsEmpty;
@@ -319,23 +368,28 @@ var
   Tmpl, Packaged: TWasmBytes;
   Path, Cmd: string;
   Status: Integer;
+  Targets: array[0..1] of TWasmMachOTarget;
+  T: Integer;
 begin
-  Tmpl := WriteMachOShellTemplate(wmtAarch64Darwin);
-  {$IFDEF CPUAARCH64}
-  Tmpl := WriteMachOShellTemplate(wmtAarch64Darwin);
-  {$ELSE}
-  Tmpl := WriteMachOShellTemplate(wmtX86_64Darwin);
-  {$ENDIF}
-  Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
-    'wasmlight-shell', Packaged))).ToBe(Ord(mmrOk));
-  Path := GetTempDir + 'wasmlight-macho-codesign-' + IntToHex(Random($FFFFFF), 6);
-  Expect<Boolean>(WriteWholeFile(Path, Packaged)).ToBe(True);
-  try
-    Cmd := '/usr/bin/codesign --verify --strict ' + Path;
-    Status := fpSystem(Cmd);
-    Expect<Integer>(Status).ToBe(0);
-  finally
-    DeleteFile(Path);
+  { codesign --verify is a signature check, not a launch: both macOS
+    targets must verify on this Darwin host. }
+  Targets[0] := wmtAarch64Darwin;
+  Targets[1] := wmtX86_64Darwin;
+  for T := 0 to High(Targets) do
+  begin
+    Tmpl := WriteMachOShellTemplate(Targets[T]);
+    Expect<Integer>(Ord(PackageMachORuntimeShell(Tmpl, SamplePayload,
+      'wasmlight-shell', Packaged))).ToBe(Ord(mmrOk));
+    Path := GetTempDir + 'wasmlight-macho-codesign-' + IntToHex(Random($FFFFFF), 6)
+      + '-' + MachOTargetName(Targets[T]);
+    Expect<Boolean>(WriteWholeFile(Path, Packaged)).ToBe(True);
+    try
+      Cmd := '/usr/bin/codesign --verify --strict ' + Path;
+      Status := fpSystem(Cmd);
+      Expect<Integer>(Status).ToBe(0);
+    finally
+      DeleteFile(Path);
+    end;
   end;
 end;
 
@@ -401,11 +455,14 @@ begin
   Test('ELF magic is rejected as not Mach-O', TestRejectNotMachO);
   Test('a truncated header is rejected', TestRejectTruncated);
   Test('a fat binary is unsupported', TestRejectFat);
+  Test('empty input is a distinct empty reject', TestRejectEmpty);
+  Test('a swapped-endian Mach-O is unsupported', TestRejectSwappedEndian);
+  Test('the CodeDirectory ident is the basename', TestIdentifierUsesBasename);
   Test('an empty payload round-trips on an unfilled template',
     TestEmptyPayloadExtractsEmpty);
   Test('target names match the ADR-0015 spellings', TestTargetNames);
   {$IFDEF DARWIN}
-  Test('codesign --verify accepts the packaged native-arch template',
+  Test('codesign --verify accepts both packaged macOS target templates',
     TestCodesignVerifies);
   Test('a packaged host executable launches and rejects a tampered payload',
     TestHostBinaryLaunchAndTamper);
