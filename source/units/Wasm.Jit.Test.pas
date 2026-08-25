@@ -1839,16 +1839,19 @@ var
       for I := 0 to High(Result.Extra) do
         Result.Extra[I] := Res[I + 1].Bits;
     except
-      on E: EWasmTrap do
-      begin
-        Result.Trapped := True;
-        Result.Msg := E.Message;
-      end;
-      on E: EWasmException do
-      begin
-        Result.Exceptional := True;
-        Result.Msg := E.Message;
-      end;
+      on E: Exception do
+        if E.ClassType = EWasmException then
+        begin
+          Result.Exceptional := True;
+          Result.Msg := E.Message;
+        end
+        else if E.ClassType = EWasmTrap then
+        begin
+          Result.Trapped := True;
+          Result.Msg := E.Message;
+        end
+        else
+          raise;
     end;
   end;
 
@@ -2030,16 +2033,19 @@ function TJitTests.DiffFresh(const ABytes: TWasmBytes; const AExport: string;
         for I := 0 to High(Result.Extra) do
           Result.Extra[I] := Res[I + 1].Bits;
       except
-        on E: EWasmTrap do
-        begin
-          Result.Trapped := True;
-          Result.Msg := E.Message;
-        end;
-        on E: EWasmException do
-        begin
-          Result.Exceptional := True;
-          Result.Msg := E.Message;
-        end;
+        on E: Exception do
+          if E.ClassType = EWasmException then
+          begin
+            Result.Exceptional := True;
+            Result.Msg := E.Message;
+          end
+          else if E.ClassType = EWasmTrap then
+          begin
+            Result.Trapped := True;
+            Result.Msg := E.Message;
+          end
+          else
+            raise;
       end;
     finally
       FreeAndNil(Jit);
@@ -3350,6 +3356,10 @@ end;
 
 procedure TJitTests.TestCompiledUncaughtThrow;
 begin
+  { The error hierarchy is load-bearing: an uncaught throw is EWasmException,
+    a sibling of EWasmTrap, never a subclass (CONTEXT.md, ADR-0009). }
+  Expect<Boolean>(EWasmException.InheritsFrom(EWasmTrap)).ToBe(False);
+  Expect<Boolean>(EWasmTrap.InheritsFrom(EWasmException)).ToBe(False);
   Expect<Boolean>(DiffModule(CompiledUncaughtThrowModuleBytes, 'boom', []))
     .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;

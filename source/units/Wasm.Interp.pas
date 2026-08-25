@@ -375,9 +375,9 @@ const
   { Revision 15: the wave-11 inline struct.new fast path bakes the GC-heap,
     block, and instance engine-id offsets; artifacts from revision 14 carry
     no such loads but fail closed against a runtime that could emit them. }
-    { Revision 16: compiled try_table / throw / throw_ref. Appends aohPublishIp,
-      aohEhThrow, and aohEhResumeIndex; compiled frames publish a Native bit
-      the unwinder consults. }
+  { Revision 16: compiled try_table / throw / throw_ref. Appends aohPublishIp,
+    aohEhThrow, and aohEhResumeIndex; compiled frames publish a Native bit
+    the unwinder consults. }
   AOT_ABI_REVISION = 16;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
