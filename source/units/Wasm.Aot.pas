@@ -42,12 +42,17 @@
   walks every defined function (compilable ones compiled, the rest recorded
   declined), which naturally covers the one-function milestone (§7.2).
 
+  STRICT COMPILE (ADR-0015, issue #31). AotCompileModuleStrict is a distinct
+  entry point: every defined function must compile or the call raises
+  EWasmAotError (function index + decline kind) and publishes nothing.
+  AotCompileModule stays the fallback-capable `.waot` cache generator.
+
   Spec pin: wasm-mcp 0.2.16, spec/main
   d7b37e4170d8315f2f1283aed4e8076591a9a333 (ADR-0004). Depends on
   Wasm.Aot.Artifact (format), Wasm.Jit (driver + helper table + stage/adopt),
   Wasm.Jit.CodeBuffer (host support probe), Wasm.Interp (ABI fingerprint),
-  Wasm.Engine (the loaded module), Wasm.Ir (IR_FORMAT_VERSION), and
-  Wasm.Runtime.Store. }
+  Wasm.Engine (the loaded module), Wasm.Ir (IR_FORMAT_VERSION),
+  Wasm.Target (descriptor fingerprints), and Wasm.Runtime.Store. }
 unit Wasm.Aot;
 
 {$I Shared.inc}
@@ -55,6 +60,7 @@ unit Wasm.Aot;
 interface
 
 uses
+  Classes,
   SysUtils,
 
   Wasm.Aot.Artifact,
@@ -85,6 +91,35 @@ type
     alrModuleHashMismatch,   { a stale artifact for a since-changed module }
     alrNoBackend             { this host has no JIT/AOT backend }
   );
+
+  { Why a strict whole-module compile refused to publish. Distinct from
+    TWasmAotLoadResult: a cache load may fall back, a strict compile may not.
+    wadTarget is the host/backend (no function). The others name one defined
+    function. wadRange is the late branch-displacement refuse after the
+    predicate passed; wadBackend is any other late staging failure. }
+  TWasmAotDeclineKind = (
+    wadTarget,
+    wadPredicate,
+    wadBackend,
+    wadRange
+  );
+
+  { A compile-time refuse of a strict whole-module compile. A SIBLING of
+    EWasmTrap under EWasmError, never a subclass: this is a host compile
+    outcome, not a guest run-time fault. FuncIrIndex is High(UInt32) for a
+    module-level target refuse; otherwise it is the defined-function index. }
+  EWasmAotError = class(EWasmError)
+  public
+    FuncIrIndex: UInt32;
+    Kind: TWasmAotDeclineKind;
+    Predicate: TWasmJitDecline;
+    constructor CreateDecline(const AFuncIrIndex: UInt32;
+      const AKind: TWasmAotDeclineKind; const APredicate: TWasmJitDecline);
+  end;
+
+const
+  { Sentinel FuncIrIndex on EWasmAotError when Kind is wadTarget. }
+  WASM_AOT_NO_FUNC = High(UInt32);
 
 { The AOT target arch id for THIS host (Wasm.Aot.Artifact's WAOT_ARCH_*), or
   WAOT_ARCH_UNKNOWN off a supported CPU. Guard 4 compares the artifact's
@@ -121,6 +156,28 @@ function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
   const ABytesPtr: PByte; const ABytesLength: NativeUInt;
   const ATarget: TWasmTarget): TWasmBytes; overload;
 
+{ Strict whole-module compile (ADR-0015): every defined function must have
+  native code or the call raises EWasmAotError and returns no bytes. Distinct
+  from AotCompileModule, which records JitCanCompile / late backend declines
+  as uncompiled cache records for interpreter fallback. }
+function AotCompileModuleStrict(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule): TWasmBytes;
+
+{ The raw-IR form of AotCompileModuleStrict. }
+function AotCompileModuleIrStrict(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const ABytesPtr: PByte;
+  const ABytesLength: NativeUInt): TWasmBytes;
+
+{ Visibility-atomic publication: write ABytes to a sibling staging file, then
+  rename over APath so a reader never sees a partial artifact. Compile
+  failures must not call this. IO errors raise EInOutError, not EWasmAotError. }
+procedure AotPublishArtifact(const APath: string; const ABytes: TWasmBytes);
+
+{ Compile strictly, then publish atomically. A decline raises EWasmAotError
+  before any bytes are written; APath is left absent or unchanged. }
+procedure AotCompileModuleStrictToFile(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule; const APath: string);
+
 { Load AArtifact against the freshly-validated ALoaded + its live AInstance in
   AStore, applying every guard (§2.3), and — only if all pass — map each compiled
   function's code executable and wire its CompiledEntry (§4.2). ALoaded MUST be
@@ -146,6 +203,51 @@ function AotLoadAndWireIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
   out AResult: TWasmAotLoadResult): TWasmJitContext;
 
 implementation
+
+function DeclineKindName(const AKind: TWasmAotDeclineKind): string;
+begin
+  case AKind of
+    wadTarget: Result := 'target (no backend)';
+    wadPredicate: Result := 'predicate';
+    wadBackend: Result := 'backend';
+    wadRange: Result := 'range (branch displacement)';
+  else
+    Result := 'unknown';
+  end;
+end;
+
+function PredicateName(const APredicate: TWasmJitDecline): string;
+begin
+  case APredicate of
+    jdNone: Result := 'none';
+    jdNoBackend: Result := 'no-backend';
+    jdNilFunction: Result := 'nil-function';
+    jdFrameTooLarge: Result := 'frame-too-large';
+    jdExceptionHandling: Result := 'exception-handling';
+    jdUnsupportedOp: Result := 'unsupported-op';
+    jdUnsupportedInstr: Result := 'unsupported-instr';
+  else
+    Result := 'unknown';
+  end;
+end;
+
+constructor EWasmAotError.CreateDecline(const AFuncIrIndex: UInt32;
+  const AKind: TWasmAotDeclineKind; const APredicate: TWasmJitDecline);
+var
+  Detail: string;
+begin
+  Kind := AKind;
+  Predicate := APredicate;
+  FuncIrIndex := AFuncIrIndex;
+  Detail := DeclineKindName(AKind);
+  if (AKind = wadPredicate) and (APredicate <> jdNone) then
+    Detail := Detail + ' (' + PredicateName(APredicate) + ')';
+  if AFuncIrIndex = WASM_AOT_NO_FUNC then
+    inherited Create('aot: declined: ' + Detail)
+  else
+    inherited CreateFmt('aot: function %d declined: %s',
+      [AFuncIrIndex, Detail]);
+end;
 
 function AotTargetArch(const ATarget: TWasmTarget): Byte;
 begin
@@ -173,6 +275,95 @@ begin
     Result := WasmAotAbiFingerprint(AStore);
 end;
 
+function CompileModuleFunctions(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const ATarget: TWasmTarget;
+  const AStrict: Boolean): TWasmAotFuncRecords;
+var
+  Ir: TWasmIrModule;
+  I: Integer;
+  Fn: PWasmIrFunctionRec;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegCount: UInt32;
+  Decline: TWasmJitDecline;
+begin
+  Result := nil;
+  Ir := AIr;
+  if AStrict and ((AotTargetArch(ATarget) = WAOT_ARCH_UNKNOWN) or
+    (not WasmTargetCanEmit(ATarget)) or
+    (JitCompileDecline(nil) = jdNoBackend)) then
+    raise EWasmAotError.CreateDecline(WASM_AOT_NO_FUNC, wadTarget, jdNoBackend);
+
+  SetLength(Result, Length(Ir.Functions));
+  for I := 0 to High(Ir.Functions) do
+  begin
+    Fn := @Ir.Functions[I];
+    Result[I].FuncIrIndex := UInt32(I);
+    Result[I].RegisterCount := Fn^.RegisterCount;
+    Result[I].EntryOffset := 0;
+    Result[I].Code := nil;
+    Result[I].Relocs := nil;
+    Result[I].Compiled := False;
+    Code := nil;
+    Decline := JitCompileDecline(Fn);
+    if (Decline = jdNone) and not JitCanEmitForTarget(Fn, ATarget) then
+      Decline := jdNoBackend;
+    if Decline <> jdNone then
+    begin
+      if AStrict then
+      begin
+        if Decline = jdNoBackend then
+          raise EWasmAotError.CreateDecline(UInt32(I), wadTarget, Decline);
+        raise EWasmAotError.CreateDecline(UInt32(I), wadPredicate, Decline);
+      end;
+      Continue;
+    end;
+
+    try
+      Code := JitStageFunctionBytes(AStore, Ir, Fn,
+        Ir.FuncImportCount + UInt32(I), ATarget, EntryOffset, RegCount);
+    except
+      { A predicate/emitter contradiction is EWasmInternal and must stay
+        that class. Bare EWasmError from the code buffer — unbound labels,
+        patch range — is a late backend refuse and becomes wadBackend on
+        the strict path. }
+      on E: EWasmInternal do
+        raise;
+      on E: EWasmError do
+        if AStrict then
+          raise EWasmAotError.CreateDecline(UInt32(I), wadBackend, jdNone)
+        else
+          raise;
+    end;
+    if Length(Code) > 0 then
+    begin
+      Result[I].Compiled := True;
+      Result[I].Code := Code;
+      Result[I].EntryOffset := UInt32(EntryOffset);
+      Result[I].RegisterCount := RegCount;
+    end
+    else if AStrict then
+      { JitStageFunctionBytes swallows EWasmJitBranchRange and returns nil;
+        that is the only late refuse after the predicate passed. }
+      raise EWasmAotError.CreateDecline(UInt32(I), wadRange, jdNone);
+  end;
+end;
+
+function SerializeCompiled(const AStore: TWasmStore; const AIr: TWasmIrModule;
+  const ABytesPtr: PByte; const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget;
+  const AFuncs: TWasmAotFuncRecords): TWasmBytes;
+var
+  Params: TWasmAotWriteParams;
+begin
+  Params.IrFormatVer := UInt16(AIr.FormatVersion);
+  Params.TargetArch := AotTargetArch(ATarget);
+  Params.Flags := 0;
+  Params.AbiFingerprint := AotFingerprintFor(AStore, ATarget);
+  Params.ModuleHash := WaotHash128(ABytesPtr, ABytesLength);
+  Result := WriteAotArtifact(Params, AFuncs);
+end;
+
 function AotCompileModule(const AStore: TWasmStore;
   const ALoaded: TWasmLoadedModule): TWasmBytes;
 begin
@@ -197,50 +388,60 @@ end;
 function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
   const ABytesPtr: PByte; const ABytesLength: NativeUInt;
   const ATarget: TWasmTarget): TWasmBytes;
-var
-  Ir: TWasmIrModule;
-  Funcs: TWasmAotFuncRecords;
-  Params: TWasmAotWriteParams;
-  I: Integer;
-  Fn: PWasmIrFunctionRec;
-  Code: TWasmBytes;
-  EntryOffset: NativeUInt;
-  RegCount: UInt32;
 begin
-  Ir := AIr;
-  SetLength(Funcs, Length(Ir.Functions));
-  for I := 0 to High(Ir.Functions) do
-  begin
-    Fn := @Ir.Functions[I];
-    Funcs[I].FuncIrIndex := UInt32(I);
-    Funcs[I].RegisterCount := Fn^.RegisterCount;
-    Funcs[I].EntryOffset := 0;
-    Funcs[I].Code := nil;
-    Funcs[I].Relocs := nil;    { empty in the unified emitter (§1.2/§1.5) }
-    Funcs[I].Compiled := False;
-    if JitCanEmitForTarget(Fn, ATarget) then
-    begin
-      Code := JitStageFunctionBytes(AStore, Ir, Fn,
-        Ir.FuncImportCount + UInt32(I), ATarget, EntryOffset, RegCount);
-      if Length(Code) > 0 then
-      begin
-        Funcs[I].Compiled := True;
-        Funcs[I].Code := Code;
-        Funcs[I].EntryOffset := UInt32(EntryOffset);
-        Funcs[I].RegisterCount := RegCount;
-      end;
-      { Length(Code) = 0 here means the backend declined late (e.g. branch
-        range) — recorded un-compiled, run interpreted at load. }
-    end;
+  Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength, ATarget,
+    CompileModuleFunctions(AStore, AIr, ATarget, False));
+end;
+
+function AotCompileModuleStrict(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule): TWasmBytes;
+begin
+  Result := AotCompileModuleIrStrict(AStore, ALoaded.Ir, ALoaded.BytesPtr,
+    ALoaded.BytesLength);
+end;
+
+function AotCompileModuleIrStrict(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const ABytesPtr: PByte;
+  const ABytesLength: NativeUInt): TWasmBytes;
+begin
+  Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength,
+    WasmTargetHost, CompileModuleFunctions(AStore, AIr, WasmTargetHost, True));
+end;
+
+procedure AotPublishArtifact(const APath: string; const ABytes: TWasmBytes);
+var
+  TmpPath: string;
+  Stream: TFileStream;
+begin
+  TmpPath := APath + '.publishing';
+  if FileExists(TmpPath) then
+    DeleteFile(TmpPath);
+  Stream := nil;
+  try
+    Stream := TFileStream.Create(TmpPath, fmCreate);
+    if Length(ABytes) > 0 then
+      Stream.WriteBuffer(ABytes[0], Length(ABytes));
+    FreeAndNil(Stream);
+    {$IFNDEF UNIX}
+    if FileExists(APath) and not DeleteFile(APath) then
+      raise EInOutError.CreateFmt('cannot replace "%s"', [APath]);
+    {$ENDIF}
+    if not RenameFile(TmpPath, APath) then
+      raise EInOutError.CreateFmt('cannot publish "%s"', [APath]);
+  finally
+    Stream.Free;
+    if FileExists(TmpPath) then
+      DeleteFile(TmpPath);
   end;
+end;
 
-  Params.IrFormatVer := UInt16(Ir.FormatVersion);
-  Params.TargetArch := AotTargetArch(ATarget);
-  Params.Flags := 0;
-  Params.AbiFingerprint := AotFingerprintFor(AStore, ATarget);
-  Params.ModuleHash := WaotHash128(ABytesPtr, ABytesLength);
-
-  Result := WriteAotArtifact(Params, Funcs);
+procedure AotCompileModuleStrictToFile(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule; const APath: string);
+var
+  Artifact: TWasmBytes;
+begin
+  Artifact := AotCompileModuleStrict(AStore, ALoaded);
+  AotPublishArtifact(APath, Artifact);
 end;
 
 function AotLoadAndWire(const AStore: TWasmStore;
