@@ -131,6 +131,13 @@ contains no interpreter or JIT compiler
 The template is shipped; the compile command that populates it is not.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Shell template**:
+The unfilled runtime shell for one released target, before a payload is
+attached. Linux templates are packaged by appending the payload after the
+last ELF file byte
+([ADR-0016](docs/adr/0016-elf-shells-append-the-payload.md)).
+_Avoid_: stub, blank binary, empty executable
+
 **Target triple**:
 The architecture-vendor-os string that names a native compilation target
 independently of the compiler host. The released 64-bit Unix set is

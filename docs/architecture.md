@@ -37,7 +37,7 @@
   shipped as a template. [roadmap.md](roadmap.md) is the honest picture of
   what remains: the rest of the native-compiler spine
   ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md))
-  (`wasmlight compile`, ELF/Mach-O packaging), broader
+  (`wasmlight compile`, Mach-O packaging), broader
   optimizing-compiler work, and later platform and host-surface releases.
   Nothing in v1 Core 3 behaviour is staged.
 
@@ -90,6 +90,14 @@ keyed that status on, and the staged-SIMD message before it is gone too.)
 structures plus a disassembler, with no validation logic in it — which is
 also why the IR module carries its own index-space snapshots instead of
 pointing back at `TWasmModule`.
+
+`Wasm.Package.Elf` also sits beside the library: it packages a Linux
+`aarch64-linux` or `x86_64-linux` runtime-shell template with an opaque
+payload by appending bytes and a trailer, with no host linker
+([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md),
+[ADR-0016](adr/0016-elf-shells-append-the-payload.md)). The interpreter-free shell and native-executable payload format are
+shipped; `wasmlight compile` is not. The packager's tests use a documented
+placeholder template.
 
 `Wasm.Wast`, `Wasm.Wast.Values`, `Wasm.Wast.Runner`, and the six
 `Wasm.Wat.*` units sit beside the library rather than in this stack: they
@@ -447,7 +455,7 @@ image; an incomplete or incompatible image is `EWasmLinkError` and is
 never interpreted. `.waot` remains the fallback-capable cache for
 `run --aot`. The envelope that carries module + native + stub connector
 and capability slots is a temporary seam until the product payload
-is embedded; ELF/Mach-O packaging and the compile command are not
+is embedded; Mach-O packaging and the compile command are not
 shipped.
 
 
