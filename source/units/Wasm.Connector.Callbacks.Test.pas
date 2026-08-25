@@ -11,6 +11,8 @@
     - queued void notifications copied from a foreign thread
     - rejection of queued results / pointer borrows
     - rejection of foreign-thread synchronous results
+    - bind/off-thread rejects are EWasmCallbackError, distinct from
+      EWasmConnectorError and from guest trap/exception/exit
     - EWasmTrap / EWasmException / EWasmExit do not unwind through the
       cdecl frame; RethrowDeferred surfaces the exact class
     - raylib-style AudioCallback and SDL-style EventFilter shapes
@@ -31,6 +33,7 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Connector,
   Wasm.Engine,
   Wasm.Connector.Callbacks,
   Wasm.Runtime.Store,
@@ -190,7 +193,7 @@ begin
     '(module (func (export "inc") (param i32) (result i32)' +
     ' (i32.add (local.get 0) (i32.const 1))))');
   Fn := ExportFunc(Inst, 'inc');
-  Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wclRetained));
+  Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wckRetained));
   Expect<Int32>(Thunk(41)).ToBe(42);
   Expect<Boolean>(FHub.HasDeferredFailure).ToBe(False);
 end;
@@ -205,8 +208,8 @@ begin
     '(module (func (export "inc") (param i32) (result i32)' +
     ' (i32.add (local.get 0) (i32.const 1))))');
   Fn := ExportFunc(Inst, 'inc');
-  First := FHub.Bind(Fn, wcsI32I32, wclRetained);
-  Second := FHub.Bind(Fn, wcsI32I32, wclRetained);
+  First := FHub.Bind(Fn, wcsI32I32, wckRetained);
+  Second := FHub.Bind(Fn, wcsI32I32, wckRetained);
   Expect<Boolean>(First = Second).ToBe(True);
   Expect<Boolean>(First <> nil).ToBe(True);
 end;
@@ -233,7 +236,7 @@ begin
   Inst := Track(Instantiate(FStore, Linker, Loaded));
   Leaf := ExportFunc(Inst, 'leaf');
   Run := ExportFunc(Inst, 'run');
-  GFireThunk := FHub.Bind(Leaf, wcsI32I32, wclRetained);
+  GFireThunk := FHub.Bind(Leaf, wcsI32I32, wckRetained);
 
   SetLength(Args, 1);
   Args[0] := MakeValueI32(20);
@@ -253,7 +256,7 @@ begin
     '(module (func (export "inc") (param i32) (result i32)' +
     ' (i32.add (local.get 0) (i32.const 1))))');
   Fn := ExportFunc(Inst, 'inc');
-  Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wclRetained));
+  Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wckRetained));
   Mark := FHub.BeginScope;
   FHub.EndScope(Mark);
   Expect<Int32>(Thunk(8)).ToBe(9);
@@ -271,7 +274,7 @@ begin
     ' (i32.add (local.get 0) (i32.const 1))))');
   Fn := ExportFunc(Inst, 'inc');
   Mark := FHub.BeginScope;
-  Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wclScoped));
+  Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wckScoped));
   Expect<Int32>(Thunk(1)).ToBe(2);
   FHub.EndScope(Mark);
   Expect<Int32>(Thunk(1)).ToBe(0);
@@ -289,7 +292,7 @@ begin
   Inst := InstantiatePlain('(module (func (export "nop")))');
   Fn := ExportFunc(Inst, 'nop');
   Hub := TWasmCallbackHub.Create(FStore);
-  Thunk := TWasmCallbackProc(Hub.Bind(Fn, wcsVoid, wclRetained));
+  Thunk := TWasmCallbackProc(Hub.Bind(Fn, wcsVoid, wckRetained));
   Thunk();
   Hub.Free;
   Raised := False;
@@ -319,7 +322,7 @@ begin
     '    (global.set $g (i32.add (global.get $g) (local.get 0)))))');
   NoteFn := ExportFunc(Inst, 'note');
   Expect<Boolean>(Inst.FindExportGlobal('g', G)).ToBe(True);
-  Thunk := FHub.Bind(NoteFn, wcsVoidI32, wclQueued);
+  Thunk := FHub.Bind(NoteFn, wcsVoidI32, wckQueued);
 
   Note.Thunk := Thunk;
   Note.Arg := 5;
@@ -355,19 +358,23 @@ begin
 
   Caught := '(none)';
   try
-    FHub.Bind(IncFn, wcsI32I32, wclQueued);
+    FHub.Bind(IncFn, wcsI32I32, wckQueued);
   except
-    on E: EWasmError do
+    on E: EWasmCallbackError do
       Caught := E.Message;
+    on E: EWasmError do
+      Caught := 'collapsed:' + E.ClassName;
   end;
   Expect<Boolean>(Pos(string(MSG_CALLBACK_QUEUED_SHAPE), Caught) = 1).ToBe(True);
 
   Caught := '(none)';
   try
-    FHub.Bind(Audio, wcsVoidPtrU32, wclQueued);
+    FHub.Bind(Audio, wcsVoidPtrU32, wckQueued);
   except
-    on E: EWasmError do
+    on E: EWasmCallbackError do
       Caught := E.Message;
+    on E: EWasmError do
+      Caught := 'collapsed:' + E.ClassName;
   end;
   Expect<Boolean>(Pos(string(MSG_CALLBACK_QUEUED_SHAPE), Caught) = 1).ToBe(True);
 end;
@@ -389,7 +396,7 @@ begin
     '    (global.set $g (i32.add (global.get $g) (local.get 0)))))');
   NoteFn := ExportFunc(Inst, 'note');
   Expect<Boolean>(Inst.FindExportGlobal('g', G)).ToBe(True);
-  Note.Thunk := FHub.Bind(NoteFn, wcsVoidI32, wclRetained);
+  Note.Thunk := FHub.Bind(NoteFn, wcsVoidI32, wckRetained);
   Note.Arg := 3;
   Note.Done := 0;
   Id := BeginThread(@ForeignVoidI32, @Note);
@@ -408,17 +415,19 @@ begin
   try
     FHub.RethrowDeferred;
   except
+    on E: EWasmCallbackError do
+    begin
+      if Pos(string(MSG_CALLBACK_OFF_THREAD), E.Message) = 1 then
+        Kind := 'off-thread'
+      else
+        Kind := 'callback';
+    end;
     on E: EWasmTrap do
       Kind := 'trap';
     on E: EWasmException do
       Kind := 'exception';
     on E: EWasmError do
-    begin
-      if Pos(string(MSG_CALLBACK_OFF_THREAD), E.Message) = 1 then
-        Kind := 'off-thread'
-      else
-        Kind := 'error';
-    end;
+      Kind := 'error';
   end;
   Expect<string>(Kind).ToBe('off-thread');
 end;
@@ -434,7 +443,7 @@ begin
   Inst := InstantiatePlain(
     '(module (func (export "boom") unreachable))');
   Fn := ExportFunc(Inst, 'boom');
-  Thunk := TWasmCallbackProc(FHub.Bind(Fn, wcsVoid, wclRetained));
+  Thunk := TWasmCallbackProc(FHub.Bind(Fn, wcsVoid, wckRetained));
   Raised := False;
   try
     Thunk();
@@ -470,7 +479,7 @@ begin
   Inst := InstantiatePlain(
     '(module (tag $e (param i32)) (func (export "boom") i32.const 1 throw $e))');
   Fn := ExportFunc(Inst, 'boom');
-  Thunk := TWasmCallbackProc(FHub.Bind(Fn, wcsVoid, wclRetained));
+  Thunk := TWasmCallbackProc(FHub.Bind(Fn, wcsVoid, wckRetained));
   Raised := False;
   try
     Thunk();
@@ -512,7 +521,7 @@ begin
   Linker.DefineFunc('host', 'exit', [], [], @HostExitNow, nil);
   Inst := Track(Instantiate(FStore, Linker, Loaded));
   Fn := ExportFunc(Inst, 'go');
-  Thunk := TWasmCallbackProc(FHub.Bind(Fn, wcsVoid, wclRetained));
+  Thunk := TWasmCallbackProc(FHub.Bind(Fn, wcsVoid, wckRetained));
   Raised := False;
   try
     Thunk();
@@ -555,7 +564,7 @@ begin
     '    (global.set $g (i32.add (local.get 0) (local.get 1)))))');
   Fn := ExportFunc(Inst, 'audio');
   Expect<Boolean>(Inst.FindExportGlobal('g', G)).ToBe(True);
-  Thunk := TWasmCallbackAudio(FHub.Bind(Fn, wcsVoidPtrU32, wclRetained));
+  Thunk := TWasmCallbackAudio(FHub.Bind(Fn, wcsVoidPtrU32, wckRetained));
   Thunk(Pointer(10), 4);
   Expect<Int32>(GlobalGet(G).I32).ToBe(14);
 end;
@@ -570,7 +579,7 @@ begin
     '(module (func (export "filter") (param i32 i32) (result i32)' +
     ' (i32.add (local.get 0) (local.get 1))))');
   Fn := ExportFunc(Inst, 'filter');
-  Thunk := TWasmCallbackFilter(FHub.Bind(Fn, wcsI32PtrPtr, wclRetained));
+  Thunk := TWasmCallbackFilter(FHub.Bind(Fn, wcsI32PtrPtr, wckRetained));
   Expect<Int32>(Thunk(Pointer(3), Pointer(4))).ToBe(7);
 end;
 

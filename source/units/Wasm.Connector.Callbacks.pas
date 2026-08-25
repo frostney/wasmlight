@@ -24,6 +24,8 @@
     - EWasmTrap, EWasmException, and EWasmExit never leave a thunk. The
       native caller sees the result type's zero; the exact failure is
       retained and rethrown on Pascal ground (RethrowDeferred / Drain).
+      Bind and off-thread rejects raise EWasmCallbackError, never a trap,
+      throw, exit, or EWasmConnectorError.
     - The store itself is not locked (ADR-0008). The only synchronisation
       is the slot/queue lock around the foreign-thread edge.
     - Function-reference identity is rooted for the binding's life
@@ -43,6 +45,7 @@ interface
 uses
   SysUtils,
 
+  Wasm.Connector,
   Wasm.Core,
   Wasm.Engine,
   Wasm.Runtime.Gc,
@@ -63,10 +66,11 @@ const
   WASM_CALLBACK_SLOT_COUNT = 8;
 
 type
-  { Retained is the default: the native entry stays valid until Unbind or
-    hub teardown. Scoped dies when its BeginScope mark is left.
-    Queued copies a void notification; delivery is on the store thread. }
-  TWasmCallbackLifetime = (wclRetained, wclScoped, wclQueued);
+  { Bind/dispatch contract failure. A sibling of EWasmConnectorError (which
+    is .wlc source) and of EWasmTrap / EWasmException / EWasmExit (which are
+    guest outcomes). Hosts discriminate on the class; do not raise a bare
+    EWasmError here. }
+  EWasmCallbackError = class(EWasmError);
 
   { Representative C shapes. Pointers marshal as i32 tokens so the same
     guest module is valid on 32- and 64-bit hosts; the connector ABI
@@ -106,9 +110,10 @@ type
     destructor Destroy; override;
 
     { Return a target-ABI function pointer for AFunc. Deduplicates a live
-      binding of the same function, shape, lifetime, and scope. }
+      binding of the same function, shape, lifetime, and scope. Lifetime is
+      TWlcCallbackKind — one vocabulary with the .wlc declaration model. }
     function Bind(const AFunc: TWasmFunc; const AShape: TWasmCallbackShape;
-      const ALifetime: TWasmCallbackLifetime): Pointer;
+      const ALifetime: TWlcCallbackKind): Pointer;
     procedure Unbind(const AThunk: Pointer);
 
     function BeginScope: Integer;
@@ -133,7 +138,7 @@ type
     Store: TWasmStore;
     Func: TWasmFunc;
     Shape: TWasmCallbackShape;
-    Lifetime: TWasmCallbackLifetime;
+    Lifetime: TWlcCallbackKind;
     ScopeDepth: Integer;
     Root: TWasmRootHandle;
   end;
@@ -255,7 +260,7 @@ constructor TWasmCallbackHub.Create(const AStore: TWasmStore);
 begin
   inherited Create;
   if AStore = nil then
-    raise EWasmError.Create('callback hub needs a store');
+    raise EWasmCallbackError.Create('callback hub needs a store');
   FStore := AStore;
   FExnRoot := WASM_NO_ROOT;
   FDead := False;
@@ -305,7 +310,7 @@ var
   Hub: TWasmCallbackHub;
   Func: TWasmFunc;
   Shape: TWasmCallbackShape;
-  Lifetime: TWasmCallbackLifetime;
+  Lifetime: TWlcCallbackKind;
   Params, Results: array of TWasmValue;
   OffThread: Boolean;
 begin
@@ -325,7 +330,7 @@ begin
     Lifetime := GSlots[ASlot].Lifetime;
     OffThread := not OnStoreThread(GSlots[ASlot].Store);
     Inc(Hub.FInFlight);
-    if OffThread and (Lifetime = wclQueued) then
+    if OffThread and (Lifetime = wckQueued) then
     begin
       EnqueueNote(ASlot, AA0, AA1);
       Dec(Hub.FInFlight);
@@ -340,9 +345,9 @@ begin
     if OffThread then
     begin
       try
-        raise EWasmError.Create(MSG_CALLBACK_OFF_THREAD);
+        raise EWasmCallbackError.Create(MSG_CALLBACK_OFF_THREAD);
       except
-        on E: EWasmError do
+        on E: EWasmCallbackError do
           Hub.Capture(E);
       end;
       Exit;
@@ -395,6 +400,8 @@ begin
     on E: EWasmException do
       Hub.Capture(E);
     on E: EWasmExit do
+      Hub.Capture(E);
+    on E: EWasmError do
       Hub.Capture(E);
   end;
   finally
@@ -756,23 +763,23 @@ end;
 
 function TWasmCallbackHub.Bind(const AFunc: TWasmFunc;
   const AShape: TWasmCallbackShape;
-  const ALifetime: TWasmCallbackLifetime): Pointer;
+  const ALifetime: TWlcCallbackKind): Pointer;
 var
   Index, FreeSlot: Integer;
   Ref: TWasmRef;
 begin
   if FDead or (FStore = nil) then
-    raise EWasmError.Create('callback hub is torn down');
+    raise EWasmCallbackError.Create('callback hub is torn down');
   if AFunc.Store <> FStore then
-    raise EWasmError.Create(MSG_CALLBACK_STORE);
+    raise EWasmCallbackError.Create(MSG_CALLBACK_STORE);
   if AFunc.Store <> nil then
     AFunc.Store.CheckThread;
   if not ShapeMatches(AFunc, AShape) then
-    raise EWasmError.Create(MSG_CALLBACK_SHAPE);
-  if (ALifetime = wclQueued) and not ShapeAllowsQueued(AShape) then
-    raise EWasmError.Create(MSG_CALLBACK_QUEUED_SHAPE);
+    raise EWasmCallbackError.Create(MSG_CALLBACK_SHAPE);
+  if (ALifetime = wckQueued) and not ShapeAllowsQueued(AShape) then
+    raise EWasmCallbackError.Create(MSG_CALLBACK_QUEUED_SHAPE);
   if (AFunc.Addr >= UInt32(Length(FStore.Funcs))) then
-    raise EWasmError.Create('callback function address is out of range');
+    raise EWasmCallbackError.Create('callback function address is out of range');
 
   EnterCriticalSection(GLock);
   try
@@ -783,13 +790,13 @@ begin
         SameFunc(GSlots[Index].Func, AFunc) and
         (GSlots[Index].Shape = AShape) and
         (GSlots[Index].Lifetime = ALifetime) and
-        ((ALifetime <> wclScoped) or (GSlots[Index].ScopeDepth = FScopeDepth)) then
+        ((ALifetime <> wckScoped) or (GSlots[Index].ScopeDepth = FScopeDepth)) then
         Exit(ThunkOf(AShape, Index));
       if (not GSlots[Index].Used) and (FreeSlot < 0) then
         FreeSlot := Index;
     end;
     if FreeSlot < 0 then
-      raise EWasmError.Create(MSG_CALLBACK_SLOTS);
+      raise EWasmCallbackError.Create(MSG_CALLBACK_SLOTS);
 
     Ref := FStore.Funcs[AFunc.Addr].RefObject;
     GSlots[FreeSlot].Used := True;
@@ -838,7 +845,7 @@ begin
   try
     for Index := 0 to WASM_CALLBACK_SLOT_COUNT - 1 do
       if GSlots[Index].Used and (GSlots[Index].Hub = Self) and
-        (GSlots[Index].Lifetime = wclScoped) and
+        (GSlots[Index].Lifetime = wckScoped) and
         (GSlots[Index].ScopeDepth >= AMark) then
         ReleaseSlot(Index);
   finally

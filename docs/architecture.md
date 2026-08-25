@@ -200,6 +200,14 @@ source, raised by the wat assembler with upstream's canonical prefixes: a
 `assert_malformed` over a text operand keys on this class where over a
 binary operand it keys on `EWasmDecodeError`.
 
+Connector failures stay off this module-contract table too, and stay
+apart from each other. `EWasmConnectorError` (`Wasm.Connector`) is a
+sibling of `EWasmTextError` for malformed `.wlc` source. `EWasmCallbackError`
+(`Wasm.Connector.Callbacks`) is a further sibling for thunk bind and
+dispatch contract failures (shape, off-thread, exhausted slots). A guest
+trap, `throw`, or `proc_exit` that occurs inside a callback keeps its own
+class and is only rethrown on Pascal ground.
+
 ## What is shipped today
 
 The path from bytes — or from text — to a running module, end to end:
@@ -456,10 +464,13 @@ boundary is drawn.
 - **`Wasm.Connector.Callbacks`** hands out target-ABI `cdecl` function
   pointers that re-enter a guest through `Call`. Retained is the default;
   `[Scoped]` dies with `EndScope`; `[Queued]` copies a void notification
-  from a foreign thread and delivers it on the store thread. A guest
+  from a foreign thread and delivers it on the store thread. Lifetimes are
+  `TWlcCallbackKind` from `Wasm.Connector`, not a second enum. A guest
   `EWasmTrap`, `EWasmException`, or `EWasmExit` is retained at the thunk
   and rethrown on Pascal ground — it never unwinds through a native C
-  frame ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md),
+  frame. Bind and off-thread rejects raise `EWasmCallbackError`, a sibling
+  of those classes and of `EWasmConnectorError`, never a collapse of them
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md),
   [ADR-0008](adr/0008-a-store-is-confined-to-one-thread.md)).
 - **`Wasm.Wasi.*`** is the deny-by-default host module, wired entirely over
   `Wasm.Engine`. The capability model is the point: a bare config grants
