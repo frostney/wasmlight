@@ -37,7 +37,7 @@
   shipped as a template. [roadmap.md](roadmap.md) is the honest picture of
   what remains: the rest of the native-compiler spine
   ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md))
-  (`wasmlight compile`, payload format, ELF/Mach-O packaging), broader
+  (`wasmlight compile`, ELF/Mach-O packaging), broader
   optimizing-compiler work, and later platform and host-surface releases.
   Nothing in v1 Core 3 behaviour is staged.
 
@@ -51,6 +51,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
+| Native executable payload | `Wasm.Native.Payload` | versioned embedded-executable container (original module, complete native code, connector plan, capability set), distinct from the `.waot` cache | **shipped** (read/write API); `wasmlight compile` that embeds it is not |
 | Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
 | IR | `Wasm.Ir` | register-based lowered form every tier consumes | **shipped** |
 | Validation | `Wasm.Validator` | the spec's static type check, run once, emitting the IR | **shipped** |
@@ -431,6 +432,13 @@ different.
   raises `EWasmAotError` (function index and decline kind) and publishes
   nothing. The cache path stays fallback-capable.
 
+The compile path uses a different container, `Wasm.Native.Payload`: a
+versioned, checksummed section directory that carries the original module,
+complete native code, the connector plan, and the compiled capability set,
+bound to one module hash and one target-shell hash. It is not a `.waot`
+cache and has no interpreter fallback. The read/write API is shipped;
+`wasmlight compile` that embeds the payload is not.
+
 The **runtime shell** (`Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native`,
 program `wasmlight-shell`) is the interpreter-free template a later
 `wasmlight compile` will populate. Startup always re-decodes and
@@ -439,8 +447,9 @@ image; an incomplete or incompatible image is `EWasmLinkError` and is
 never interpreted. `.waot` remains the fallback-capable cache for
 `run --aot`. The envelope that carries module + native + stub connector
 and capability slots is a temporary seam until the product payload
-format lands; ELF/Mach-O packaging and the compile command are not
+is embedded; ELF/Mach-O packaging and the compile command are not
 shipped.
+
 
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the
