@@ -307,13 +307,13 @@ begin
   Result := True;
   AIsPointer := False;
   case AKind of
-    wlmI1, wlmU1, wlmI2, wlmU2, wlmI4, wlmU4, wlmBool:
+    wlmInt8, wlmUInt8, wlmInt16, wlmUInt16, wlmInt32, wlmUInt32, wlmBool:
       ANum := wntI32;
-    wlmI8, wlmU8:
+    wlmInt64, wlmUInt64:
       ANum := wntI64;
-    wlmR4:
+    wlmFloat32:
       ANum := wntF32;
-    wlmR8:
+    wlmFloat64:
       ANum := wntF64;
     wlmLPStr, wlmLPWStr, wlmLPUTF8Str, wlmLPArray, wlmByValArray,
       wlmSysInt, wlmSysUInt:
