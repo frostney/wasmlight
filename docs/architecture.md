@@ -48,7 +48,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
 | Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), the immutable compiled capability set, and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Connector.Memory`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), the immutable compiled capability set, connector copy-in/out/inout, scoped borrows, and opaque handles, and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Native C ABI | `Wasm.Abi`, `Wasm.Native.Load`, `Wasm.Native.Call` | 64-bit Unix C-ABI call plans (AAPCS64, Apple AAPCS64, SysV x86-64), application-local library load, precompiled call gates; no TinyCC or libffi ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)) | **shipped** (planning on every host; live calls on 64-bit Unix) |
 | Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
@@ -205,6 +205,14 @@ is an `EWasmError` subtype so the trampoline carries it out, but a distinct
 sibling — neither a trap nor a `throw` — so a host classifies it exactly;
 `wasmlight run` maps it to the process exit code and everything else is an
 error.
+
+A further host-surface sibling, `EWasmConnectorError`, is declared in
+`Wasm.Connector.Memory`. It is a connector-contract failure — a stale
+opaque handle, a retained or live scoped borrow used to re-enter the
+guest or to participate in a callback, or a nil host buffer — not a
+guest memory fault. Out-of-range connector copies and borrows still
+raise `EWasmTrap` with `out of bounds memory access`, the same message
+the chokepoint uses for every memory strategy.
 
 `EWasmAotError` is another host-surface sibling, declared in `Wasm.Aot`: a
 strict whole-module compile refused a function (or the target). It is not a
@@ -540,6 +548,16 @@ boundary is drawn.
   facade never sees a memory's base pointer. It re-exports the collector's
   host-root API (contract HOST-1) so a host holding a reference across an
   allocation can root it, and declares `EWasmExit`.
+- **`Wasm.Connector.Memory`** is the connector memory primitive
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)):
+  copy-in, copy-out, and inout buffers with explicit bounds; a scoped
+  synchronous borrow through the same overflow-safe chokepoint pre-check;
+  and a per-store opaque-handle table. A borrowed view cannot be used
+  after `Release`, cannot call back into the guest, and cannot
+  participate in a callback. Raw native pointers never become guest
+  values; a dropped or never-issued handle fails with
+  `EWasmConnectorError`. The `.wlc` parser and C-ABI call engine are
+  not this unit.
 - **`Wasm.Wasi.*`** is the deny-by-default host module, wired entirely over
   `Wasm.Engine`. The capability model is the point: a bare config grants
   stdio + clock + random and nothing else — no environment, no filesystem,

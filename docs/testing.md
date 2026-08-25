@@ -3,14 +3,14 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Sixty suites today, including compiled WASI
+  independent programs. Sixty-one suites today, including compiled WASI
   capability-set coverage, the `wasmlight compile` CLI contract,
   catalog-discovery coverage, the native executable payload format, the
   Connector language lexer, parser, and resolve suites, `Wasm.Target.Test`,
   the runtime-shell payload and startup suites, Linux ELF runtime-shell
   packager coverage, the Mach-O packager and SHA-256 known-answer
-  suites, and 64-bit Unix C-ABI call-plan, local-library, and call-gate
-  coverage.
+  suites, 64-bit Unix C-ABI call-plan, local-library, and call-gate
+  coverage, and connector copy/borrow/handle coverage.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -137,6 +137,7 @@ instead.
 | `Wasm.Native.Load.Test` | Application-local library resolution: platform filename beside the executable, relative join, literal absolute path, `..` escape, a cwd decoy ignored, and missing library as `EWasmLinkError`. |
 | `Wasm.Native.Call.Test` | Precompiled call gates: Pascal `cdecl` scalars/stack/aggregates/pointer-views, C and Pascal fixture libraries observationally identical on scalars, stack, pairs, HFAs, pointer-views, and large aggregates, missing symbol as `EWasmLinkError`; live calls gated to 64-bit Unix. |
 | `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
+| `Wasm.Connector.Memory.Test` | Connector copy-in/out/inout through the chokepoint, scoped-borrow lifetime, and opaque handles: OOB and wrapping transfers trap as `out of bounds memory access` on both i32 and i64 memories; a retained borrow, guest re-entry, and callback while a view is live are `EWasmConnectorError`; stale, zero, and unknown handles fail with one message; a handle is never the raw native pointer. |
 | `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |
 | `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
 | `Wasm.Wasi.Test` | The host module, hermetically: captured stdio buffers instead of real fds, an injected fixed clock and deterministic random source, and temp-dir preopens for the filesystem — args/environ, `fd_write`/`read`/`seek`/`close`, `clock_time_get`, `random_get`, and `path_open` plus the wave-2 file ops. The deny-by-default negatives carry the weight: a fabricated fd is `weBadf`, an ungranted clock or an absent preopen is `weNotCapable`, and a path that is absolute, escapes via `..`, or escapes via a symlink is `weNotCapable` before any OS call. |
