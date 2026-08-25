@@ -639,13 +639,8 @@ begin
   ]);
 end;
 
-{ The EH-transparency shape (jit-spec §8.3/§10.2). A `throw` is delivered by
-  an explicit unwind over the ACTIVATION STACK that stops at the first frame
-  the interpreter cannot resume past, and every tier-seam frame is such a
-  frame — so a compiled function sitting BETWEEN a throw and its handler would
-  turn a caught exception into an uncaught one. $middle is exactly that
-  function: nothing but a call, no handler of its own, in a module that has a
-  tag. The fence must therefore refuse to compile it.
+{ A compiled function sitting BETWEEN a throw and its handler must stay
+  transparent: the unwind pops it and continues (eh-spec §2.3, ADR-0009).
 
     (tag  $e (param i32))
     (func $thrower (param i32) (throw $e (local.get 0)))
@@ -666,6 +661,154 @@ begin
       the export section — ids are not the encoding order. }
     Sect(13, VecOf([BLit([$00, $00])])),
     Sect(7, VecOf([
+      ExportEntry('middle', $00, 1),
+      ExportEntry('outer', $00, 2)])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $20, $00, $08, $00, $0B]),
+      CodeEntry([$00, $20, $00, $10, $00, $41, $00, $0B]),
+      CodeEntry([$00,
+        $02, $7F,
+        $1F, $7F, $01, $00, $00, $01,
+        $20, $00, $10, $01,
+        $0B,
+        $0F,
+        $0B,
+        $0B])]))
+  ]);
+end;
+
+{ Same-function compiled catch: try_table (result i32) (catch tag0 label0)
+  i32.const 5; throw 0. Payload 5 is the result (exec-try_table / catch). }
+function CompiledCatchPayloadModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $01, $7F, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([ExportEntry('caught', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $1F, $7F, $01, $00, $00, $00,
+      $41, $05,
+      $08, $00,
+      $0B,
+      $0B])]))
+  ]);
+end;
+
+{ catch_all: throw is swallowed, function returns 7. }
+function CompiledCatchAllModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([ExportEntry('caught', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $40,
+      $1F, $40, $01, $02, $00,
+      $08, $00,
+      $0B,
+      $0B,
+      $41, $07,
+      $0B])]))
+  ]);
+end;
+
+{ catch_ref delivers a non-null exnref; ref.is_null is 0. }
+function CompiledCatchRefModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([ExportEntry('caught', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $69,
+      $1F, $69, $01, $01, $00, $00,
+      $08, $00,
+      $0B,
+      $0B,
+      $D1,
+      $0B])]))
+  ]);
+end;
+
+{ catch_all_ref: same observable as catch_ref for a single tag. }
+function CompiledCatchAllRefModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $00, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([ExportEntry('caught', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $02, $69,
+      $1F, $69, $01, $03, $00,
+      $08, $00,
+      $0B,
+      $0B,
+      $D1,
+      $0B])]))
+  ]);
+end;
+
+{ Uncaught throw: EWasmException at the invocation boundary. }
+function CompiledUncaughtThrowModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $00])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([ExportEntry('boom', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([$00, $08, $00, $0B])]))
+  ]);
+end;
+
+{ throw_ref of null exnref traps 'null reference' (exec-throw_ref). }
+function CompiledThrowRefNullModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $00, $00])])),
+    Sect(3, VecOf([BLit([$00])])),
+    Sect(7, VecOf([ExportEntry('boom', $00, 0)])),
+    Sect(10, VecOf([CodeEntry([
+      $00,
+      $D0, $69,
+      $0A,
+      $0B])]))
+  ]);
+end;
+
+{ Nested compiled frames: thrower, middle, and outer all compile. }
+function NestedCompiledEhModuleBytes: TWasmBytes;
+begin
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$60, $01, $7F, $00]),
+      BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$01]), BLit([$01])])),
+    Sect(13, VecOf([BLit([$00, $00])])),
+    Sect(7, VecOf([
+      ExportEntry('thrower', $00, 0),
       ExportEntry('middle', $00, 1),
       ExportEntry('outer', $00, 2)])),
     Sect(10, VecOf([
@@ -1430,6 +1573,7 @@ type
 
   TCallOutcome = record
     Trapped: Boolean;
+    Exceptional: Boolean;
     Msg: string;
     Bits: UInt64;                    { result slot 0 }
     Extra: array[0 .. 3] of UInt64;  { result slots 1..4 (multi-value, v128) }
@@ -1536,6 +1680,13 @@ type
     procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
+    procedure TestCompiledCatchPayload;
+    procedure TestCompiledCatchAll;
+    procedure TestCompiledCatchRef;
+    procedure TestCompiledCatchAllRef;
+    procedure TestCompiledUncaughtThrow;
+    procedure TestCompiledThrowRefNull;
+    procedure TestNestedCompiledFramesCatch;
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
@@ -1674,6 +1825,7 @@ var
     for I := 0 to High(Res) do
       Res[I].Bits := High(UInt64);
     Result.Trapped := False;
+    Result.Exceptional := False;
     Result.Msg := '';
     Result.Bits := 0;
     for I := 0 to High(Result.Extra) do
@@ -1687,11 +1839,19 @@ var
       for I := 0 to High(Result.Extra) do
         Result.Extra[I] := Res[I + 1].Bits;
     except
-      on E: EWasmTrap do
-      begin
-        Result.Trapped := True;
-        Result.Msg := E.Message;
-      end;
+      on E: Exception do
+        if E.ClassType = EWasmException then
+        begin
+          Result.Exceptional := True;
+          Result.Msg := E.Message;
+        end
+        else if E.ClassType = EWasmTrap then
+        begin
+          Result.Trapped := True;
+          Result.Msg := E.Message;
+        end
+        else
+          raise;
     end;
   end;
 
@@ -1767,9 +1927,10 @@ begin
     Expect<NativeUInt>(InterpContextFor(Store)^.Depth).ToBe(0);
     Expect<NativeUInt>(InterpContextFor(Store)^.ValueTop).ToBe(0);
 
-    { Observational identity: same trap-or-value, bitwise. }
+    { Observational identity: same trap / exception / value, bitwise. }
     Expect<Boolean>(JitOut.Trapped).ToBe(InterpOut.Trapped);
-    if InterpOut.Trapped then
+    Expect<Boolean>(JitOut.Exceptional).ToBe(InterpOut.Exceptional);
+    if InterpOut.Trapped or InterpOut.Exceptional then
       Expect<string>(JitOut.Msg).ToBe(InterpOut.Msg)
     else
     begin
@@ -1812,6 +1973,7 @@ function TJitTests.DiffFresh(const ABytes: TWasmBytes; const AExport: string;
   begin
     ACompiled := False;
     Result.Trapped := False;
+    Result.Exceptional := False;
     Result.Msg := '';
     Result.Bits := 0;
     for I := 0 to High(Result.Extra) do
@@ -1871,11 +2033,19 @@ function TJitTests.DiffFresh(const ABytes: TWasmBytes; const AExport: string;
         for I := 0 to High(Result.Extra) do
           Result.Extra[I] := Res[I + 1].Bits;
       except
-        on E: EWasmTrap do
-        begin
-          Result.Trapped := True;
-          Result.Msg := E.Message;
-        end;
+        on E: Exception do
+          if E.ClassType = EWasmException then
+          begin
+            Result.Exceptional := True;
+            Result.Msg := E.Message;
+          end
+          else if E.ClassType = EWasmTrap then
+          begin
+            Result.Trapped := True;
+            Result.Msg := E.Message;
+          end
+          else
+            raise;
       end;
     finally
       FreeAndNil(Jit);
@@ -1895,7 +2065,8 @@ begin
   JitOut := RunTier(True, Result);               { the compiled tier }
 
   Expect<Boolean>(JitOut.Trapped).ToBe(InterpOut.Trapped);
-  if InterpOut.Trapped then
+  Expect<Boolean>(JitOut.Exceptional).ToBe(InterpOut.Exceptional);
+  if InterpOut.Trapped or InterpOut.Exceptional then
     Expect<string>(JitOut.Msg).ToBe(InterpOut.Msg)
   else
   begin
@@ -3147,14 +3318,9 @@ end;
 
 procedure TJitTests.TestThrowAcrossCompiledFrameCaught;
 begin
-  { Fix A (Finding 3), the soundness regression test. $middle is a call-bearing
-    function in a module that HAS a tag — exactly what fence 2 used to decline.
-    Fence 2 is retired, so $middle COMPILES, and the throw raised by the inner
-    (interpreted, iroThrow) callee must unwind ACROSS $middle's compiled seam
-    frame to reach the interpreted try_table in $outer. DiffModule force-compiles
-    $middle (True = it really compiled) and asserts the outcome is byte-identical
-    under both tiers — which is what would fail if the compiled seam frame
-    incorrectly swallowed the exception as 'uncaught'. }
+  { $middle sits between a thrower and $outer's try_table. Force-compile
+    $middle and assert the payload is caught identically under both tiers —
+    the compiled seam frame must stay transparent (eh-spec §2.3, ADR-0009). }
   CompileExports(['middle']);
   Expect<Boolean>(DiffModule(ThrowAcrossCallModuleBytes, 'outer',
     [MakeValueI32(7)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
@@ -3162,6 +3328,57 @@ begin
   { The oracle: the exception really is caught (no trap), yielding the payload. }
   Expect<string>(TrapMessageOf(ThrowAcrossCallModuleBytes, 'outer',
     [MakeValueI32(7)])).ToBe('');
+end;
+
+procedure TJitTests.TestCompiledCatchPayload;
+begin
+  Expect<Boolean>(DiffModule(CompiledCatchPayloadModuleBytes, 'caught', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
+procedure TJitTests.TestCompiledCatchAll;
+begin
+  Expect<Boolean>(DiffModule(CompiledCatchAllModuleBytes, 'caught', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
+procedure TJitTests.TestCompiledCatchRef;
+begin
+  Expect<Boolean>(DiffModule(CompiledCatchRefModuleBytes, 'caught', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
+procedure TJitTests.TestCompiledCatchAllRef;
+begin
+  Expect<Boolean>(DiffModule(CompiledCatchAllRefModuleBytes, 'caught', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
+procedure TJitTests.TestCompiledUncaughtThrow;
+begin
+  { The error hierarchy is load-bearing: an uncaught throw is EWasmException,
+    a sibling of EWasmTrap, never a subclass (CONTEXT.md, ADR-0009). }
+  Expect<Boolean>(EWasmException.InheritsFrom(EWasmTrap)).ToBe(False);
+  Expect<Boolean>(EWasmTrap.InheritsFrom(EWasmException)).ToBe(False);
+  Expect<Boolean>(DiffModule(CompiledUncaughtThrowModuleBytes, 'boom', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+end;
+
+procedure TJitTests.TestCompiledThrowRefNull;
+begin
+  Expect<Boolean>(DiffModule(CompiledThrowRefNullModuleBytes, 'boom', []))
+    .ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<string>(TrapMessageOf(CompiledThrowRefNullModuleBytes, 'boom', []))
+    .ToBe('null reference');
+end;
+
+procedure TJitTests.TestNestedCompiledFramesCatch;
+begin
+  CompileExports(['thrower', 'middle', 'outer']);
+  Expect<Boolean>(DiffModule(NestedCompiledEhModuleBytes, 'outer',
+    [MakeValueI32(9)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<string>(TrapMessageOf(NestedCompiledEhModuleBytes, 'outer',
+    [MakeValueI32(9)])).ToBe('');
 end;
 
 { --- Waves 4 & 5: memory / table / reference / global / GC -------------- }
@@ -3677,6 +3894,17 @@ begin
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',
     TestThrowAcrossCompiledFrameCaught);
+  Test('compiled catch delivers the tag payload', TestCompiledCatchPayload);
+  Test('compiled catch_all swallows any tag', TestCompiledCatchAll);
+  Test('compiled catch_ref delivers a non-null exnref', TestCompiledCatchRef);
+  Test('compiled catch_all_ref delivers a non-null exnref',
+    TestCompiledCatchAllRef);
+  Test('an uncaught compiled throw surfaces as EWasmException',
+    TestCompiledUncaughtThrow);
+  Test('compiled throw_ref of null traps null reference',
+    TestCompiledThrowRefNull);
+  Test('a throw across nested compiled frames is caught identically',
+    TestNestedCompiledFramesCatch);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
   Test('a forwarded memory load keeps the store memory effect',

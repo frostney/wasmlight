@@ -272,6 +272,10 @@ type
     { The thrown exn handle (a TWasmRef as a raw NativeUInt), handed across the
       LongJmp so the landing knows what to keep unwinding. }
     ExnRef: NativeUInt;
+    { True when the hop lands on a catch that must NOT re-scan: UnwindException
+      already matched a handler (compiled resume, or an interpreted LoadTop).
+      Plain SeamHop leaves this False. }
+    Resume: Boolean;
   end;
 
 threadvar
@@ -285,6 +289,8 @@ threadvar
   for a rtCompiledSeam frame — such a frame exists only beneath a compiled body,
   which installed a catch). }
 procedure SeamHop(const AExn: NativeUInt);
+{ Like SeamHop, but the landing must not re-scan: a handler already matched. }
+procedure SeamHopResume(const AExn: NativeUInt);
 
 { Record AKind and transfer to the current trampoline. Never returns.
 
@@ -722,6 +728,14 @@ end;
 procedure SeamHop(const AExn: NativeUInt);
 begin
   CurrentSeamCatch^.ExnRef := AExn;
+  CurrentSeamCatch^.Resume := False;
+  LongJmp(CurrentSeamCatch^.JmpBuf, 1);
+end;
+
+procedure SeamHopResume(const AExn: NativeUInt);
+begin
+  CurrentSeamCatch^.ExnRef := AExn;
+  CurrentSeamCatch^.Resume := True;
   LongJmp(CurrentSeamCatch^.JmpBuf, 1);
 end;
 

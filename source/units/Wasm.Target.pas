@@ -69,12 +69,12 @@ const
   WASM_TARGET_VALUE_SLOT_SIZE = UInt32(8);
 
   { Must stay equal to AOT_HELPER_COUNT in Wasm.Runtime.Store. }
-  WASM_TARGET_HELPER_COUNT = UInt32(17);
+  WASM_TARGET_HELPER_COUNT = UInt32(20);
 
   { Must stay equal to AOT_ABI_REVISION in Wasm.Interp. Identity fields
     are folded in addition to this revision, so two OS descriptors of the
     same arch do not share a fingerprint. }
-  WASM_TARGET_ABI_REVISION = UInt32(15);
+  WASM_TARGET_ABI_REVISION = UInt32(16);
 
   WASM_TARGET_POINTER_SIZE = Byte(8);
   WASM_TARGET_PAGE_SIZE_4K = UInt32(4096);
@@ -379,7 +379,7 @@ begin
   Result.CtxDepth := 56;
   Result.CtxFuncsSlot := 64;
   Result.CtxGcFrameSlot := 72;
-  Result.ActStride := 120;
+  Result.ActStride := 128;
   Result.ActBase := 32;
   Result.ActFn := 0;
   Result.ActInstance := 8;

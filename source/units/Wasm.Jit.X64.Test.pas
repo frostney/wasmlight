@@ -64,7 +64,7 @@ type
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWaves;
-    procedure TestPredicateDeclinesEh;
+    procedure TestPredicateEmitsEh;
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestGcFieldAccessBytes;
@@ -794,8 +794,7 @@ end;
 
 procedure TX64Tests.TestPredicateCoversWaves;
 begin
-  { Representative ops from every wave must be compilable (only EH is declined,
-    like the aarch64 backend). }
+  { Representative ops from every wave must be compilable. }
   Expect<Boolean>(X64CanEmitOp(iroI32Add)).ToBe(True);       { Wave 2 inline }
   Expect<Boolean>(X64CanEmitOp(iroI32Clz)).ToBe(True);       { leaf on x86-64 }
   Expect<Boolean>(X64CanEmitOp(iroF64Add)).ToBe(True);       { Wave 2 leaf }
@@ -808,11 +807,11 @@ begin
   Expect<Boolean>(X64CanEmitOp(iroArrayFillVec)).ToBe(True); { last vec op }
 end;
 
-procedure TX64Tests.TestPredicateDeclinesEh;
+procedure TX64Tests.TestPredicateEmitsEh;
 begin
-  { Exception-handling ops are never compiled (§8.3, §10.2). }
-  Expect<Boolean>(X64CanEmitOp(iroThrow)).ToBe(False);
-  Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(False);
+  { throw / throw_ref compile; matching stays in UnwindException. }
+  Expect<Boolean>(X64CanEmitOp(iroThrow)).ToBe(True);
+  Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(True);
 end;
 
 procedure TX64Tests.TestCallArityFence;
@@ -873,9 +872,9 @@ begin
   Test('helper calls and the IR pointer are position-independent',
     TestPositionIndependentSequences);
   Test('slot byte offset is register*8', TestSlotOffset);
-  Test('predicate covers waves 2-6 (only EH is declined)',
+  Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWaves);
-  Test('predicate declines exception-handling ops', TestPredicateDeclinesEh);
+  Test('predicate emits exception-handling ops', TestPredicateEmitsEh);
   Test('the call-site arity fence admits a zero-slot call', TestCallArityFence);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
