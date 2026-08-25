@@ -36,6 +36,13 @@ type
     function WriteSample: TWasmBytes;
     procedure PatchU32(var ABytes: TWasmBytes; const AOffset: Integer;
       const AValue: UInt32);
+    procedure PatchU64(var ABytes: TWasmBytes; const AOffset: Integer;
+      const AValue: UInt64);
+    procedure PatchHash128(var ABytes: TWasmBytes; const AOffset: Integer;
+      const AHash: TWasmNativeHash128);
+    procedure RecomputeBodyChecksum(var ABytes: TWasmBytes);
+    procedure RewriteCodeSection(var AEncoded: TWasmBytes;
+      const APayload: TWasmNativePayload; const ANewCode: TWasmBytes);
     procedure ExpectParse(const ABytes: TWasmBytes;
       const AExpected: TWasmNativePayloadParseResult);
   public
@@ -51,6 +58,7 @@ type
     procedure TestRejectLiteralBadMagic;
     procedure TestRejectLiteralIncompatibleVersion;
     procedure TestRejectLiteralOverflowingSectionCount;
+    procedure TestRejectLiteralDirectoryAddOverflow;
     procedure TestRejectLiteralShortDirectory;
     procedure TestRejectBadChecksum;
     procedure TestRejectIdentityMismatch;
@@ -60,9 +68,12 @@ type
     procedure TestRejectBadSectionHash;
     procedure TestRejectEmptyFunctionCode;
     procedure TestRejectOverflowingFuncCount;
+    procedure TestRejectOversizedCodeLength;
+    procedure TestRejectEntryOffsetPastCode;
     procedure TestExtentBoundaryTable;
     procedure TestWriterRejectsEmptyModule;
     procedure TestWriterRejectsEmptyFunctionCode;
+    procedure TestWriterRejectsHashMismatch;
   end;
 
 function BytesOf(const A: array of Byte): TWasmBytes;
@@ -135,6 +146,36 @@ begin
   ABytes[AOffset + 1] := Byte(AValue shr 8);
   ABytes[AOffset + 2] := Byte(AValue shr 16);
   ABytes[AOffset + 3] := Byte(AValue shr 24);
+end;
+
+procedure TNativePayloadTests.PatchU64(var ABytes: TWasmBytes;
+  const AOffset: Integer; const AValue: UInt64);
+begin
+  PatchU32(ABytes, AOffset, UInt32(AValue));
+  PatchU32(ABytes, AOffset + 4, UInt32(AValue shr 32));
+end;
+
+procedure TNativePayloadTests.PatchHash128(var ABytes: TWasmBytes;
+  const AOffset: Integer; const AHash: TWasmNativeHash128);
+begin
+  PatchU64(ABytes, AOffset, AHash.Lo);
+  PatchU64(ABytes, AOffset + 8, AHash.Hi);
+end;
+
+procedure TNativePayloadTests.RecomputeBodyChecksum(var ABytes: TWasmBytes);
+var
+  Body: TWasmBytes;
+  Checksum: UInt64;
+  I: Integer;
+begin
+  SetLength(Body, Length(ABytes) - WNEP_HEADER_SIZE);
+  for I := 0 to High(Body) do
+    Body[I] := ABytes[WNEP_HEADER_SIZE + I];
+  if Length(Body) = 0 then
+    Checksum := WnepHash64(nil, 0)
+  else
+    Checksum := WnepHash64(@Body[0], NativeUInt(Length(Body)));
+  PatchU64(ABytes, WNEP_SELFCHECKSUM_OFFSET, Checksum);
 end;
 
 procedure TNativePayloadTests.ExpectParse(const ABytes: TWasmBytes;
@@ -312,6 +353,29 @@ begin
   ExpectParse(Bytes_, nprOverflow);
 end;
 
+procedure TNativePayloadTests.TestRejectLiteralDirectoryAddOverflow;
+var
+  Bytes_: TWasmBytes;
+  I: Integer;
+begin
+  { Literal WNEP v1 header whose sectionCount ($07FFFFFF) * 32 fits u32 but
+    adding the 64-byte header overflows. }
+  SetLength(Bytes_, WNEP_HEADER_SIZE);
+  for I := 0 to High(Bytes_) do
+    Bytes_[I] := 0;
+  Bytes_[0] := $57;
+  Bytes_[1] := $4E;
+  Bytes_[2] := $45;
+  Bytes_[3] := $50;
+  Bytes_[4] := $01;
+  Bytes_[5] := $00;
+  Bytes_[WNEP_SECTIONCOUNT_OFFSET] := $FF;
+  Bytes_[WNEP_SECTIONCOUNT_OFFSET + 1] := $FF;
+  Bytes_[WNEP_SECTIONCOUNT_OFFSET + 2] := $FF;
+  Bytes_[WNEP_SECTIONCOUNT_OFFSET + 3] := $07;
+  ExpectParse(Bytes_, nprOverflow);
+end;
+
 procedure TNativePayloadTests.TestRejectLiteralShortDirectory;
 var
   Bytes_: TWasmBytes;
@@ -396,38 +460,45 @@ end;
 procedure TNativePayloadTests.TestRejectBadSectionHash;
 var
   Bytes_: TWasmBytes;
-  Body: TWasmBytes;
-  Checksum: UInt64;
-  I: Integer;
+  ZeroHash: TWasmNativeHash128;
 begin
   Bytes_ := WriteSample;
-  { Zero the module section's content-hash Lo (directory entry 0, hash at
+  { Zero the module section's content hash (directory entry 0, hash at
     +12) and recompute the body checksum so the reject is the section hash,
     not selfChecksum. }
-  for I := 0 to 15 do
-    Bytes_[WNEP_HEADER_SIZE + 12 + I] := 0;
-  SetLength(Body, Length(Bytes_) - WNEP_HEADER_SIZE);
-  for I := 0 to High(Body) do
-    Body[I] := Bytes_[WNEP_HEADER_SIZE + I];
-  Checksum := WnepHash64(@Body[0], NativeUInt(Length(Body)));
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET] := Byte(Checksum);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 1] := Byte(Checksum shr 8);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 2] := Byte(Checksum shr 16);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 3] := Byte(Checksum shr 24);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 4] := Byte(Checksum shr 32);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 5] := Byte(Checksum shr 40);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 6] := Byte(Checksum shr 48);
-  Bytes_[WNEP_SELFCHECKSUM_OFFSET + 7] := Byte(Checksum shr 56);
+  ZeroHash.Lo := 0;
+  ZeroHash.Hi := 0;
+  PatchHash128(Bytes_, WNEP_HEADER_SIZE + 12, ZeroHash);
+  RecomputeBodyChecksum(Bytes_);
   ExpectParse(Bytes_, nprBadSectionHash);
+end;
+
+procedure TNativePayloadTests.RewriteCodeSection(var AEncoded: TWasmBytes;
+  const APayload: TWasmNativePayload; const ANewCode: TWasmBytes);
+var
+  Found, CodeOff, I: Integer;
+  SectionBytes: TWasmBytes;
+begin
+  Found := -1;
+  for I := 0 to High(APayload.Sections) do
+    if APayload.Sections[I].Kind = WNEP_SECTION_CODE then
+      Found := I;
+  Expect<Boolean>(Found >= 0).ToBe(True);
+  CodeOff := Integer(APayload.Sections[Found].DataOffset);
+  for I := 0 to High(ANewCode) do
+    AEncoded[CodeOff + I] := ANewCode[I];
+  SetLength(SectionBytes, APayload.Sections[Found].DataSize);
+  for I := 0 to High(SectionBytes) do
+    SectionBytes[I] := AEncoded[CodeOff + I];
+  PatchHash128(AEncoded, WNEP_HEADER_SIZE + (Found * WNEP_DIR_ENTRY_SIZE) + 12,
+    WnepHash128Bytes(SectionBytes));
+  RecomputeBodyChecksum(AEncoded);
 end;
 
 procedure TNativePayloadTests.TestRejectEmptyFunctionCode;
 var
-  EmptyRec, Encoded, NewCode, Body: TWasmBytes;
+  EmptyRec, Encoded: TWasmBytes;
   Payload: TWasmNativePayload;
-  NewHash: TWasmNativeHash128;
-  Checksum: UInt64;
-  CodeOff, I: Integer;
 begin
   { Literal empty function record: funcCount=1 and codeLength=0. }
   EmptyRec := BytesOf([
@@ -439,102 +510,61 @@ begin
   ]);
   Encoded := WriteSample;
   Expect<Integer>(Ord(ParseNativePayload(Encoded, Payload))).ToBe(Ord(nprOk));
-  CodeOff := 0;
-  for I := 0 to High(Payload.Sections) do
-    if Payload.Sections[I].Kind = WNEP_SECTION_CODE then
-      CodeOff := Integer(Payload.Sections[I].DataOffset);
-  Expect<Boolean>(CodeOff > 0).ToBe(True);
-  for I := 0 to High(EmptyRec) do
-    Encoded[CodeOff + I] := EmptyRec[I];
-  SetLength(NewCode, Payload.Sections[1].DataSize);
-  for I := 0 to High(NewCode) do
-    NewCode[I] := Encoded[CodeOff + I];
-  NewHash := WnepHash128Bytes(NewCode);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 12] := Byte(NewHash.Lo);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 13] := Byte(NewHash.Lo shr 8);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 14] := Byte(NewHash.Lo shr 16);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 15] := Byte(NewHash.Lo shr 24);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 16] := Byte(NewHash.Lo shr 32);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 17] := Byte(NewHash.Lo shr 40);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 18] := Byte(NewHash.Lo shr 48);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 19] := Byte(NewHash.Lo shr 56);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 20] := Byte(NewHash.Hi);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 21] := Byte(NewHash.Hi shr 8);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 22] := Byte(NewHash.Hi shr 16);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 23] := Byte(NewHash.Hi shr 24);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 24] := Byte(NewHash.Hi shr 32);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 25] := Byte(NewHash.Hi shr 40);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 26] := Byte(NewHash.Hi shr 48);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 27] := Byte(NewHash.Hi shr 56);
-  SetLength(Body, Length(Encoded) - WNEP_HEADER_SIZE);
-  for I := 0 to High(Body) do
-    Body[I] := Encoded[WNEP_HEADER_SIZE + I];
-  Checksum := WnepHash64(@Body[0], NativeUInt(Length(Body)));
-  Encoded[WNEP_SELFCHECKSUM_OFFSET] := Byte(Checksum);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 1] := Byte(Checksum shr 8);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 2] := Byte(Checksum shr 16);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 3] := Byte(Checksum shr 24);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 4] := Byte(Checksum shr 32);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 5] := Byte(Checksum shr 40);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 6] := Byte(Checksum shr 48);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 7] := Byte(Checksum shr 56);
+  RewriteCodeSection(Encoded, Payload, EmptyRec);
   ExpectParse(Encoded, nprMalformed);
 end;
 
 procedure TNativePayloadTests.TestRejectOverflowingFuncCount;
 var
-  Encoded: TWasmBytes;
+  Encoded, Prefix: TWasmBytes;
   Payload: TWasmNativePayload;
-  NewCode: TWasmBytes;
-  NewHash: TWasmNativeHash128;
-  Body: TWasmBytes;
-  Checksum: UInt64;
-  CodeOff, I: Integer;
 begin
   Encoded := WriteSample;
   Expect<Integer>(Ord(ParseNativePayload(Encoded, Payload))).ToBe(Ord(nprOk));
-  CodeOff := 0;
-  for I := 0 to High(Payload.Sections) do
-    if Payload.Sections[I].Kind = WNEP_SECTION_CODE then
-      CodeOff := Integer(Payload.Sections[I].DataOffset);
   { Literal funcCount = 0x10000000 in a short code section cannot fit. }
-  Encoded[CodeOff] := $00;
-  Encoded[CodeOff + 1] := $00;
-  Encoded[CodeOff + 2] := $00;
-  Encoded[CodeOff + 3] := $10;
-  SetLength(NewCode, Payload.Sections[1].DataSize);
-  for I := 0 to High(NewCode) do
-    NewCode[I] := Encoded[CodeOff + I];
-  NewHash := WnepHash128Bytes(NewCode);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 12] := Byte(NewHash.Lo);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 13] := Byte(NewHash.Lo shr 8);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 14] := Byte(NewHash.Lo shr 16);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 15] := Byte(NewHash.Lo shr 24);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 16] := Byte(NewHash.Lo shr 32);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 17] := Byte(NewHash.Lo shr 40);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 18] := Byte(NewHash.Lo shr 48);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 19] := Byte(NewHash.Lo shr 56);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 20] := Byte(NewHash.Hi);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 21] := Byte(NewHash.Hi shr 8);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 22] := Byte(NewHash.Hi shr 16);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 23] := Byte(NewHash.Hi shr 24);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 24] := Byte(NewHash.Hi shr 32);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 25] := Byte(NewHash.Hi shr 40);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 26] := Byte(NewHash.Hi shr 48);
-  Encoded[WNEP_HEADER_SIZE + WNEP_DIR_ENTRY_SIZE + 27] := Byte(NewHash.Hi shr 56);
-  SetLength(Body, Length(Encoded) - WNEP_HEADER_SIZE);
-  for I := 0 to High(Body) do
-    Body[I] := Encoded[WNEP_HEADER_SIZE + I];
-  Checksum := WnepHash64(@Body[0], NativeUInt(Length(Body)));
-  Encoded[WNEP_SELFCHECKSUM_OFFSET] := Byte(Checksum);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 1] := Byte(Checksum shr 8);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 2] := Byte(Checksum shr 16);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 3] := Byte(Checksum shr 24);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 4] := Byte(Checksum shr 32);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 5] := Byte(Checksum shr 40);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 6] := Byte(Checksum shr 48);
-  Encoded[WNEP_SELFCHECKSUM_OFFSET + 7] := Byte(Checksum shr 56);
+  Prefix := BytesOf([$00, $00, $00, $10]);
+  RewriteCodeSection(Encoded, Payload, Prefix);
   ExpectParse(Encoded, nprOverflow);
+end;
+
+procedure TNativePayloadTests.TestRejectOversizedCodeLength;
+var
+  Encoded, Prefix: TWasmBytes;
+  Payload: TWasmNativePayload;
+begin
+  Encoded := WriteSample;
+  Expect<Integer>(Ord(ParseNativePayload(Encoded, Payload))).ToBe(Ord(nprOk));
+  { Literal one-function record whose codeLength ($FFFFFFFF) cannot fit the
+    remaining section; the count must be rejected without wrapping Pos+Count
+    on 32-bit NativeUInt. Layout: funcCount, then irIndex/regCount/entry/len. }
+  Prefix := BytesOf([
+    $01, $00, $00, $00,
+    $00, $00, $00, $00,
+    $00, $00, $00, $00,
+    $00, $00, $00, $00,
+    $FF, $FF, $FF, $FF
+  ]);
+  RewriteCodeSection(Encoded, Payload, Prefix);
+  ExpectParse(Encoded, nprMalformed);
+end;
+
+procedure TNativePayloadTests.TestRejectEntryOffsetPastCode;
+var
+  Encoded, Prefix: TWasmBytes;
+  Payload: TWasmNativePayload;
+begin
+  Encoded := WriteSample;
+  Expect<Integer>(Ord(ParseNativePayload(Encoded, Payload))).ToBe(Ord(nprOk));
+  { EntryOffset $FFFFFFFF with a 7-byte code body is past the code extent. }
+  Prefix := BytesOf([
+    $01, $00, $00, $00,
+    $00, $00, $00, $00,
+    $05, $00, $00, $00,
+    $FF, $FF, $FF, $FF,
+    $07, $00, $00, $00
+  ]);
+  RewriteCodeSection(Encoded, Payload, Prefix);
+  ExpectParse(Encoded, nprMalformed);
 end;
 
 procedure TNativePayloadTests.TestExtentBoundaryTable;
@@ -634,6 +664,23 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+procedure TNativePayloadTests.TestWriterRejectsHashMismatch;
+var
+  Params: TWasmNativePayloadWriteParams;
+  Raised: Boolean;
+begin
+  Params := SampleParams;
+  Params.ModuleHash.Lo := Params.ModuleHash.Lo xor 1;
+  Raised := False;
+  try
+    WriteNativePayload(Params);
+  except
+    on E: EWasmInternal do
+      Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
 procedure TNativePayloadTests.SetupTests;
 begin
   Test('header identity fields round-trip through write/parse',
@@ -655,6 +702,8 @@ begin
     TestRejectLiteralIncompatibleVersion);
   Test('literal overflowing sectionCount is nprOverflow',
     TestRejectLiteralOverflowingSectionCount);
+  Test('literal directory size plus header overflow is nprOverflow',
+    TestRejectLiteralDirectoryAddOverflow);
   Test('literal header with no directory is nprTruncated',
     TestRejectLiteralShortDirectory);
   Test('a flipped body byte is nprBadChecksum', TestRejectBadChecksum);
@@ -671,12 +720,18 @@ begin
     TestRejectEmptyFunctionCode);
   Test('literal overflowing funcCount is nprOverflow',
     TestRejectOverflowingFuncCount);
+  Test('literal oversized function codeLength is nprMalformed',
+    TestRejectOversizedCodeLength);
+  Test('an entryOffset past the function code is nprMalformed',
+    TestRejectEntryOffsetPastCode);
   Test('directory offset/size boundaries reject with the matching reason',
     TestExtentBoundaryTable);
   Test('writer refuses a payload with no module bytes',
     TestWriterRejectsEmptyModule);
   Test('writer refuses a function record with no code',
     TestWriterRejectsEmptyFunctionCode);
+  Test('writer refuses a moduleHash that is not the module bytes',
+    TestWriterRejectsHashMismatch);
 end;
 
 begin

@@ -502,7 +502,10 @@ end;
 function RBytes(var AR: TWnepReader; const ACount: UInt32): TWasmBytes;
 begin
   Result := nil;
-  if AR.Bad or (AR.Pos + ACount > AR.Len) then
+  { Subtract remaining length rather than add Pos+Count: on 32-bit hosts
+    NativeUInt is 32-bit, so a hostile UInt32 count would wrap the add and
+    skip the bounds check. }
+  if AR.Bad or (ACount > AR.Len) or (AR.Pos > AR.Len - ACount) then
   begin
     AR.Bad := True;
     Exit;
@@ -521,7 +524,7 @@ begin
   if Rem <> 0 then
   begin
     Rem := 16 - Rem;
-    if AR.Pos + Rem > AR.Len then
+    if (AR.Pos > AR.Len) or (Rem > AR.Len - AR.Pos) then
       AR.Bad := True
     else
       Inc(AR.Pos, Rem);
@@ -593,6 +596,8 @@ begin
     AFuncs[I].EntryOffset := RU32(R);
     CodeLen := RU32(R);
     if CodeLen = 0 then
+      Exit(nprMalformed);
+    if AFuncs[I].EntryOffset >= CodeLen then
       Exit(nprMalformed);
     CodeStart := R.Pos;
     AFuncs[I].Code := RBytes(R, CodeLen);
