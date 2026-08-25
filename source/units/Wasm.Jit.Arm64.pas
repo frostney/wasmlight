@@ -3824,6 +3824,90 @@ begin
   end;
 end;
 
+{ ===================================================================== }
+{  compiled exception handling                                           }
+{ ===================================================================== }
+
+var
+  GArm64EhHasHandlers: Boolean = False;
+  GArm64EhEndLabel: TWasmJitLabel = 0;
+  GArm64EhCodeCount: UInt32 = 0;
+  GArm64EhTableLabel: TWasmJitLabel = 0;
+
+function Arm64AdrPlaceholder(const ARd: Byte): UInt32;
+begin
+  Result := $10000000 or ARd;
+end;
+
+procedure Arm64EmitAdrTo(const ABuf: TWasmCodeBuffer; const ARd: Byte;
+  const ATarget: TWasmJitLabel);
+var
+  Site: Integer;
+begin
+  Site := ABuf.CurrentOffset;
+  ABuf.AddPatch(Site, ATarget, Integer(Arm64AdrPlaceholder(ARd)));
+  ABuf.EmitU32(Arm64AdrPlaceholder(ARd));
+end;
+
+procedure Arm64EmitEhJumpDispatch(const ABuf: TWasmCodeBuffer);
+begin
+  { x0 = target IR index. A catch of the try_table's own label can land at
+    IP = Length(Code) (fall off the body). That is a function return, not a
+    table slot. }
+  Arm64EmitLoadImm32(ABuf, 1, GArm64EhCodeCount);
+  ABuf.EmitU32(Arm64CmpW(0, 1));
+  EmitBCondTo(ABuf, ARM64_COND_HS, UInt32(GArm64EhEndLabel));
+  { adr x1, table; add x1, x1, x0 lsl #2; br x1 }
+  Arm64EmitAdrTo(ABuf, 1, GArm64EhTableLabel);
+  ABuf.EmitU32($8B000821);
+  ABuf.EmitU32($D61F0020);
+end;
+
+procedure Arm64BeginEhEmit(const AHasHandlers: Boolean;
+  const ATableLabel, AEndLabel: TWasmJitLabel; const ACodeCount: UInt32);
+begin
+  GArm64EhHasHandlers := AHasHandlers;
+  GArm64EhTableLabel := ATableLabel;
+  GArm64EhEndLabel := AEndLabel;
+  GArm64EhCodeCount := ACodeCount;
+end;
+
+procedure Arm64EmitEhResumeCheck(const ABuf: TWasmCodeBuffer);
+var
+  Body: TWasmJitLabel;
+begin
+  if not GArm64EhHasHandlers then
+    Exit;
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  Arm64EmitCallHelper(ABuf, aohEhResumeIndex);
+  { cmn w0, #1 → Z set iff w0 = $FFFFFFFF = High(UInt32) (normal entry). }
+  ABuf.EmitU32($3100041F);
+  Body := ABuf.NewLabel;
+  EmitBCondTo(ABuf, ARM64_COND_EQ, Body);
+  Arm64EmitEhJumpDispatch(ABuf);
+  ABuf.BindLabel(Body);
+end;
+
+procedure Arm64EmitEhTable(const ABuf: TWasmCodeBuffer; const ACount: Integer);
+var
+  I: Integer;
+begin
+  if not GArm64EhHasHandlers then
+    Exit;
+  ABuf.BindLabel(GArm64EhTableLabel);
+  for I := 0 to ACount - 1 do
+    EmitBranchTo(ABuf, UInt32(I));
+end;
+
+procedure Arm64EmitEhThrow(const ABuf: TWasmCodeBuffer; const AInsIndex: UInt32);
+begin
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  ABuf.EmitU32(Arm64MovReg(1, ARM64_REG_REGFILE));
+  Arm64EmitIrInsPtr(ABuf, 2, AInsIndex);
+  Arm64EmitCallHelper(ABuf, aohEhThrow);
+  if GArm64EhHasHandlers then
+    Arm64EmitEhJumpDispatch(ABuf);
+end;
 
 { ===================================================================== }
 {  op templates                                                          }
