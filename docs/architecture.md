@@ -37,7 +37,7 @@
   shipped as a template. [roadmap.md](roadmap.md) is the honest picture of
   what remains: the rest of the native-compiler spine
   ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md))
-  (`wasmlight compile`, Mach-O packaging), broader
+  (`wasmlight compile`), broader
   optimizing-compiler work, and later platform and host-surface releases.
   Nothing in v1 Core 3 behaviour is staged.
 
@@ -90,6 +90,16 @@ keyed that status on, and the staged-SIMD message before it is gone too.)
 structures plus a disassembler, with no validation logic in it — which is
 also why the IR module carries its own index-space snapshots instead of
 pointing back at `TWasmModule`.
+
+`Wasm.MachO` and `Wasm.Sha256` also sit beside the runtime stack: they
+are the Mach-O packager for `aarch64-darwin` and `x86_64-darwin` runtime
+shells ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)).
+`WriteMachOShellTemplate` / `PackageMachORuntimeShell` emit a thin
+`MH_EXECUTE` with the compile payload in `__WSHL,__payload` and a
+linker-style ad-hoc CodeDirectory. They do not invoke a compiler or
+linker, and they do not decode wasm. The payload bytes in packager tests are a documented placeholder until
+`wasmlight compile` embeds the product payload; integrity is the signature,
+not a second checksum scheme.
 
 `Wasm.Package.Elf` also sits beside the library: it packages a Linux
 `aarch64-linux` or `x86_64-linux` runtime-shell template with an opaque
@@ -455,8 +465,7 @@ image; an incomplete or incompatible image is `EWasmLinkError` and is
 never interpreted. `.waot` remains the fallback-capable cache for
 `run --aot`. The envelope that carries module + native + stub connector
 and capability slots is a temporary seam until the product payload
-is embedded; Mach-O packaging and the compile command are not
-shipped.
+is embedded; the compile command is not shipped.
 
 
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit

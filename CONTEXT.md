@@ -131,6 +131,13 @@ contains no interpreter or JIT compiler
 The template is shipped; the compile command that populates it is not.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Runtime-shell payload section**:
+The Mach-O section `__WSHL,__payload` where the packager places the compile
+payload. The bytes are opaque until the product record layout lands; an
+altered section fails the embedded ad-hoc CodeDirectory
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: overlay, resource fork, post-signature trailer
+
 **Shell template**:
 The unfilled runtime shell for one released target, before a payload is
 attached. Linux templates are packaged by appending the payload after the
