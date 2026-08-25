@@ -38,6 +38,7 @@ lwpt agents --check     # CI form: exit non-zero when the block is stale
 lwpt build [target]    # binaries land under build/
 lwpt test              # discovers source/units/*.Test.pas
 ./build/wasmlight inspect <module.wasm>
+./build/wasmlight-shell [<payload.wshl> [guest-args...]]  # runtime-shell template
 ./build/wasmbench      # execution workloads and tiers (measurement only)
 # isolate with --workload loop|fib|memory|numeric|simd|startup and --tier
 npx markdownlint-cli2 "**/*.md"   # docs gate, config .markdownlint-cli2.jsonc
