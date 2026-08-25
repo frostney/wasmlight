@@ -193,7 +193,25 @@ function WlcCallbackKindName(const AKind: TWlcCallbackKind): string;
 implementation
 
 uses
+  TypInfo,
+
   Wasm.Connector.Parser;
+
+function WlcEnumTailName(ATypeInfo: PTypeInfo; const AOrd: Integer;
+  const APrefix: string; const ALowercase: Boolean): string;
+var
+  Name: string;
+begin
+  Name := GetEnumName(ATypeInfo, AOrd);
+  if Copy(Name, 1, Length(APrefix)) = APrefix then
+    Delete(Name, 1, Length(APrefix));
+  if Name = '' then
+    Result := '?'
+  else if ALowercase then
+    Result := LowerCase(Name)
+  else
+    Result := Name;
+end;
 
 procedure RaiseConnectorError(const AWhat: string;
   const ALine, AColumn: Integer);
@@ -214,52 +232,17 @@ end;
 
 function WlcMarshalKindName(const AKind: TWlcMarshalKind): string;
 begin
-  case AKind of
-    wlmDefault: Result := 'Default';
-    wlmInt8: Result := 'Int8';
-    wlmUInt8: Result := 'UInt8';
-    wlmInt16: Result := 'Int16';
-    wlmUInt16: Result := 'UInt16';
-    wlmInt32: Result := 'Int32';
-    wlmUInt32: Result := 'UInt32';
-    wlmInt64: Result := 'Int64';
-    wlmUInt64: Result := 'UInt64';
-    wlmFloat32: Result := 'Float32';
-    wlmFloat64: Result := 'Float64';
-    wlmBool: Result := 'Bool';
-    wlmLPStr: Result := 'LPStr';
-    wlmLPWStr: Result := 'LPWStr';
-    wlmLPUTF8Str: Result := 'LPUTF8Str';
-    wlmLPArray: Result := 'LPArray';
-    wlmByValArray: Result := 'ByValArray';
-    wlmSysInt: Result := 'SysInt';
-    wlmSysUInt: Result := 'SysUInt';
-  else
-    Result := '?';
-  end;
+  Result := WlcEnumTailName(TypeInfo(TWlcMarshalKind), Ord(AKind), 'wlm', False);
 end;
 
 function WlcDirectionName(const ADirection: TWlcDirection): string;
 begin
-  case ADirection of
-    wldDefault: Result := 'default';
-    wldIn: Result := 'in';
-    wldOut: Result := 'out';
-    wldInOut: Result := 'inout';
-  else
-    Result := '?';
-  end;
+  Result := WlcEnumTailName(TypeInfo(TWlcDirection), Ord(ADirection), 'wld', True);
 end;
 
 function WlcCallbackKindName(const AKind: TWlcCallbackKind): string;
 begin
-  case AKind of
-    wckRetained: Result := 'retained';
-    wckScoped: Result := 'scoped';
-    wckQueued: Result := 'queued';
-  else
-    Result := '?';
-  end;
+  Result := WlcEnumTailName(TypeInfo(TWlcCallbackKind), Ord(AKind), 'wck', True);
 end;
 
 end.
