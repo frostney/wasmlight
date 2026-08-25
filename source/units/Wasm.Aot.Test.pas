@@ -283,17 +283,30 @@ begin
   ]);
 end;
 
-{ A single throw with no handler: JitCanCompile refuses iroThrow
-  (unsupported-op), so the strict path must fail on function 0. }
-function ThrowModuleBytes: TWasmBytes;
+{ try_table catch_all with no throw: handler tables compile, so strict
+  compile must publish native code for every function. }
+function TryTableModuleBytes: TWasmBytes;
+var
+  Type0, Type1: TWasmBytes;
+  Body0, Body1, Body2, Body3: TWasmBytes;
 begin
+  Type0 := BLit([$60, $02, $7F, $7F, $01, $7F]);
+  Type1 := BLit([$60, $00, $01, $7F]);
+  Body0 := BLit([$00, $20, $00, $20, $01, $6A, $0B]);
+  Body1 := BLit([$00, $20, $00, $20, $01, $10, $00, $0B]);
+  Body2 := BLit([$00, $02, $40, $1F, $40, $01, $02, $00, $0B, $0B, $41, $07, $0B]);
+  Body3 := BLit([$00, $10, $02, $0B]);
   Result := Cat([
     BLit(WASM_HEADER),
-    Sect(1, VecOf([BLit([$60, $00, $00])])),
-    Sect(3, VecOf([BLit([$00])])),
-    Sect(13, VecOf([BLit([$00, $00])])),
-    Sect(7, VecOf([FuncExport('boom', 0)])),
-    Sect(10, VecOf([CodeEntry([$00, $08, $00, $0B])]))
+    Sect(1, VecOf([Type0, Type1])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$01]), BLit([$01])])),
+    Sect(7, VecOf([
+      FuncExport('add', 0),
+      FuncExport('addcaller', 1),
+      FuncExport('handled', 2),
+      FuncExport('handledcaller', 3)])),
+    Sect(10, VecOf([CodeEntry(Body0), CodeEntry(Body1), CodeEntry(Body2),
+      CodeEntry(Body3)]))
   ]);
 end;
 
@@ -1314,27 +1327,21 @@ end;
 procedure TAotTests.TestStrictPredicateDeclineExceptionHandling;
 var
   Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
   Engine: TWasmEngine;
   Store: TWasmStore;
   Loaded: TWasmLoadedModule;
   Caught: Boolean;
   Kind: TWasmAotDeclineKind;
-  Predicate: TWasmJitDecline;
-  FuncIdx: UInt32;
-  Msg: string;
-  ClassNm: string;
+  I: Integer;
 begin
-  Bytes_ := MultiFuncModuleBytes;
+  Bytes_ := TryTableModuleBytes;
   Engine := TWasmEngine.Create;
   Loaded := nil;
   Store := nil;
   Caught := False;
   Artifact := nil;
   Kind := wadTarget;
-  Predicate := jdNone;
-  FuncIdx := 0;
-  Msg := '';
-  ClassNm := '';
   try
     Loaded := LoadModule(Bytes_);
     Store := TWasmStore.Create(Engine);
@@ -1345,22 +1352,17 @@ begin
       begin
         Caught := True;
         Kind := E.Kind;
-        Predicate := E.Predicate;
-        FuncIdx := E.FuncIrIndex;
-        Msg := E.Message;
-        ClassNm := E.ClassName;
       end;
     end;
+    {$IFDEF WASM_JIT_BACKEND}
+    Expect<Boolean>(Caught).ToBe(False);
+    Expect<Boolean>(Length(Artifact) > 0).ToBe(True);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    for I := 0 to High(Parsed.Funcs) do
+      Expect<Boolean>(Parsed.Funcs[I].Compiled).ToBe(True);
+    {$ELSE}
     Expect<Boolean>(Caught).ToBe(True);
     Expect<Integer>(Length(Artifact)).ToBe(0);
-    Expect<string>(ClassNm).ToBe('EWasmAotError');
-    {$IFDEF WASM_JIT_BACKEND}
-    Expect<Integer>(Ord(Kind)).ToBe(Ord(wadPredicate));
-    Expect<Integer>(Ord(Predicate)).ToBe(Ord(jdExceptionHandling));
-    Expect<Integer>(Integer(FuncIdx)).ToBe(2);
-    Expect<Boolean>(Pos('function 2', Msg) > 0).ToBe(True);
-    Expect<Boolean>(Pos('exception-handling', Msg) > 0).ToBe(True);
-    {$ELSE}
     Expect<Integer>(Ord(Kind)).ToBe(Ord(wadTarget));
     {$ENDIF}
   finally
@@ -1382,7 +1384,7 @@ var
   FuncIdx: UInt32;
   Msg: string;
 begin
-  Bytes_ := ThrowModuleBytes;
+  Bytes_ := MultiFuncModuleBytes;
   Engine := TWasmEngine.Create;
   Loaded := nil;
   Store := nil;
@@ -1411,9 +1413,9 @@ begin
     Expect<Integer>(Length(Artifact)).ToBe(0);
     {$IFDEF WASM_JIT_BACKEND}
     Expect<Integer>(Ord(Kind)).ToBe(Ord(wadPredicate));
-    Expect<Integer>(Ord(Predicate)).ToBe(Ord(jdUnsupportedOp));
-    Expect<Integer>(Integer(FuncIdx)).ToBe(0);
-    Expect<Boolean>(Pos('unsupported-op', Msg) > 0).ToBe(True);
+    Expect<Integer>(Ord(Predicate)).ToBe(Ord(jdUnsupportedInstr));
+    Expect<Integer>(Integer(FuncIdx)).ToBe(3);
+    Expect<Boolean>(Pos('unsupported-instr', Msg) > 0).ToBe(True);
     {$ELSE}
     Expect<Integer>(Ord(Kind)).ToBe(Ord(wadTarget));
     {$ENDIF}
@@ -1524,14 +1526,14 @@ begin
     Store := TWasmStore.Create(Engine);
     Artifact := AotCompileModule(Store, Loaded);
     Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
-    Expect<Integer>(Length(Parsed.Funcs)).ToBe(4);
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(5);
     {$IFDEF WASM_JIT_BACKEND}
     Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
-    Expect<Boolean>(Parsed.Funcs[2].Compiled).ToBe(False);
-    Expect<Integer>(Length(Parsed.Funcs[2].Code)).ToBe(0);
+    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(False);
+    Expect<Integer>(Length(Parsed.Funcs[3].Code)).ToBe(0);
     {$ELSE}
     Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(False);
-    Expect<Boolean>(Parsed.Funcs[2].Compiled).ToBe(False);
+    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(False);
     {$ENDIF}
   finally
     FreeAndNil(Store);
@@ -1671,9 +1673,9 @@ begin
     TestForeignIsaEmissionDeclined);
   Test('strict compile succeeds only when every defined function is native',
     TestStrictSuccessCompilesEveryFunction);
-  Test('strict compile fails a try_table predicate decline',
+  Test('strict compile publishes native code for try_table handlers',
     TestStrictPredicateDeclineExceptionHandling);
-  Test('strict compile fails an unsupported-op predicate decline',
+  Test('strict compile fails a wide-call predicate decline',
     TestStrictPredicateDeclineUnsupportedOp);
   Test('strict compile fails a target decline off the AOT host',
     TestStrictTargetDecline);
