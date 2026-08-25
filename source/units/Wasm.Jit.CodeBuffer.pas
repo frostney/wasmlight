@@ -153,6 +153,11 @@ type
       back-patch). Only valid while still mutable (before MakeExecutable). }
     procedure PatchU32(const AOffset: Integer; const AValue: UInt32);
     procedure PatchByte(const AOffset: Integer; const AByte: Byte);
+    { Insert 4 little-endian bytes at AOffset, shifting the tail and every
+      label/patch at or past that offset. Used to relax an out-of-range
+      conditional into invert + B without rebuilding the function. }
+    procedure InsertU32(const AOffset: Integer; const AValue: UInt32);
+    procedure SetPatchKind(const AIndex, AKind: Integer);
 
     { --- label map & patch list (encoder-agnostic branch resolution) --- }
     function NewLabel: TWasmJitLabel;
@@ -400,6 +405,41 @@ begin
   if (AOffset < 0) or (AOffset >= FLength) then
     raise EWasmError.Create('patch offset out of range');
   FStage[AOffset] := AByte;
+end;
+
+procedure TWasmCodeBuffer.InsertU32(const AOffset: Integer;
+  const AValue: UInt32);
+var
+  I: Integer;
+begin
+  CheckMutable;
+  if (AOffset < 0) or (AOffset > FLength) then
+    raise EWasmError.Create('insert offset out of range');
+  EnsureCapacity(4);
+  I := FLength - 1;
+  while I >= AOffset do
+  begin
+    FStage[I + 4] := FStage[I];
+    Dec(I);
+  end;
+  FStage[AOffset] := Byte(AValue);
+  FStage[AOffset + 1] := Byte(AValue shr 8);
+  FStage[AOffset + 2] := Byte(AValue shr 16);
+  FStage[AOffset + 3] := Byte(AValue shr 24);
+  Inc(FLength, 4);
+  for I := 0 to High(FLabelOffsets) do
+    if FLabelOffsets[I] >= AOffset then
+      Inc(FLabelOffsets[I], 4);
+  for I := 0 to High(FPatches) do
+    if FPatches[I].SiteOffset >= AOffset then
+      Inc(FPatches[I].SiteOffset, 4);
+end;
+
+procedure TWasmCodeBuffer.SetPatchKind(const AIndex, AKind: Integer);
+begin
+  if (AIndex < 0) or (AIndex >= Length(FPatches)) then
+    raise EWasmError.Create('patch index out of range');
+  FPatches[AIndex].Kind := AKind;
 end;
 
 function TWasmCodeBuffer.NewLabel: TWasmJitLabel;

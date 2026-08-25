@@ -177,6 +177,7 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | WASI preview1 host module: args/environ, clock, a real-CSPRNG `random_get`, stdio, and the wave-2 filesystem behind preopen containment — deny-by-default, no ambient authority | `Wasm.Wasi` (+ `Wasm.Wasi.Types`, `Wasm.Wasi.Memory`) | `Wasm.Wasi.Test` (+ `Wasm.Wasi.Types.Test`, `Wasm.Wasi.Memory.Test`) |
 | `wasmlight run`: decode + validate a WASI command, link it deny-by-default, run `_start`, map the outcome to a process exit code (`run --aot <artifact.waot>` loads an AOT artifact for instant startup, `--no-aot` forces interpret) | `Wasm.Run` + `source/apps/wasmlight.pas` | `Wasm.Run.Test` + manual |
 | `wasmlight aot`: compile a module ahead of time to a `.waot` artifact | `Wasm.Aot` + `source/apps/wasmlight.pas` | `Wasm.Aot.Test` + manual |
+| ELF runtime-shell packager for `aarch64-linux` and `x86_64-linux` (append payload + trailer; no host linker). The interpreter-free shell, payload format, and `wasmlight compile` are not shipped | `Wasm.Package.Elf` | `Wasm.Package.Elf.Test` |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
@@ -535,12 +536,16 @@ compiles each function to native code the first time it runs and honours
 the three obligations decisions already fixed: it emits the epoch check at
 every back-edge, the compiled frame *is* the interpreter's frame so the
 GC's stack map and tail-call handling come for free, and live references
-stay discoverable. It carries the full non-EH op set; a function using
-`throw` / `throw_ref` or hosting a `try_table` handler is declined and
-stays interpreted, and the two tiers interoperate transparently across the
-seam. The correctness proof is differential: `--tier=jit` over the corpus
-is **byte-identical** to `--tier=interp` — locally `compiled=8703` on
-aarch64, `pass=65188 fail=0 skip=0` — with cross-platform identity enforced
+stay discoverable. It compiles `try_table` handler tables and
+`throw` / `throw_ref` on both backends; matching stays in
+`UnwindException` by tag store-address, and an uncaught throw is
+`EWasmException` via the trampoline. Direct compiled-to-compiled calls
+still decline handler-bearing and throwing functions so they keep an
+`InvokeCompiled` seam. Remaining portable declines for mixed-tier tests
+are things like call arity greater than 256. The correctness proof is
+differential: `--tier=jit` over the corpus is **byte-identical** to
+`--tier=interp` — locally `compiled=8703` on aarch64,
+`pass=65188 fail=0 skip=0` — with cross-platform identity enforced
 in CI.
 
 The tier runs only where `WASM_JIT_EXEC` holds — a **64-bit UNIX host**.

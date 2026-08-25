@@ -46,6 +46,7 @@ program Wasm.Aot.Test;
 {$ENDIF}
 
 uses
+  Classes,
   SysUtils,
 
   TestingPascalLibrary,
@@ -59,7 +60,8 @@ uses
   Wasm.Jit.CodeBuffer,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 { --- byte-assembly helpers (mirrors Wasm.Jit.Test) ---------------------- }
 
@@ -216,31 +218,96 @@ begin
     ULeb(AIndex)]);
 end;
 
-{ A four-function module for the Wave-2 multi-function + declined proof
-  (aot-spec §7.3):
-    f0 "add"            (i32 i32)->i32  local.get0 local.get1 i32.add   [leaf, compiled]
+{ A five-function module for the multi-function + declined proof
+  (aot-spec §7.3). Handler tables and wide non-tail calls now compile, so
+  the declined fixture is a `return_call` one past WASM_TIER_TAIL_CAP:
+    f0 "add"            (i32 i32)->i32  local.get0 local.get1 i32.add   [compiled]
     f1 "addcaller"      (i32 i32)->i32  local.get0 local.get1 call 0    [compiled -> compiled]
-    f2 "declined"       ()->i32         block (try_table (catch_all) empty-body) i32.const 7
-                                        [DECLINED: owns a try_table handler table (EH),
-                                         so JitCanCompile refuses it — runs interpreted,
-                                         returns 7 with no throw]
-    f3 "declinedcaller" ()->i32         call 2                          [compiled -> DECLINED/interpreted]
-  It needs no tag section: catch_all references a label, not a tag, and nothing
-  throws — so f2 simply runs its empty try body and returns 7. The point is the
-  compiled/interpreted mix: f1 (compiled) calls f0 (compiled), and f3 (compiled)
-  calls f2 (interpreted), all across the CompiledEntry seam. }
+    f2 $wide            (i32×1025)->i32 i32.const 7                     [compiled leaf]
+    f3 "declined"       ()->i32         return_call $wide with 1025 zeros [DECLINED]
+    f4 "declinedcaller" ()->i32         call 3                          [compiled -> interpreted]
+  f1 (compiled) calls f0 (compiled), and f4 (compiled) calls f3 (interpreted). }
+function RepeatByte(const AByte: Byte; const ACount: Integer): TWasmBytes;
+var
+  I: Integer;
+begin
+  SetLength(Result, ACount);
+  for I := 0 to ACount - 1 do
+    Result[I] := AByte;
+end;
+
+function RepeatBytes(const AItem: TWasmBytes; const ACount: Integer): TWasmBytes;
+var
+  I, J, N: Integer;
+begin
+  SetLength(Result, Length(AItem) * ACount);
+  N := 0;
+  for I := 1 to ACount do
+    for J := 0 to High(AItem) do
+    begin
+      Result[N] := AItem[J];
+      Inc(N);
+    end;
+end;
+
 function MultiFuncModuleBytes: TWasmBytes;
+const
+  WIDE_ARITY = WASM_TIER_TAIL_CAP + 1;
+var
+  Type0, Type1, TypeWide: TWasmBytes;
+  Body0, Body1, BodyWide, BodyDeclined, BodyCaller: TWasmBytes;
+begin
+  Type0 := BLit([$60, $02, $7F, $7F, $01, $7F]);   { (i32 i32) -> i32 }
+  Type1 := BLit([$60, $00, $01, $7F]);             { () -> i32 }
+  TypeWide := Cat([BLit([$60]), ULeb(WIDE_ARITY), RepeatByte($7F, WIDE_ARITY),
+    BLit([$01, $7F])]);
+  Body0 := BLit([$00, $20, $00, $20, $01, $6A, $0B]);
+  Body1 := BLit([$00, $20, $00, $20, $01, $10, $00, $0B]);
+  BodyWide := BLit([$00, $41, $07, $0B]);
+  BodyDeclined := Cat([BLit([$00]), RepeatBytes(BLit([$41, $00]), WIDE_ARITY),
+    BLit([$12, $02, $0B])]);
+  BodyCaller := BLit([$00, $10, $03, $0B]);
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([Type0, Type1, TypeWide])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00]), BLit([$02]), BLit([$01]),
+      BLit([$01])])),
+    Sect(7, VecOf([
+      FuncExport('add', 0),
+      FuncExport('addcaller', 1),
+      FuncExport('declined', 3),
+      FuncExport('declinedcaller', 4)])),
+    Sect(10, VecOf([CodeEntry(Body0), CodeEntry(Body1), CodeEntry(BodyWide),
+      CodeEntry(BodyDeclined), CodeEntry(BodyCaller)]))
+  ]);
+end;
+
+{ 2048 i32 locals — past the historical Arm64 short-form slot cap. }
+function LargeFrameModuleBytes: TWasmBytes;
+begin
+  Result := OneFunc(BLit([$60, $00, $01, $7F]),
+    Cat([
+      BLit([$01]),
+      ULeb(2048),
+      BLit([$7F, $41, 42, $21]),
+      ULeb(2047),
+      BLit([$20]),
+      ULeb(2047),
+      BLit([$0B])
+    ]), 'big');
+end;
+
+{ try_table catch_all with no throw: handler tables compile, so strict
+  compile must publish native code for every function. }
+function TryTableModuleBytes: TWasmBytes;
 var
   Type0, Type1: TWasmBytes;
   Body0, Body1, Body2, Body3: TWasmBytes;
 begin
-  Type0 := BLit([$60, $02, $7F, $7F, $01, $7F]);   { (i32 i32) -> i32 }
-  Type1 := BLit([$60, $00, $01, $7F]);             { () -> i32 }
+  Type0 := BLit([$60, $02, $7F, $7F, $01, $7F]);
+  Type1 := BLit([$60, $00, $01, $7F]);
   Body0 := BLit([$00, $20, $00, $20, $01, $6A, $0B]);
   Body1 := BLit([$00, $20, $00, $20, $01, $10, $00, $0B]);
-  { $00 locals; $02 $40 block void; $1F $40 try_table void; $01 catch count;
-    $02 $00 catch_all -> label0 (the block); $0B end try_table; $0B end block;
-    $41 $07 i32.const 7; $0B end func. }
   Body2 := BLit([$00, $02, $40, $1F, $40, $01, $02, $00, $0B, $0B, $41, $07, $0B]);
   Body3 := BLit([$00, $10, $02, $0B]);
   Result := Cat([
@@ -250,11 +317,45 @@ begin
     Sect(7, VecOf([
       FuncExport('add', 0),
       FuncExport('addcaller', 1),
-      FuncExport('declined', 2),
-      FuncExport('declinedcaller', 3)])),
+      FuncExport('handled', 2),
+      FuncExport('handledcaller', 3)])),
     Sect(10, VecOf([CodeEntry(Body0), CodeEntry(Body1), CodeEntry(Body2),
       CodeEntry(Body3)]))
   ]);
+end;
+
+function TempArtifactPath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir) +
+    'wasmlight-aot-strict-' + IntToStr(GetProcessID) + '-' +
+    IntToStr(GetTickCount64) + '.waot';
+end;
+
+function ReadFileBytes(const APath: string): TWasmBytes;
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then
+      Stream.ReadBuffer(Result[0], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure WriteFileBytes(const APath: string; const ABytes: TWasmBytes);
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if Length(ABytes) > 0 then
+      Stream.WriteBuffer(ABytes[0], Length(ABytes));
+  finally
+    Stream.Free;
+  end;
 end;
 
 type
@@ -273,12 +374,24 @@ type
     procedure TestMilestoneAddViaArtifact;
     procedure TestArtifactCodeIsPositionIndependent;
     procedure TestMultiFunctionWithDeclined;
+    procedure TestLargeFrameAllCompiled;
     procedure TestJitAndAotCodeAreByteIdentical;
     procedure TestEpochBumpBeforeAcyclicNativeRecursion;
     procedure TestGuardRejectsWrongIrVersion;
     procedure TestGuardRejectsWrongArch;
     procedure TestGuardRejectsCorruptChecksum;
     procedure TestGuardRejectsModuleHashMismatch;
+    procedure TestHostTargetMatchesDefaultCompile;
+    procedure TestForeignOsDescriptorFingerprintRejected;
+    procedure TestForeignIsaEmissionDeclined;
+    procedure TestStrictSuccessCompilesEveryFunction;
+    procedure TestStrictPredicateDeclineExceptionHandling;
+    procedure TestStrictPredicateDeclineUnsupportedOp;
+    procedure TestStrictTargetDecline;
+    procedure TestStrictRangeAndBackendDiagnostics;
+    procedure TestCacheStillRecordsDeclinedFunctions;
+    procedure TestStrictFailedCompileLeavesNoOutput;
+    procedure TestStrictSuccessPublishesAtomically;
   end;
 
 function TAotTests.ExportAddr(const AInstance: TWasmModuleInstance;
@@ -572,16 +685,16 @@ begin
     CompileStore := TWasmStore.Create(CompileEngine);
     Artifact := AotCompileModule(CompileStore, CompileLoaded);
 
-    { The whole module serialized: four records, f2 (EH) declined, the rest
-      compiled. A declined record carries no code. }
+    { Five records: f3 (over-wide return_call) declined, the rest compiled. }
     ParseRes := ParseAotArtifact(Artifact, Parsed);
     Expect<Integer>(Ord(ParseRes)).ToBe(Ord(aprOk));
-    Expect<Integer>(Length(Parsed.Funcs)).ToBe(4);
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(5);
     Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
     Expect<Boolean>(Parsed.Funcs[1].Compiled).ToBe(True);
-    Expect<Boolean>(Parsed.Funcs[2].Compiled).ToBe(False);
-    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(True);
-    Expect<Integer>(Length(Parsed.Funcs[2].Code)).ToBe(0);
+    Expect<Boolean>(Parsed.Funcs[2].Compiled).ToBe(True);
+    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(False);
+    Expect<Boolean>(Parsed.Funcs[4].Compiled).ToBe(True);
+    Expect<Integer>(Length(Parsed.Funcs[3].Code)).ToBe(0);
 
     { --- LOAD into a fresh store --- }
     Imports.Funcs := nil;
@@ -623,19 +736,8 @@ begin
       .ToBe(InterpResult1(Bytes_, 'addcaller', [Params[0], Params[1]]));
     Expect<Integer>(Res[0].I32).ToBe(42);
 
-    { declined(): interpreted f2 -> 7. }
-    Res[0].Bits := High(UInt64);
-    InterpInvoke(Store, Declined, nil, @Res[0]);
-    Expect<UInt64>(Res[0].Bits).ToBe(InterpResult1(Bytes_, 'declined', []));
-    Expect<Integer>(Res[0].I32).ToBe(7);
-
-    { declinedcaller(): compiled f3 calls DECLINED/interpreted f2 across the
-      seam -> 7 (compiled<->interpreted interop). }
-    Res[0].Bits := High(UInt64);
-    InterpInvoke(Store, DeclinedCaller, nil, @Res[0]);
-    Expect<UInt64>(Res[0].Bits)
-      .ToBe(InterpResult1(Bytes_, 'declinedcaller', []));
-    Expect<Integer>(Res[0].I32).ToBe(7);
+    { The declined return_call is past the shared tail/marshal cap, so it is
+      recorded as interpreted and left unwired. Do not invoke it. }
   finally
     FreeAndNil(Jit);
     FreeAndNil(Store);
@@ -644,6 +746,43 @@ begin
     FreeAndNil(CompileStore);
     FreeAndNil(CompileLoaded);
     FreeAndNil(CompileEngine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestLargeFrameAllCompiled;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  ParseRes: TWasmAotParseResult;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+begin
+  Bytes_ := LargeFrameModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Expect<Boolean>(Loaded.Ir.Functions[0].RegisterCount >= 2048).ToBe(True);
+    Expect<Boolean>(JitCanCompile(@Loaded.Ir.Functions[0])).ToBe(True);
+    Artifact := AotCompileModule(Store, Loaded);
+    ParseRes := ParseAotArtifact(Artifact, Parsed);
+    Expect<Integer>(Ord(ParseRes)).ToBe(Ord(aprOk));
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(1);
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
+    Expect<Boolean>(Length(Parsed.Funcs[0].Code) > 0).ToBe(True);
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
   end;
 end;
 {$ELSE}
@@ -1031,6 +1170,522 @@ begin
 end;
 {$ENDIF}
 
+procedure TAotTests.TestHostTargetMatchesDefaultCompile;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  DefaultArt, HostArt: TWasmBytes;
+  DefaultParsed, HostParsed: TWasmAotArtifact;
+begin
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  try
+    DefaultArt := AotCompileModule(Store, Loaded);
+    HostArt := AotCompileModule(Store, Loaded, WasmTargetHost);
+    Expect<Integer>(Ord(ParseAotArtifact(DefaultArt, DefaultParsed)))
+      .ToBe(Ord(aprOk));
+    Expect<Integer>(Ord(ParseAotArtifact(HostArt, HostParsed)))
+      .ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(DefaultParsed.Header.TargetArch))
+      .ToBe(Integer(AotHostArch));
+    Expect<UInt64>(DefaultParsed.Header.AbiFingerprint).ToBe(
+      WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost)));
+    Expect<UInt64>(HostParsed.Header.AbiFingerprint).ToBe(
+      DefaultParsed.Header.AbiFingerprint);
+  finally
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestForeignOsDescriptorFingerprintRejected;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Foreign: TWasmTarget;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Jit: TWasmJitContext;
+  Res: TWasmAotLoadResult;
+begin
+  Foreign := WasmTargetOf(WasmTargetHost.Arch,
+    TWasmTargetOs(Ord(wtoDarwin) + Ord(wtoLinux) - Ord(WasmTargetHost.Os)));
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  Jit := nil;
+  try
+    Artifact := AotCompileModule(Store, Loaded, Foreign);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(Parsed.Header.TargetArch)).ToBe(Integer(AotHostArch));
+    Expect<UInt64>(Parsed.Header.AbiFingerprint).ToBe(
+      WasmTargetAbiFingerprint(WasmTargetAbi(Foreign)));
+    Expect<Boolean>(
+      Parsed.Header.AbiFingerprint <> WasmAotAbiFingerprint(Store)).ToBe(True);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, Res);
+    Expect<Integer>(Ord(Res)).ToBe(Ord(alrAbiMismatch));
+    Expect<Boolean>(Jit = nil).ToBe(True);
+  finally
+    FreeAndNil(Jit);
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestForeignIsaEmissionDeclined;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Foreign: TWasmTarget;
+  Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Jit: TWasmJitContext;
+  Res: TWasmAotLoadResult;
+  I: Integer;
+  AnyCompiled: Boolean;
+begin
+  Foreign := WasmTargetOf(
+    {$IFDEF CPUAARCH64}wtaX86_64{$ELSE}wtaAArch64{$ENDIF},
+    WasmTargetHost.Os);
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := LoadModule(Bytes_);
+  Store := TWasmStore.Create(Engine);
+  Jit := nil;
+  try
+    Expect<Boolean>(JitCanEmitForTarget(@Loaded.Ir.Functions[0], Foreign))
+      .ToBe(False);
+    Artifact := AotCompileModule(Store, Loaded, Foreign);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Integer(Parsed.Header.TargetArch))
+      .ToBe(Integer(AotTargetArch(Foreign)));
+    Expect<Boolean>(Parsed.Header.TargetArch <> AotHostArch).ToBe(True);
+    AnyCompiled := False;
+    for I := 0 to High(Parsed.Funcs) do
+      if Parsed.Funcs[I].Compiled then
+        AnyCompiled := True;
+    Expect<Boolean>(AnyCompiled).ToBe(False);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, Res);
+    Expect<Integer>(Ord(Res)).ToBe(Ord(alrArchMismatch));
+    Expect<Boolean>(Jit = nil).ToBe(True);
+  finally
+    FreeAndNil(Jit);
+    Store.Free;
+    Loaded.Free;
+    Engine.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestStrictSuccessCompilesEveryFunction;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  I: Integer;
+begin
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Artifact := AotCompileModuleStrict(Store, Loaded);
+    Expect<Boolean>(Length(Artifact) > 0).ToBe(True);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(Length(Loaded.Ir.Functions));
+    for I := 0 to High(Parsed.Funcs) do
+    begin
+      Expect<Boolean>(Parsed.Funcs[I].Compiled).ToBe(True);
+      Expect<Boolean>(Length(Parsed.Funcs[I].Code) > 0).ToBe(True);
+    end;
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
+procedure TAotTests.TestStrictPredicateDeclineExceptionHandling;
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Caught: Boolean;
+  Kind: TWasmAotDeclineKind;
+  I: Integer;
+begin
+  Bytes_ := TryTableModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  Caught := False;
+  Artifact := nil;
+  Kind := wadTarget;
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    try
+      Artifact := AotCompileModuleStrict(Store, Loaded);
+    except
+      on E: EWasmAotError do
+      begin
+        Caught := True;
+        Kind := E.Kind;
+      end;
+    end;
+    {$IFDEF WASM_JIT_BACKEND}
+    Expect<Boolean>(Caught).ToBe(False);
+    Expect<Boolean>(Length(Artifact) > 0).ToBe(True);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    for I := 0 to High(Parsed.Funcs) do
+      Expect<Boolean>(Parsed.Funcs[I].Compiled).ToBe(True);
+    {$ELSE}
+    Expect<Boolean>(Caught).ToBe(True);
+    Expect<Integer>(Length(Artifact)).ToBe(0);
+    Expect<Integer>(Ord(Kind)).ToBe(Ord(wadTarget));
+    {$ENDIF}
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+
+procedure TAotTests.TestStrictPredicateDeclineUnsupportedOp;
+var
+  Bytes_, Artifact: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Caught: Boolean;
+  Kind: TWasmAotDeclineKind;
+  Predicate: TWasmJitDecline;
+  FuncIdx: UInt32;
+  Msg: string;
+begin
+  Bytes_ := MultiFuncModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  Caught := False;
+  Artifact := nil;
+  Kind := wadTarget;
+  Predicate := jdNone;
+  FuncIdx := High(UInt32);
+  Msg := '';
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    try
+      Artifact := AotCompileModuleStrict(Store, Loaded);
+    except
+      on E: EWasmAotError do
+      begin
+        Caught := True;
+        Kind := E.Kind;
+        Predicate := E.Predicate;
+        FuncIdx := E.FuncIrIndex;
+        Msg := E.Message;
+      end;
+    end;
+    Expect<Boolean>(Caught).ToBe(True);
+    Expect<Integer>(Length(Artifact)).ToBe(0);
+    {$IFDEF WASM_JIT_BACKEND}
+    Expect<Integer>(Ord(Kind)).ToBe(Ord(wadPredicate));
+    Expect<Integer>(Ord(Predicate)).ToBe(Ord(jdUnsupportedInstr));
+    Expect<Integer>(Integer(FuncIdx)).ToBe(3);
+    Expect<Boolean>(Pos('unsupported-instr', Msg) > 0).ToBe(True);
+    {$ELSE}
+    Expect<Integer>(Ord(Kind)).ToBe(Ord(wadTarget));
+    {$ENDIF}
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+
+procedure TAotTests.TestStrictTargetDecline;
+var
+  Bytes_, Artifact: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Caught: Boolean;
+  Kind: TWasmAotDeclineKind;
+  FuncIdx: UInt32;
+  Msg: string;
+  ClassNm: string;
+begin
+  Bytes_ := AddModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  Caught := False;
+  Artifact := nil;
+  Kind := wadTarget;
+  FuncIdx := 0;
+  Msg := '';
+  ClassNm := '';
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    {$IFDEF WASM_JIT_BACKEND}
+    Artifact := AotCompileModuleStrict(Store, Loaded);
+    Expect<Boolean>(Length(Artifact) > 0).ToBe(True);
+    Expect<Integer>(Ord(JitCompileDecline(nil))).ToBe(Ord(jdNilFunction));
+    {$ELSE}
+    try
+      Artifact := AotCompileModuleStrict(Store, Loaded);
+    except
+      on E: EWasmAotError do
+      begin
+        Caught := True;
+        Kind := E.Kind;
+        FuncIdx := E.FuncIrIndex;
+        Msg := E.Message;
+        ClassNm := E.ClassName;
+      end;
+    end;
+    Expect<Boolean>(Caught).ToBe(True);
+    Expect<Integer>(Length(Artifact)).ToBe(0);
+    Expect<string>(ClassNm).ToBe('EWasmAotError');
+    Expect<Integer>(Ord(Kind)).ToBe(Ord(wadTarget));
+    Expect<Integer>(Integer(FuncIdx)).ToBe(Integer(WASM_AOT_NO_FUNC));
+    Expect<Boolean>(Pos('target', Msg) > 0).ToBe(True);
+    {$ENDIF}
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+
+procedure TAotTests.TestStrictRangeAndBackendDiagnostics;
+var
+  RangeErr, BackendErr: EWasmAotError;
+begin
+  { A live function large enough to overflow a branch immediate is impractical
+    in this suite (jit-spec §11.4). The kinds and messages the strict path
+    raises are the regression surface. }
+  RangeErr := EWasmAotError.CreateDecline(0, wadRange, jdNone);
+  try
+    Expect<Integer>(Ord(RangeErr.Kind)).ToBe(Ord(wadRange));
+    Expect<Integer>(Integer(RangeErr.FuncIrIndex)).ToBe(0);
+    Expect<string>(RangeErr.ClassName).ToBe('EWasmAotError');
+    Expect<Boolean>(Pos('function 0', RangeErr.Message) > 0).ToBe(True);
+    Expect<Boolean>(Pos('range', RangeErr.Message) > 0).ToBe(True);
+  finally
+    RangeErr.Free;
+  end;
+  BackendErr := EWasmAotError.CreateDecline(1, wadBackend, jdNone);
+  try
+    Expect<Integer>(Ord(BackendErr.Kind)).ToBe(Ord(wadBackend));
+    Expect<Integer>(Integer(BackendErr.FuncIrIndex)).ToBe(1);
+    Expect<Boolean>(Pos('backend', BackendErr.Message) > 0).ToBe(True);
+  finally
+    BackendErr.Free;
+  end;
+end;
+
+procedure TAotTests.TestCacheStillRecordsDeclinedFunctions;
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+begin
+  Bytes_ := MultiFuncModuleBytes;
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Artifact := AotCompileModule(Store, Loaded);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(5);
+    {$IFDEF WASM_JIT_BACKEND}
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
+    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(False);
+    Expect<Integer>(Length(Parsed.Funcs[3].Code)).ToBe(0);
+    {$ELSE}
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(False);
+    Expect<Boolean>(Parsed.Funcs[3].Compiled).ToBe(False);
+    {$ENDIF}
+  finally
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+
+procedure TAotTests.TestStrictFailedCompileLeavesNoOutput;
+var
+  Path, Staging: string;
+  Marker: TWasmBytes;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Caught: Boolean;
+  I: Integer;
+begin
+  Path := TempArtifactPath;
+  Staging := Path + '.publishing';
+  SetLength(Marker, 4);
+  Marker[0] := Byte('K');
+  Marker[1] := Byte('E');
+  Marker[2] := Byte('E');
+  Marker[3] := Byte('P');
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  Caught := False;
+  try
+    Loaded := LoadModule(MultiFuncModuleBytes);
+    Store := TWasmStore.Create(Engine);
+
+    Expect<Boolean>(FileExists(Path)).ToBe(False);
+    try
+      AotCompileModuleStrictToFile(Store, Loaded, Path);
+    except
+      on E: EWasmAotError do
+        Caught := True;
+    end;
+    Expect<Boolean>(Caught).ToBe(True);
+    Expect<Boolean>(FileExists(Path)).ToBe(False);
+    Expect<Boolean>(FileExists(Staging)).ToBe(False);
+
+    WriteFileBytes(Path, Marker);
+    Caught := False;
+    try
+      AotCompileModuleStrictToFile(Store, Loaded, Path);
+    except
+      on E: EWasmAotError do
+        Caught := True;
+    end;
+    Expect<Boolean>(Caught).ToBe(True);
+    Expect<Boolean>(FileExists(Path)).ToBe(True);
+    Expect<Boolean>(FileExists(Staging)).ToBe(False);
+    Marker := ReadFileBytes(Path);
+    Expect<Integer>(Length(Marker)).ToBe(4);
+    for I := 0 to 3 do
+      Expect<Integer>(Marker[I]).ToBe(Ord('KEEP'[I + 1]));
+  finally
+    if FileExists(Staging) then
+      DeleteFile(Staging);
+    if FileExists(Path) then
+      DeleteFile(Path);
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+
+procedure TAotTests.TestStrictSuccessPublishesAtomically;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Path, Staging: string;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Loaded: TWasmLoadedModule;
+  Parsed: TWasmAotArtifact;
+  OnDisk: TWasmBytes;
+begin
+  Path := TempArtifactPath;
+  Staging := Path + '.publishing';
+  Engine := TWasmEngine.Create;
+  Loaded := nil;
+  Store := nil;
+  try
+    Loaded := LoadModule(AddModuleBytes);
+    Store := TWasmStore.Create(Engine);
+    AotCompileModuleStrictToFile(Store, Loaded, Path);
+    Expect<Boolean>(FileExists(Path)).ToBe(True);
+    Expect<Boolean>(FileExists(Staging)).ToBe(False);
+    OnDisk := ReadFileBytes(Path);
+    Expect<Integer>(Ord(ParseAotArtifact(OnDisk, Parsed))).ToBe(Ord(aprOk));
+    Expect<Integer>(Length(Parsed.Funcs)).ToBe(1);
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
+  finally
+    if FileExists(Staging) then
+      DeleteFile(Staging);
+    if FileExists(Path) then
+      DeleteFile(Path);
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
 procedure TAotTests.SetupTests;
 begin
   Test('AOT-compiled i32.add loads from the artifact and matches the interpreter',
@@ -1039,6 +1694,8 @@ begin
     TestArtifactCodeIsPositionIndependent);
   Test('a whole multi-function module AOT-loads, declined function stays interpreted',
     TestMultiFunctionWithDeclined);
+  Test('a large-frame module records its non-EH function compiled',
+    TestLargeFrameAllCompiled);
   Test('AOT-loaded code is byte-identical to a fresh JIT compilation',
     TestJitAndAotCodeAreByteIdentical);
   Test('an epoch bump before acyclic AOT recursion does not invent a safepoint',
@@ -1051,6 +1708,28 @@ begin
     TestGuardRejectsCorruptChecksum);
   Test('an artifact loaded against a different module is rejected (moduleHash)',
     TestGuardRejectsModuleHashMismatch);
+  Test('an explicit host target stamps the same descriptor fingerprint',
+    TestHostTargetMatchesDefaultCompile);
+  Test('a foreign-OS same-arch artifact is rejected on ABI fingerprint',
+    TestForeignOsDescriptorFingerprintRejected);
+  Test('a foreign-ISA target stamps the other arch and declines emission',
+    TestForeignIsaEmissionDeclined);
+  Test('strict compile succeeds only when every defined function is native',
+    TestStrictSuccessCompilesEveryFunction);
+  Test('strict compile publishes native code for try_table handlers',
+    TestStrictPredicateDeclineExceptionHandling);
+  Test('strict compile fails a return_call tail-cap predicate decline',
+    TestStrictPredicateDeclineUnsupportedOp);
+  Test('strict compile fails a target decline off the AOT host',
+    TestStrictTargetDecline);
+  Test('strict range and backend diagnostics name the function and kind',
+    TestStrictRangeAndBackendDiagnostics);
+  Test('cache compile still records declined functions for fallback',
+    TestCacheStillRecordsDeclinedFunctions);
+  Test('a failed strict compile leaves no partial output',
+    TestStrictFailedCompileLeavesNoOutput);
+  Test('a successful strict compile publishes atomically',
+    TestStrictSuccessPublishesAtomically);
 end;
 
 begin

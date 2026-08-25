@@ -52,7 +52,7 @@ and [DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md).
 brew install frostney/tap/lwpt   # or the release tarball — see docs/quick-start.md
 git clone https://github.com/frostney/wasmlight.git && cd wasmlight
 lwpt install     # resolve deps, write lwpt.cfg
-lwpt build       # all three programs, into build/
+lwpt build       # all four programs, into build/
 lwpt test        # co-located unit suites
 ```
 
