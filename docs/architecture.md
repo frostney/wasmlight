@@ -49,7 +49,7 @@ Read bottom-up; each layer may use only the layers below it.
 | --- | --- | --- | --- |
 | Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
 | Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Connector.Memory`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), the immutable compiled capability set, connector copy-in/out/inout, scoped borrows, and opaque handles, and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
-| Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
+| Embedding API | `Wasm.Engine`, `Wasm.Connector.Callbacks` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots; target-ABI callback thunks with retained/scoped/queued lifetimes | **shipped** |
 | Native C ABI | `Wasm.Abi`, `Wasm.Native.Load`, `Wasm.Native.Call` | 64-bit Unix C-ABI call plans (AAPCS64, Apple AAPCS64, SysV x86-64), application-local library load, precompiled call gates; no TinyCC or libffi ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)) | **shipped** (planning on every host; live calls on 64-bit Unix) |
 | Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
@@ -240,7 +240,11 @@ binary operand it keys on `EWasmDecodeError`.
 
 `Wasm.Connector` defines `EWasmConnectorError` (a sibling of
 `EWasmTextError`, carrying `Line`/`Column`) for malformed `.wlc` source
-and for a selected connector that cannot be read. `Wasm.Compile` adds two
+and for a selected connector that cannot be read. `EWasmCallbackError`
+(`Wasm.Connector.Callbacks`) is a further sibling for thunk bind and
+dispatch contract failures (shape, off-thread, exhausted slots). A guest
+trap, `throw`, or `proc_exit` that occurs inside a callback keeps its own
+class and is only rethrown on Pascal ground. `Wasm.Compile` adds two
 further compile-surface siblings under `EWasmError`: `EWasmCompileError`
 (strict compile declined or is not available) and `EWasmPackagingError`
 (target or runtime-shell packaging). They are not guest faults and are
@@ -548,6 +552,17 @@ boundary is drawn.
   facade never sees a memory's base pointer. It re-exports the collector's
   host-root API (contract HOST-1) so a host holding a reference across an
   allocation can root it, and declares `EWasmExit`.
+- **`Wasm.Connector.Callbacks`** hands out target-ABI `cdecl` function
+  pointers that re-enter a guest through `Call`. Retained is the default;
+  `[Scoped]` dies with `EndScope`; `[Queued]` copies a void notification
+  from a foreign thread and delivers it on the store thread. Lifetimes are
+  `TWlcCallbackKind` from `Wasm.Connector`, not a second enum. A guest
+  `EWasmTrap`, `EWasmException`, or `EWasmExit` is retained at the thunk
+  and rethrown on Pascal ground — it never unwinds through a native C
+  frame. Bind and off-thread rejects raise `EWasmCallbackError`, a sibling
+  of those classes and of `EWasmConnectorError`, never a collapse of them
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md),
+  [ADR-0008](adr/0008-a-store-is-confined-to-one-thread.md)).
 - **`Wasm.Connector.Memory`** is the connector memory primitive
   ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)):
   copy-in, copy-out, and inout buffers with explicit bounds; a scoped
