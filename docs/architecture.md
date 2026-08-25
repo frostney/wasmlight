@@ -48,6 +48,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Host surface | `Wasm.Wasi.*`, `Wasm.Run` | deny-by-default WASI preview1 host and the `wasmlight run` driver; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Native C ABI | `Wasm.Abi`, `Wasm.Native.Load`, `Wasm.Native.Call` | 64-bit Unix C-ABI call plans (AAPCS64, Apple AAPCS64, SysV x86-64), application-local library load, precompiled call gates; no TinyCC or libffi ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)) | **shipped** (planning on every host; live calls on 64-bit Unix) |
+| Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
 | Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
@@ -483,6 +484,15 @@ boundary is drawn.
   134, an uncaught exception to 1, a decode/validate/link failure to 1. It
   is factored out of the program entry point so it is unit-testable with
   injected streams, never touching real stdio.
+- **`Wasm.Connector` / `Wasm.Connector.Resolve`** are compile-time linking,
+  not a runtime host. `ParseConnector` turns `.wlc` into declaration
+  records. `ResolveConnectorPlan` matches each non-built-in import exactly
+  once by connector class, method name, and the wasm signature after fixed
+  marshalling, treats `EntryPoint` as a native-symbol alias only, and
+  strips unused libraries and types. Failures are `EWasmLinkError`. The
+  plan is the immutable input later compile work embeds; resolve does not
+  load a library. See [connector-language.md](connector-language.md) and
+  [connector-resolve.md](connector-resolve.md).
 
 ## Related documents
 
@@ -490,4 +500,6 @@ boundary is drawn.
 - [Code style](code-style.md) — including the hot-path RTL policy
 - [Testing](testing.md) — the test tiers and the spec testsuite
 - [CONTEXT.md](../CONTEXT.md) — canonical glossary
+- [Connector language](connector-language.md) — `.wlc` grammar and `ParseConnector`
+- [Connector resolve](connector-resolve.md) — unique import matching and the stripped plan
 - [docs/adr/](adr/) — architectural decisions
