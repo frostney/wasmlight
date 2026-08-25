@@ -29,7 +29,9 @@ Do not invoke `fpc` directly; the one supported form is
 | Target | Source | Output |
 | --- | --- | --- |
 | `wasmlight` | `source/apps/wasmlight.pas` | `build/wasmlight` |
+| `wasmlight-shell` | `source/apps/wasmlight-shell.pas` | `build/wasmlight-shell` |
 | `wasmbench` | `source/apps/wasmbench.pas` | `build/wasmbench` |
+| `wasmspec` | `source/apps/wasmspec.pas` | `build/wasmspec` |
 
 Test programs are not `[build]` targets — `lwpt test` discovers, compiles,
 and runs `source/units/*.Test.pas` independently. Release archives are

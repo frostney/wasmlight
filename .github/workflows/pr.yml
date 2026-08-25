@@ -216,6 +216,93 @@ jobs:
             echo "::error::a non-module was accepted"; exit 1
           fi
 
+      # The runtime-shell template must exist, reject an empty embed, and
+      # (on 64-bit UNIX) carry neither interpreter dispatch nor JIT
+      # compile symbols, and no host compiler/linker/SDK libraries.
+      - name: runtime-shell audit
+        run: |
+          set -euo pipefail
+          SHELL_BIN=./build/wasmlight-shell${{ matrix.exe }}
+          test -x "$SHELL_BIN"
+          set +e
+          "$SHELL_BIN" >"$RUNNER_TEMP/shell-empty.out" 2>"$RUNNER_TEMP/shell-empty.err"
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::empty shell template exited 0"; exit 1
+          fi
+          if ! grep -q 'no embedded module' "$RUNNER_TEMP/shell-empty.err"; then
+            echo "::error::empty shell template did not report a missing module"
+            cat "$RUNNER_TEMP/shell-empty.err"
+            exit 1
+          fi
+          # Black-box: incomplete native image is EWasmLinkError, no interp
+          # fallback. Valid image (64-bit UNIX) runs _start natively.
+          PY=python3
+          if ! command -v python3 >/dev/null 2>&1; then PY=python; fi
+          "$PY" scripts/write-wshl-payload.py --write-fixture-wasm \
+            "$RUNNER_TEMP/shell-cmd.wasm" - "$RUNNER_TEMP/shell-incomplete.wshl"
+          set +e
+          "$SHELL_BIN" "$RUNNER_TEMP/shell-incomplete.wshl" \
+            >"$RUNNER_TEMP/shell-incomplete.out" \
+            2>"$RUNNER_TEMP/shell-incomplete.err"
+          INC_STATUS=$?
+          set -e
+          if [ "$INC_STATUS" -eq 0 ]; then
+            echo "::error::incomplete shell image exited 0"; exit 1
+          fi
+          if ! grep -q 'EWasmLinkError' "$RUNNER_TEMP/shell-incomplete.err"; then
+            echo "::error::incomplete shell image was not a link error"
+            cat "$RUNNER_TEMP/shell-incomplete.err"
+            exit 1
+          fi
+          if [ -s "$RUNNER_TEMP/shell-incomplete.out" ]; then
+            echo "::error::incomplete shell image wrote stdout (interpreter fallback?)"
+            cat "$RUNNER_TEMP/shell-incomplete.out"
+            exit 1
+          fi
+          if [ "${{ matrix.jit }}" = "true" ]; then
+            ./build/wasmlight aot "$RUNNER_TEMP/shell-cmd.wasm" \
+              -o "$RUNNER_TEMP/shell-cmd.waot"
+            "$PY" scripts/write-wshl-payload.py \
+              "$RUNNER_TEMP/shell-cmd.wasm" "$RUNNER_TEMP/shell-cmd.waot" \
+              "$RUNNER_TEMP/shell-complete.wshl"
+            set +e
+            "$SHELL_BIN" "$RUNNER_TEMP/shell-complete.wshl" \
+              >"$RUNNER_TEMP/shell-complete.out" \
+              2>"$RUNNER_TEMP/shell-complete.err"
+            OK_STATUS=$?
+            set -e
+            if [ "$OK_STATUS" -ne 0 ]; then
+              echo "::error::complete shell image failed"
+              cat "$RUNNER_TEMP/shell-complete.err"
+              exit 1
+            fi
+          fi
+          if [ "${{ matrix.jit }}" = "true" ]; then
+            if command -v nm >/dev/null 2>&1; then
+              # Live symbols only. `nm -a` also prints DWARF names from
+              # helper units the shell links for frames/traps; those are
+              # not interpreter dispatch or JIT compile entry points.
+              if nm "$SHELL_BIN" | grep -Ei 'JitCanCompile|JitStageFunctionBytes|JitForceCompile|JitCompileToBuffer|InterpTierInvoke'; then
+                echo "::error::runtime shell contains interpreter dispatch or JIT compiler symbols"
+                exit 1
+              fi
+            fi
+            if command -v otool >/dev/null 2>&1; then
+              DEPS=$(otool -L "$SHELL_BIN")
+            elif command -v ldd >/dev/null 2>&1; then
+              DEPS=$(ldd "$SHELL_BIN")
+            else
+              DEPS=""
+            fi
+            if printf '%s\n' "$DEPS" | grep -Ei 'libclang|libzig|libwasmer|zig'; then
+              echo "::error::runtime shell links a host compiler, linker, or foreign runtime"
+              echo "$DEPS"
+              exit 1
+            fi
+          fi
+
       # One archive per Unix compiler host: layout, MANIFEST, checksums, and
       # ELF/Mach-O shell structure. Compile gates run only when
       # `wasmlight compile` exists — cross-emission is structural, native
@@ -234,7 +321,6 @@ jobs:
           instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
             --archive "$ARCHIVE" \
             --checksums "$CHECKSUMS"
-
       # The upstream conformance corpus is the project's strongest oracle.
       # It is fetched at a PINNED commit (never vendored — tests/spec/testsuite
       # is gitignored; the SHA lives in tests/spec/testsuite.commit so the

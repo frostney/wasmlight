@@ -77,8 +77,7 @@ const
     the common path ops) so a program discovers a usefully-capable preopen; the
     host still resolves every path under the chosen directory (embedding-spec.md
     §5.3), so the capability is the directory, not any of these bits. }
-  WASM_RUN_DIR_RIGHTS: TWasmWasiRights =
-    UInt64($1FFFFFFF);   { all preview1 rights bits (0..28) — F4 refines }
+  WASM_RUN_DIR_RIGHTS: TWasmWasiRights = WASM_PREOPEN_DIR_RIGHTS;
 
 type
   { The outcome of a run: the process exit code and an optional diagnostic the

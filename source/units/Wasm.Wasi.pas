@@ -76,6 +76,13 @@ uses
   Wasm.Wasi.Memory,
   Wasm.Wasi.Types;
 
+const
+  { Directory rights granted to a `--dir` or compiled preopen. Untyped so
+    both `WASM_RUN_DIR_RIGHTS` and `WASM_COMPILED_DIR_RIGHTS` can initialize
+    from it. All preview1 rights bits (0..28). The capability is the
+    directory; containment still holds every path under it. }
+  WASM_PREOPEN_DIR_RIGHTS = UInt64($1FFFFFFF);
+
 type
   { --- injectable seams (embedding-spec.md §2.1, §2.3) ------------------- }
 
