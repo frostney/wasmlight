@@ -27,6 +27,7 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Interp,
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
   Wasm.Jit.X64,
@@ -821,8 +822,9 @@ var
   Aux: TWasmIrAuxU32;
   I: Integer;
 begin
-  { Call-site arity is not a decline. An empty aux and an argument block one
-    past the historical short-form cap both compile. }
+  { Direct-call arity is not a decline. An empty aux and an argument block
+    one past the historical short-form cap both compile. return_call* past
+    the shared tail-channel cap declines. }
   Ins.Op := iroCall;
   Ins.Dest := 0;
   Ins.A := 0;
@@ -836,6 +838,15 @@ begin
   for I := 1 to X64_MAX_CALL_SLOTS + 1 do
     Aux[I] := 0;
   Ins.Op := iroReturnCall;
+  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
+
+  SetLength(Aux, WASM_TIER_TAIL_CAP + 2);
+  Aux[0] := WASM_TIER_TAIL_CAP + 1;
+  for I := 1 to WASM_TIER_TAIL_CAP + 1 do
+    Aux[I] := 0;
+  Ins.Op := iroReturnCall;
+  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(False);
+  Ins.Op := iroCall;
   Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
 end;
 
@@ -883,7 +894,7 @@ begin
   Test('predicate covers waves 2-6 (only EH is declined)',
     TestPredicateCoversWaves);
   Test('predicate declines exception-handling ops', TestPredicateDeclinesEh);
-  Test('the call-site arity predicate admits an over-wide call',
+  Test('the call-site arity predicate admits wide calls and fences huge tails',
     TestCallArityFence);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);

@@ -178,9 +178,9 @@ function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
 
 { The compile predicate and scope fence (§10.3): True only if the active backend
   can emit EVERY op in the function. False for EH ops / handler tables
-  (issue #32), or an unsupported target — the function then runs interpreted.
-  Frame size and call arity are not declines: both backends encode large
-  slots and large call-scratch frames. }
+  (issue #32), an unsupported target, or a return_call* past WASM_TIER_TAIL_CAP
+  — the function then runs interpreted. Frame size and non-tail call arity
+  are encoded: both backends form large slots and large call-scratch frames. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
 { A deliberately narrow proof for the AArch64 native self-call ABI: one
@@ -324,8 +324,9 @@ begin
   if Length(AFn^.Handlers) > 0 then
     Exit;
   { Every op must have a template. The FIRST missing template declines the
-    whole function — today that is only EH (`iroThrow` / `iroThrowRef`).
-    Frame size and call arity are encoded, not declined. }
+    whole function — today that is EH (`iroThrow` / `iroThrowRef`) plus a
+    return_call* whose argument block exceeds the shared tail channel.
+    Frame size and non-tail call arity are encoded, not declined. }
   for I := 0 to High(AFn^.Code) do
   begin
     {$IFDEF WASM_JIT_ARM64}

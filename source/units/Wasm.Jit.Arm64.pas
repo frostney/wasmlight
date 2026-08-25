@@ -626,9 +626,10 @@ procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
 
 { The INSTRUCTION-level half of the compile predicate. Arm64CanEmitOp answers
   "is there a template for this op"; this answers "can this particular
-  instruction's template be emitted". Call-site arity is no longer a decline:
-  large argument/result blocks take a multi-instruction SP adjust. Remaining
-  False values are reserved for a future shape the template cannot emit. }
+  instruction's template be emitted". Direct call-site arity is encoded with a
+  multi-instruction SP adjust. A return_call* whose argument block exceeds
+  WASM_TIER_TAIL_CAP stays interpreted — that is the shared GTierTail bound,
+  not an encoding limit. }
 function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -5722,11 +5723,13 @@ end;
 function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 begin
-  { Call-site arity is encoded with a multi-instruction SP adjust; no
-    instruction shape declines a valid IR function. }
+  { Direct/indirect/ref calls marshal on the native stack. return_call*
+    publishes arguments through GTierTail, which is bounded. }
   Result := True;
-  if AIns.Op <> AIns.Op then
-    Result := Length(AAux) < 0;
+  case AIns.Op of
+    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
+      Result := IrAuxBlockCount(AAux, AIns.A) <= WASM_TIER_TAIL_CAP;
+  end;
 end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;

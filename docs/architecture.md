@@ -387,9 +387,11 @@ different.
   at every back-edge and keeps live references discoverable, honouring the
   same safepoint obligations as the interpreter. It carries the full
   non-EH op set. The remaining compile declines are an unsupported target
-  (no backend) and exception handling — a function that throws or hosts a
-  `try_table` handler stays interpreted. Large register files, wide calls,
-  and out-of-range conditional branches are encoded, not declined.
+  (no backend), exception handling — a function that throws or hosts a
+  `try_table` handler stays interpreted — and a `return_call*` whose
+  argument block exceeds the shared cross-tier tail channel. Large
+  register files, wide non-tail calls, and out-of-range conditional
+  branches are encoded, not declined.
   Compiled and interpreted functions interoperate transparently across the
   seam (a throw from a compiled callee reaches an outer interpreted
   handler, and a cross-tier tail call stays O(1)).

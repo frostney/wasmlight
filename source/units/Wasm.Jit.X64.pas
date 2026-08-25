@@ -3900,9 +3900,13 @@ end;
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 begin
+  { Direct/indirect/ref calls marshal on the native stack. return_call*
+    publishes arguments through GTierTail, which is bounded. }
   Result := True;
-  if AIns.Op <> AIns.Op then
-    Result := Length(AAux) < 0;
+  case AIns.Op of
+    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
+      Result := IrAuxBlockCount(AAux, AIns.A) <= WASM_TIER_TAIL_CAP;
+  end;
 end;
 
 function X64EmitOp(const ABuf: TWasmCodeBuffer;

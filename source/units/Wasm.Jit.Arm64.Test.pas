@@ -578,8 +578,9 @@ begin
   Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(False);
 end;
 
-{ Call-site arity is no longer a compile fence: an over-wide argument block
-  is encoded with a multi-instruction SP adjust. Non-call instructions pass. }
+{ Direct-call arity is not a compile fence: an over-wide argument block is
+  encoded with a multi-instruction SP adjust. return_call* past the shared
+  tail-channel cap still declines so the interpreter runs it. }
 procedure TArm64Tests.TestCallArityFence;
 var
   Aux: TWasmIrAuxU32;
@@ -611,6 +612,16 @@ begin
     Aux[I] := 0;
   Instr.Op := iroReturnCall;
   Instr.A := 0;
+  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
+
+  { One past the shared GTierTail cap: return_call declines, call does not. }
+  SetLength(Aux, WASM_TIER_TAIL_CAP + 2);
+  Aux[0] := WASM_TIER_TAIL_CAP + 1;
+  for I := 1 to WASM_TIER_TAIL_CAP + 1 do
+    Aux[I] := 0;
+  Instr.Op := iroReturnCall;
+  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(False);
+  Instr.Op := iroCall;
   Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
 end;
 
@@ -1086,7 +1097,7 @@ begin
   Test('slot byte offset is register*8', TestSlotOffset);
   Test('predicate covers waves 2-6 (only EH is declined)',
     TestPredicateCoversWave2);
-  Test('the call-site arity predicate admits an over-wide call',
+  Test('the call-site arity predicate admits wide calls and fences huge tails',
     TestCallArityFence);
   Test('a zero SP adjust copies SP rather than XZR',
     TestSpZeroAdjustCopiesSp);
