@@ -284,7 +284,11 @@ begin
       Code := JitStageFunctionBytes(AStore, Ir, Fn,
         Ir.FuncImportCount + UInt32(I), EntryOffset, RegCount);
     except
-      on E: EWasmAotError do
+      { A predicate/emitter contradiction is EWasmInternal and must stay
+        that class. Bare EWasmError from the code buffer — unbound labels,
+        patch range — is a late backend refuse and becomes wadBackend on
+        the strict path. }
+      on E: EWasmInternal do
         raise;
       on E: EWasmError do
         if AStrict then
