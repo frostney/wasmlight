@@ -46,7 +46,7 @@ needed. The committed `.lwpt/modules/` tree plus `lwpt.lock` make
 ## Build and test
 
 ```bash
-lwpt build           # all three programs into build/
+lwpt build           # all four programs into build/
 lwpt test            # co-located unit suites
 ```
 
@@ -142,12 +142,14 @@ absolute path is refused before any OS call. Arguments after the module
 ./build/wasmlight run --dir /data=./out --env LANG=C app.wasm arg1 arg2
 ```
 
-Those three programs are the whole shipped surface today: decode, validate,
+Those programs are the shipped surface today: decode, validate,
 instantiate, and execute the **complete core wasm 3.0 instruction set** —
 every numeric, reference, GC, SIMD, and exception-handling instruction —
 conformance-tested against the pinned core corpus (65,188 pass, no failures or
 skips),
 **and run WASI preview1 command modules** under deny-by-default sandboxing.
+`wasmlight-shell` is the interpreter-free runtime-shell template; it is
+built with the other programs and is not a user-facing compile command.
 See [roadmap.md](roadmap.md) for what comes next and in what order.
 
 For the full command set (formatter, benchmarks, CI gates) see

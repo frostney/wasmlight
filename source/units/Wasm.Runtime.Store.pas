@@ -941,7 +941,10 @@ type
     aohDirectCallFinish,       { 13 compiled direct-call frame exit }
     aohResolveMemory,          { 14 scalar-memory instance resolution }
     aohDirectCallFinishScalar, { 15 scalar compiled direct-call frame exit }
-    aohDirectCallPrepareScalar { 16 scalar compiled direct-call frame entry }
+    aohDirectCallPrepareScalar,{ 16 scalar compiled direct-call frame entry }
+    aohPublishIp,              { 17 compiled call-site IP publication }
+    aohEhThrow,                { 18 compiled throw / throw_ref }
+    aohEhResumeIndex           { 19 compiled handler-table resume index }
   );
 
 const

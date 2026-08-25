@@ -41,6 +41,7 @@ lwpt test              # discovers source/units/*.Test.pas
 ./build/wasmlight compile <module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...
 # compile is registered; native emission still fails with structured errors
 # until the remaining ADR-0015 stages land — never a .waot/JIT fallback
+./build/wasmlight-shell [<payload.wshl> [guest-args...]]  # runtime-shell template
 ./build/wasmbench      # execution workloads and tiers (measurement only)
 # isolate with --workload loop|fib|memory|numeric|simd|startup and --tier
 npx markdownlint-cli2 "**/*.md"   # docs gate, config .markdownlint-cli2.jsonc
