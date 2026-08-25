@@ -57,6 +57,7 @@ type
     procedure TestEmitLittleEndian;
     procedure TestEmitBytesAndByte;
     procedure TestLabelPatchResolution;
+    procedure TestInsertU32ShiftsLabelsAndPatches;
 
     procedure TestSupportedReportsTrueOrFalse;
 
@@ -154,6 +155,42 @@ begin
     Buf.PatchU32(Site, $14000003);
     Expect<Byte>(Buf.ByteAt(0)).ToBe($03);
     Expect<Byte>(Buf.ByteAt(3)).ToBe($14);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TCodeBufferTests.TestInsertU32ShiftsLabelsAndPatches;
+var
+  Buf: TWasmCodeBuffer;
+  L: TWasmJitLabel;
+begin
+  { A veneer insert at offset 4 must move later labels and later patch sites
+    by 4 bytes, leave an earlier patch site in place, and write the word
+    little-endian. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    L := Buf.NewLabel;
+    Buf.EmitU32($14000000);
+    Buf.AddPatch(0, L, 1);
+    Buf.EmitU32($AABBCCDD);
+    Buf.AddPatch(4, L, 2);
+    Buf.BindLabel(L);
+    Expect<Integer>(Buf.Size).ToBe(8);
+    Expect<Integer>(Buf.LabelOffset(L)).ToBe(8);
+    Expect<Integer>(Buf.GetPatch(1).SiteOffset).ToBe(4);
+
+    Buf.InsertU32(4, $04030201);
+    Expect<Integer>(Buf.Size).ToBe(12);
+    Expect<Byte>(Buf.ByteAt(4)).ToBe($01);
+    Expect<Byte>(Buf.ByteAt(5)).ToBe($02);
+    Expect<Byte>(Buf.ByteAt(6)).ToBe($03);
+    Expect<Byte>(Buf.ByteAt(7)).ToBe($04);
+    Expect<Byte>(Buf.ByteAt(8)).ToBe($DD);
+    Expect<Byte>(Buf.ByteAt(11)).ToBe($AA);
+    Expect<Integer>(Buf.GetPatch(0).SiteOffset).ToBe(0);
+    Expect<Integer>(Buf.GetPatch(1).SiteOffset).ToBe(8);
+    Expect<Integer>(Buf.LabelOffset(L)).ToBe(12);
   finally
     Buf.Free;
   end;
@@ -298,6 +335,8 @@ begin
   Test('emit words are little-endian', TestEmitLittleEndian);
   Test('emit byte and byte array grow geometrically', TestEmitBytesAndByte);
   Test('label map resolves a forward branch offset', TestLabelPatchResolution);
+  Test('InsertU32 shifts later labels and patch sites',
+    TestInsertU32ShiftsLabelsAndPatches);
   Test('support predicate matches the compiled leg',
     TestSupportedReportsTrueOrFalse);
 

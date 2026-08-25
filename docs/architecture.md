@@ -59,6 +59,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Module model | `Wasm.Module` | decoded module: populated entity lists, with unparsed payloads kept as spans | **shipped** |
 | Decode | `Wasm.Decoder` | binary → module model | **shipped** |
 | Primitives | `Wasm.Binary` | bounds-checked cursor, LEB128, little-endian reads | **shipped** |
+| Native target | `Wasm.Target` | host-independent 64-bit Unix triples and ABI descriptors ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); staging and fingerprints consume a requested target, executable memory stays host-gated, and foreign-ISA backends remain compile-time | **shipped** |
 | Vocabulary | `Wasm.Core` | value/heap/reference types, section ids and their prescribed order, tiers, error hierarchy | **shipped** |
 
 The Decode layer is one unit in the table and five behind it:
@@ -202,6 +203,11 @@ is an `EWasmError` subtype so the trampoline carries it out, but a distinct
 sibling — neither a trap nor a `throw` — so a host classifies it exactly;
 `wasmlight run` maps it to the process exit code and everything else is an
 error.
+
+`EWasmAotError` is another host-surface sibling, declared in `Wasm.Aot`: a
+strict whole-module compile refused a function (or the target). It is not a
+trap and not a decode/validation failure. The fallback `.waot` cache path
+does not raise it; declined functions stay uncompiled there.
 
 `EWasmException` is a **sibling of `EWasmTrap`, not a subclass** — both
 under `EWasmError`, but a host discriminates between a trap and an escaped
@@ -402,29 +408,48 @@ different.
 
 - **The baseline JIT** (`Wasm.Jit` driver, `Wasm.Jit.CodeBuffer` W^X code
   buffer, and the two backends `Wasm.Jit.Arm64` / `Wasm.Jit.X64`) compiles
-  a function to native code the first time it runs. The design choice that
+  a function to native code the first time it runs. JIT staging and AOT
+  consume a requested `Wasm.Target` for arch stamps, fingerprints, and
+  published foreign-target offsets; executable-memory allocation, native
+  invocation, and ISA selection stay host-gated (`JitCompileToBuffer`
+  remains host-ifdef'd, so foreign-ISA byte emission is still declined).
+  The design choice that
   makes it cheap: the compiled frame *is* the interpreter's frame, so the
   GC stack map, the tail-call frame replacement, and stack-exhaustion
   handling are inherited rather than re-derived. It emits the epoch check
   at every back-edge and keeps live references discoverable, honouring the
-  same safepoint obligations as the interpreter. It carries the full
-  non-EH op set; a function that throws or hosts a `try_table` handler is
-  declined and stays interpreted, and compiled and interpreted functions
-  interoperate transparently across the seam (a throw from a compiled
-  callee reaches an outer interpreted handler, and a cross-tier tail call
-  stays O(1)).
+  same safepoint obligations as the interpreter. `throw` / `throw_ref` and
+  `try_table` handler tables compile on both backends; matching stays in
+  the shared `UnwindException` walk by tag store-address, so a caught throw
+  never leaves the guest and an uncaught throw surfaces as `EWasmException`
+  through the invocation trampoline. Handler-bearing and throwing functions
+  decline only the direct-call fast path so each keeps an `InvokeCompiled`
+  seam. Large register files, wide non-tail calls, and out-of-range
+  conditional branches are encoded, not declined. The remaining compile
+  declines are an unsupported target (no backend) and a `return_call*`
+  whose argument block exceeds the shared cross-tier tail channel.
+  Compiled and interpreted functions interoperate transparently across the
+  seam (a throw from a compiled callee reaches an outer interpreted
+  handler, and a cross-tier tail call stays O(1)).
 - **The AOT compiler** (`Wasm.Aot`, `Wasm.Aot.Artifact`) runs the same
   backends ahead of time, emitting **position-independent** code — helper
   calls go through a per-process indirect table and the IR base arrives in
   a pinned register, so nothing absolute is baked — and serializes it to a
-  `.waot` artifact. `run --aot` loads the artifact in a fresh process for
-  instant startup; it is not a re-JIT (the loaded executable memory is
-  byte-identical to a fresh compile). The **security invariant**: AOT
-  always re-decodes and re-validates the module, and the artifact's code is
-  used only if its magic, AOT version, IR version, target arch, ABI
-  fingerprint, module hash, and self-checksum all match the freshly
-  validated module — otherwise the run falls back to the interpreter. The
-  artifact is a per-module perf cache bound by hash, never a trust bypass.
+  `.waot` artifact. Target architecture and ABI fingerprints come from the
+  selected `Wasm.Target` descriptor, not from host CPU/OS defines; host-
+  native emission still bakes the live store so release and debug binaries
+  cannot miscompile themselves, while a requested foreign target consumes
+  the published descriptor. `run --aot` still loads only a host-arch,
+  host-ABI artifact and maps it executable through the host-gated code
+  buffer. The **security invariant**: AOT always re-decodes and re-validates
+  the module, and the artifact's code is used only if its magic, AOT version,
+  IR version, target arch, ABI fingerprint, module hash, and self-checksum
+  all match the freshly validated module — otherwise the run falls back to
+  the interpreter. The artifact is a per-module perf cache bound by hash,
+  never a trust bypass. `AotCompileModuleStrict` is a distinct all-or-fail
+  entry point: every defined function must have native code or compilation
+  raises `EWasmAotError` (function index and decline kind) and publishes
+  nothing. The cache path stays fallback-capable.
 
 The compile path uses a different container, `Wasm.Native.Payload`: a
 versioned, checksummed section directory that carries the original module,
