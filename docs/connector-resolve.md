@@ -13,8 +13,8 @@
 
 ## Resolve contract
 
-The caller supplies parsed (or constructed) `TWlcDocument` values and the
-guest imports. `WlcGuestImportsFromModule` / `ResolveConnectorModule` read
+The caller supplies `TWlcDocument` values from `ParseConnector` (or
+constructed records) and the guest imports. `WlcGuestImportsFromModule` / `ResolveConnectorModule` read
 imports from a decoded `TWasmModule`. Built-in module names — typically
 `wasi_snapshot_preview1` via `WLC_WASI_MODULE` — are skipped; they are
 not discovered.

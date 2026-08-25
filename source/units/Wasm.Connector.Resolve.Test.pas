@@ -1,10 +1,11 @@
 { Unit suite for Wasm.Connector.Resolve.
 
-  Declarations are built as records so this suite does not depend on the
-  #41 parser. Guest modules are assembled, decoded, and validated through
-  the shipped path. Cases cover EntryPoint aliasing, unique matching,
-  missing/duplicate/incompatible/ambiguous bindings, unused stripping,
-  and built-in WASI imports that must not require a connector. }
+  Guest modules are assembled, decoded, and validated through the shipped
+  path. Declaration records are built directly to isolate matching from
+  the parser, and `.wlc` snippets go through `ParseConnector` for the
+  shipped parse-then-resolve path. Cases cover EntryPoint aliasing, unique
+  matching, missing/duplicate/incompatible/ambiguous bindings, unused
+  stripping, and built-in WASI imports that must not require a connector. }
 program Wasm.Connector.Resolve.Test;
 
 {$I Shared.inc}
@@ -45,6 +46,7 @@ type
     function HasPrefix(const AMessage, APrefix: string): Boolean;
     function SampleLibc: TWlcDocument;
     function SampleWat: string;
+    function WriteWlc(const ALibrary, AEntry: string): string;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -65,6 +67,9 @@ type
     procedure TestUnsupportedTypeRejected;
     procedure TestModuleAdapterMatchesAssembler;
     procedure TestNilModuleIsRejected;
+    procedure TestParsedSourceResolvesAliasAndStripsUnused;
+    procedure TestParsedAmbiguousBindingRejected;
+    procedure TestParsedMissingImportIsUnknown;
   end;
 
 function TConnectorResolveTests.TypeRef(const AName: string;
@@ -229,6 +234,16 @@ begin
     sLineBreak +
     '  (func (export "run") (param i32 i32 i32) (result i32)' + sLineBreak +
     '    (call 0 (local.get 0) (local.get 1) (local.get 2))))';
+end;
+
+function TConnectorResolveTests.WriteWlc(const ALibrary, AEntry: string): string;
+begin
+  Result :=
+    'public static class Libc' + #10 +
+    '{' + #10 +
+    '    [DllImport("' + ALibrary + '", EntryPoint = "' + AEntry + '")]' + #10 +
+    '    public static extern int Write(int fd, [In, MarshalAs(UnmanagedType.LPArray)] byte[] buf, int count);' + #10 +
+    '}' + #10;
 end;
 
 procedure TConnectorResolveTests.BeforeEach;
@@ -428,6 +443,53 @@ begin
   Expect<string>(Caught).ToBe('connector resolve needs a module');
 end;
 
+procedure TConnectorResolveTests.TestParsedSourceResolvesAliasAndStripsUnused;
+var
+  Plan: TWlcConnectorPlan;
+  Source: string;
+begin
+  Source :=
+    WriteWlc('libc', 'write') +
+    'static class UnusedLib' + #10 +
+    '{' + #10 +
+    '    [DllImport("gone")]' + #10 +
+    '    static extern void leftover();' + #10 +
+    '}' + #10;
+  Plan := ResolveConnectorModule([ParseConnector(Source)],
+    LoadWat(SampleWat), [WLC_WASI_MODULE]);
+  Expect<Integer>(Length(Plan.Thunks)).ToBe(1);
+  Expect<string>(Plan.Thunks[0].GuestName).ToBe('Write');
+  Expect<string>(Plan.Thunks[0].NativeSymbol).ToBe('write');
+  Expect<string>(Plan.Thunks[0].LibraryName).ToBe('libc');
+  Expect<Integer>(Length(Plan.Libraries)).ToBe(1);
+  Expect<string>(Plan.Libraries[0]).ToBe('libc');
+  Expect<Integer>(Length(Plan.Connectors)).ToBe(1);
+  Expect<string>(Plan.Connectors[0].Name).ToBe('Libc');
+  Expect<Integer>(Length(Plan.Connectors[0].Methods)).ToBe(1);
+  Expect<string>(Plan.Connectors[0].Methods[0].Name).ToBe('Write');
+end;
+
+procedure TConnectorResolveTests.TestParsedAmbiguousBindingRejected;
+var
+  Caught: string;
+begin
+  Caught := ResolveError(
+    [ParseConnector(WriteWlc('libc', 'write')),
+     ParseConnector(WriteWlc('other', 'write_alt'))],
+    LoadWat(SampleWat), [WLC_WASI_MODULE]);
+  Expect<Boolean>(HasPrefix(Caught, MSG_WLC_AMBIGUOUS_BINDING)).ToBe(True);
+end;
+
+procedure TConnectorResolveTests.TestParsedMissingImportIsUnknown;
+var
+  Caught: string;
+begin
+  Caught := ResolveError([ParseConnector(WriteWlc('libc', 'write'))],
+    LoadWat('(module (import "Libc" "open" (func (param i32) (result i32))))'),
+    []);
+  Expect<Boolean>(HasPrefix(Caught, MSG_WLC_UNKNOWN_IMPORT)).ToBe(True);
+end;
+
 procedure TConnectorResolveTests.SetupTests;
 begin
   Test('EntryPoint aliases the native symbol and not the guest name',
@@ -458,6 +520,12 @@ begin
     TestModuleAdapterMatchesAssembler);
   Test('a nil module is rejected before import matching',
     TestNilModuleIsRejected);
+  Test('ParseConnector output aliases EntryPoint and strips unused',
+    TestParsedSourceResolvesAliasAndStripsUnused);
+  Test('ParseConnector output rejects ambiguous bindings',
+    TestParsedAmbiguousBindingRejected);
+  Test('ParseConnector output rejects a missing import',
+    TestParsedMissingImportIsUnknown);
 end;
 
 begin
