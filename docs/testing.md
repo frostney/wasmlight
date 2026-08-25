@@ -3,9 +3,9 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-seven suites today, including the native
-  executable payload format and the Connector language lexer and parser
-  suites.
+  independent programs. Forty-nine suites today, including the native
+  executable payload format, the Connector language lexer and parser
+  suites, and the runtime-shell payload and startup suites.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -131,6 +131,8 @@ instead.
 | `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
 | `Wasm.Connector.Lexer.Test` | The Connector-language tokenizer: punctuation, identifiers, strings, integers, comment trivia, one-token peek, Unix/Windows/classic-Mac newlines, and the unclosed-string / unclosed-comment / illegal-character faults with 1-based positions. |
 | `Wasm.Connector.Test` | `ParseConnector` and the declaration model: static classes, structs, enums, delegates, and `extern` methods; `DllImport` / `EntryPoint` / `MarshalAs` / `In` / `Out` / `Scoped` / `Queued`; unused declarations retained; and a literal-snippet rejection for every excluded construct (method bodies, properties, inheritance, generics, expressions, control flow, allocation). |
+| `Wasm.Shell.Payload.Test` | The temporary runtime-shell envelope: empty and non-empty section round-trips, and malformed cases spelled as literal bytes (bad magic, truncated header/body, unknown version, trailing bytes). |
+| `Wasm.Shell.Test` | The interpreter-free startup path: decode and validation keep their error classes, an incomplete or stale native image is `EWasmLinkError` with no interpreter fallback, connector/capability stubs reject non-empty values, and a valid image runs `_start` through native entries on a 64-bit UNIX host (hello, trap, `17+25` then `proc_exit(42)`). |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and

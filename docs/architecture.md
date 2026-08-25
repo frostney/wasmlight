@@ -33,11 +33,13 @@
   from a Pascal host or from `wasmlight run` (Track F). The JIT and AOT are
   a 64-bit-UNIX acceleration (two backends, aarch64 and x86-64); on Windows
   and 32-bit targets the runtime is interpreter-only and still fully
-  conformant.   [roadmap.md](roadmap.md) is the honest picture of what
-  remains: the planned native-compiler spine
-  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)),
-  broader optimizing-compiler work, and later platform and host-surface
-  releases. Nothing in v1 Core 3 behaviour is staged.
+  conformant. The interpreter-free runtime shell (`wasmlight-shell`) is
+  shipped as a template. [roadmap.md](roadmap.md) is the honest picture of
+  what remains: the rest of the native-compiler spine
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md))
+  (`wasmlight compile`, ELF/Mach-O packaging), broader
+  optimizing-compiler work, and later platform and host-surface releases.
+  Nothing in v1 Core 3 behaviour is staged.
 
 ## Layering
 
@@ -45,7 +47,7 @@ Read bottom-up; each layer may use only the layers below it.
 
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run` | deny-by-default WASI preview1 host and the `wasmlight run` driver; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, and the interpreter-free runtime-shell startup path; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
@@ -412,6 +414,18 @@ bound to one module hash and one target-shell hash. It is not a `.waot`
 cache and has no interpreter fallback. The read/write API is shipped;
 `wasmlight compile` that embeds the payload is not.
 
+The **runtime shell** (`Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native`,
+program `wasmlight-shell`) is the interpreter-free template a later
+`wasmlight compile` will populate. Startup always re-decodes and
+re-validates the embedded module, then wires only a complete native
+image; an incomplete or incompatible image is `EWasmLinkError` and is
+never interpreted. `.waot` remains the fallback-capable cache for
+`run --aot`. The envelope that carries module + native + stub connector
+and capability slots is a temporary seam until the product payload
+is embedded; ELF/Mach-O packaging and the compile command are not
+shipped.
+
+
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the
 interpreter, the tier of record, runs alone; that leg is unaccelerated but
@@ -434,7 +448,7 @@ Pascal helper frame spans the native callee. Delicate or unsupported operations
 continue through the exact shared helpers. The code-generation plan is a side
 table over the validated IR, so no optimization rewrites or re-validates it.
 
-`wasmspec` is the third shipped program: it runs the `.wast` corpus through
+`wasmspec` is a shipped program: it runs the `.wast` corpus through
 `Wasm.Wast.Runner`, which assembles text modules, decodes, validates,
 instantiates, and executes assertions through the interpreter — SIMD judged
 per lane and `assert_exception` judged (Track H), so the `staged` column is
