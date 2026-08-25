@@ -33,3 +33,11 @@
 {$IF DEFINED(UNIX) AND DEFINED(CPU64)}
   {$DEFINE WASM_GUARD_STRATEGIES}
 {$ENDIF}
+
+{ 64-bit Unix C-ABI call gates and application-local dlopen (issue #43,
+  ADR-0015). Centralised here so Wasm.Native.Call and Wasm.Native.Load
+  fail closed on the same hosts — a bare UNIX ifdef would let 32-bit
+  Unix dlopen a library that no shipped plan can apply. }
+{$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
+  {$DEFINE WASM_NATIVE_CALL}
+{$ENDIF}

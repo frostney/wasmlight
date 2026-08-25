@@ -904,7 +904,7 @@ begin
     AWorkloads := [bwMemoryVarying]
   else if AValue = 'numeric' then
     AWorkloads := [bwNumeric]
-    else if AValue = 'simd' then
+  else if AValue = 'simd' then
     AWorkloads := [bwSimd]
   else if (AValue = 'host-call') or (AValue = 'hostcall') then
     AWorkloads := [bwHostCall]
@@ -933,11 +933,11 @@ var
   WorkloadOpt, TierOpt: TStringOption;
   IterationsOpt, ExecutionIterationsOpt, FibInputOpt,
     MemoryIterationsOpt, NumericIterationsOpt, SimdIterationsOpt,
-    SamplesOpt: TIntegerOption;
+    HostCallIterationsOpt, SamplesOpt: TIntegerOption;
   Workloads: TBenchmarkWorkloads;
   Tiers: TExecutionTiers;
   Iterations, ExecutionIterations, FibInput, MemoryIterations,
-    NumericIterations, SimdIterations,
+    NumericIterations, SimdIterations, HostCallIterations,
     SampleCount: Integer;
   WorkloadValue, TierValue: string;
 begin
@@ -964,6 +964,9 @@ begin
     SimdIterationsOpt := Options.AddInteger('simd-iterations',
       'SIMD loop iterations per tier (default: ' +
       IntToStr(DEFAULT_SIMD_ITERATIONS) + ')');
+    HostCallIterationsOpt := Options.AddInteger('host-call-iterations',
+      'Native C-ABI call-plan iterations (default: ' +
+      IntToStr(DEFAULT_HOSTCALL_ITERATIONS) + ')');
     SamplesOpt := Options.AddInteger('samples',
       'Samples per execution workload and tier (default: ' +
       IntToStr(DEFAULT_SAMPLES) + ')');
@@ -989,6 +992,8 @@ begin
     NumericIterations := NumericIterationsOpt.ValueOr(
       DEFAULT_NUMERIC_ITERATIONS);
     SimdIterations := SimdIterationsOpt.ValueOr(DEFAULT_SIMD_ITERATIONS);
+    HostCallIterations := HostCallIterationsOpt.ValueOr(
+      DEFAULT_HOSTCALL_ITERATIONS);
     SampleCount := SamplesOpt.ValueOr(DEFAULT_SAMPLES);
     WorkloadValue := LowerCase(WorkloadOpt.ValueOr('all'));
     TierValue := LowerCase(TierOpt.ValueOr('all'));
@@ -1040,6 +1045,12 @@ begin
       ExitCode := 1;
       Exit;
     end;
+    if HostCallIterations <= 0 then
+    begin
+      WriteLn(ErrOutput, 'wasmbench: --host-call-iterations must be positive');
+      ExitCode := 1;
+      Exit;
+    end;
     if SampleCount <= 0 then
     begin
       WriteLn(ErrOutput, 'wasmbench: --samples must be positive');
@@ -1077,7 +1088,7 @@ begin
       BenchExecution('simd', BENCH_SIMD_WAT, SimdIterations, SimdIterations,
         0, SampleCount, Tiers);
     if bwHostCall in Workloads then
-      BenchHostCall(DEFAULT_HOSTCALL_ITERATIONS);
+      BenchHostCall(HostCallIterations);
   finally
     Options.Free;
   end;

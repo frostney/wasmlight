@@ -25,6 +25,7 @@ type
     procedure TestDotDotEscapeIsALinkError;
     procedure TestMissingLibraryIsALinkError;
     procedure TestEmptyNameIsALinkError;
+    procedure TestCwdDecoyIsNotLoaded;
   end;
 
 procedure TLibraryTests.TestBareNameGainsPlatformFileName;
@@ -122,6 +123,40 @@ begin
   Expect<Boolean>(RaisedOk).ToBe(True);
 end;
 
+procedure TLibraryTests.TestCwdDecoyIsNotLoaded;
+var
+  Decoy: string;
+  Caught: string;
+  RaisedOk: Boolean;
+  F: Text;
+begin
+  Decoy := IncludeTrailingPathDelimiter(GetCurrentDir) +
+    NativeLibraryFileName('wasmlightabi-ambient-decoy');
+  AssignFile(F, Decoy);
+  Rewrite(F);
+  CloseFile(F);
+  Caught := '';
+  RaisedOk := False;
+  try
+    try
+      LoadLocalLibraryAt('wasmlightabi-ambient-decoy', '/opt/app').Free;
+    except
+      on E: EWasmLinkError do
+      begin
+        RaisedOk := True;
+        Caught := E.Message;
+      end;
+    end;
+  finally
+    DeleteFile(Decoy);
+  end;
+  Expect<Boolean>(RaisedOk).ToBe(True);
+  Expect<Boolean>(Pos(string(MSG_LINK_UNKNOWN_LIBRARY), Caught) = 1).ToBe(True);
+  {$IFDEF WASM_NATIVE_CALL}
+  Expect<Boolean>(Pos('/opt/app/', Caught) > 0).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TLibraryTests.SetupTests;
 begin
   Test('bare name receives the platform filename beside the executable',
@@ -132,6 +167,7 @@ begin
   Test('relative escape is a link error', TestDotDotEscapeIsALinkError);
   Test('missing library is a link error', TestMissingLibraryIsALinkError);
   Test('empty name is a link error', TestEmptyNameIsALinkError);
+  Test('a cwd decoy is not an ambient library search', TestCwdDecoyIsNotLoaded);
 end;
 
 begin

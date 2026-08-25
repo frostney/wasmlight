@@ -68,7 +68,7 @@ const
   LIB_SUFFIX = '.so';
   {$ENDIF}
 
-{$IFDEF UNIX}
+{$IFDEF WASM_NATIVE_CALL}
 function CDlOpen(AName: PAnsiChar; AFlags: LongInt): Pointer; cdecl;
   {$IFDEF DARWIN}
   external 'c' name 'dlopen';
@@ -89,7 +89,9 @@ function CDlClose(ALib: Pointer): LongInt; cdecl;
   {$ELSE}
   external 'dl' name 'dlclose';
   {$ENDIF}
+{$ENDIF}
 
+{$IFDEF UNIX}
 {$IFDEF DARWIN}
 function NSGetExecutablePath(ABuf: PAnsiChar; var ABufSize: UInt32): Integer; cdecl;
   external 'c' name '_NSGetExecutablePath';
@@ -98,7 +100,7 @@ function NSGetExecutablePath(ABuf: PAnsiChar; var ABufSize: UInt32): Integer; cd
 
 destructor TWasmNativeLibrary.Destroy;
 begin
-  {$IFDEF UNIX}
+  {$IFDEF WASM_NATIVE_CALL}
   if FHandle <> nil then
     CDlClose(FHandle);
   {$ENDIF}
@@ -139,8 +141,16 @@ begin
   {$ENDIF}
   {$ENDIF}
   Result := ExcludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)));
+  if Result <> '' then
+    Result := ExcludeTrailingPathDelimiter(ExpandFileName(Result));
   if Result = '' then
-    Result := ExcludeTrailingPathDelimiter(GetCurrentDir);
+    raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) +
+      ': no executable directory');
+  {$IFDEF UNIX}
+  if Result[1] <> '/' then
+    raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) +
+      ': no executable directory');
+  {$ENDIF}
 end;
 
 function NativeLibraryFileName(const ABareName: string): string;
@@ -199,27 +209,29 @@ begin
 end;
 
 function LoadLocalLibraryAt(const AName, AExecutableDir: string): TWasmNativeLibrary;
+{$IFDEF WASM_NATIVE_CALL}
 var
   Path: string;
   Handle: Pointer;
+{$ENDIF}
 begin
+  {$IFNDEF WASM_NATIVE_CALL}
+  Result := nil;
+  raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) +
+    ': native libraries are 64-bit Unix only');
+  {$ELSE}
   Path := ResolveLocalLibraryPath(AName, AExecutableDir);
   if not FileExists(Path) then
     raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) + ': ' + Path);
 
-  {$IFDEF UNIX}
   Handle := CDlOpen(PAnsiChar(AnsiString(Path)), RTLD_NOW or RTLD_LOCAL);
   if Handle = nil then
     raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) + ': ' + Path);
-  {$ELSE}
-  Handle := nil;
-  raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) +
-    ': native libraries are 64-bit Unix only');
-  {$ENDIF}
 
   Result := TWasmNativeLibrary.Create;
   Result.FHandle := Handle;
   Result.FPath := Path;
+  {$ENDIF}
 end;
 
 function LoadLocalLibrary(const AName: string): TWasmNativeLibrary;
@@ -232,7 +244,7 @@ function LookupLocalSymbol(const ALibrary: TWasmNativeLibrary;
 begin
   if (ALibrary = nil) or (ALibrary.FHandle = nil) or (ASymbol = '') then
     raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_SYMBOL) + ': ' + ASymbol);
-  {$IFDEF UNIX}
+  {$IFDEF WASM_NATIVE_CALL}
   Result := CDlSym(ALibrary.FHandle, PAnsiChar(AnsiString(ASymbol)));
   {$ELSE}
   Result := nil;

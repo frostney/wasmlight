@@ -11,10 +11,6 @@ program Wasm.Native.Call.Test;
 
 {$I Shared.inc}
 
-{$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
-  {$DEFINE WASM_NATIVE_CALL}
-{$ENDIF}
-
 uses
   Process,
   SysUtils,
@@ -156,6 +152,23 @@ begin
   except
     Result := False;
   end;
+end;
+
+function CompileCLibrary(const ASource, AOutput: string): Boolean;
+begin
+  {$IFDEF DARWIN}
+  Result := CompileShared('clang -dynamiclib -o ' + QuoteUnix(AOutput) + ' ' +
+    QuoteUnix(ASource));
+  {$ELSE}
+  Result := CompileShared('clang -shared -fPIC -o ' + QuoteUnix(AOutput) + ' ' +
+    QuoteUnix(ASource));
+  {$ENDIF}
+end;
+
+function CompilePasLibrary(const ASource, AOutput: string): Boolean;
+begin
+  Result := CompileShared('fpc -Mdelphi -Cg -fPIC -o' + QuoteUnix(AOutput) +
+    ' ' + QuoteUnix(ASource));
 end;
 
 procedure TCallTests.TestSupportedPredicate;
@@ -319,22 +332,16 @@ begin
   {$IFDEF DARWIN}
   CName := 'libwasmlightabi.dylib';
   PasName := 'libwasmlightabi_pas.dylib';
-  ClangOk := CompileShared('clang -dynamiclib -o ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Work) + CName) + ' ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Root) + 'wasmlightabi.c'));
-  FpcOk := CompileShared('fpc -Mdelphi -Cg -fPIC -o' +
-    IncludeTrailingPathDelimiter(Work) + PasName + ' ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Root) + 'libwasmlightabi.pas'));
   {$ELSE}
   CName := 'libwasmlightabi.so';
   PasName := 'libwasmlightabi_pas.so';
-  ClangOk := CompileShared('clang -shared -fPIC -o ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Work) + CName) + ' ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Root) + 'wasmlightabi.c'));
-  FpcOk := CompileShared('fpc -Mdelphi -Cg -fPIC -o' +
-    IncludeTrailingPathDelimiter(Work) + PasName + ' ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Root) + 'libwasmlightabi.pas'));
   {$ENDIF}
+  ClangOk := CompileCLibrary(
+    IncludeTrailingPathDelimiter(Root) + 'wasmlightabi.c',
+    IncludeTrailingPathDelimiter(Work) + CName);
+  FpcOk := CompilePasLibrary(
+    IncludeTrailingPathDelimiter(Root) + 'libwasmlightabi.pas',
+    IncludeTrailingPathDelimiter(Work) + PasName);
   Expect<Boolean>(ClangOk).ToBe(True);
   Expect<Boolean>(FpcOk).ToBe(True);
   CLib := CName;
@@ -361,6 +368,62 @@ begin
     Expect<Int32>(AbiValueAsI32(Ret)).ToBe(45);
     ApplyNativeCall(Plan, PasFn, Args, Ret);
     Expect<Int32>(AbiValueAsI32(Ret)).ToBe(45);
+
+    Plan := PlanCall(AbiHostTarget,
+      AbiSignature([AbiStruct([AbiI32, AbiI32]), AbiStruct([AbiI32, AbiI32])],
+        AbiStruct([AbiI32, AbiI32])));
+    CFn := LookupLocalSymbol(CHandle, 'add_pair');
+    PasFn := LookupLocalSymbol(PasHandle, 'add_pair');
+    ApplyNativeCall(Plan, CFn,
+      [AbiValueBytes([1, 0, 0, 0, 2, 0, 0, 0]),
+       AbiValueBytes([3, 0, 0, 0, 4, 0, 0, 0])], Ret);
+    Expect<Int32>(PInteger(@Ret.Data[0])^).ToBe(4);
+    Expect<Int32>(PInteger(@Ret.Data[4])^).ToBe(6);
+    ApplyNativeCall(Plan, PasFn,
+      [AbiValueBytes([1, 0, 0, 0, 2, 0, 0, 0]),
+       AbiValueBytes([3, 0, 0, 0, 4, 0, 0, 0])], Ret);
+    Expect<Int32>(PInteger(@Ret.Data[0])^).ToBe(4);
+    Expect<Int32>(PInteger(@Ret.Data[4])^).ToBe(6);
+
+    Plan := PlanCall(AbiHostTarget,
+      AbiSignature([AbiStruct([AbiF32, AbiF32]), AbiStruct([AbiF32, AbiF32])],
+        AbiStruct([AbiF32, AbiF32])));
+    CFn := LookupLocalSymbol(CHandle, 'add_hfa');
+    PasFn := LookupLocalSymbol(PasHandle, 'add_hfa');
+    ApplyNativeCall(Plan, CFn,
+      [AbiValueBytes([0, 0, 128, 63, 0, 0, 0, 64]),
+       AbiValueBytes([0, 0, 64, 64, 0, 0, 160, 64])], Ret);
+    Expect<Boolean>(Abs(PSingle(@Ret.Data[0])^ - 4.0) < 0.0001).ToBe(True);
+    Expect<Boolean>(Abs(PSingle(@Ret.Data[4])^ - 7.0) < 0.0001).ToBe(True);
+    ApplyNativeCall(Plan, PasFn,
+      [AbiValueBytes([0, 0, 128, 63, 0, 0, 0, 64]),
+       AbiValueBytes([0, 0, 64, 64, 0, 0, 160, 64])], Ret);
+    Expect<Boolean>(Abs(PSingle(@Ret.Data[0])^ - 4.0) < 0.0001).ToBe(True);
+    Expect<Boolean>(Abs(PSingle(@Ret.Data[4])^ - 7.0) < 0.0001).ToBe(True);
+
+    CFn := LookupLocalSymbol(CHandle, 'load_ptr');
+    PasFn := LookupLocalSymbol(PasHandle, 'load_ptr');
+    I := 99;
+    Plan := PlanCall(AbiHostTarget, AbiSignature([AbiPointerTo(AbiI32)], AbiI32));
+    ApplyNativeCall(Plan, CFn, [AbiValuePointer(@I)], Ret);
+    Expect<Int32>(AbiValueAsI32(Ret)).ToBe(99);
+    ApplyNativeCall(Plan, PasFn, [AbiValuePointer(@I)], Ret);
+    Expect<Int32>(AbiValueAsI32(Ret)).ToBe(99);
+
+    Plan := PlanCall(AbiHostTarget,
+      AbiSignature([AbiStruct([AbiI64, AbiI64, AbiI64])], AbiI64));
+    CFn := LookupLocalSymbol(CHandle, 'sum_big');
+    PasFn := LookupLocalSymbol(PasHandle, 'sum_big');
+    ApplyNativeCall(Plan, CFn,
+      [AbiValueBytes([10, 0, 0, 0, 0, 0, 0, 0,
+                      20, 0, 0, 0, 0, 0, 0, 0,
+                      12, 0, 0, 0, 0, 0, 0, 0])], Ret);
+    Expect<Int64>(AbiValueAsI64(Ret)).ToBe(42);
+    ApplyNativeCall(Plan, PasFn,
+      [AbiValueBytes([10, 0, 0, 0, 0, 0, 0, 0,
+                      20, 0, 0, 0, 0, 0, 0, 0,
+                      12, 0, 0, 0, 0, 0, 0, 0])], Ret);
+    Expect<Int64>(AbiValueAsI64(Ret)).ToBe(42);
   finally
     CHandle.Free;
     PasHandle.Free;
@@ -388,15 +451,12 @@ begin
   ForceDirectories(Work);
   {$IFDEF DARWIN}
   Name := 'libwasmlightabi.dylib';
-  Ok := CompileShared('clang -dynamiclib -o ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Work) + Name) + ' ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Root) + 'wasmlightabi.c'));
   {$ELSE}
   Name := 'libwasmlightabi.so';
-  Ok := CompileShared('clang -shared -fPIC -o ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Work) + Name) + ' ' +
-    QuoteUnix(IncludeTrailingPathDelimiter(Root) + 'wasmlightabi.c'));
   {$ENDIF}
+  Ok := CompileCLibrary(
+    IncludeTrailingPathDelimiter(Root) + 'wasmlightabi.c',
+    IncludeTrailingPathDelimiter(Work) + Name);
   Expect<Boolean>(Ok).ToBe(True);
   Lib := LoadLocalLibraryAt(Name, Work);
   RaisedOk := False;

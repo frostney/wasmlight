@@ -118,7 +118,7 @@ _Avoid_: connector manifest, registry, dependency graph
 **Call plan**:
 The register and stack placement of one native C signature on a target C ABI
 (AAPCS64, Apple's AAPCS64 variant, or SysV x86-64). It is data produced before
-any call; an incompatible plan is a link failure.
+any call; applying an incompatible plan is a link failure.
 _Avoid_: calling convention, marshalling table, FFI recipe
 
 **Application-local library**:

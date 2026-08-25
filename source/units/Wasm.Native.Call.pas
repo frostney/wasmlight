@@ -13,10 +13,6 @@ unit Wasm.Native.Call;
 
 {$I Shared.inc}
 
-{$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
-  {$DEFINE WASM_NATIVE_CALL}
-{$ENDIF}
-
 interface
 
 uses
