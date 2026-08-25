@@ -48,7 +48,7 @@ Read bottom-up; each layer may use only the layers below it.
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
 | Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), the immutable compiled capability set, and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
@@ -544,6 +544,16 @@ boundary is drawn.
   134, an uncaught exception to 1, a decode/validate/link failure to 1. It
   is factored out of the program entry point so it is unit-testable with
   injected streams, never touching real stdio.
+- **`Wasm.Compile.Capabilities`** is the immutable compiled WASI capability
+  set ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)):
+  the directories, environment, and guest-argument policy a generated
+  executable embeds. A default set grants no filesystem and no
+  environment. Relative host paths resolve from the executable directory;
+  absolute host paths stay literal; every invocation argument belongs to
+  the guest. Embedded environment values are visible in the executable and
+  are not a secret mechanism. The set cannot grow after it is frozen, and
+  apply refuses a config that already has preopens or env. Containment
+  stays in `Wasm.Wasi`.
 
 ### Target-shell discovery
 
