@@ -273,10 +273,10 @@ jobs:
           fi
 
       # One archive per Unix compiler host: layout, MANIFEST, checksums, and
-      # ELF/Mach-O shell structure. Compile gates run only when
-      # `wasmlight compile` exists — cross-emission is structural, native
-      # execution is host-only (not a 16-cell matrix). Windows is a later
-      # release and has no 0.2.0 archive.
+      # ELF/Mach-O shell structure. Compile gates run when `wasmlight compile`
+      # can emit; until then verify defers them. Cross-emission is structural,
+      # native execution is host-only (not a 16-cell matrix). Windows is a
+      # later release and has no 0.2.0 archive.
       - name: Pack and verify release archive
         if: runner.os != 'Windows'
         run: |

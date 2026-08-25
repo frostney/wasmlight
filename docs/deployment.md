@@ -89,11 +89,13 @@ and verifier can run before live shells exist. `--require-compile` makes
 the compile gates mandatory.
 
 CI on each Unix host packs that host's archive and verifies version,
-manifest, checksums, and shell structure. When `wasmlight compile` is
-shipped, the same job also compiles one module for every target and
-checks image magic, then executes only the host-native output. That is
-four structural emissions plus one native run per host — not a 16-cell
-execution matrix.
+manifest, checksums, and shell structure. When `wasmlight compile` can
+emit a native executable, the same job also compiles one no-import
+module for every target and checks image magic, then executes only the
+host-native output. That is four structural emissions plus one native
+run per host — not a 16-cell execution matrix. Until native emission
+ships, verify records that the compile CLI is present and defers those
+gates.
 
 ## Release checklist
 

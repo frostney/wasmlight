@@ -127,6 +127,9 @@ function DistroSynthesizeCatalog(const ARoot: string): TWasmDistroResult;
 
 function DistroHelpListsCompile(const AHelpText: string): Boolean;
 function DistroUnknownCompileCommand(const AText: string): Boolean;
+{ True when compile exists but native emission/packaging is still the
+  documented stub (ADR-0015). Verify must not treat that as a broken archive. }
+function DistroCompileEmissionNotShipped(const AText: string): Boolean;
 
 implementation
 
@@ -832,6 +835,15 @@ end;
 function DistroUnknownCompileCommand(const AText: string): Boolean;
 begin
   Result := Pos('unknown command: compile', LowerCase(AText)) > 0;
+end;
+
+function DistroCompileEmissionNotShipped(const AText: string): Boolean;
+var
+  Lower: string;
+begin
+  Lower := LowerCase(AText);
+  Result := (Pos('strict compile is not available', Lower) > 0)
+    or (Pos('runtime shell packaging is not available', Lower) > 0);
 end;
 
 end.

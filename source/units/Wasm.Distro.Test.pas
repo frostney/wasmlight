@@ -39,6 +39,7 @@ type
     procedure TestChecksumsCoverFourArchives;
     procedure TestChecksumsRejectPath;
     procedure TestCompileHelpDetection;
+    procedure TestCompileEmissionNotShipped;
   end;
 
 function TDistroTests.TempRoot: string;
@@ -316,6 +317,16 @@ begin
   Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsChecksumMalformed));
 end;
 
+procedure TDistroTests.TestCompileEmissionNotShipped;
+begin
+  Expect<Boolean>(DistroCompileEmissionNotShipped(
+    'wasmlight compile: EWasmCompileError: strict compile is not available')).ToBe(True);
+  Expect<Boolean>(DistroCompileEmissionNotShipped(
+    'runtime shell packaging is not available for target "x86_64-linux"')).ToBe(True);
+  Expect<Boolean>(DistroCompileEmissionNotShipped(
+    'EWasmLinkError: unknown import')).ToBe(False);
+end;
+
 procedure TDistroTests.TestCompileHelpDetection;
 begin
   Expect<Boolean>(DistroHelpListsCompile(
@@ -346,6 +357,8 @@ begin
   Test('checksum names may not contain a path', TestChecksumsRejectPath);
   Test('compile is detected from the command list, not the aot blurb',
     TestCompileHelpDetection);
+  Test('stub compile/packaging errors are emission-not-shipped, not archive faults',
+    TestCompileEmissionNotShipped);
 end;
 
 begin
