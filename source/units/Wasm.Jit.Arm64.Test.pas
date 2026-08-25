@@ -572,10 +572,9 @@ begin
   Expect<Boolean>(Arm64CanEmitOp(iroStructGetVec)).ToBe(True);
   Expect<Boolean>(Arm64CanEmitOp(iroArrayFillVec)).ToBe(True);
 
-  { The ONLY ops still declined are the EH ops — after Wave 6 a function is
-    compilable iff it contains no exception-handling op (§10.2). }
-  Expect<Boolean>(Arm64CanEmitOp(iroThrow)).ToBe(False);
-  Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(False);
+  { throw / throw_ref compile; matching stays in UnwindException. }
+  Expect<Boolean>(Arm64CanEmitOp(iroThrow)).ToBe(True);
+  Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(True);
 end;
 
 { Direct-call arity is not a compile fence: an over-wide argument block is
@@ -908,7 +907,7 @@ const
     and cannot share this pin. }
   FastPathWords: array[0 .. 42] of UInt32 = (
     $F9405689, $F9401D2C, $D100058C, $F940152A,             { ctx walk }
-    $52800F09, $9B09298C, $F940058C, $F9402D8C, $B9400189,
+    $52801009, $9B09298C, $F940058C, $F9402D8C, $B9400189,
     $F9400E8A,                                             { store -> heap }
     $F940194B,                                             { FFree[0] head }
     $3400040B,                                             { cbz head -> slow }
@@ -1064,7 +1063,7 @@ begin
   Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
   Test('local BL patches stay position-independent', TestLocalCallPatch);
   Test('slot byte offset is register*8', TestSlotOffset);
-  Test('predicate covers waves 2-6 (only EH is declined)',
+  Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWave2);
   Test('the call-site arity predicate admits wide calls and fences huge tails',
     TestCallArityFence);

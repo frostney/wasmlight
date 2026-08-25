@@ -356,6 +356,11 @@ procedure X64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
   RegisterJit to store in Store.JitHelperTable. }
 function X64GetHelperTable: PPointer;
 
+procedure X64BeginEhEmit(const AHasHandlers: Boolean;
+  const ATableLabel, AEndLabel: TWasmJitLabel; const ACodeCount: UInt32);
+procedure X64EmitEhResumeCheck(const ABuf: TWasmCodeBuffer);
+procedure X64EmitEhTable(const ABuf: TWasmCodeBuffer; const ACount: Integer);
+
 { Resolve every branch placeholder on ABuf's patch list into its final rel32.
   Call once, after the whole function is emitted and every label bound, while
   the buffer is still writable (§4.3). }
@@ -1390,6 +1395,7 @@ begin
     end;
 
     Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults, RetKind);
+    JitMarkTopNative(Ctx);
     Pend^.Pending := False;
     Entry := TX64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
     { The freshly-decoded IR base @Fn^.Code[0] the body pins in rbp to compute
@@ -1400,17 +1406,42 @@ begin
       IrBase := @IrFn^.Code[0]
     else
       IrBase := nil;
-    { Fix A (Finding 3): the compiled body is a native barrier; a wasm exception
-      thrown beneath it LongJmps up to this seam catch (a Pascal raise cannot
-      cross the native frame). Continue the unwind (pops this frame, hops further
-      out, or RaiseUncaughts at a genuine outermost rtEntry). }
+    { The compiled body is a native barrier. A wasm exception thrown beneath
+      it LongJmps up to this seam catch (a Pascal raise cannot cross the
+      native frame). On the hop, re-enter the unwind: a match in this
+      function re-enters Entry at the landing pad; otherwise the unwind hops
+      further out or RaiseUncaughts at a genuine outermost rtEntry
+      (ADR-0009). }
     Seam.Prev := CurrentSeamCatch;
+    Seam.Resume := False;
     CurrentSeamCatch := @Seam;
     if SetJmp(Seam.JmpBuf) <> 0 then
     begin
       CurrentSeamCatch := Seam.Prev;
-      UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
-      Exit;
+      if Ctx^.Depth = 0 then
+        JitRaiseUncaught(AStore, TWasmRef(Seam.ExnRef));
+      if not Seam.Resume then
+        UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
+      if (Ctx^.Depth > 0) and (Ctx^.Acts[Ctx^.Depth - 1].Fn = IrFn) then
+      begin
+        JitEhRequestResume;
+        Seam.Prev := CurrentSeamCatch;
+        Seam.Resume := False;
+        CurrentSeamCatch := @Seam;
+        Entry(Base, AStore, IrBase, Ctx);
+        CurrentSeamCatch := Seam.Prev;
+        JitLeaveFrame(Ctx);
+        if not Pend^.Pending then
+          Exit;
+        Pend^.Pending := False;
+        CurAddr := Pend^.Addr;
+        CurArgs := @Pend^.Args[0];
+        Continue;
+      end;
+      if CurrentSeamCatch <> nil then
+        SeamHopResume(Seam.ExnRef)
+      else
+        Exit;
     end;
     Entry(Base, AStore, IrBase, Ctx);
     CurrentSeamCatch := Seam.Prev;
@@ -2966,6 +2997,98 @@ begin
   end;
 end;
 
+var
+  GX64EhHasHandlers: Boolean = False;
+  GX64EhEndLabel: TWasmJitLabel = 0;
+  GX64EhCodeCount: UInt32 = 0;
+  GX64EhTableLabel: TWasmJitLabel = 0;
+
+procedure X64EmitLeaRipTo(const ABuf: TWasmCodeBuffer; const ADest: Byte;
+  const ATarget: TWasmJitLabel);
+var
+  Site: Integer;
+begin
+  { lea rDest, [rip+disp32] — 7 bytes; rel32 is the last 4. }
+  Site := ABuf.CurrentOffset;
+  if ADest >= 8 then
+    ABuf.EmitByte($4C)
+  else
+    ABuf.EmitByte($48);
+  ABuf.EmitByte($8D);
+  ABuf.EmitByte($05 or ((ADest and 7) shl 3));
+  ABuf.EmitU32(0);
+  ABuf.AddPatch(Site, ATarget, 7);
+end;
+
+procedure X64EmitEhJumpDispatch(const ABuf: TWasmCodeBuffer);
+begin
+  { rax = target IR index. IP = Length(Code) is a function-end landing. }
+  X64EmitMovRegImm32(ABuf, X64_RCX, GX64EhCodeCount);
+  X64EmitAluRegReg(ABuf, $39, False, X64_RAX, X64_RCX);   { cmp eax, ecx }
+  X64EmitJccTo(ABuf, X64_CC_AE, UInt32(GX64EhEndLabel));
+  { lea rcx, [rip+table]; lea rcx, [rcx+rax*8]; jmp rcx }
+  X64EmitLeaRipTo(ABuf, X64_RCX, GX64EhTableLabel);
+  ABuf.EmitByte($48);
+  ABuf.EmitByte($8D);
+  ABuf.EmitByte($0C);
+  ABuf.EmitByte($C1);
+  ABuf.EmitByte($FF);
+  ABuf.EmitByte($E1);
+end;
+
+procedure X64BeginEhEmit(const AHasHandlers: Boolean;
+  const ATableLabel, AEndLabel: TWasmJitLabel; const ACodeCount: UInt32);
+begin
+  GX64EhHasHandlers := AHasHandlers;
+  GX64EhTableLabel := ATableLabel;
+  GX64EhEndLabel := AEndLabel;
+  GX64EhCodeCount := ACodeCount;
+end;
+
+procedure X64EmitEhResumeCheck(const ABuf: TWasmCodeBuffer);
+var
+  Body: TWasmJitLabel;
+begin
+  if not GX64EhHasHandlers then
+    Exit;
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitCallHelper(ABuf, aohEhResumeIndex);
+  { cmp eax, -1 ; je body }
+  ABuf.EmitByte($83);
+  ABuf.EmitByte($F8);
+  ABuf.EmitByte($FF);
+  Body := ABuf.NewLabel;
+  X64EmitJccTo(ABuf, X64_CC_E, UInt32(Body));
+  X64EmitEhJumpDispatch(ABuf);
+  ABuf.BindLabel(Body);
+end;
+
+procedure X64EmitEhTable(const ABuf: TWasmCodeBuffer; const ACount: Integer);
+var
+  I: Integer;
+begin
+  if not GX64EhHasHandlers then
+    Exit;
+  ABuf.BindLabel(GX64EhTableLabel);
+  for I := 0 to ACount - 1 do
+  begin
+    X64EmitJmpTo(ABuf, UInt32(I));
+    ABuf.EmitByte($90);
+    ABuf.EmitByte($90);
+    ABuf.EmitByte($90);
+  end;
+end;
+
+procedure X64EmitEhThrow(const ABuf: TWasmCodeBuffer; const AInsIndex: UInt32);
+begin
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitMovRegReg(ABuf, X64_ARG1, X64_REG_REGFILE);
+  X64EmitIrInsPtr(ABuf, X64_ARG2, AInsIndex);
+  X64EmitCallHelper(ABuf, aohEhThrow);
+  if GX64EhHasHandlers then
+    X64EmitEhJumpDispatch(ABuf);
+end;
+
 { ===================================================================== }
 {  op templates                                                          }
 { ===================================================================== }
@@ -3614,7 +3737,8 @@ begin
 end;
 
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32; const AUseNativeScalarCall: Boolean);
+  const AAux: TWasmIrAuxU32; const AInsIndex: UInt32;
+  const AUseNativeScalarCall: Boolean);
 var
   ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
   FallbackLabel, DoneLabel, NativeFallback, NativeDone: TWasmJitLabel;
@@ -3644,6 +3768,9 @@ begin
 
   X64EmitSubRsp(ABuf, Int32(FrameBytes));
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
+  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
+  X64EmitMovRegImm32(ABuf, X64_ARG1, AInsIndex + 1);
+  X64EmitCallHelper(ABuf, aohPublishIp);
   X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);   { store }
 
   case AIns.Op of
@@ -3894,7 +4021,8 @@ begin
   Result := X64InlineOp(AOp) or X64LeafBinaryOp(AOp)
     or X64LeafUnaryOp(AOp) or X64CallOp(AOp)
     or X64RuntimeOp(AOp) or X64BranchRefOp(AOp)
-    or X64VecOp(AOp);
+    or X64VecOp(AOp)
+    or (AOp in [iroThrow, iroThrowRef]);
 end;
 
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
@@ -3925,6 +4053,8 @@ begin
     iroI32Const, iroF32Const: EmitConst32(ABuf, AIns);
     iroI64Const, iroF64Const: EmitConst64(ABuf, AIns);
 
+    iroThrow, iroThrowRef:
+      X64EmitEhThrow(ABuf, AInsIndex);
     iroJump:
       begin
         if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
@@ -3948,7 +4078,7 @@ begin
     iroUnreachable: EmitTrapCall(ABuf, wtkUnreachable);
 
     iroCall, iroCallIndirect, iroCallRef:
-      EmitCall(ABuf, AIns, AAux, AUseNativeScalarCall);
+      EmitCall(ABuf, AIns, AAux, AInsIndex, AUseNativeScalarCall);
     iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
       EmitReturnCall(ABuf, AIns, AAux, ARetainContext);
 
@@ -4117,6 +4247,9 @@ begin
       @JitFinishDirectCallScalar;
     GX64HelperTable[aohDirectCallPrepareScalar] :=
       @JitPrepareDirectCallScalar;
+    GX64HelperTable[aohPublishIp] := @JitPublishIp;
+    GX64HelperTable[aohEhThrow] := @JitCompiledThrow;
+    GX64HelperTable[aohEhResumeIndex] := @JitEhResumeIndex;
     GX64HelperTableFilled := True;
   end;
   Result := @GX64HelperTable[aohTrapKind];

@@ -61,7 +61,8 @@ uses
   Wasm.Ir,
   Wasm.Runtime.Gc,
   Wasm.Runtime.Store,
-  Wasm.Runtime.Values;
+  Wasm.Runtime.Values,
+  Wasm.Target;
 
 type
   { The interpreter's activation and per-store context, exposed so the
@@ -113,6 +114,12 @@ type
     RetCount: UInt32;
     RetBase: NativeUInt;
     EntryResults: PWasmValue;        { rtEntry only: the invoke's AResults }
+    { True when this activation is running generated native code (InvokeCompiled
+      or a direct compiled call). The unwinder hops across a Native rtCaller
+      the same way it hops a rtCompiledSeam — a Pascal raise cannot cross the
+      native frame, and a same-UnwindException continue would return to the
+      thrower's helper after popping that frame. }
+    Native: Boolean;
   end;
 
   PWasmInterpContext = ^TWasmInterpContext;
@@ -289,6 +296,35 @@ procedure MarkTierTailTarget;
 procedure UnwindException(const ACtx: PWasmInterpContext; const AExn: TWasmRef;
   const AThrowFrame: Boolean);
 
+{ Mark the current top activation as running generated native code. The
+  compiled-entry wrappers and direct-call prepare call this after they carve
+  the frame; interpreted entry leaves Native False. }
+procedure JitMarkTopNative(const ACtx: PWasmInterpContext);
+
+{ Publish the compiled caller's resume IP (call-site + 1) so UnwindException
+  scans the call instruction (eh-spec §2.3). cdecl for the helper table. }
+procedure JitPublishIp(const AStore: TWasmStore; const AIp: PtrUInt); cdecl;
+
+{ Compiled throw / throw_ref (exec-throw / exec-throw_ref at pin
+  d7b37e4170d8315f2f1283aed4e8076591a9a333). Allocates or rethrows, then
+  UnwindException. Returns the catching frame's TargetInstr when the thrower's
+  own handler matched (same native frame still live). Otherwise hops or
+  raises and does not return. }
+function JitCompiledThrow(const AStore: TWasmStore; const ARegBase: PWasmValue;
+  const AIns: PWasmIrInstr): PtrUInt; cdecl;
+
+{ Prologue poll for a handler-bearing compiled body. Returns High(UInt32) on
+  a normal entry; on a seam-catch resume returns Act.IP (the clause target)
+  and clears the resume flag. }
+function JitEhResumeIndex(const AStore: TWasmStore): PtrUInt; cdecl;
+
+{ Request that the next JitEhResumeIndex call on this thread return Act.IP. }
+procedure JitEhRequestResume;
+
+{ Raise EWasmException from a compiled-seam catch after the native frame has
+  already been abandoned by a hop (ADR-0009). }
+procedure JitRaiseUncaught(const AStore: TWasmStore; const AExn: TWasmRef);
+
 { Prologue. Exhaustion-check both caps (-> TrapNow(wtkStackExhausted), the
   same threshold every path uses); carve the register file at ValueTop; zero
   every slot (a ref reads null, a numeric local defaults 0); marshal the FLAT
@@ -340,17 +376,17 @@ const
   { Revision 15: the wave-11 inline struct.new fast path bakes the GC-heap,
     block, and instance engine-id offsets; artifacts from revision 14 carry
     no such loads but fail closed against a runtime that could emit them. }
-  AOT_ABI_REVISION = 15;
+  { Revision 16: compiled try_table / throw / throw_ref. Appends aohPublishIp,
+    aohEhThrow, and aohEhResumeIndex; compiled frames publish a Native bit
+    the unwinder consults. Must stay equal to WASM_TARGET_ABI_REVISION. }
+  AOT_ABI_REVISION = 16;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
-  (aot-spec §1.4): all WasmJitOffsets fields, all WasmJitFrameOffsets fields,
-  SizeOf(TWasmIrInstr) (the pinned-IR-base stride), SizeOf(TWasmValue) (the slot
-  stride), the helper-table slot count, and AOT_ABI_REVISION. The AOT loader
-  recomputes this from the LIVE runtime and rejects an artifact on mismatch —
-  the "same build/ABI" guard beside the IR-version and arch guards. Wave 0
-  ships the compute function; the AOT tier consumes it in Wave 1. Needs a live
-  store because StoreEpoch et al. are measured from the object reference. }
+  (aot-spec §1.4). On a released 64-bit Unix target this is
+  WasmTargetAbiFingerprint of the host descriptor — identity plus the
+  published LP64 layout, not a live SizeOf. Off those hosts the historical
+  live-layout fold is retained so Windows/32-bit cache stamping is unchanged. }
 function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
 
 implementation
@@ -374,6 +410,7 @@ threadvar
     no JIT registered none is ever set and every tier entry is rtEntry with no
     tail bounce. }
   GJitSeamReentry: Boolean;
+  GJitEhResume: Boolean;
   { Set by the backend trampoline loop's interpreted arm before it runs an
     interpreted TAIL target (Fix A, Finding 1): tells that target's Run it may
     hand a cross-tier tail back to the loop (BOUNCE) instead of nesting. A plain
@@ -669,6 +706,7 @@ begin
 
   { Return wiring: results flow into the caller's dest block. }
   Callee^.RetKind := rtCaller;
+  Callee^.Native := False;
   Callee^.RetCount := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
   if Callee^.RetCount > 0 then
     Callee^.RetDest := PUInt32(@ACaller^.Fn^.AuxU32[ADstAux + 1])
@@ -726,6 +764,7 @@ begin
   ATop^.Instance := CalleeInst;
   ATop^.FuncAddrs := @CalleeInst.FuncAddrs[0];
   ATop^.IP := 0;
+  ATop^.Native := False;
   ACtx^.ValueTop := ATop^.Base + CalleeFn^.RegisterCount;
 
   Slots := Frame(ACtx^.Values, ATop^.Base);
@@ -880,8 +919,10 @@ var
   CallerRegs: PWasmValue;
   ArgN, ResN, I: UInt32;
   Seam: TWasmSeamCatch;
+  CallerWasNative: Boolean;
   ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
 begin
+  CallerWasNative := ACaller^.Native;
   ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
   ResN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
   if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
@@ -906,13 +947,22 @@ begin
     control never returns here. }
   MarkJitSeamReentry;
   Seam.Prev := CurrentSeamCatch;
+  Seam.Resume := False;
   CurrentSeamCatch := @Seam;
   if SetJmp(Seam.JmpBuf) = 0 then
     ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0])
   else
   begin
     CurrentSeamCatch := Seam.Prev;
-    UnwindException(ACtx, TWasmRef(Seam.ExnRef), False);
+    if ACtx^.Depth = 0 then
+      JitRaiseUncaught(ACtx^.Store, TWasmRef(Seam.ExnRef));
+    if not Seam.Resume then
+      UnwindException(ACtx, TWasmRef(Seam.ExnRef), False);
+    { A compiled caller invoked this helper from native code. Hop to that
+      caller's InvokeCompiled seam so a matched clause can re-enter the
+      landing pad instead of returning into the call instruction. }
+    if CallerWasNative and (CurrentSeamCatch <> nil) then
+      SeamHopResume(Seam.ExnRef);
     Exit;
   end;
   CurrentSeamCatch := Seam.Prev;
@@ -961,6 +1011,7 @@ begin
     non-throwing path is unchanged: scatter results + DoReturn. }
   MarkJitSeamReentry;
   Seam.Prev := CurrentSeamCatch;
+  Seam.Resume := False;
   CurrentSeamCatch := @Seam;
   if SetJmp(Seam.JmpBuf) <> 0 then
   begin
@@ -1713,6 +1764,84 @@ begin
   raise EWasmException.CreateExn(NativeUInt(AExn), ATagAddr);
 end;
 
+procedure JitMarkTopNative(const ACtx: PWasmInterpContext);
+begin
+  ACtx^.Acts[ACtx^.Depth - 1].Native := True;
+end;
+
+procedure JitPublishIp(const AStore: TWasmStore; const AIp: PtrUInt); cdecl;
+var
+  Ctx: PWasmInterpContext;
+begin
+  Ctx := InterpContextFor(AStore);
+  Ctx^.Acts[Ctx^.Depth - 1].IP := UInt32(AIp);
+end;
+
+procedure JitEhRequestResume;
+begin
+  GJitEhResume := True;
+end;
+
+procedure JitRaiseUncaught(const AStore: TWasmStore; const AExn: TWasmRef);
+begin
+  RaiseUncaught(AExn, AStore.Heap.ExnTagAddr(AExn));
+end;
+
+function JitEhResumeIndex(const AStore: TWasmStore): PtrUInt; cdecl;
+var
+  Ctx: PWasmInterpContext;
+begin
+  if not GJitEhResume then
+  begin
+    Result := High(UInt32);
+    Exit;
+  end;
+  GJitEhResume := False;
+  Ctx := InterpContextFor(AStore);
+  Result := Ctx^.Acts[Ctx^.Depth - 1].IP;
+end;
+
+function JitCompiledThrow(const AStore: TWasmStore; const ARegBase: PWasmValue;
+  const AIns: PWasmIrInstr): PtrUInt; cdecl;
+var
+  Ctx: PWasmInterpContext;
+  Act: PWasmActivation;
+  Fn: PWasmIrFunction;
+  Store: TWasmStore;
+  Reg: PWasmValue;
+  Exn: TWasmRef;
+  TagAddr, ArgC, I, Ip: UInt32;
+begin
+  Ctx := InterpContextFor(AStore);
+  Act := @Ctx^.Acts[Ctx^.Depth - 1];
+  Fn := Act^.Fn;
+  Store := AStore;
+  Reg := ARegBase;
+  Ip := UInt32((NativeUInt(AIns) - NativeUInt(@Fn^.Code[0]))
+    div NativeUInt(SizeOf(TWasmIrInstr)));
+  Act^.IP := Ip;
+  if AIns^.Op = iroThrowRef then
+  begin
+    Exn := Reg[AIns^.A].Ref;
+    if RefIsNull(Exn) then
+      TrapNow(wtkNullReference);
+  end
+  else
+  begin
+    TagAddr := Act^.Instance.TagAddrs[UInt32(AIns^.Imm)];
+    ArgC := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
+    Exn := Store.Heap.AllocExn(TagAddr, Store.Tags[TagAddr].TypeId, ArgC);
+    I := 0;
+    while I < ArgC do
+    begin
+      Store.Heap.ExnSetArg(Exn, I, Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+      Inc(I);
+    end;
+  end;
+  UnwindException(Ctx, Exn, True);
+  Result := Act^.IP;
+end;
+
 { Kept OUT of Run: building the message string would give Run a managed
   local, hence an implicit finalisation frame that a trap's raw LongJmp
   abandons — corrupting the exception-frame stack (TRAP-1). Run must have no
@@ -1814,20 +1943,19 @@ begin
       was suspended at a call and holds the RESUME IP = callsite+1; scan it at
       IP-1, the call site. (See the Track-H note on test-throw-1-2.) }
     if ThrowFrame or (Top^.IP = 0) then
-      { A throwing frame is scanned at its own IP. A compiled seam frame's IP is
-        always 0 (native code never advances Act^.IP) and it carries no handler
-        table anyway, so scanning at 0 finds nothing and — crucially — avoids the
-        0-1 underflow that a checked build traps as a range error (Fix A). }
+      { A throwing frame is scanned at its own IP. IP=0 is also the unset
+        default for a frame that has not published a call site (a handler-free
+        compiled frame still uses this so IP-1 cannot underflow). }
       Ip := Top^.IP
     else
       Ip := Top^.IP - 1;
 
     { Scan the static handler table IN ORDER (inner appended before outer). A
       covering entry whose clauses do not match must NOT stop the scan — keep
-      going to the next-outer covering entry in this same frame. A compiled
-      frame carries an empty Handlers table (fence 1 declines handler-bearing
-      functions), so this loop simply finds nothing for it and falls through to
-      the rtCompiledSeam hop below — the frame is transparent to the unwind. }
+      going to the next-outer covering entry in this same frame. Compiled
+      frames now carry the same handler table the interpreter does; matching
+      is still by tag store-address (eh-spec §2.3/§4). A compiled frame
+      without handlers is still transparent. }
     H := 0;
     while H < UInt32(Length(Fn2^.Handlers)) do
     begin
@@ -1863,8 +1991,18 @@ begin
     Dec(ACtx^.Depth);
     case Top^.RetKind of
       rtCaller:
-        { A same-Run call frame: keep scanning the caller in THIS context. }
-        ThrowFrame := False;
+        { A same-Run interpreted call: keep scanning in THIS context. A
+          compiled rtCaller (direct native call) is a native barrier — hop
+          so the throw helper does not return into a popped native frame. }
+        if Top^.Native then
+        begin
+          if CurrentSeamCatch <> nil then
+            SeamHop(NativeUInt(AExn))
+          else
+            RaiseUncaught(AExn, TagAddr);
+        end
+        else
+          ThrowFrame := False;
       rtCompiledSeam:
         { A tier-seam entry: hop to the innermost seam catch (a compiled body's
           wrapper, or an interp->compiled launcher) via a LongJmp — NOT a Pascal
@@ -1878,8 +2016,13 @@ begin
         else
           RaiseUncaught(AExn, TagAddr);
       else
-        { rtEntry — the genuine outermost boundary: uncaught (eh-spec §2.4). }
-        RaiseUncaught(AExn, TagAddr);
+        { rtEntry — the genuine outermost boundary: uncaught (eh-spec §2.4).
+          Hop out of any remaining native frame first so the Pascal raise
+          does not have to unwind generated code (ADR-0009). }
+        if CurrentSeamCatch <> nil then
+          SeamHop(NativeUInt(AExn))
+        else
+          RaiseUncaught(AExn, TagAddr);
     end;
   end;
 end;
@@ -3213,6 +3356,7 @@ begin
   { Fix A: rtEntry for a genuine outermost entry, rtCompiledSeam for a nested
     tier-seam entry (a compiled body, or a cross-seam interpreted callee) — this
     is what makes the frame transparent-to or a boundary-for the unwind. }
+  Entry^.Native := False;
   Entry^.RetKind := ARetKind;
   { RetCount is a SLOT count so a v128 result flows into two flat AResults
     slots (simd-spec §1.6); DoReturn's per-slot copy then needs no change. }
@@ -3275,6 +3419,7 @@ begin
   Fn := @FuncInst^.Instance.Ir.Functions[FuncInst^.FuncIrIndex];
   AState^.RegBase := JitEnterResolvedFrame(Ctx, FuncInst^.Instance, Fn,
     AArgs, AResults, rtCaller, False);
+  JitMarkTopNative(Ctx);
   if Length(Fn^.Code) > 0 then
     AState^.IrBase := @Fn^.Code[0]
   else
@@ -3327,6 +3472,7 @@ begin
   Slots[Fn^.LocalRegs[0]] := AArgs[0];
 
   Entry^.RetKind := rtCaller;
+  Entry^.Native := True;
   Entry^.RetCount := 0;
   Entry^.RetDest := nil;
   Entry^.RetBase := 0;
@@ -3457,7 +3603,7 @@ end;
 { FNV-1a hashing wraps modulo 2^64 by design, so overflow/range checks must be
   off for the multiply below (they are on project-wide via Shared.inc). }
 {$push}{$Q-}{$R-}
-function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+function WasmAotAbiFingerprintFromLiveRuntime(const AStore: TWasmStore): UInt64;
 var
   H: UInt64;
   JO: TWasmJitOffsets;
@@ -3558,6 +3704,14 @@ begin
   Result := H;
 end;
 {$pop}
+
+function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+begin
+  if WasmTargetSupported(WasmTargetHost) then
+    Result := WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost))
+  else
+    Result := WasmAotAbiFingerprintFromLiveRuntime(AStore);
+end;
 
 procedure InterpTierInvoke(const AStore: TWasmStore; const AFuncAddr: TWasmFuncAddr;
   const AParams: PWasmValue; const AResults: PWasmValue);

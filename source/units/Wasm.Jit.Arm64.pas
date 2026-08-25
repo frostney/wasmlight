@@ -521,6 +521,15 @@ procedure Arm64EmitIrInsPtr(const ABuf: TWasmCodeBuffer; const ADestReg: Byte;
   RegisterJit to store in Store.JitHelperTable (aot-spec §4.3). }
 function Arm64GetHelperTable: PPointer;
 
+{ Compiled exception handling. BeginEhEmit records whether this function has
+  a handler table (so throw can resume in-frame and the prologue can re-enter
+  a landing pad). EmitEhResumeCheck polls JitEhResumeIndex after the pin.
+  EmitEhTable emits one A64 `b` per IR instruction as a PIC jump table. }
+procedure Arm64BeginEhEmit(const AHasHandlers: Boolean;
+  const ATableLabel, AEndLabel: TWasmJitLabel; const ACodeCount: UInt32);
+procedure Arm64EmitEhResumeCheck(const ABuf: TWasmCodeBuffer);
+procedure Arm64EmitEhTable(const ABuf: TWasmCodeBuffer; const ACount: Integer);
+
 { Resolve every forward/backward branch placeholder recorded on ABuf's patch
   list into its final A64 branch word. Call once, after the whole function is
   emitted and every label bound, while the buffer is still writable (§4.3). }
@@ -1925,6 +1934,7 @@ begin
       helper (§5.1). CurArgs is consumed here, BEFORE the body can overwrite the
       pending buffer it may point into. }
     Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults, RetKind);
+    JitMarkTopNative(Ctx);
     Pend^.Pending := False;
     Entry := TArm64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
     { The IR-code base @Fn^.Code[0] the compiled body pins in x23 to compute
@@ -1936,20 +1946,43 @@ begin
       IrBase := @IrFn^.Code[0]
     else
       IrBase := nil;
-    { Fix A (Finding 3): the compiled body is a native barrier. A wasm exception
-      thrown beneath it LongJmps up to THIS seam catch (a Pascal raise cannot
-      cross the native frame on this target). On the hop, re-enter the unwind: it
-      pops this compiled frame (transparent, no handlers) and hops further out —
-      or, at a genuine outermost rtEntry, RaiseUncaughts. It never resumes here
-      (a compiled frame carries no handler), so control never returns to the
-      normal path; the Exit is defensive. }
+    { The compiled body is a native barrier. A wasm exception thrown beneath
+      it LongJmps up to THIS seam catch (a Pascal raise cannot cross the
+      native frame on this target). On the hop, re-enter the unwind: a match
+      in this function re-enters Entry at the landing pad; otherwise the
+      unwind hops further out or RaiseUncaughts at a genuine outermost
+      rtEntry (ADR-0009). }
     Seam.Prev := CurrentSeamCatch;
+    Seam.Resume := False;
     CurrentSeamCatch := @Seam;
     if SetJmp(Seam.JmpBuf) <> 0 then
     begin
       CurrentSeamCatch := Seam.Prev;
-      UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
-      Exit;
+      if Ctx^.Depth = 0 then
+        JitRaiseUncaught(AStore, TWasmRef(Seam.ExnRef));
+      if not Seam.Resume then
+        UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
+      if (Ctx^.Depth > 0) and (Ctx^.Acts[Ctx^.Depth - 1].Fn = IrFn) then
+      begin
+        JitEhRequestResume;
+        Seam.Prev := CurrentSeamCatch;
+        Seam.Resume := False;
+        CurrentSeamCatch := @Seam;
+        Entry(Base, AStore, IrBase, Ctx,
+          AStore.Funcs[CurAddr].CompiledEntry);
+        CurrentSeamCatch := Seam.Prev;
+        JitLeaveFrame(Ctx);
+        if not Pend^.Pending then
+          Exit;
+        Pend^.Pending := False;
+        CurAddr := Pend^.Addr;
+        CurArgs := @Pend^.Args[0];
+        Continue;
+      end;
+      if CurrentSeamCatch <> nil then
+        SeamHopResume(Seam.ExnRef)
+      else
+        Exit;
     end;
     Entry(Base, AStore, IrBase, Ctx,
       AStore.Funcs[CurAddr].CompiledEntry);
@@ -3729,7 +3762,7 @@ procedure Arm64ResolvePatches(const ABuf: TWasmCodeBuffer);
 var
   I: Integer;
   P: TWasmJitPatch;
-  Base, Instr, Inverted: UInt32;
+  Base, Instr, Inverted, ImmLo, ImmHi: UInt32;
   Delta, Imm: Integer;
 begin
   { Kind 0 means a consumed overflow site that was rewritten in place. New B
@@ -3745,36 +3778,52 @@ begin
     end;
     Base := UInt32(P.Kind);
     Delta := ABuf.PatchDelta(I);
-    Imm := Delta div 4;
-    if (Base and $7C000000) = $14000000 then
+    if (Base and $9F000000) = $10000000 then
     begin
-      if not Arm64SignedImmFits(Imm, 26) then
+      { ADR: 21-bit byte immediate (immhi:immlo), not a word displacement. }
+      if not Arm64SignedImmFits(Delta, 21) then
         raise EWasmJitBranchRange.CreateFmt(
-          'JIT: B/BL displacement %d does not fit imm26', [Delta]);
-      Instr := Base or (UInt32(Imm) and $03FFFFFF);
-      ABuf.PatchU32(P.SiteOffset, Instr);
-    end
-    else if Arm64SignedImmFits(Imm, 19) then
-    begin
-      Instr := Base or ((UInt32(Imm) and $7FFFF) shl 5);
+          'JIT: ADR displacement %d does not fit imm21', [Delta]);
+      ImmLo := UInt32(Delta) and 3;
+      ImmHi := (UInt32(Delta) shr 2) and $7FFFF;
+      { Keep ADR opcode bits [28:24]=10000 and Rd; immlo occupies [30:29]. }
+      Instr := (Base and $1F00001F) or (ImmLo shl 29) or (ImmHi shl 5);
       ABuf.PatchU32(P.SiteOffset, Instr);
     end
     else
     begin
-      { Invert the 4-byte conditional so it skips an inserted B, which then
-        carries the original target with imm26 reach. }
-      if (Base and $FF000010) = $54000000 then
-        Inverted := (Base and $FFFFFFF0) or ((Base xor 1) and $F)
+      Imm := Delta div 4;
+      if (Base and $7C000000) = $14000000 then
+      begin
+        if not Arm64SignedImmFits(Imm, 26) then
+          raise EWasmJitBranchRange.CreateFmt(
+            'JIT: B/BL displacement %d does not fit imm26', [Delta]);
+        Instr := Base or (UInt32(Imm) and $03FFFFFF);
+        ABuf.PatchU32(P.SiteOffset, Instr);
+      end
+      else if Arm64SignedImmFits(Imm, 19) then
+      begin
+        Instr := Base or ((UInt32(Imm) and $7FFFF) shl 5);
+        ABuf.PatchU32(P.SiteOffset, Instr);
+      end
       else
-        Inverted := Base xor $01000000;
-      ABuf.InsertU32(P.SiteOffset + 4, Arm64BPlaceholder);
-      ABuf.PatchU32(P.SiteOffset, Inverted or (UInt32(2) shl 5));
-      ABuf.AddPatch(P.SiteOffset + 4, P.Target, Integer(Arm64BPlaceholder));
-      ABuf.SetPatchKind(I, 0);
+      begin
+        { Invert the 4-byte conditional so it skips an inserted B, which then
+          carries the original target with imm26 reach. }
+        if (Base and $FF000010) = $54000000 then
+          Inverted := (Base and $FFFFFFF0) or ((Base xor 1) and $F)
+        else
+          Inverted := Base xor $01000000;
+        ABuf.InsertU32(P.SiteOffset + 4, Arm64BPlaceholder);
+        ABuf.PatchU32(P.SiteOffset, Inverted or (UInt32(2) shl 5));
+        ABuf.AddPatch(P.SiteOffset + 4, P.Target, Integer(Arm64BPlaceholder));
+        ABuf.SetPatchKind(I, 0);
+      end;
     end;
     Inc(I);
   end;
 end;
+
 
 { ===================================================================== }
 {  op templates                                                          }
@@ -5224,7 +5273,8 @@ end;
   type+table immediate plus the index operand / the funcref operand), and the
   last two arguments are always the arg and result scratch pointers. }
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32; const AUsePinnedMemory,
+  const AAux: TWasmIrAuxU32; const AInsIndex: UInt32;
+  const AUsePinnedMemory,
   ANativeScalarSelf: Boolean; const ANativeRegisterCount,
   ANativeParamReg, ANativeResultReg: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel);
@@ -5265,6 +5315,9 @@ begin
 
   Arm64EmitSubImmXAny(ABuf, ARM64_REG_SP, ARM64_REG_SP, FrameBytes);
   EmitMarshalArgs(ABuf, AAux, AIns.A, ArgN);
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  Arm64EmitLoadImm32(ABuf, 1, AInsIndex + 1);
+  Arm64EmitCallHelper(ABuf, aohPublishIp);
   ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
 
   case AIns.Op of
@@ -5717,7 +5770,8 @@ begin
   Result := Arm64InlineOp(AOp) or Arm64LeafBinaryOp(AOp)
     or Arm64LeafUnaryOp(AOp) or Arm64CallOp(AOp)
     or Arm64RuntimeOp(AOp) or Arm64BranchRefOp(AOp)
-    or Arm64VecOp(AOp);
+    or Arm64VecOp(AOp)
+    or (AOp in [iroThrow, iroThrowRef]);
 end;
 
 function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
@@ -5752,6 +5806,8 @@ begin
     iroI64Const, iroF64Const: EmitConst64(ABuf, AIns);
 
     { --- control ------------------------------------------------------ }
+    iroThrow, iroThrowRef:
+      Arm64EmitEhThrow(ABuf, AInsIndex);
     iroJump:
       begin
         if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
@@ -5782,7 +5838,7 @@ begin
 
     { --- calls (Wave 3) ------------------------------------------------ }
     iroCall, iroCallIndirect, iroCallRef:
-      EmitCall(ABuf, AIns, AAux, AUsePinnedMemory, ANativeScalarSelf,
+      EmitCall(ABuf, AIns, AAux, AInsIndex, AUsePinnedMemory, ANativeScalarSelf,
         ANativeRegisterCount, ANativeParamReg, ANativeResultReg,
         ANativeCoreLabel, ANativeExhaustedLabel);
     iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
@@ -6020,6 +6076,9 @@ begin
       @JitFinishDirectCallScalar;
     GArm64HelperTable[aohDirectCallPrepareScalar] :=
       @JitPrepareDirectCallScalar;
+    GArm64HelperTable[aohPublishIp] := @JitPublishIp;
+    GArm64HelperTable[aohEhThrow] := @JitCompiledThrow;
+    GArm64HelperTable[aohEhResumeIndex] := @JitEhResumeIndex;
     GArm64HelperTableFilled := True;
   end;
   Result := @GArm64HelperTable[aohTrapKind];
