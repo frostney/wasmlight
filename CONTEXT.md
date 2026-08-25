@@ -131,6 +131,31 @@ contains no interpreter or JIT compiler
 The template is shipped; the compile command that populates it is not.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
+**Target triple**:
+The architecture-vendor-os string that names a native compilation target
+independently of the compiler host. The released 64-bit Unix set is
+`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+and `x86_64-unknown-linux-gnu`.
+_Avoid_: host triple, platform string, LLVM target
+
+**Target ABI descriptor**:
+The published pointer size, object format, calling convention, page size,
+and runtime-shell layout offsets for one target triple. Artifact
+fingerprints and foreign-target baked offsets come from this descriptor,
+not from `SizeOf`. Host-native JIT/AOT still bake the live store so a
+compiler-profile layout shift cannot crash the running binary
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: host ABI, process fingerprint
+
+**Strict compilation**:
+All-or-fail ahead-of-time compilation of every defined guest function. A
+successful result contains native code for each function; any predicate,
+backend, range, or target decline fails with a structured non-trap error and
+publishes no output. Distinct from `.waot` cache generation, which may record
+declined functions for interpreter fallback
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: full AOT, forced AOT, trusted compile
+
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. The executable cannot expand this set at run time, and its
