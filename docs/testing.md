@@ -3,11 +3,12 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Fifty-four suites today, including catalog-discovery
-  coverage, the native executable payload format, the Connector language
-  lexer and parser suites, `Wasm.Target.Test`, the runtime-shell payload
-  and startup suites, Linux ELF runtime-shell packager coverage, and the
-  Mach-O packager and SHA-256 known-answer suites.
+  independent programs. Fifty-five suites today, including the
+  `wasmlight compile` CLI contract, catalog-discovery coverage, the native
+  executable payload format, the Connector language lexer and parser
+  suites, `Wasm.Target.Test`, the runtime-shell payload and startup suites,
+  Linux ELF runtime-shell packager coverage, and the Mach-O packager and
+  SHA-256 known-answer suites.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -135,6 +136,7 @@ instead.
 | `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
 | `Wasm.Wasi.Test` | The host module, hermetically: captured stdio buffers instead of real fds, an injected fixed clock and deterministic random source, and temp-dir preopens for the filesystem — args/environ, `fd_write`/`read`/`seek`/`close`, `clock_time_get`, `random_get`, and `path_open` plus the wave-2 file ops. The deny-by-default negatives carry the weight: a fabricated fd is `weBadf`, an ungranted clock or an absent preopen is `weNotCapable`, and a path that is absolute, escapes via `..`, or escapes via a symlink is `weNotCapable` before any OS call. |
 | `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
+| `Wasm.Compile.Test` | The `wasmlight compile` driver: registry-owned `-o` / `--target` / `--connector` help, flag-shaped option values, host-default and explicit released targets, selected `.wlc` parse through `ParseConnector`, and distinct decode / validation / link / connector / strict-compile / packaging / I/O failures that never write an executable or fall back to `.waot`. Native emission is not claimed. |
 | `Wasm.Compile.Catalog.Test` | Installed runtime-shell discovery: the four released 64-bit Unix triples, catalog write/parse, FNV-1a-64 checksums, host-default selection through the same path as an explicit triple, release-completeness, and the negative catalog cases (missing, duplicate, stale, mismatched, corrupt, escaping paths). |
 | `Wasm.Connector.Lexer.Test` | The Connector-language tokenizer: punctuation, identifiers, strings, integers, comment trivia, one-token peek, Unix/Windows/classic-Mac newlines, and the unclosed-string / unclosed-comment / illegal-character faults with 1-based positions. |
 | `Wasm.Connector.Test` | `ParseConnector` and the declaration model: static classes, structs, enums, delegates, and `extern` methods; `DllImport` / `EntryPoint` / `MarshalAs` / `In` / `Out` / `Scoped` / `Queued`; unused declarations retained; and a literal-snippet rejection for every excluded construct (method bodies, properties, inheritance, generics, expressions, control flow, allocation). |

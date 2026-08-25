@@ -47,8 +47,8 @@ Read bottom-up; each layer may use only the layers below it.
 
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
-| Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for the planned `wasmlight compile` path ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** (library; the compile CLI is still planned) |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, and the interpreter-free runtime-shell startup path; component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** |
+| Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
 | Embedding API | `Wasm.Engine` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
@@ -227,6 +227,15 @@ source, raised by the wat assembler with upstream's canonical prefixes: a
 `.wat` module that will not assemble is a text error, not a bad module.
 `assert_malformed` over a text operand keys on this class where over a
 binary operand it keys on `EWasmDecodeError`.
+
+`Wasm.Connector` defines `EWasmConnectorError` (a sibling of
+`EWasmTextError`, carrying `Line`/`Column`) for malformed `.wlc` source
+and for a selected connector that cannot be read. `Wasm.Compile` adds two
+further compile-surface siblings under `EWasmError`: `EWasmCompileError`
+(strict compile declined or is not available) and `EWasmPackagingError`
+(target or runtime-shell packaging). They are not guest faults and are
+not subclasses of `EWasmLinkError` or `EWasmTrap`. Output I/O stays
+`EStreamError` so a write failure is not folded into those classes.
 
 ## What is shipped today
 
