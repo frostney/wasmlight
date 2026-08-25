@@ -24,6 +24,13 @@ A Component Model artifact: a WIT-described unit wrapping one or more core
 modules behind typed, language-neutral interfaces.
 _Avoid_: module, package, bundle
 
+**Native executable payload**:
+The self-describing byte container embedded in a compiled native executable:
+the original module, complete native code, the connector plan, and the
+compiled capability set, bound to one module and one target shell
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: .waot, AOT artifact, cache, bundle
+
 **Instance**:
 A module joined to its imports and its store-side state. Instantiation is
 where linking fails, distinct from decoding and validation.
@@ -127,17 +134,65 @@ path. Ambient search paths are not part of the name.
 _Avoid_: shared object, plugin, system library
 
 **Runtime shell**:
-The prebuilt, interpreter-free Pascal executable template into which
-`wasmlight compile` embeds a validated module, complete native code, and its
-connector plan. It retains validation and runtime helpers but contains no
-interpreter or JIT compiler
+The prebuilt, interpreter-free Pascal executable template (`wasmlight-shell`)
+into which `wasmlight compile` embeds a validated module, complete native
+code, and its connector plan. It retains validation and runtime helpers but
+contains no interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+The template is shipped; the compile command that populates it is not.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
+
+**Shell catalog**:
+The installed, versioned index of runtime-shell templates. Target selection
+resolves a triple to exactly one compatible catalog entry or fails; it does
+not search ambient paths or the network.
+_Avoid_: sysroot, toolchain, SDK, target cache
+
+**Runtime-shell payload section**:
+The Mach-O section `__WSHL,__payload` where the packager places the compile
+payload. The bytes are opaque until the product record layout lands; an
+altered section fails the embedded ad-hoc CodeDirectory
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: overlay, resource fork, post-signature trailer
+
+**Shell template**:
+The unfilled runtime shell for one released target, before a payload is
+attached. Linux templates are packaged by appending the payload after the
+last ELF file byte
+([ADR-0016](docs/adr/0016-elf-shells-append-the-payload.md)).
+_Avoid_: stub, blank binary, empty executable
+
+**Target triple**:
+The architecture-vendor-os string that names a native compilation target
+independently of the compiler host. The released 64-bit Unix set is
+`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+and `x86_64-unknown-linux-gnu`.
+_Avoid_: host triple, platform string, LLVM target
+
+**Target ABI descriptor**:
+The published pointer size, object format, calling convention, page size,
+and runtime-shell layout offsets for one target triple. Artifact
+fingerprints and foreign-target baked offsets come from this descriptor,
+not from `SizeOf`. Host-native JIT/AOT still bake the live store so a
+compiler-profile layout shift cannot crash the running binary
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: host ABI, process fingerprint
+
+**Strict compilation**:
+All-or-fail ahead-of-time compilation of every defined guest function. A
+successful result contains native code for each function; any predicate,
+backend, range, or target decline fails with a structured non-trap error and
+publishes no output. Distinct from `.waot` cache generation, which may record
+declined functions for interpreter fallback
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+_Avoid_: full AOT, forced AOT, trusted compile
 
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
-native executable. The executable cannot expand this set at run time, and its
-invocation arguments belong entirely to the guest.
+native executable. Relative host directories resolve from the executable
+directory; absolute host paths stay literal; invocation arguments belong
+entirely to the guest; environment values are embedded literally and are
+not secrets. The executable cannot expand this set at run time.
 _Avoid_: runtime configuration, ambient permissions, launcher options
 
 **Entry point alias**:
