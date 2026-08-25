@@ -3,8 +3,9 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Forty-seven suites today, including connector
-  callback thunks and the Connector language lexer and parser suites.
+  independent programs. Fifty-two suites today, including connector
+  callback thunks, connector memory copies, and the Connector language
+  lexer, parser, and resolve suites.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -122,14 +123,19 @@ instead.
 | `Wasm.Jit.Test` | The JIT driver and the differential proof: `JitCanCompile`'s scope fence, compile-to-buffer, and the arch-agnostic behaviour checks (integer/i64 arithmetic, div/rem traps, float NaN discipline, relops, select, calls and O(1) tail calls) asserted equal to the interpreter, gated on `WASM_JIT_BACKEND` so a no-backend leg still builds. |
 | `Wasm.Aot.Artifact.Test` | The `.waot` format: header read/write round-trip, the FNV-1a module hash and self-checksum, and each guard (magic, AOT version, IR version, target arch, ABI fingerprint, module hash) rejecting with its own distinct reason. |
 | `Wasm.Aot.Test` | The AOT layer end to end: compile a module to an artifact, load it into a fresh store (re-validating first), and prove the wired-up executable memory is byte-identical to a fresh JIT compile — plus a multi-function module and a declined-function case, gated on a live backend. |
+| `Wasm.Abi.Test` | 64-bit Unix C-ABI call plans: LP64 layout, AAPCS64 scalar/HFA/B.4/x8 placement, Apple AAPCS64 natural stack packing, SysV register/stack/MEMORY-return placement, and pointer-view as an integer class — every target judged on every host. |
+| `Wasm.Native.Load.Test` | Application-local library resolution: platform filename beside the executable, relative join, literal absolute path, `..` escape, a cwd decoy ignored, and missing library as `EWasmLinkError`. |
+| `Wasm.Native.Call.Test` | Precompiled call gates: Pascal `cdecl` scalars/stack/aggregates/pointer-views, C and Pascal fixture libraries observationally identical on scalars, stack, pairs, HFAs, pointer-views, and large aggregates, missing symbol as `EWasmLinkError`; live calls gated to 64-bit Unix. |
 | `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
 | `Wasm.Connector.Callbacks.Test` | Connector callback thunks: direct store-thread re-entry and nested trampoline, retained vs scoped lifetimes, teardown-safe dead pointers, queued void notifications copied from a foreign thread, rejection of queued results/borrows and foreign-thread synchronous results as `EWasmCallbackError`, and `EWasmTrap` / `EWasmException` / `EWasmExit` retained at the cdecl boundary then rethrown on Pascal ground. Representative raylib audio and SDL event-filter shapes, without linking those libraries. |
+| `Wasm.Connector.Memory.Test` | Connector copy-in/out/inout through the chokepoint, scoped-borrow lifetime, and opaque handles: OOB and wrapping transfers trap as `out of bounds memory access` on both i32 and i64 memories; a retained borrow, guest re-entry, and callback while a view is live are `EWasmConnectorError`; stale, zero, and unknown handles fail with one message; a handle is never the raw native pointer. |
 | `Wasm.Connector.Lexer.Test` | The Connector-language tokenizer: punctuation, identifiers, strings, integers, comment trivia, one-token peek, Unix/Windows/classic-Mac newlines, and the unclosed-string / unclosed-comment / illegal-character faults with 1-based positions. |
 | `Wasm.Connector.Test` | `ParseConnector` and the declaration model: static classes, structs, enums, delegates, and `extern` methods; `DllImport` / `EntryPoint` / `MarshalAs` / `In` / `Out` / `Scoped` / `Queued`; unused declarations retained; and a literal-snippet rejection for every excluded construct (method bodies, properties, inheritance, generics, expressions, control flow, allocation). |
 | `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |
 | `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
 | `Wasm.Wasi.Test` | The host module, hermetically: captured stdio buffers instead of real fds, an injected fixed clock and deterministic random source, and temp-dir preopens for the filesystem — args/environ, `fd_write`/`read`/`seek`/`close`, `clock_time_get`, `random_get`, and `path_open` plus the wave-2 file ops. The deny-by-default negatives carry the weight: a fabricated fd is `weBadf`, an ungranted clock or an absent preopen is `weNotCapable`, and a path that is absolute, escapes via `..`, or escapes via a symlink is `weNotCapable` before any OS call. |
 | `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
+| `Wasm.Connector.Resolve.Test` | Unique import matching into a stripped connector plan: `EntryPoint` aliases the native symbol only, unused libraries/types/classes drop out, built-in WASI imports need no declaration, and missing, duplicate, incompatible, ambiguous, non-function, and unsupported-type bindings raise `EWasmLinkError`. |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and
