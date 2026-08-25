@@ -536,12 +536,16 @@ compiles each function to native code the first time it runs and honours
 the three obligations decisions already fixed: it emits the epoch check at
 every back-edge, the compiled frame *is* the interpreter's frame so the
 GC's stack map and tail-call handling come for free, and live references
-stay discoverable. It carries the full non-EH op set; a function using
-`throw` / `throw_ref` or hosting a `try_table` handler is declined and
-stays interpreted, and the two tiers interoperate transparently across the
-seam. The correctness proof is differential: `--tier=jit` over the corpus
-is **byte-identical** to `--tier=interp` — locally `compiled=8703` on
-aarch64, `pass=65188 fail=0 skip=0` — with cross-platform identity enforced
+stay discoverable. It compiles `try_table` handler tables and
+`throw` / `throw_ref` on both backends; matching stays in
+`UnwindException` by tag store-address, and an uncaught throw is
+`EWasmException` via the trampoline. Direct compiled-to-compiled calls
+still decline handler-bearing and throwing functions so they keep an
+`InvokeCompiled` seam. Remaining portable declines for mixed-tier tests
+are things like call arity greater than 256. The correctness proof is
+differential: `--tier=jit` over the corpus is **byte-identical** to
+`--tier=interp` — locally `compiled=8703` on aarch64,
+`pass=65188 fail=0 skip=0` — with cross-platform identity enforced
 in CI.
 
 The tier runs only where `WASM_JIT_EXEC` holds — a **64-bit UNIX host**.
