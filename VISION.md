@@ -60,8 +60,11 @@ The next product spine, not yet shipped, is native application
 compilation: `wasmlight compile` produces a complete native executable
 from a validated module
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-That work is sequenced in [roadmap.md](docs/roadmap.md). Until it lands,
-the shipped CLI remains `inspect` / `validate` / `run` / `aot`.
+That work is sequenced in [roadmap.md](docs/roadmap.md). The `compile`
+verb is registered with `--target` and `--connector`, but producing a
+native executable is not shipped: the command reports structured errors
+until the remaining compiler stages land. The shipped execution CLI
+remains `inspect` / `validate` / `run` / `aot`.
 
 wasmlight is a member of the lwpt ecosystem: built, tested, formatted, and
 released through lwpt, and consumable by any lwpt project.

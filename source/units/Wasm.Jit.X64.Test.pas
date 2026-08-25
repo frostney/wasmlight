@@ -27,6 +27,7 @@ uses
 
   TestingPascalLibrary,
   Wasm.Core,
+  Wasm.Interp,
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
   Wasm.Jit.X64,
@@ -64,7 +65,7 @@ type
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWaves;
-    procedure TestPredicateDeclinesEh;
+    procedure TestPredicateEmitsEh;
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestGcFieldAccessBytes;
@@ -794,8 +795,7 @@ end;
 
 procedure TX64Tests.TestPredicateCoversWaves;
 begin
-  { Representative ops from every wave must be compilable (only EH is declined,
-    like the aarch64 backend). }
+  { Representative ops from every wave must be compilable. }
   Expect<Boolean>(X64CanEmitOp(iroI32Add)).ToBe(True);       { Wave 2 inline }
   Expect<Boolean>(X64CanEmitOp(iroI32Clz)).ToBe(True);       { leaf on x86-64 }
   Expect<Boolean>(X64CanEmitOp(iroF64Add)).ToBe(True);       { Wave 2 leaf }
@@ -808,27 +808,44 @@ begin
   Expect<Boolean>(X64CanEmitOp(iroArrayFillVec)).ToBe(True); { last vec op }
 end;
 
-procedure TX64Tests.TestPredicateDeclinesEh;
+procedure TX64Tests.TestPredicateEmitsEh;
 begin
-  { Exception-handling ops are never compiled (§8.3, §10.2). }
-  Expect<Boolean>(X64CanEmitOp(iroThrow)).ToBe(False);
-  Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(False);
+  { throw / throw_ref compile; matching stays in UnwindException. }
+  Expect<Boolean>(X64CanEmitOp(iroThrow)).ToBe(True);
+  Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(True);
 end;
 
 procedure TX64Tests.TestCallArityFence;
 var
   Ins: TWasmIrInstr;
   Aux: TWasmIrAuxU32;
+  I: Integer;
 begin
-  { A call whose arg+result slot count exceeds the marshal cap declines at the
-    instruction level, so the whole function stays interpreted (§4.4). With an
-    empty aux the counts are 0, so it passes. }
+  { Direct-call arity is not a decline. An empty aux and an argument block
+    one past the historical short-form cap both compile. return_call* past
+    the shared tail-channel cap declines. }
   Ins.Op := iroCall;
   Ins.Dest := 0;
   Ins.A := 0;
   Ins.B := 0;
   Ins.Imm := 0;
   Aux := nil;
+  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
+
+  SetLength(Aux, X64_MAX_CALL_SLOTS + 2);
+  Aux[0] := X64_MAX_CALL_SLOTS + 1;
+  for I := 1 to X64_MAX_CALL_SLOTS + 1 do
+    Aux[I] := 0;
+  Ins.Op := iroReturnCall;
+  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
+
+  SetLength(Aux, WASM_TIER_TAIL_CAP + 2);
+  Aux[0] := WASM_TIER_TAIL_CAP + 1;
+  for I := 1 to WASM_TIER_TAIL_CAP + 1 do
+    Aux[I] := 0;
+  Ins.Op := iroReturnCall;
+  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(False);
+  Ins.Op := iroCall;
   Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
 end;
 
@@ -873,10 +890,11 @@ begin
   Test('helper calls and the IR pointer are position-independent',
     TestPositionIndependentSequences);
   Test('slot byte offset is register*8', TestSlotOffset);
-  Test('predicate covers waves 2-6 (only EH is declined)',
+  Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWaves);
-  Test('predicate declines exception-handling ops', TestPredicateDeclinesEh);
-  Test('the call-site arity fence admits a zero-slot call', TestCallArityFence);
+  Test('predicate emits exception-handling ops', TestPredicateEmitsEh);
+  Test('the call-site arity predicate admits wide calls and fences huge tails',
+    TestCallArityFence);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
   Test('numeric GC fields use baked native x64 loads and stores',

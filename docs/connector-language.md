@@ -13,9 +13,10 @@
 
 ## Parser-accepted grammar
 
-This section describes the grammar the parser accepts today. It is not a
-`wasmlight compile` surface. Import matching and unused-declaration
-stripping are `ResolveConnectorPlan` in `Wasm.Connector.Resolve`
+This section describes the grammar the parser accepts today.
+`wasmlight compile --connector` selects and parses `.wlc` files through
+`ParseConnector`. Import matching and unused-declaration stripping are
+`ResolveConnectorPlan` in `Wasm.Connector.Resolve`
 ([connector-resolve.md](connector-resolve.md)); embedding remains later
 work.
 
