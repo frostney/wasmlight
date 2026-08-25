@@ -2,8 +2,10 @@
 
 ## Executive Summary
 
-- `.wlc` is the Wasmlight Connector Language: a declaration-only language
-  with a constrained C# P/Invoke shape.
+- `.wlc` is a declaration-only DSL for Wasmlight connectors. It is not a
+  programming language: it is not Turing complete and it admits no
+  general-purpose computation. Bindings are declared; they are not
+  programmed.
 - `ParseConnector` in `Wasm.Connector` is the shipped parse entry point. It
   builds a declaration model for later ABI planning. It is not a compile
   command and does not load a library.
@@ -15,13 +17,12 @@ This section describes the grammar the parser accepts today. It is not a
 `wasmlight compile` surface: connector selection, import resolution, and
 embedding are later work.
 
-A file is a sequence of `[Connector]` static classes. Each class may
-contain structs, enums, delegates, and `static extern` methods. Braces
-and semicolons follow ordinary C# placement. `//` and non-nested `/* */`
-comments are trivia.
+A file is a sequence of static classes. Each class may contain structs,
+enums, delegates, and `static extern` methods. Braces and semicolons
+follow ordinary C# placement. `//` and non-nested `/* */` comments are
+trivia.
 
 ```csharp
-[Connector]
 public static class Libc
 {
     public enum Whence : int
@@ -47,7 +48,7 @@ public static class Libc
     public static extern int getpid();
 
     [DllImport("libc", EntryPoint = "write")]
-    [return: MarshalAs(UnmanagedType.I4)]
+    [return: MarshalAs(UnmanagedType.Int32)]
     public static extern int Write(
         int fd,
         [In, MarshalAs(UnmanagedType.LPArray)] byte[] buf,
@@ -57,7 +58,6 @@ public static class Libc
 
 Fixed attributes:
 
-- `Connector` on the static class
 - `DllImport("library")` on each extern method, with optional
   `EntryPoint = "symbol"` (also accepted as a standalone `[EntryPoint("symbol")]`)
 - `MarshalAs(UnmanagedType.Kind)` on parameters, fields, and
@@ -67,9 +67,10 @@ Fixed attributes:
   (scoped borrow)
 - `Queued` on a delegate (foreign-thread void notification)
 
-Accepted `UnmanagedType` members are the C ABI set `I1`, `U1`, `I2`,
-`U2`, `I4`, `U4`, `I8`, `U8`, `R4`, `R8`, `Bool`, `LPStr`, `LPWStr`,
-`LPUTF8Str`, `LPArray`, `ByValArray`, `SysInt`, and `SysUInt`.
+Accepted `UnmanagedType` members are the C ABI set `Int8`, `UInt8`,
+`Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float32`,
+`Float64`, `Bool`, `LPStr`, `LPWStr`, `LPUTF8Str`, `LPArray`,
+`ByValArray`, `SysInt`, and `SysUInt`.
 
 Visibility keywords are accepted and ignored. Parameter modifiers
 `ref`, `out`, and `in` are recorded. Enum members may use an integer
@@ -92,7 +93,6 @@ These prefixes mark constructs outside the language:
 - `control flow is outside the connector language`
 - `allocation is outside the connector language`
 
-Unknown attributes, a non-static class, a missing `[Connector]`, and an
-`extern` method without `[DllImport]` are also rejected with a precise
-prefix. The error class is a sibling of `EWasmTextError`, never a
-decode or validation error.
+Unknown attributes, a non-static class, and an `extern` method without
+`[DllImport]` are also rejected with a precise prefix. The error class
+is a sibling of `EWasmTextError`, never a decode or validation error.

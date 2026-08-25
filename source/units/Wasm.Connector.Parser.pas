@@ -107,9 +107,8 @@ end;
 
 function IsAllowedAttrName(const AName: string): Boolean;
 begin
-  Result := (AName = 'Connector') or (AName = 'DllImport') or
-    (AName = 'EntryPoint') or (AName = 'MarshalAs') or
-    (AName = 'In') or (AName = 'Out') or
+  Result := (AName = 'DllImport') or (AName = 'EntryPoint') or
+    (AName = 'MarshalAs') or (AName = 'In') or (AName = 'Out') or
     (AName = 'Scoped') or (AName = 'Queued');
 end;
 
@@ -117,26 +116,26 @@ function MarshalKindFromName(const AName: string;
   out AKind: TWlcMarshalKind): Boolean;
 begin
   Result := True;
-  if AName = 'I1' then
-    AKind := wlmI1
-  else if AName = 'U1' then
-    AKind := wlmU1
-  else if AName = 'I2' then
-    AKind := wlmI2
-  else if AName = 'U2' then
-    AKind := wlmU2
-  else if AName = 'I4' then
-    AKind := wlmI4
-  else if AName = 'U4' then
-    AKind := wlmU4
-  else if AName = 'I8' then
-    AKind := wlmI8
-  else if AName = 'U8' then
-    AKind := wlmU8
-  else if AName = 'R4' then
-    AKind := wlmR4
-  else if AName = 'R8' then
-    AKind := wlmR8
+  if AName = 'Int8' then
+    AKind := wlmInt8
+  else if AName = 'UInt8' then
+    AKind := wlmUInt8
+  else if AName = 'Int16' then
+    AKind := wlmInt16
+  else if AName = 'UInt16' then
+    AKind := wlmUInt16
+  else if AName = 'Int32' then
+    AKind := wlmInt32
+  else if AName = 'UInt32' then
+    AKind := wlmUInt32
+  else if AName = 'Int64' then
+    AKind := wlmInt64
+  else if AName = 'UInt64' then
+    AKind := wlmUInt64
+  else if AName = 'Float32' then
+    AKind := wlmFloat32
+  else if AName = 'Float64' then
+    AKind := wlmFloat64
   else if AName = 'Bool' then
     AKind := wlmBool
   else if AName = 'LPStr' then
@@ -469,7 +468,6 @@ begin
       AIsScoped := True
     else if (AAttrs[I].Name = 'DllImport') or
             (AAttrs[I].Name = 'EntryPoint') or
-            (AAttrs[I].Name = 'Connector') or
             (AAttrs[I].Name = 'Queued') then
       RaiseConnectorError('attribute ''' + AAttrs[I].Name +
         ''' is not allowed here', AAttrs[I].Line, AAttrs[I].Column);
@@ -880,9 +878,7 @@ function TWlcParser.ParseConnectorClass(
   const AAttrs: TWlcAttrArray): TWlcConnector;
 begin
   Result := Default(TWlcConnector);
-  if not HasAttr(AAttrs, 'Connector') then
-    Fault('static class requires [Connector]');
-  RejectDisallowedAttrs(AAttrs, 'Connector');
+  RejectDisallowedAttrs(AAttrs, '');
   TrySkipVisibility;
   if not TokenIs('static') then
     Fault('connector class must be static');
@@ -924,7 +920,7 @@ begin
     if TokenIs('using') or TokenIs('namespace') then
       FaultToken(MSG_WLC_UNEXPECTED);
     TrySkipVisibility;
-    if TokenIs('static') or HasAttr(Attrs, 'Connector') then
+    if TokenIs('static') then
     begin
       N := Length(Result.Connectors);
       SetLength(Result.Connectors, N + 1);
@@ -944,8 +940,12 @@ var
   Parser: TWlcParser;
 begin
   Parser := Default(TWlcParser);
-  Parser.FLexer.Init(ASource);
-  Result := Parser.ParseDocument;
+  Parser.FLexer := TWlcLexer.Create(ASource);
+  try
+    Result := Parser.ParseDocument;
+  finally
+    Parser.FLexer.Free;
+  end;
 end;
 
 end.

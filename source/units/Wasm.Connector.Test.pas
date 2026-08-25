@@ -36,7 +36,8 @@ type
     procedure TestRejectsExpressions;
     procedure TestRejectsControlFlow;
     procedure TestRejectsAllocation;
-    procedure TestRejectsMissingConnector;
+    procedure TestAcceptsBareStaticClass;
+    procedure TestRejectsConnectorAttribute;
     procedure TestRejectsNonStaticClass;
     procedure TestRejectsMissingDllImport;
     procedure TestRejectsUnknownAttribute;
@@ -81,7 +82,6 @@ end;
 function TWlcParserTests.SampleSource: string;
 begin
   Result :=
-    '[Connector]' + #10 +
     'public static class Libc' + #10 +
     '{' + #10 +
     '    public enum Whence : int' + #10 +
@@ -104,14 +104,13 @@ begin
     '    [DllImport("libc")]' + #10 +
     '    public static extern int getpid();' + #10 +
     '    [DllImport("libc", EntryPoint = "write")]' + #10 +
-    '    [return: MarshalAs(UnmanagedType.I4)]' + #10 +
+    '    [return: MarshalAs(UnmanagedType.Int32)]' + #10 +
     '    public static extern int Write(int fd, [In, MarshalAs(UnmanagedType.LPArray)] byte[] buf, int count);' + #10 +
     '    [DllImport("libcb")]' + #10 +
     '    public static extern void set_notify(Notify cb);' + #10 +
     '    [DllImport("/abs/lib.so")]' + #10 +
     '    public static extern void unused_abs();' + #10 +
     '}' + #10 +
-    '[Connector]' + #10 +
     'static class UnusedLib' + #10 +
     '{' + #10 +
     '    [DllImport("unused")]' + #10 +
@@ -169,7 +168,7 @@ var
 begin
   Doc := ParseConnector(SampleSource);
   WriteFn := Doc.Connectors[0].Methods[1];
-  Expect<string>(WlcMarshalKindName(WriteFn.ReturnMarshal.Kind)).ToBe('I4');
+  Expect<string>(WlcMarshalKindName(WriteFn.ReturnMarshal.Kind)).ToBe('Int32');
   Expect<Integer>(Length(WriteFn.Params)).ToBe(3);
   Expect<string>(WlcDirectionName(WriteFn.Params[1].Direction)).ToBe('in');
   Expect<string>(WlcMarshalKindName(WriteFn.Params[1].Marshal.Kind)).ToBe('LPArray');
@@ -196,7 +195,7 @@ var
   Src: string;
 begin
   Src :=
-    '[Connector] static class C {' +
+    'static class C {' +
     '  struct S { [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] int[] Vals; }' +
     '  [DllImport("lib")] static extern void copy([In, Out] byte[] buf);' +
     '  [DllImport("lib")] static extern void borrow(in int x, ref int y, out int z);' +
@@ -236,7 +235,7 @@ var
   Src, Msg: string;
 begin
   Src :=
-    '[Connector] static class C { ' +
+    'static class C { ' +
     '[DllImport("x")] static extern int f() { return 1; } }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_METHOD_BODY);
@@ -246,7 +245,7 @@ procedure TWlcParserTests.TestRejectsProperty;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] static class C { int X { get; set; } }';
+  Src := 'static class C { int X { get; set; } }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_PROPERTY);
 end;
@@ -255,7 +254,7 @@ procedure TWlcParserTests.TestRejectsInheritance;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] static class C : Base { }';
+  Src := 'static class C : Base { }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_INHERITANCE);
 end;
@@ -264,7 +263,7 @@ procedure TWlcParserTests.TestRejectsGenerics;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] static class C { struct Box<T> { T Value; } }';
+  Src := 'static class C { struct Box<T> { T Value; } }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_GENERIC);
 end;
@@ -274,7 +273,7 @@ var
   Src, Msg: string;
 begin
   Src :=
-    '[Connector] static class C { enum E { A = 1 + 2 } }';
+    'static class C { enum E { A = 1 + 2 } }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_EXPRESSION);
 end;
@@ -283,7 +282,7 @@ procedure TWlcParserTests.TestRejectsControlFlow;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] static class C { if (true) { } }';
+  Src := 'static class C { if (true) { } }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_CONTROL);
 end;
@@ -292,25 +291,34 @@ procedure TWlcParserTests.TestRejectsAllocation;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] static class C { new int[4]; }';
+  Src := 'static class C { new int[4]; }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, MSG_WLC_ALLOCATION);
 end;
 
-procedure TWlcParserTests.TestRejectsMissingConnector;
+procedure TWlcParserTests.TestAcceptsBareStaticClass;
+var
+  Doc: TWlcDocument;
+begin
+  Doc := ParseConnector('static class C { }');
+  Expect<Integer>(Length(Doc.Connectors)).ToBe(1);
+  Expect<string>(Doc.Connectors[0].Name).ToBe('C');
+end;
+
+procedure TWlcParserTests.TestRejectsConnectorAttribute;
 var
   Src, Msg: string;
 begin
-  Src := 'static class C { }';
+  Src := '[Connector] static class C { }';
   Msg := ParseError(Src);
-  ExpectPrefix(Msg, 'static class requires [Connector]');
+  ExpectPrefix(Msg, 'unknown attribute ''Connector''');
 end;
 
 procedure TWlcParserTests.TestRejectsNonStaticClass;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] class C { }';
+  Src := 'class C { }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, 'connector class must be static');
 end;
@@ -319,7 +327,7 @@ procedure TWlcParserTests.TestRejectsMissingDllImport;
 var
   Src, Msg: string;
 begin
-  Src := '[Connector] static class C { static extern int f(); }';
+  Src := 'static class C { static extern int f(); }';
   Msg := ParseError(Src);
   ExpectPrefix(Msg, 'extern method requires [DllImport]');
 end;
@@ -336,7 +344,7 @@ end;
 procedure TWlcParserTests.TestDiagnosticsCarryPosition;
 begin
   Expect<string>(ParseErrorPos(
-    '[Connector] static class C { int X { get; set; } }')).ToBe('1:36');
+    'static class C { int X { get; set; } }')).ToBe('1:24');
 end;
 
 procedure TWlcParserTests.SetupTests;
@@ -354,7 +362,8 @@ begin
   Test('rejects expressions', TestRejectsExpressions);
   Test('rejects control flow', TestRejectsControlFlow);
   Test('rejects allocation', TestRejectsAllocation);
-  Test('rejects missing Connector', TestRejectsMissingConnector);
+  Test('accepts bare static class', TestAcceptsBareStaticClass);
+  Test('rejects Connector attribute', TestRejectsConnectorAttribute);
   Test('rejects non-static class', TestRejectsNonStaticClass);
   Test('rejects missing DllImport', TestRejectsMissingDllImport);
   Test('rejects unknown attribute', TestRejectsUnknownAttribute);

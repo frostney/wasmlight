@@ -46,7 +46,7 @@ type
     Column: Integer;
   end;
 
-  TWlcLexer = record
+  TWlcLexer = class
   private
     FSource: string;
     FPos: Integer;
@@ -54,7 +54,7 @@ type
     FColumn: Integer;
 
     function Eof: Boolean; inline;
-    function Cur: Char; inline;
+    function Cursor: Char; inline;
     function PeekChar: Char; inline;
     procedure Advance;
     procedure Fault(const AWhat: string);
@@ -66,7 +66,7 @@ type
     function ScanString: TWlcToken;
     function ScanInteger: TWlcToken;
   public
-    procedure Init(const ASource: string);
+    constructor Create(const ASource: string);
     function Next: TWlcToken;
     function Peek: TWlcToken;
   end;
@@ -75,31 +75,20 @@ function WlcTokenKindName(const AKind: TWlcTokenKind): string;
 
 implementation
 
+uses
+  TypInfo;
+
 function WlcTokenKindName(const AKind: TWlcTokenKind): string;
+var
+  Name: string;
 begin
-  case AKind of
-    wlkIdent: Result := 'ident';
-    wlkString: Result := 'string';
-    wlkInteger: Result := 'integer';
-    wlkLBrace: Result := 'lbrace';
-    wlkRBrace: Result := 'rbrace';
-    wlkLParen: Result := 'lparen';
-    wlkRParen: Result := 'rparen';
-    wlkLBracket: Result := 'lbracket';
-    wlkRBracket: Result := 'rbracket';
-    wlkComma: Result := 'comma';
-    wlkSemicolon: Result := 'semicolon';
-    wlkEquals: Result := 'equals';
-    wlkColon: Result := 'colon';
-    wlkDot: Result := 'dot';
-    wlkLess: Result := 'less';
-    wlkGreater: Result := 'greater';
-    wlkStar: Result := 'star';
-    wlkPlus: Result := 'plus';
-    wlkEof: Result := 'eof';
+  Name := GetEnumName(TypeInfo(TWlcTokenKind), Ord(AKind));
+  if Copy(Name, 1, 3) = 'wlk' then
+    Delete(Name, 1, 3);
+  if Name = '' then
+    Result := '?'
   else
-    Result := '?';
-  end;
+    Result := LowerCase(Name);
 end;
 
 function TWlcLexer.Eof: Boolean;
@@ -107,7 +96,7 @@ begin
   Result := FPos > Length(FSource);
 end;
 
-function TWlcLexer.Cur: Char;
+function TWlcLexer.Cursor: Char;
 begin
   Result := FSource[FPos];
 end;
@@ -126,7 +115,14 @@ var
 begin
   Ch := FSource[FPos];
   Inc(FPos);
-  if (Ch = #10) or ((Ch = #13) and (Eof or (Cur <> #10))) then
+  if Ch = #13 then
+  begin
+    if not Eof and (Cursor = #10) then
+      Inc(FPos);
+    Inc(FLine);
+    FColumn := 1;
+  end
+  else if Ch = #10 then
   begin
     Inc(FLine);
     FColumn := 1;
@@ -148,7 +144,7 @@ end;
 
 procedure TWlcLexer.SkipLineComment;
 begin
-  while not Eof and (Cur <> #10) and (Cur <> #13) do
+  while not Eof and (Cursor <> #10) and (Cursor <> #13) do
     Advance;
 end;
 
@@ -156,7 +152,7 @@ procedure TWlcLexer.SkipBlockComment(const AOpenLine, AOpenColumn: Integer);
 begin
   while not Eof do
   begin
-    if (Cur = '*') and (PeekChar = '/') then
+    if (Cursor = '*') and (PeekChar = '/') then
     begin
       Advance;
       Advance;
@@ -173,7 +169,7 @@ var
 begin
   while not Eof do
   begin
-    case Cur of
+    case Cursor of
       #9, #10, #13, ' ':
         Advance;
       '/':
@@ -210,10 +206,10 @@ begin
   Start := FPos;
   Advance;
   while not Eof and (
-    ((Cur >= 'A') and (Cur <= 'Z')) or
-    ((Cur >= 'a') and (Cur <= 'z')) or
-    ((Cur >= '0') and (Cur <= '9')) or
-    (Cur = '_')) do
+    ((Cursor >= 'A') and (Cursor <= 'Z')) or
+    ((Cursor >= 'a') and (Cursor <= 'z')) or
+    ((Cursor >= '0') and (Cursor <= '9')) or
+    (Cursor = '_')) do
     Advance;
   Result.Text := Copy(FSource, Start, FPos - Start);
 end;
@@ -230,7 +226,7 @@ begin
   Decoded := '';
   while not Eof do
   begin
-    Ch := Cur;
+    Ch := Cursor;
     if Ch = '"' then
     begin
       Advance;
@@ -248,7 +244,7 @@ begin
     begin
       if Eof then
         FaultAt(MSG_WLC_UNCLOSED_STRING, OpenLine, OpenColumn);
-      case Cur of
+      case Cursor of
         '\': Decoded := Decoded + '\';
         '"': Decoded := Decoded + '"';
         'n': Decoded := Decoded + #10;
@@ -278,10 +274,10 @@ begin
   Result.Line := FLine;
   Result.Column := FColumn;
   Start := FPos;
-  Negative := Cur = '-';
+  Negative := Cursor = '-';
   if Negative then
     Advance;
-  Hex := (not Eof) and (Cur = '0') and ((PeekChar = 'x') or (PeekChar = 'X'));
+  Hex := (not Eof) and (Cursor = '0') and ((PeekChar = 'x') or (PeekChar = 'X'));
   if Hex then
   begin
     Advance;
@@ -290,7 +286,7 @@ begin
     Digits := 0;
     while not Eof do
     begin
-      Ch := Cur;
+      Ch := Cursor;
       if (Ch >= '0') and (Ch <= '9') then
         Digit := Ord(Ch) - Ord('0')
       else if (Ch >= 'A') and (Ch <= 'F') then
@@ -312,9 +308,9 @@ begin
   begin
     Acc := 0;
     Digits := 0;
-    while not Eof and (Cur >= '0') and (Cur <= '9') do
+    while not Eof and (Cursor >= '0') and (Cursor <= '9') do
     begin
-      Digit := Ord(Cur) - Ord('0');
+      Digit := Ord(Cursor) - Ord('0');
       if Acc > ((High(Int64) - Digit) div 10) then
         Fault(MSG_WLC_EXPRESSION);
       Acc := Acc * 10 + Digit;
@@ -330,8 +326,9 @@ begin
   Result.Text := Copy(FSource, Start, FPos - Start);
 end;
 
-procedure TWlcLexer.Init(const ASource: string);
+constructor TWlcLexer.Create(const ASource: string);
 begin
+  inherited Create;
   FSource := ASource;
   FPos := 1;
   FLine := 1;
@@ -353,7 +350,7 @@ begin
     Result.Column := FColumn;
     Exit;
   end;
-  Ch := Cur;
+  Ch := Cursor;
   if ((Ch >= 'A') and (Ch <= 'Z')) or
      ((Ch >= 'a') and (Ch <= 'z')) or
      (Ch = '_') then

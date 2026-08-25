@@ -2,8 +2,8 @@
   Connector Language (`.wlc`).
 
   A connector is a declarative C-ABI binding, not a program: the parser
-  accepts only `[Connector]` static classes, structs, enums, delegates,
-  and `extern` methods, plus the fixed attribute vocabulary. Method bodies,
+  accepts only static classes, structs, enums, delegates, and `extern`
+  methods, plus the fixed attribute vocabulary. Method bodies,
   properties, inheritance, generics, expressions, control flow, and
   allocation are outside the language (issue #41). Resolution, alias
   matching, and unused-declaration stripping belong to issue #42; this
@@ -45,19 +45,19 @@ type
   );
 
   { Default means "use the declared type's C ABI mapping". Named members
-    match the C# `UnmanagedType` spellings the grammar accepts. }
+    match the explicit `UnmanagedType` spellings the grammar accepts. }
   TWlcMarshalKind = (
     wlmDefault,
-    wlmI1,
-    wlmU1,
-    wlmI2,
-    wlmU2,
-    wlmI4,
-    wlmU4,
-    wlmI8,
-    wlmU8,
-    wlmR4,
-    wlmR8,
+    wlmInt8,
+    wlmUInt8,
+    wlmInt16,
+    wlmUInt16,
+    wlmInt32,
+    wlmUInt32,
+    wlmInt64,
+    wlmUInt64,
+    wlmFloat32,
+    wlmFloat64,
     wlmBool,
     wlmLPStr,
     wlmLPWStr,
@@ -216,16 +216,16 @@ function WlcMarshalKindName(const AKind: TWlcMarshalKind): string;
 begin
   case AKind of
     wlmDefault: Result := 'Default';
-    wlmI1: Result := 'I1';
-    wlmU1: Result := 'U1';
-    wlmI2: Result := 'I2';
-    wlmU2: Result := 'U2';
-    wlmI4: Result := 'I4';
-    wlmU4: Result := 'U4';
-    wlmI8: Result := 'I8';
-    wlmU8: Result := 'U8';
-    wlmR4: Result := 'R4';
-    wlmR8: Result := 'R8';
+    wlmInt8: Result := 'Int8';
+    wlmUInt8: Result := 'UInt8';
+    wlmInt16: Result := 'Int16';
+    wlmUInt16: Result := 'UInt16';
+    wlmInt32: Result := 'Int32';
+    wlmUInt32: Result := 'UInt32';
+    wlmInt64: Result := 'Int64';
+    wlmUInt64: Result := 'UInt64';
+    wlmFloat32: Result := 'Float32';
+    wlmFloat64: Result := 'Float64';
     wlmBool: Result := 'Bool';
     wlmLPStr: Result := 'LPStr';
     wlmLPWStr: Result := 'LPWStr';

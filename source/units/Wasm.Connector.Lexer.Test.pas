@@ -40,21 +40,25 @@ var
   Part: string;
 begin
   Result := '';
-  Lexer.Init(ASource);
-  repeat
-    Token := Lexer.Next;
-    case Token.Kind of
-      wlkIdent: Part := 'id:' + Token.Text;
-      wlkString: Part := 'str:' + Token.Text;
-      wlkInteger: Part := 'int:' + Token.Text;
-      wlkEof: Part := 'eof';
-    else
-      Part := WlcTokenKindName(Token.Kind);
-    end;
-    if Result <> '' then
-      Result := Result + ' ';
-    Result := Result + Part;
-  until Token.Kind = wlkEof;
+  Lexer := TWlcLexer.Create(ASource);
+  try
+    repeat
+      Token := Lexer.Next;
+      case Token.Kind of
+        wlkIdent: Part := 'id:' + Token.Text;
+        wlkString: Part := 'str:' + Token.Text;
+        wlkInteger: Part := 'int:' + Token.Text;
+        wlkEof: Part := 'eof';
+      else
+        Part := WlcTokenKindName(Token.Kind);
+      end;
+      if Result <> '' then
+        Result := Result + ' ';
+      Result := Result + Part;
+    until Token.Kind = wlkEof;
+  finally
+    Lexer.Free;
+  end;
 end;
 
 function TWlcLexerTests.LexError(const ASource: string): string;
@@ -63,14 +67,18 @@ var
   Token: TWlcToken;
 begin
   Result := '';
+  Lexer := TWlcLexer.Create(ASource);
   try
-    Lexer.Init(ASource);
-    repeat
-      Token := Lexer.Next;
-    until Token.Kind = wlkEof;
-  except
-    on E: EWasmConnectorError do
-      Result := E.Message;
+    try
+      repeat
+        Token := Lexer.Next;
+      until Token.Kind = wlkEof;
+    except
+      on E: EWasmConnectorError do
+        Result := E.Message;
+    end;
+  finally
+    Lexer.Free;
   end;
 end;
 
@@ -80,14 +88,18 @@ var
   Token: TWlcToken;
 begin
   Result := '';
+  Lexer := TWlcLexer.Create(ASource);
   try
-    Lexer.Init(ASource);
-    repeat
-      Token := Lexer.Next;
-    until Token.Kind = wlkEof;
-  except
-    on E: EWasmConnectorError do
-      Result := IntToStr(E.Line) + ':' + IntToStr(E.Column);
+    try
+      repeat
+        Token := Lexer.Next;
+      until Token.Kind = wlkEof;
+    except
+      on E: EWasmConnectorError do
+        Result := IntToStr(E.Line) + ':' + IntToStr(E.Column);
+    end;
+  finally
+    Lexer.Free;
   end;
 end;
 
@@ -118,12 +130,20 @@ var
   Token: TWlcToken;
 begin
   Expect<string>(Signature('0 12 -3 0x10')).ToBe('int:0 int:12 int:-3 int:0x10 eof');
-  Lexer.Init('0x10');
-  Token := Lexer.Next;
-  Expect<Int64>(Token.IntValue).ToBe(16);
-  Lexer.Init('-8');
-  Token := Lexer.Next;
-  Expect<Int64>(Token.IntValue).ToBe(-8);
+  Lexer := TWlcLexer.Create('0x10');
+  try
+    Token := Lexer.Next;
+    Expect<Int64>(Token.IntValue).ToBe(16);
+  finally
+    Lexer.Free;
+  end;
+  Lexer := TWlcLexer.Create('-8');
+  try
+    Token := Lexer.Next;
+    Expect<Int64>(Token.IntValue).ToBe(-8);
+  finally
+    Lexer.Free;
+  end;
 end;
 
 procedure TWlcLexerTests.TestCommentsAreTrivia;
@@ -137,15 +157,19 @@ var
   Lexer: TWlcLexer;
   P1, N1, P2: TWlcToken;
 begin
-  Lexer.Init('static class');
-  P1 := Lexer.Peek;
-  N1 := Lexer.Next;
-  Expect<string>(P1.Text).ToBe(N1.Text);
-  Expect<string>(N1.Text).ToBe('static');
-  P2 := Lexer.Peek;
-  Expect<string>(P2.Text).ToBe('class');
-  Expect<string>(Lexer.Next.Text).ToBe('class');
-  Expect<string>(WlcTokenKindName(Lexer.Peek.Kind)).ToBe('eof');
+  Lexer := TWlcLexer.Create('static class');
+  try
+    P1 := Lexer.Peek;
+    N1 := Lexer.Next;
+    Expect<string>(P1.Text).ToBe(N1.Text);
+    Expect<string>(N1.Text).ToBe('static');
+    P2 := Lexer.Peek;
+    Expect<string>(P2.Text).ToBe('class');
+    Expect<string>(Lexer.Next.Text).ToBe('class');
+    Expect<string>(WlcTokenKindName(Lexer.Peek.Kind)).ToBe('eof');
+  finally
+    Lexer.Free;
+  end;
 end;
 
 procedure TWlcLexerTests.TestUnclosedString;
@@ -178,6 +202,8 @@ end;
 procedure TWlcLexerTests.TestLineAndColumn;
 begin
   Expect<string>(LexErrorPos('ok' + #10 + '  @')).ToBe('2:3');
+  Expect<string>(LexErrorPos('ok' + #13#10 + '  @')).ToBe('2:3');
+  Expect<string>(LexErrorPos('ok' + #13 + '  @')).ToBe('2:3');
 end;
 
 procedure TWlcLexerTests.SetupTests;
@@ -190,7 +216,7 @@ begin
   Test('unclosed string', TestUnclosedString);
   Test('unclosed comment', TestUnclosedComment);
   Test('illegal character', TestIllegalCharacter);
-  Test('line and column', TestLineAndColumn);
+  Test('Unix, Windows, and classic Mac line endings', TestLineAndColumn);
 end;
 
 begin
