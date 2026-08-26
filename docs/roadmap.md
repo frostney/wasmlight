@@ -88,12 +88,12 @@
   CI has now passed all six configured targets; the four 64-bit UNIX legs
   proved interpreter/JIT/AOT tally identity and the Windows legs proved the
   interpreter.
-- **`0.1.0` has shipped.** The next product spine is native application
-  compilation: `wasmlight compile` produces a complete native executable
-  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). That
-  command is planned, not shipped. The compiled capability-set model
-  (`Wasm.Compile.Capabilities`) is a shipped library unit the command will
-  consume. Merged work after `0.1.0` — JIT/GC performance, CI hardening,
+- **`0.1.0` has shipped.** Native application compilation now emits a
+  WASI command executable on the four released 64-bit UNIX targets
+  (`wasmlight compile`,
+  [ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)).
+  Connector host functions and compiled `--dir`/`--env` are not yet
+  embedded. Merged work after `0.1.0` — JIT/GC performance, CI hardening,
   and documentation — folds into `0.2.0` rather than a `0.1.1` patch.
 - **Next sequence:** `0.2.0` strict native compiler, connectors,
   64-bit Unix cross-compilation, and Homebrew; `0.3.0` Win64 native

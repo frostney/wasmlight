@@ -39,8 +39,8 @@ lwpt build [target]    # binaries land under build/
 lwpt test              # discovers source/units/*.Test.pas
 ./build/wasmlight inspect <module.wasm>
 ./build/wasmlight compile <module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...
-# compile is registered; native emission still fails with structured errors
-# until the remaining ADR-0015 stages land — never a .waot/JIT fallback
+# native WASI executable onto a catalog or sibling wasmlight-shell
+# never a .waot/JIT/interpreter fallback
 ./build/wasmlight-shell [<payload.wshl> [guest-args...]]  # runtime-shell template
 ./build/wasmbench      # execution workloads and tiers (measurement only)
 # isolate with --workload loop|fib|memory|numeric|simd|startup and --tier

@@ -1,17 +1,17 @@
 { wasmlight-shell — the prebuilt, interpreter-free runtime-shell template.
 
-  This program is the Pascal executable `wasmlight compile` will later
-  populate (#39) by attaching a payload (#35) into an ELF or Mach-O
-  image (#36/#37). Today it is the template plus the attach seam:
+  This program is the Pascal executable `wasmlight compile` populates by
+  attaching a native-executable payload into an ELF or Mach-O image.
+  The unfilled template also keeps the attach seam for tests:
 
     - no arguments: use the embedded payload (empty in the template);
     - first argument is a `.wshl` payload file when the embed is empty;
       remaining arguments are the guest argv;
     - when a payload is embedded, every argument is guest argv.
 
-  There are no Wasmlight runtime flags (`--dir`, `--env`, `--aot`). The
-  compiled capability set is a stub: deny-by-default WASI (stdio + clock
-  + random, no preopens, no environment). #40 owns embedding those values.
+  There are no Wasmlight runtime flags (`--dir`, `--env`, `--aot`). Compiled
+  `--dir`/`--env` values live in the payload; an empty capability set is
+  deny-by-default WASI (stdio + clock + random, no preopens, no environment).
 
   The program does not use Wasm.Interp dispatch, Wasm.Jit compile, or
   Wasm.Aot compile. Startup always re-decodes and re-validates. }
@@ -34,8 +34,9 @@ uses
   Wasm.Shell,
   Wasm.Wasi;
 
-{ The packaging issues write a non-empty blob here. The template keeps it
-  empty so `lwpt build` produces a reusable shell. }
+{ The packaging path writes a non-empty blob into the ELF trailer or
+  Mach-O `__WSHL,__payload` of this executable. The template keeps the
+  Pascal embed empty so `lwpt build` produces a reusable shell. }
 function EmbeddedPayload: TWasmBytes;
 begin
   Result := nil;
@@ -54,6 +55,8 @@ begin
   Payload := EmbeddedPayload;
   GuestStart := 1;
   AttachPath := '';
+  if Length(Payload) = 0 then
+    ExtractPackagedPayloadFromFile(ParamStr(0), Payload);
   if Length(Payload) = 0 then
   begin
     if ParamCount < 1 then
