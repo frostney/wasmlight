@@ -34,10 +34,10 @@
   a 64-bit-UNIX acceleration (two backends, aarch64 and x86-64); on Windows
   and 32-bit targets the runtime is interpreter-only and still fully
   conformant. The interpreter-free runtime shell (`wasmlight-shell`) is
-  shipped as a template. [roadmap.md](roadmap.md) is the honest picture of
-  what remains: the rest of the native-compiler spine
-  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md))
-  (`wasmlight compile`), broader
+  shipped as a template that `wasmlight compile` populates. [roadmap.md](roadmap.md)
+  is the honest picture of what remains: connector host functions and
+  compiled `--dir`/`--env` on that spine
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)), broader
   optimizing-compiler work, and later platform and host-surface releases.
   Nothing in v1 Core 3 behaviour is staged.
 
@@ -48,13 +48,13 @@ Read bottom-up; each layer may use only the layers below it.
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
 | Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Connector.Memory`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, the `wasmlight compile` CLI contract (`--target`, `--connector`, `-o`), the immutable compiled capability set, connector copy-in/out/inout, scoped borrows, and opaque handles, and the interpreter-free runtime-shell startup path; native executable emission is not shipped ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | run **shipped**; compile CLI **wired**, executable emission **not shipped** |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Connector.Memory`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, `wasmlight compile` to an interpreter-free native executable (WASI only; catalog or host-sibling shell), the immutable compiled capability set, connector copy-in/out/inout, scoped borrows, and opaque handles, and the interpreter-free runtime-shell startup path ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** (compile on 64-bit UNIX; Windows/32-bit hosts cannot emit) |
 | Embedding API | `Wasm.Engine`, `Wasm.Connector.Callbacks` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots; target-ABI callback thunks with retained/scoped/queued lifetimes | **shipped** |
 | Native C ABI | `Wasm.Abi`, `Wasm.Native.Load`, `Wasm.Native.Call` | 64-bit Unix C-ABI call plans (AAPCS64, Apple AAPCS64, SysV x86-64), application-local library load, precompiled call gates; no TinyCC or libffi ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)) | **shipped** (planning on every host; live calls on 64-bit Unix) |
 | Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
-| Native executable payload | `Wasm.Native.Payload` | versioned embedded-executable container (original module, complete native code, connector plan, capability set), distinct from the `.waot` cache | **shipped** (read/write API); `wasmlight compile` that embeds it is not |
+| Native executable payload | `Wasm.Native.Payload` | versioned embedded-executable container (original module, complete native code, connector plan, capability set), distinct from the `.waot` cache | **shipped**; `wasmlight compile` embeds it |
 | Tier seam | the trampoline in `Wasm.Runtime.Traps` + the IR's safepoint flags | the contract every tier implements; trap trampoline, epoch check, safepoints | **shipped** (the interpreter honours it) |
 | IR | `Wasm.Ir` | register-based lowered form every tier consumes | **shipped** |
 | Validation | `Wasm.Validator` | the spec's static type check, run once, emitting the IR | **shipped** |
@@ -100,16 +100,15 @@ shells ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)).
 `WriteMachOShellTemplate` / `PackageMachORuntimeShell` emit a thin
 `MH_EXECUTE` with the compile payload in `__WSHL,__payload` and a
 linker-style ad-hoc CodeDirectory. They do not invoke a compiler or
-linker, and they do not decode wasm. The payload bytes in packager tests are a documented placeholder until
-`wasmlight compile` embeds the product payload; integrity is the signature,
-not a second checksum scheme.
+linker, and they do not decode wasm. `wasmlight compile` embeds the product
+payload; integrity is the signature, not a second checksum scheme.
 
 `Wasm.Package.Elf` also sits beside the library: it packages a Linux
 `aarch64-linux` or `x86_64-linux` runtime-shell template with an opaque
 payload by appending bytes and a trailer, with no host linker
 ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md),
-[ADR-0016](adr/0016-elf-shells-append-the-payload.md)). The interpreter-free shell and native-executable payload format are
-shipped; `wasmlight compile` is not. The packager's tests use a documented
+[ADR-0016](adr/0016-elf-shells-append-the-payload.md)). `wasmlight compile`
+packages onto these templates. The packager's tests also use a documented
 placeholder template.
 
 `Wasm.Wast`, `Wasm.Wast.Values`, `Wasm.Wast.Runner`, and the six
@@ -478,18 +477,17 @@ The compile path uses a different container, `Wasm.Native.Payload`: a
 versioned, checksummed section directory that carries the original module,
 complete native code, the connector plan, and the compiled capability set,
 bound to one module hash and one target-shell hash. It is not a `.waot`
-cache and has no interpreter fallback. The read/write API is shipped;
-`wasmlight compile` that embeds the payload is not.
+cache and has no interpreter fallback. `wasmlight compile` writes that
+payload and packages it onto a catalog or host-sibling runtime shell.
 
 The **runtime shell** (`Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native`,
-program `wasmlight-shell`) is the interpreter-free template a later
-`wasmlight compile` will populate. Startup always re-decodes and
+program `wasmlight-shell`) is the interpreter-free template
+`wasmlight compile` populates. Startup always re-decodes and
 re-validates the embedded module, then wires only a complete native
 image; an incomplete or incompatible image is `EWasmLinkError` and is
 never interpreted. `.waot` remains the fallback-capable cache for
-`run --aot`. The envelope that carries module + native + stub connector
-and capability slots is a temporary seam until the product payload
-is embedded; the compile command is not shipped.
+`run --aot`. Packaged ELF/Mach-O images carry the product payload;
+the attach-seam `.wshl` envelope remains for template tests.
 
 Both compiling tiers run only where `WASM_JIT_EXEC` holds — a **64-bit
 UNIX host**. On Windows and 32-bit targets they are inactive and the
@@ -590,6 +588,13 @@ boundary is drawn.
   134, an uncaught exception to 1, a decode/validate/link failure to 1. It
   is factored out of the program entry point so it is unit-testable with
   injected streams, never touching real stdio.
+- **`Wasm.Compile`** is the driver behind `wasmlight compile`: validate
+  once, strict-AOT every defined function for `--target`, write a native-
+  executable payload, and package it onto a catalog or host-sibling
+  runtime shell. WASI preview1 is a built-in; other imports fail at link
+  unless a selected connector uniquely binds them, and connector host
+  functions are not yet embedded. There is no `.waot`, JIT, or interpreter
+  fallback. A missing catalog or unusable shell is `EWasmPackagingError`.
 - **`Wasm.Connector` / `Wasm.Connector.Resolve`** are compile-time linking,
   not a runtime host. `ParseConnector` turns `.wlc` into declaration
   records. `ResolveConnectorPlan` matches each non-built-in import exactly
@@ -620,8 +625,11 @@ entry — matching version, arch, OS, format, and FNV-1a-64 checksum — or
 fails with a distinct reason. The host triple is only the default
 spelling; it is not a separate emission path, and the reader never
 searches PATH, HOME, or the network
-([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). Native
-executable emission is not shipped.
+([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). For the
+host target, a missing catalog may fall back to a sibling `wasmlight-shell`
+next to the compiler. A Darwin sibling without header slack for
+`__WSHL,__payload` takes an appended trailer instead of rewriting the
+Mach-O load commands.
 
 ## Related documents
 

@@ -2,16 +2,14 @@
 
   `wasmlight compile <module.wasm> -o <executable>` is the native-application
   command: validate once, compile every guest function, and emit a complete
-  interpreter-free executable. Sibling work still owns the strict AOT API,
-  runtime shells, and payload format. Selected `--connector` files are
-  parsed through `Wasm.Connector`; resolution and embedding remain later
-  work. This unit wires the command contract around those stages so the
-  CLI, `--target`, and `--connector` exist and fail with structured
-  diagnostics rather than silently falling back to a `.waot` cache, the
-  JIT, the interpreter, ambient discovery, or the network.
+  interpreter-free executable. Selected `--connector` files are parsed through
+  `Wasm.Connector` and resolved through `Wasm.Connector.Resolve`. WASI
+  preview1 is a built-in of the runtime shell; other imports must resolve
+  uniquely. Connector host functions are not yet embedded in the generated
+  executable, so a resolved non-WASI import fails closed at link.
 
-  It is a THIN driver over the shipped decode/validate path, adding no tier
-  logic and never publishing output until every stage succeeds:
+  It is a THIN driver over shipped stages, adding no tier logic and never
+  publishing output until every stage succeeds:
 
     1. Request check     — module path and `-o` are required; `--target`
                            defaults to the host and must be a released
@@ -21,15 +19,15 @@
                            distinct.
     3. Connectors        — explicit `--connector` paths only. A selected
                            file that cannot be read, a duplicate path, or
-                           malformed `.wlc` is EWasmConnectorError from
-                           Wasm.Connector. Resolution is later work.
-    4. Link              — deny-by-default: any import is an
-                           EWasmLinkError until compiled WASI (#40) and
-                           connector resolution (#42) exist.
-    5. Strict compile    — all-or-fail native emission. Until #31 this
-                           stage is EWasmCompileError.
-    6. Packaging         — runtime-shell assembly. Until #34–#38 this
-                           stage is EWasmPackagingError.
+                           malformed `.wlc` is EWasmConnectorError.
+    4. Link              — deny-by-default: `wasi_snapshot_preview1` is
+                           granted; any other import is EWasmLinkError
+                           unless a selected connector binds it uniquely.
+    5. Strict compile    — AotCompileModuleStrict for the requested
+                           target. A decline is EWasmCompileError.
+    6. Packaging         — WriteNativePayload into a catalog (or host
+                           sibling) runtime shell via ELF/Mach-O. A
+                           missing or unusable shell is EWasmPackagingError.
     7. Atomic write      — only after the stages above succeed; an I/O
                            failure is EStreamError and leaves no new
                            executable.
@@ -64,9 +62,8 @@ const
   WASM_COMPILE_TARGET_I386_WIN32 = 'i386-win32';
 
 type
-  { A strict-compile decline: a function could not be compiled, or the
-    all-or-fail AOT entry is not available yet. Not a trap and not a
-    `.waot` decline record. Connector failures use Wasm.Connector's
+  { A strict-compile decline: a function could not be compiled. Not a trap
+    and not a `.waot` decline record. Connector failures use Wasm.Connector's
     EWasmConnectorError — this unit does not redeclare it. }
   EWasmCompileError = class(EWasmError);
 
@@ -83,6 +80,9 @@ type
     OutputPath: string;
     Target: string;
     Connectors: array of string;
+    { Empty means the catalog beside the compiler, then the host sibling
+      `wasmlight-shell` for the host target. Tests inject a fixture root. }
+    CatalogRoot: string;
   end;
 
   { The outcome of a compile: the process exit code and a diagnostic the
@@ -141,16 +141,30 @@ function CompileFromOptions(const APositionals: TStringList;
   compile. }
 procedure WriteCompileOutput(const APath: string; const ABytes: TWasmBytes);
 
-{ Runtime-shell packaging stub. Always raises EWasmPackagingError until
-  the shell/payload work lands. }
-procedure PackageCompilePayload(const ATarget: string);
+{ Combine APayload with the selected runtime shell for ATarget. Raises
+  EWasmPackagingError when the catalog/shell is missing or the packager
+  refuses the template. AOutputPath supplies the Mach-O CodeDirectory
+  ident (basename). }
+function PackageCompilePayload(const ATarget: string;
+  const APayload: TWasmBytes; const ACatalogRoot, AOutputPath: string):
+  TWasmBytes;
 
 implementation
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  Wasm.Aot,
+  Wasm.Aot.Artifact,
+  Wasm.Compile.Catalog,
   Wasm.Connector,
-  Wasm.Module,
-  Wasm.Runtime.Traps;
+  Wasm.Connector.Resolve,
+  Wasm.MachO,
+  Wasm.Native.Payload,
+  Wasm.Package.Elf,
+  Wasm.Runtime.Store,
+  Wasm.Target;
 
 const
   WASM_COMPILE_EXIT_ERROR = 1;
@@ -284,6 +298,7 @@ begin
   ARequest.OutputPath := '';
   ARequest.Target := '';
   ARequest.Connectors := nil;
+  ARequest.CatalogRoot := '';
   AError := '';
 
   if APositionals.Count < 1 then
@@ -352,11 +367,16 @@ begin
   end;
 end;
 
-procedure CheckConnectors(const AConnectors: array of string);
+procedure CheckConnectorsAndLink(const ALoaded: TWasmLoadedModule;
+  const AConnectors: array of string);
 var
   I, J: Integer;
   Path: string;
+  Docs: array of TWlcDocument;
+  Plan: TWlcConnectorPlan;
+  BuiltIn: array[0..0] of string;
 begin
+  SetLength(Docs, Length(AConnectors));
   for I := 0 to High(AConnectors) do
   begin
     Path := AConnectors[I];
@@ -370,9 +390,7 @@ begin
       raise EWasmConnectorError.Create('cannot read connector "' +
         Path + '"');
     try
-      { Parse for validity. Resolution and unused-declaration stripping
-        belong to issue #42; the document is discarded here. }
-      ParseConnector(ReadConnectorSource(Path));
+      Docs[I] := ParseConnector(ReadConnectorSource(Path));
     except
       on E: EWasmConnectorError do
         raise;
@@ -381,28 +399,228 @@ begin
           Path + '"');
     end;
   end;
+  BuiltIn[0] := WLC_WASI_MODULE;
+  Plan := ResolveConnectorModule(Docs, ALoaded.Model, BuiltIn);
+  if Length(Plan.Thunks) > 0 then
+    raise EWasmLinkError.Create(
+      'compiled executables grant WASI only; connector host functions are not embedded');
 end;
 
-procedure CheckLink(const ALoaded: TWasmLoadedModule);
+function CompileWasmTarget(const ATriple: string;
+  out ATarget: TWasmTarget): Boolean;
 var
-  Imp: TWasmImport;
+  Llvm: string;
 begin
-  if ALoaded.Model.ImportCount = 0 then
+  if ATriple = WASM_COMPILE_TARGET_AARCH64_DARWIN then
+    Llvm := WASM_TARGET_TRIPLE_AARCH64_DARWIN
+  else if ATriple = WASM_COMPILE_TARGET_X64_DARWIN then
+    Llvm := WASM_TARGET_TRIPLE_X86_64_DARWIN
+  else if ATriple = WASM_COMPILE_TARGET_AARCH64_LINUX then
+    Llvm := WASM_TARGET_TRIPLE_AARCH64_LINUX
+  else if ATriple = WASM_COMPILE_TARGET_X64_LINUX then
+    Llvm := WASM_TARGET_TRIPLE_X86_64_LINUX
+  else
+    Llvm := '';
+  Result := (Llvm <> '') and WasmTargetParse(Llvm, ATarget);
+end;
+
+function ReadAllBytes(const APath: string): TWasmBytes;
+var
+  Stream: TFileStream;
+begin
+  Result := nil;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then
+      Stream.ReadBuffer(Result[0], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+function LoadCompileTemplate(const ATarget, ACatalogRoot: string): TWasmBytes;
+var
+  Root, Sibling: string;
+  Entry: TWasmShellEntry;
+  Sel: TWasmShellSelectResult;
+begin
+  Root := ACatalogRoot;
+  if Root = '' then
+    Root := CompilerCatalogRoot(ParamStr(0));
+  Sel := ResolveShell(Root, ATarget, Entry);
+  if Sel = ssrOk then
+    Exit(ReadAllBytes(Entry.ShellPath));
+  if (ACatalogRoot = '') and (ATarget = CompileHostTarget) then
+  begin
+    Sibling := IncludeTrailingPathDelimiter(ExtractFileDir(ParamStr(0))) +
+      'wasmlight-shell';
+    if FileExists(Sibling) then
+      Exit(ReadAllBytes(Sibling));
+  end;
+  raise EWasmPackagingError.Create(FormatSelectError(Sel, ATarget));
+end;
+
+function CopyLoadedBytes(const ALoaded: TWasmLoadedModule): TWasmBytes;
+begin
+  Result := nil;
+  if ALoaded.BytesLength = 0 then
     Exit;
-  Imp := ALoaded.Model.Imports[0];
-  raise EWasmLinkError.CreateFmt('%s: "%s"."%s"',
-    [string(MSG_LINK_UNKNOWN_IMPORT), Imp.ModuleName, Imp.Name]);
+  SetLength(Result, ALoaded.BytesLength);
+  Move(ALoaded.BytesPtr^, Result[0], ALoaded.BytesLength);
 end;
 
-procedure StrictCompileNative;
+function WaotToWnepHash(const AHash: TWasmAotHash128): TWasmNativeHash128;
 begin
-  raise EWasmCompileError.Create('strict compile is not available');
+  Result.Lo := AHash.Lo;
+  Result.Hi := AHash.Hi;
 end;
 
-procedure PackageCompilePayload(const ATarget: string);
+function NativePayloadFromArtifact(const ALoaded: TWasmLoadedModule;
+  const AArtifact, ATemplate: TWasmBytes;
+  const ATarget: string): TWasmBytes;
+var
+  Parsed: TWasmAotArtifact;
+  Params: TWasmNativePayloadWriteParams;
+  Funcs: TWasmNativeCodeRecords;
+  I: Integer;
 begin
-  raise EWasmPackagingError.Create(
-    'runtime shell packaging is not available for target "' + ATarget + '"');
+  if ParseAotArtifact(AArtifact, Parsed) <> aprOk then
+    raise EWasmCompileError.Create('strict compile produced a malformed image');
+  SetLength(Funcs, Length(Parsed.Funcs));
+  for I := 0 to High(Parsed.Funcs) do
+  begin
+    if not Parsed.Funcs[I].Compiled then
+      raise EWasmCompileError.CreateFmt('aot: function %d declined: incomplete',
+        [Parsed.Funcs[I].FuncIrIndex]);
+    Funcs[I].FuncIrIndex := Parsed.Funcs[I].FuncIrIndex;
+    Funcs[I].RegisterCount := Parsed.Funcs[I].RegisterCount;
+    Funcs[I].EntryOffset := Parsed.Funcs[I].EntryOffset;
+    Funcs[I].Code := Parsed.Funcs[I].Code;
+  end;
+  Params.IrFormatVer := Parsed.Header.IrFormatVer;
+  if (ATarget = WASM_COMPILE_TARGET_AARCH64_DARWIN) or
+    (ATarget = WASM_COMPILE_TARGET_AARCH64_LINUX) then
+    Params.TargetArch := WNEP_ARCH_AARCH64
+  else
+    Params.TargetArch := WNEP_ARCH_X64;
+  if (ATarget = WASM_COMPILE_TARGET_AARCH64_LINUX) or
+    (ATarget = WASM_COMPILE_TARGET_X64_LINUX) then
+    Params.TargetOs := WNEP_OS_LINUX
+  else
+    Params.TargetOs := WNEP_OS_DARWIN;
+  Params.Flags := 0;
+  Params.AbiFingerprint := Parsed.Header.AbiFingerprint;
+  Params.ModuleHash := WaotToWnepHash(Parsed.Header.ModuleHash);
+  Params.ShellHash := WnepHash128Bytes(ATemplate);
+  Params.ModuleBytes := CopyLoadedBytes(ALoaded);
+  Params.Funcs := Funcs;
+  Params.ConnectorPlan := nil;
+  Params.CapabilitySet := nil;
+  Result := WriteNativePayload(Params);
+end;
+
+function StrictCompileNative(const ALoaded: TWasmLoadedModule;
+  const ATarget: string): TWasmBytes;
+var
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  WasmT: TWasmTarget;
+begin
+  if not CompileWasmTarget(ATarget, WasmT) then
+    raise EWasmPackagingError.Create('unknown compile target "' + ATarget + '"');
+  Engine := TWasmEngine.Create;
+  Store := TWasmStore.Create(Engine);
+  try
+    try
+      Result := AotCompileModuleStrict(Store, ALoaded, WasmT);
+    except
+      on E: EWasmAotError do
+        raise EWasmCompileError.Create(E.Message);
+    end;
+  finally
+    Store.Free;
+    Engine.Free;
+  end;
+end;
+
+function ElfPackageFailText(const ARes: TWasmElfPackageResult): string;
+begin
+  case ARes of
+    eprBadTemplate: Result := 'template is not a usable ELF';
+    eprWrongMachine: Result := 'ELF template target mismatch';
+    eprMalformed: Result := 'malformed ELF template';
+    eprAlreadyPackaged: Result := 'ELF template is already packaged';
+    eprBadMagic: Result := 'ELF template has no payload trailer';
+    eprBadVersion: Result := 'unsupported ELF payload trailer';
+    eprBadChecksum: Result := 'ELF payload checksum mismatch';
+    eprTruncated: Result := 'truncated ELF template';
+  else
+    Result := 'ELF packaging failed';
+  end;
+end;
+
+function MachOPackageFailText(const ARes: TWasmMachOResult): string;
+begin
+  case ARes of
+    mmrEmpty: Result := 'empty Mach-O template';
+    mmrNotMachO: Result := 'template is not Mach-O';
+    mmrUnsupported: Result := 'unsupported Mach-O template';
+    mmrTruncated: Result := 'truncated Mach-O template';
+    mmrMalformed: Result := 'malformed Mach-O template';
+    mmrNoHeaderSlack: Result := 'Mach-O template has no header slack for payload';
+    mmrPayloadMissing: Result := 'Mach-O template has no payload section';
+    mmrSignatureInvalid: Result := 'Mach-O ad-hoc signature is invalid';
+  else
+    Result := 'Mach-O packaging failed';
+  end;
+end;
+
+function PackageCompilePayload(const ATarget: string;
+  const APayload: TWasmBytes; const ACatalogRoot, AOutputPath: string):
+  TWasmBytes;
+var
+  Template: TWasmBytes;
+  Packaged: TWasmBytes;
+  ElfTarget: TWasmElfPackageTarget;
+  ElfRes: TWasmElfPackageResult;
+  MachRes: TWasmMachOResult;
+  Ident: string;
+begin
+  Template := LoadCompileTemplate(ATarget, ACatalogRoot);
+  if (ATarget = WASM_COMPILE_TARGET_AARCH64_LINUX) or
+    (ATarget = WASM_COMPILE_TARGET_X64_LINUX) then
+  begin
+    if ATarget = WASM_COMPILE_TARGET_AARCH64_LINUX then
+      ElfTarget := weptAarch64Linux
+    else
+      ElfTarget := weptX86_64Linux;
+    ElfRes := PackageElfShell(Template, APayload, ElfTarget, Packaged);
+    if ElfRes <> eprOk then
+      raise EWasmPackagingError.Create(
+        'runtime shell packaging failed for target "' + ATarget + '": ' +
+        ElfPackageFailText(ElfRes));
+    Result := Packaged;
+    Exit;
+  end;
+  Ident := ExtractFileName(AOutputPath);
+  if Ident = '' then
+    Ident := MACHO_DEFAULT_IDENT;
+  MachRes := PackageMachORuntimeShell(Template, APayload, Ident, Packaged);
+  if MachRes = mmrNoHeaderSlack then
+  begin
+    if PackageAppendedPayload(Template, APayload, Packaged) <> eprOk then
+      raise EWasmPackagingError.Create(
+        'runtime shell packaging failed for target "' + ATarget +
+        '": cannot append payload to Mach-O template');
+    Result := Packaged;
+    Exit;
+  end;
+  if MachRes <> mmrOk then
+    raise EWasmPackagingError.Create(
+      'runtime shell packaging failed for target "' + ATarget + '": ' +
+      MachOPackageFailText(MachRes));
+  Result := Packaged;
 end;
 
 procedure WriteCompileOutput(const APath: string; const ABytes: TWasmBytes);
@@ -444,22 +662,29 @@ begin
       DeleteFile(TmpPath);
     raise;
   end;
+  {$IFDEF UNIX}
+  if FpChmod(APath, &755) <> 0 then
+    raise EStreamError.Create('cannot mark executable "' + APath + '"');
+  {$ENDIF}
 end;
 
 function CompileLoaded(const ALoaded: TWasmLoadedModule;
   const ARequest: TWasmCompileRequest): TWasmCompileResult;
 var
   Target: string;
+  Artifact, Template, Payload, Packaged: TWasmBytes;
 begin
   if not ResolvedCompileTarget(ARequest.Target, Target, Result) then
     Exit;
 
   try
-    CheckConnectors(ARequest.Connectors);
-    CheckLink(ALoaded);
-    StrictCompileNative;
-    PackageCompilePayload(Target);
-    WriteCompileOutput(ARequest.OutputPath, nil);
+    CheckConnectorsAndLink(ALoaded, ARequest.Connectors);
+    Artifact := StrictCompileNative(ALoaded, Target);
+    Template := LoadCompileTemplate(Target, ARequest.CatalogRoot);
+    Payload := NativePayloadFromArtifact(ALoaded, Artifact, Template, Target);
+    Packaged := PackageCompilePayload(Target, Payload, ARequest.CatalogRoot,
+      ARequest.OutputPath);
+    WriteCompileOutput(ARequest.OutputPath, Packaged);
     Result.ExitCode := 0;
     Result.Diagnostic := '';
   except

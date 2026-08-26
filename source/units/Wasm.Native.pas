@@ -40,6 +40,7 @@ uses
   Wasm.Interp,
   Wasm.Ir,
   Wasm.Jit.CodeBuffer,
+  Wasm.Native.Payload,
   Wasm.Runtime.Store,
   Wasm.Runtime.Traps,
   Wasm.Runtime.Values;
@@ -85,6 +86,14 @@ function NativeLoadResultText(const AResult: TWasmNativeLoadResult): string;
 function NativeLoadComplete(const AStore: TWasmStore;
   const ALoaded: TWasmLoadedModule; const AInstance: TWasmModuleInstance;
   const AArtifact: TWasmBytes; out AResult: TWasmNativeLoadResult): TWasmNativeContext;
+
+{ Same complete-image install over a parsed native-executable payload
+  (WNEP). Every defined function must have code; there is no interpreter
+  fallback. }
+function NativeLoadCompletePayload(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule; const AInstance: TWasmModuleInstance;
+  const APayload: TWasmNativePayload;
+  out AResult: TWasmNativeLoadResult): TWasmNativeContext;
 
 { Host-to-guest entry that installs the per-invocation trampoline and
   dispatches only through compiled entries. A missing compiled entry is
@@ -372,6 +381,139 @@ begin
         Exit;
       end;
       if (not Rec^.Compiled) or (Length(Rec^.Code) = 0) then
+      begin
+        AResult := nlrIncomplete;
+        Native.Free;
+        Exit;
+      end;
+      if Rec^.RegisterCount <> Ir.Functions[Rec^.FuncIrIndex].RegisterCount then
+      begin
+        AResult := nlrMalformed;
+        Native.Free;
+        Exit;
+      end;
+      ModuleFuncIndex := Ir.FuncImportCount + Rec^.FuncIrIndex;
+      if ModuleFuncIndex >= UInt32(Length(AInstance.FuncAddrs)) then
+      begin
+        AResult := nlrMalformed;
+        Native.Free;
+        Exit;
+      end;
+      Addr := AInstance.FuncAddrs[ModuleFuncIndex];
+      if not Native.LoadPrecompiled(Addr, Rec^.Code, Rec^.EntryOffset) then
+      begin
+        AResult := nlrIncomplete;
+        Native.Free;
+        Exit;
+      end;
+      if NativeCanDirectCall(Ir.Functions[Rec^.FuncIrIndex]) then
+        AStore.Funcs[Addr].CompiledDirectEntry :=
+          AStore.Funcs[Addr].CompiledEntry;
+      Covered[Rec^.FuncIrIndex] := True;
+    end;
+
+    for I := 0 to High(Covered) do
+      if not Covered[I] then
+      begin
+        AResult := nlrIncomplete;
+        Native.Free;
+        Exit;
+      end;
+  except
+    Native.Free;
+    AResult := nlrMalformed;
+    Exit;
+  end;
+
+  AResult := nlrLoaded;
+  Result := Native;
+end;
+
+function NativeLoadCompletePayload(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule; const AInstance: TWasmModuleInstance;
+  const APayload: TWasmNativePayload;
+  out AResult: TWasmNativeLoadResult): TWasmNativeContext;
+var
+  LiveHash: TWasmNativeHash128;
+  Native: TWasmNativeContext;
+  I: Integer;
+  Rec: ^TWasmNativeCodeRecord;
+  Covered: array of Boolean;
+  ModuleFuncIndex: UInt32;
+  Addr: TWasmFuncAddr;
+  Ir: TWasmIrModule;
+begin
+  Result := nil;
+  if (AStore = nil) or (ALoaded = nil) or (AInstance = nil) then
+  begin
+    AResult := nlrMalformed;
+    Exit;
+  end;
+  if Length(APayload.ModuleBytes) = 0 then
+  begin
+    AResult := nlrIncomplete;
+    Exit;
+  end;
+
+  if APayload.Header.IrFormatVer <> UInt16(IR_FORMAT_VERSION) then
+  begin
+    AResult := nlrIrVersionMismatch;
+    Exit;
+  end;
+  if NativeHostArch = WAOT_ARCH_UNKNOWN then
+  begin
+    AResult := nlrNoBackend;
+    Exit;
+  end;
+  if APayload.Header.TargetArch <> NativeHostArch then
+  begin
+    AResult := nlrArchMismatch;
+    Exit;
+  end;
+  if APayload.Header.AbiFingerprint <> WasmAotAbiFingerprint(AStore) then
+  begin
+    AResult := nlrAbiMismatch;
+    Exit;
+  end;
+  LiveHash := WnepHash128(ALoaded.BytesPtr, ALoaded.BytesLength);
+  if not WnepHash128Equal(APayload.Header.ModuleHash, LiveHash) then
+  begin
+    AResult := nlrModuleHashMismatch;
+    Exit;
+  end;
+  if not JitExecMemSupported then
+  begin
+    AResult := nlrNoBackend;
+    Exit;
+  end;
+
+  Ir := ALoaded.Ir;
+  SetLength(Covered, Length(Ir.Functions));
+  for I := 0 to High(Covered) do
+    Covered[I] := False;
+
+  Native := TWasmNativeContext.Create(AStore);
+  try
+    AStore.JitInvokeCompiled := @NativeDispatch;
+    AStore.TierInvoke := @NativeTierInvoke;
+    {$IFDEF WASM_JIT_ARM64}
+    AStore.JitHelperTable := Arm64GetHelperTable;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    AStore.JitHelperTable := X64GetHelperTable;
+    {$ENDIF}
+    Native.FHookInstalled := True;
+
+    for I := 0 to High(APayload.Funcs) do
+    begin
+      Rec := @APayload.Funcs[I];
+      if Rec^.FuncIrIndex >= UInt32(Length(Ir.Functions)) then
+      begin
+        AResult := nlrMalformed;
+        Native.Free;
+        Exit;
+      end;
+      if Length(Rec^.Code) = 0 then
       begin
         AResult := nlrIncomplete;
         Native.Free;

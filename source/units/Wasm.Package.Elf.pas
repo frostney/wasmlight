@@ -137,6 +137,16 @@ function PackageElfShell(const ATemplate, APayload: TWasmBytes;
 function ParseElfPackage(const ABytes: TWasmBytes;
   out AInfo: TWasmElfPackageInfo): TWasmElfPackageResult;
 
+{ Append APayload and a WLSHELF trailer onto any template without requiring
+  ELF. Used when a Mach-O host sibling has no header slack for a payload
+  section. The trailer target byte is 0 so ParseElfPackage rejects it. }
+function PackageAppendedPayload(const ATemplate, APayload: TWasmBytes;
+  out APackaged: TWasmBytes): TWasmElfPackageResult;
+
+{ Read a WLSHELF trailer whose prefix is not necessarily ELF. }
+function ParseAppendedPayload(const ABytes: TWasmBytes;
+  out APayload: TWasmBytes): TWasmElfPackageResult;
+
 { Write ABytes and, on UNIX, set owner/group/other execute so the kernel
   will honour the ELF. The bytes themselves are unchanged. }
 procedure WriteElfPackageFile(const APath: string; const ABytes: TWasmBytes);
@@ -568,6 +578,88 @@ begin
   if Hash <> AInfo.PayloadHash then
   begin
     AInfo.Payload := nil;
+    Exit(eprBadChecksum);
+  end;
+  Result := eprOk;
+end;
+
+function PackageAppendedPayload(const ATemplate, APayload: TWasmBytes;
+  out APackaged: TWasmBytes): TWasmElfPackageResult;
+var
+  Total, Off: Integer;
+  Hash: UInt64;
+begin
+  APackaged := nil;
+  if UInt64(Length(ATemplate)) + UInt64(Length(APayload))
+    + WLSHELF_TRAILER_SIZE > UInt64(High(Integer)) then
+    Exit(eprMalformed);
+  Total := Length(ATemplate) + Length(APayload) + WLSHELF_TRAILER_SIZE;
+  SetLength(APackaged, Total);
+  if Length(ATemplate) > 0 then
+    Move(ATemplate[0], APackaged[0], Length(ATemplate));
+  if Length(APayload) > 0 then
+    Move(APayload[0], APackaged[Length(ATemplate)], Length(APayload));
+  Hash := ElfPackageHash64Bytes(APayload);
+  Off := Length(ATemplate) + Length(APayload);
+  WriteU64At(APackaged, Off, UInt64(Length(ATemplate)));
+  WriteU64At(APackaged, Off + 8, UInt64(Length(APayload)));
+  WriteU64At(APackaged, Off + 16, Hash);
+  APackaged[Off + 24] := 0;
+  APackaged[Off + 25] := WLSHELF_FORMAT_VERSION;
+  APackaged[Off + 26] := 0;
+  APackaged[Off + 27] := 0;
+  APackaged[Off + 28] := WLSHELF_MAGIC0;
+  APackaged[Off + 29] := WLSHELF_MAGIC1;
+  APackaged[Off + 30] := WLSHELF_MAGIC2;
+  APackaged[Off + 31] := WLSHELF_MAGIC3;
+  APackaged[Off + 32] := WLSHELF_MAGIC4;
+  APackaged[Off + 33] := WLSHELF_MAGIC5;
+  APackaged[Off + 34] := WLSHELF_MAGIC6;
+  APackaged[Off + 35] := WLSHELF_MAGIC7;
+  Result := eprOk;
+end;
+
+function ParseAppendedPayload(const ABytes: TWasmBytes;
+  out APayload: TWasmBytes): TWasmElfPackageResult;
+var
+  TrailerOff: Integer;
+  PayloadOffset, PayloadSize, Hash, ExpectedEnd, StoredHash: UInt64;
+begin
+  APayload := nil;
+  if Length(ABytes) < WLSHELF_TRAILER_SIZE then
+    Exit(eprTruncated);
+  TrailerOff := Length(ABytes) - WLSHELF_TRAILER_SIZE;
+  if not TrailerMagicAt(ABytes, TrailerOff + 28) then
+    Exit(eprBadMagic);
+  if ABytes[TrailerOff + 25] <> WLSHELF_FORMAT_VERSION then
+    Exit(eprBadVersion);
+  if (ABytes[TrailerOff + 26] <> 0) or (ABytes[TrailerOff + 27] <> 0) then
+    Exit(eprMalformed);
+  if ABytes[TrailerOff + 24] <> 0 then
+    Exit(eprMalformed);
+  if not ReadU64(ABytes, TrailerOff, PayloadOffset) then
+    Exit(eprTruncated);
+  if not ReadU64(ABytes, TrailerOff + 8, PayloadSize) then
+    Exit(eprTruncated);
+  if not ReadU64(ABytes, TrailerOff + 16, StoredHash) then
+    Exit(eprTruncated);
+  if PayloadOffset > UInt64(High(Integer)) then
+    Exit(eprTruncated);
+  if PayloadSize > UInt64(High(Integer)) then
+    Exit(eprTruncated);
+  ExpectedEnd := PayloadOffset + PayloadSize + UInt64(WLSHELF_TRAILER_SIZE);
+  if ExpectedEnd <> UInt64(Length(ABytes)) then
+    Exit(eprTruncated);
+  SetLength(APayload, Integer(PayloadSize));
+  if PayloadSize > 0 then
+    Move(ABytes[Integer(PayloadOffset)], APayload[0], Integer(PayloadSize));
+  if Length(APayload) = 0 then
+    Hash := ElfPackageHash64(nil, 0)
+  else
+    Hash := ElfPackageHash64(@APayload[0], NativeUInt(Length(APayload)));
+  if Hash <> StoredHash then
+  begin
+    APayload := nil;
     Exit(eprBadChecksum);
   end;
   Result := eprOk;
