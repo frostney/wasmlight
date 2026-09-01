@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.7.0"
+  LWPT_VERSION: "0.6.0"
 
 jobs:
   # Branches come from main only. A PR head must CONTAIN the current default
