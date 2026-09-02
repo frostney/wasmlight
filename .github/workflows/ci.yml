@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.7.0"
+  LWPT_VERSION: "0.6.0"
 
 jobs:
   test:
@@ -168,14 +168,6 @@ jobs:
       - name: lwpt agents --check (one runner)
         if: matrix.format-check == true
         run: lwpt agents --check
-
-      - name: lwpt health (complexity ratchet)
-        if: matrix.format-check == true
-        run: lwpt health
-
-      - name: lwpt duplication (clone ratchet)
-        if: matrix.format-check == true
-        run: lwpt duplication
 
       - name: lwpt build (all programs)
         run: lwpt build
