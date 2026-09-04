@@ -512,7 +512,7 @@ procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
 function Arm64CanInlineScalarBody(const ACode: TWasmBytes): Boolean;
 procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const ACode: TWasmBytes; const ARegisterCount: UInt32;
+  const ACode: TWasmBytes; const ARegisterCount, AResultSlot: UInt32;
   var ACache: TArm64RegCache);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer;
@@ -5364,7 +5364,7 @@ end;
 
 procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const ACode: TWasmBytes; const ARegisterCount: UInt32;
+  const ACode: TWasmBytes; const ARegisterCount, AResultSlot: UInt32;
   var ACache: TArm64RegCache);
 var
   FO: TWasmJitFrameOffsets;
@@ -5408,9 +5408,9 @@ begin
   end;
   ABuf.EmitBytes(ACode);
   if ACache.PreservedInlineStatics then
-    Arm64CachedStore(ABuf, ACache, 12, IrAuxBlockItem(AAux, AIns.B, 0))
+    Arm64CachedStore(ABuf, ACache, 12, AResultSlot)
   else
-    StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
+    StX(ABuf, 12, AResultSlot);
   EmitBranchTo(ABuf, UInt32(Done));
   ABuf.BindLabel(Exhausted);
   Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
