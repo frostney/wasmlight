@@ -53,6 +53,7 @@ type
     procedure TestWordBuilderBits;
     procedure TestFrameWordBits;
     procedure TestNativeLeafFrameBranches;
+    procedure TestInlineScalarBodyFence;
     procedure TestBranchPlaceholderBits;
     procedure TestLocalCallPatch;
     procedure TestSlotOffset;
@@ -97,6 +98,47 @@ function EmittedWord(const ABuf: TWasmCodeBuffer;
   const AIndex: Integer): UInt32; forward;
 
 { --- portable bit assertions -------------------------------------------- }
+
+procedure TArm64Tests.TestInlineScalarBodyFence;
+var
+  Buf: TWasmCodeBuffer;
+  I: Integer;
+const
+  Rejected: array[0..10] of UInt32 = (
+    $F940026C, { ldr x12,[x19]: spill reload }
+    $F900026C, { str x12,[x19]: spill }
+    $5800000C, { literal load }
+    $14000001, { b }
+    $94000001, { bl }
+    $D63F0120, { blr x9 }
+    $D65F03C0, { ret }
+    $1000000C, { adr x12 }
+    $9000000C, { adrp x12 }
+    $AA0C03F3, { mov x19,x12: pinned register clobber }
+    $910043FF  { add sp,sp,#16 }
+  );
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.EmitU32(Arm64AddW(14, 12, 13));
+    Buf.EmitU32(Arm64MovReg(12, 14));
+    Expect<Boolean>(Arm64CanInlineScalarBody(Buf.SnapshotBytes)).ToBe(True);
+    Buf.EmitByte(0);
+    Expect<Boolean>(Arm64CanInlineScalarBody(Buf.SnapshotBytes)).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+  for I := Low(Rejected) to High(Rejected) do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      Buf.EmitU32(Rejected[I]);
+      Expect<Boolean>(Arm64CanInlineScalarBody(Buf.SnapshotBytes)).ToBe(False);
+    finally
+      Buf.Free;
+    end;
+  end;
+end;
 
 procedure TArm64Tests.TestWordBuilderBits;
 begin
@@ -1088,6 +1130,8 @@ end;
 procedure TArm64Tests.SetupTests;
 begin
   Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
+  Test('scalar body fence excludes spills, control flow and pinned writes',
+    TestInlineScalarBodyFence);
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
   Test('native leaf entry branches follow the restored stack frame',
     TestNativeLeafFrameBranches);
