@@ -525,6 +525,8 @@ var
   {$IFDEF WASM_JIT_ARM64}
   InlineBodies: array of TWasmBytes;
   InlineRegisterCounts: array of UInt32;
+  InlineResultSlots: array of UInt32;
+  NativeResultSource: UInt32;
   UsePreservedInlineCache: Boolean;
   {$ENDIF}
   UseExtendedFrame: Boolean;
@@ -592,7 +594,7 @@ var
       end;
   end;
 
-  function VectorUseCount(const AReg: UInt32): UInt32;
+  function RegisterUseCount(const AReg: UInt32): UInt32;
   var
     Info: TWasmIrOpInfo;
     K, N: Integer;
@@ -654,6 +656,7 @@ var
   begin
     SetLength(InlineBodies, Length(AFn^.Code));
     SetLength(InlineRegisterCounts, Length(AFn^.Code));
+    SetLength(InlineResultSlots, Length(AFn^.Code));
     UsedBytes := 0;
     for K := 0 to High(AFn^.Code) do
     begin
@@ -695,6 +698,8 @@ var
           Continue;
         InlineBodies[K] := Body;
         InlineRegisterCounts[K] := Leaf^.RegisterCount;
+        InlineResultSlots[K] := IrAuxBlockItem(AFn^.AuxU32,
+          AFn^.Code[K].B, 0);
         Inc(UsedBytes, Length(Body));
       finally
         LeafBuffer.Free;
@@ -718,7 +723,7 @@ var
         (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
         (PlannedCode[K - 1].Dest < UInt32(Length(AFn^.RegTypes))) and
         (AFn^.RegTypes[PlannedCode[K - 1].Dest].Kind = wvkVec) and
-        (VectorUseCount(PlannedCode[K - 1].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K - 1].Dest) = 1) and
         not IsVisibleFrameReg(PlannedCode[K - 1].Dest) and
         IsVisibleFrameReg(PlannedCode[K].Dest) and
         not Targets[K - 1] and not Targets[K] then
@@ -749,6 +754,59 @@ var
         SkipPlanned[K] := True;
       end;
   end;
+
+  {$IFDEF WASM_JIT_ARM64}
+  procedure AnalyzeResultCopies;
+  var
+    K, Last: Integer;
+    SingleReturn: Boolean;
+    ResultSlot: UInt32;
+  begin
+    NativeResultSource := NativeResultReg;
+    Last := High(PlannedCode);
+    if UseNativeScalarLeaf and (Last >= 1) and (Last < 24) and
+      (PlannedCode[Last].Op = iroReturn) and
+      (PlannedCode[Last - 1].Op = iroMove) and
+      (PlannedCode[Last - 1].Dest = NativeResultReg) and
+      not SkipPlanned[Last - 1] and not Targets[Last - 1] and
+      not Targets[Last] then
+    begin
+      SingleReturn := True;
+      for K := 0 to Last - 1 do
+        if PlannedCode[K].Op = iroReturn then
+          SingleReturn := False;
+      if SingleReturn then
+      begin
+        { The final copy has no intervening instruction or other return path.
+          Read its already-planned source into x12 at return; the external
+          wrapper still publishes x12 to canonical NativeResultReg. }
+        NativeResultSource := PlannedCode[Last - 1].A;
+        SkipPlanned[Last - 1] := True;
+      end;
+    end;
+    if not UsePreservedInlineCache then
+      Exit;
+    for K := 0 to Last - 1 do
+      if (Length(InlineBodies[K]) <> 0) and
+        (PlannedCode[K + 1].Op = iroMove) and
+        not SkipPlanned[K + 1] and not Targets[K] and
+        not Targets[K + 1] then
+      begin
+        ResultSlot := InlineResultSlots[K];
+        if (PlannedCode[K + 1].A = ResultSlot) and
+          not IsVisibleFrameReg(ResultSlot) and
+          IsVisibleFrameReg(PlannedCode[K + 1].Dest) and
+          (RegisterUseCount(ResultSlot) = 1) then
+        begin
+          { The proven body produces one numeric result, used only by this
+            adjacent lowering move. Count aux-list uses too; preserve both
+            labels and the call's exact capacity checks before computation. }
+          InlineResultSlots[K] := PlannedCode[K + 1].Dest;
+          SkipPlanned[K + 1] := True;
+        end;
+      end;
+  end;
+  {$ENDIF}
 
   function IsVisibleFrameReg(const AReg: UInt32): Boolean;
   var
@@ -1327,6 +1385,13 @@ var
       iroCall:
         for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, AIns.A)) - 1 do
           CountSlotUse(IrAuxBlockItem(AFn^.AuxU32, AIns.A, UInt32(N)));
+      {$IFDEF WASM_JIT_ARM64}
+      iroReturn:
+        if UseNativeScalarCore then
+          { Result-copy planning may make the actual return source an
+            expression slot. Retain its final read across dynamic eviction. }
+          CountSlotUse(NativeResultSource);
+      {$ENDIF}
     end;
   end;
 
@@ -2129,6 +2194,9 @@ begin
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
     AnalyzeLocalAliases;
+    {$IFDEF WASM_JIT_ARM64}
+    AnalyzeResultCopies;
+    {$ENDIF}
     AnalyzeStoreLoadForwarding;
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeMaskedShiftFusion;
@@ -2262,7 +2330,8 @@ begin
       if not UsePinnedMemory and (Length(InlineBodies[I]) <> 0) then
       begin
         Arm64EmitScalarBodyCall(Buf, AFn^.Code[I], AFn^.AuxU32,
-          InlineBodies[I], InlineRegisterCounts[I], ArmCache);
+          InlineBodies[I], InlineRegisterCounts[I], InlineResultSlots[I],
+          ArmCache);
         Emitted := True;
       end
       else if MaskedShiftSource[I] >= 0 then
@@ -2291,7 +2360,7 @@ begin
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
-            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
+            NativeResultSource, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
             @GcShapes[0], @GcAllocShapes[0], GcAllocInfo);
       end;
       {$ENDIF}

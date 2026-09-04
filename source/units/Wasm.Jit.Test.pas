@@ -1684,6 +1684,8 @@ type
     procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestInlineCallCacheAcrossBranches;
     procedure TestInlineCallCacheWideLiveTemporary;
+    procedure TestInlineResultCopiesAndAuxUses;
+    procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
     procedure TestLargeRegisterFileCompiles;
@@ -3184,6 +3186,122 @@ begin
     [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestNativeResultAcrossDroppedComputations;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_BACKEND}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount, Addr: UInt32;
+  Kind: TWasmExternKind;
+  Params: array[0..1] of TWasmValue;
+  Res: TWasmValue;
+  {$ENDIF}
+begin
+  { The return value remains on the wasm stack while dropped expressions
+    create enough register pressure to evict its dynamic host. Removing the
+    final lowering move must transfer its live use to the native return. }
+  Bytes := AssembleWatText('(module ' +
+    '(func (export "leaf") (param i64 i64) (result i64) ' +
+    '(i64.sub (local.get 0) (local.get 1)) ' +
+    '(drop (i64.add (local.get 0) (i64.const 17))) ' +
+    '(drop (i64.mul (local.get 1) (i64.const 19))) ' +
+    '(drop (i64.xor (local.get 0) (i64.const 23)))))');
+  CompileExports(['leaf']);
+  Expect<Boolean>(DiffFresh(Bytes, 'leaf',
+    [MakeValueI64(8589934595), MakeValueI64(4294967297)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := Bytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Expect<Boolean>(JitCanNativeScalarLeaf(@FIr.Functions[0])).ToBe(True);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+    EntryOffset, RegisterCount);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('leaf', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Params[0] := MakeValueI64(8589934595);
+  Params[1] := MakeValueI64(4294967297);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Params[0], @Res);
+  Expect<UInt64>(Res.Bits).ToBe(4294967298);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestInlineResultCopiesAndAuxUses;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_BACKEND}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount, Addr: UInt32;
+  Kind: TWasmExternKind;
+  Params: array[0..1] of TWasmValue;
+  Res: TWasmValue;
+  {$ENDIF}
+begin
+  { Direct local.set consumes a call result once. The nested local.tee result
+    is used by both a lowering move and a later call's aux argument list;
+    forwarding it solely to the local would lose that second use. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param i64 i64) (result i64) ' +
+    '(i64.sub (local.get 0) (local.get 1))) ' +
+    '(func (export "right") (param i64 i64) (result i64) (local.get 1)) ' +
+    '(func (export "run") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) (local $seen i64) ' +
+    '(local.set $acc (i64.const 8589934595)) ' +
+    '(loop $again ' +
+    '(local.set $acc (call $leaf (local.get $acc) (i64.const 4294967297))) ' +
+    '(local.set $seen (call $leaf ' +
+    '(local.tee $acc (call $leaf (local.get $acc) (i64.const 1))) ' +
+    '(local.get $acc))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $again (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.add (local.get $acc) (local.get $seen))))');
+  CompileExports(['leaf', 'right', 'run']);
+  Expect<Boolean>(DiffFresh(Bytes, 'leaf',
+    [MakeValueI64(8589934595), MakeValueI64(4294967297)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'right',
+    [MakeValueI64(8589934595), MakeValueI64(4294967297)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(3)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := Bytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  { Staged external leaf entry must still publish to the canonical result
+    slot, even though the native return now reads its expression source. }
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+    EntryOffset, RegisterCount);
+  InstantiateModule(FStore, FIr, @FBytes[0], Length(FBytes), FImports);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('leaf', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Params[0] := MakeValueI64(8589934595);
+  Params[1] := MakeValueI64(4294967297);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Params[0], @Res);
+  Expect<UInt64>(Res.Bits).ToBe(4294967298);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[2], 2,
+    EntryOffset, RegisterCount);
+  Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Params[0] := MakeValueI64(3);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Params[0], @Res);
+  Expect<UInt64>(Res.Bits).ToBe(UInt64($FFFFFFFEFFFFFFFD));
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestInlineCallCacheWideLiveTemporary;
 var
   Bytes: TWasmBytes;
@@ -4153,6 +4271,10 @@ end;
 
 procedure TJitTests.SetupTests;
 begin
+  Test('native return retains a value across dropped computations',
+    TestNativeResultAcrossDroppedComputations);
+  Test('inline results preserve external slots and aux-list uses',
+    TestInlineResultCopiesAndAuxUses);
   Test('slot stride matches the interpreter frame', TestSlotSizeMatchesInterp);
   Test('force-compile sets the compiled entry', TestForceCompileSetsEntry);
   Test('JIT i32.add is bitwise identical to the interpreter',
