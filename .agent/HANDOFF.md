@@ -1,5 +1,96 @@
 # Handoff
 
+Updated: 2026-09-04 (Wave 16 baseline instability localized)
+
+## Wave 16 diagnosis — ARM64 leaf epilogue post-indexed reload
+
+- Continued on `codex/optimize-runtime-wave16`, runtime source still at
+  `8b43e25447d3200ff9f86d48add5411ab355df54`. No production runtime patch,
+  commit, push, or PR was made. This handoff is the only delivery-worktree diff.
+- The initial awake direct-call variance is causally sensitive to
+  `Arm64EmitNativeLeafEntry`'s `Arm64LdpX19LrPost(FrameBytes)` emission
+  (`source/units/Wasm.Jit.Arm64.pas:807`). For this workload it emits
+  `ldp x19, x30, [sp], #96`. Keeping the paired load but moving the stack
+  adjustment to a separate `add sp, sp, #96` dramatically tightens timings.
+  The exact CPU mechanism (forwarding, dependency handling, etc.) is unproven;
+  do not label this a confirmed silicon defect.
+- Strongest control: six fresh processes, original module/artifact loaded once
+  each, same code/data addresses within each process, alternating ABBA with a
+  full four-invocation warmup block discarded. Each variant has 84 measured
+  samples. A NOP in the post-indexed control equalizes instruction count and
+  RET address with the separate-adjustment variant. All 192 invocations,
+  including warmups, passed the original fixture's independent result check.
+  Post-indexed control median **174.770 ms**, range **131.243–189.723**;
+  separate adjustment median **128.699 ms**, range **125.864–147.144**.
+  Median CPU cycles: **751.371 -> 549.165 million**, with approximately
+  **4.902 billion instructions** in both variants. This is diagnostic evidence,
+  not an accepted general optimization or a cross-platform correctness claim.
+- Startup/AOT setup was under 0.5 ms, CPU time tracked elapsed time, and the
+  final samples executed over 99% of their instructions on this host's Super
+  cores. Explicit high QoS, alignment/stack sweeps, a constant-target lookup,
+  and a direct branch did not independently remove the original variance.
+- A later isolation schedule crossed real laptop sleep/DarkWake cycles and is
+  wholly excluded as `excluded-sleep-frame-isolation.json`; power logs retain
+  the matching transitions. Awake confirmation used a scoped `caffeinate -i`
+  assertion and the shared benchmark lock. No permanent power settings changed.
+  These later sleep outliers are distinct from the initial CPU-time variance.
+- Durable evidence root remains
+  `/Users/jstein/.local/share/wasmlight-evidence/wave16-8b43e254`.
+  Read `diagnosis.md`, `final-layout-control.json`, and
+  `diagnosis-manifest.json`. `variance-probe-final` / `.pas` and
+  `final-layout-control.py` provide the reproducer. An isolated detached
+  `diagnostic-worktree` contains only a diagnostic program and manifest build
+  entry; its runtime units are restored to HEAD. Diagnostic byte patches are
+  guarded and valid only for this exact fixture, not arbitrary guest code.
+- Next: implement the separate stack adjustment in the real ARM64 leaf
+  epilogue emitter, preserving all labels and canonical entry paths; then
+  establish release A/B guard results and run the full optimization workflow's
+  correctness and cross-architecture gates. The retained baseline binary hash
+  is unchanged. No such production candidate has been accepted yet.
+
+Updated: 2026-09-04 (Wave 16 stopped at unstable baseline)
+
+## Wave 16 — direct-call baseline is not stable enough for acceptance
+
+- Freshly fetched `origin/main` and HEAD are
+  `8b43e25447d3200ff9f86d48add5411ab355df54`. Its exact push-to-main
+  [CI run 32890633665](https://github.com/frostney/wasmlight/actions/runs/32890633665)
+  completed successfully with all six required target jobs green.
+- Clean detached worktree became `codex/optimize-runtime-wave16` at that tip.
+  No runtime source was changed, candidate dispatched, commit made, or PR
+  published. Only this handoff changed. Frozen install and all four release
+  build entries passed with released `lwpt 0.6.0`.
+- Native host: Apple M5 Max / Mac17,6, macOS 26.6.2, arm64. Retained release
+  binaries, hashes, build logs, prepared modules/artifacts, and raw samples
+  are under
+  `/Users/jstein/.local/share/wasmlight-evidence/wave16-8b43e254`.
+  Baseline `wasmlight` SHA-256 is
+  `aed9da6c68abe6583a9812b70519f39181f0e834defe1cabcfc31ce3be1d39d5`.
+- Target was the existing independently checked 50-million-direct-call
+  workload. `bench.py --profile best --workload call --samples 7 --warmups 1`
+  used the retained binary and exact source commit, precompiled artifacts
+  outside timing, and `/tmp/wasmlight-perf-gate.lock`. All seven installed
+  runtimes passed their result checks. Wasmlight AOT measured median
+  **158.968 ms**, range **130.825–238.060 ms**; Wasmtime 47.0.3 measured
+  **62.333 ms**, range **61.085–66.418 ms**. The nominal 2.55x ratio is a
+  noisy diagnostic, not an accepted stable gap.
+- Confirmation reused the same binaries/artifacts under the same lock:
+  one discarded warmup per runtime, seven forward-order pairs followed by
+  seven reverse-order pairs. Wasmlight forward median **154.887 ms**
+  (137.406–221.499), reverse **172.294 ms** (141.501–214.853).
+  Wasmtime forward median **64.596 ms** (63.437–66.026), reverse
+  **62.707 ms** (62.118–63.859). All executions verified their results.
+- The unchanged baseline remains unstable across both schedules. Background
+  applications were active, but the cause is unresolved; do not attribute
+  it to host load, ASLR, or generated code without evidence. The skill's
+  unstable-baseline stop condition applies. No performance win is claimed.
+- Next: diagnose the process-to-process timing variance, then recapture a
+  stable release baseline before profiling or selecting candidates. Do not
+  repeat the rejected Wave 15 compact-call/scalar-leaf-inline experiments
+  without new profile evidence. Guard measurements, candidate A/B runs,
+  checked-build/unit/corpus gates, and cross-architecture verification were
+  not run because no runtime candidate was made.
+
 Updated: 2026-08-24 (roadmap and GitHub records created)
 
 ## Proposed 0.2.0 native compiler and connectors
