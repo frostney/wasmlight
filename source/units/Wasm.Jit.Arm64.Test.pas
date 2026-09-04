@@ -52,6 +52,7 @@ type
 
     procedure TestWordBuilderBits;
     procedure TestFrameWordBits;
+    procedure TestNativeLeafFrameBranches;
     procedure TestBranchPlaceholderBits;
     procedure TestLocalCallPatch;
     procedure TestSlotOffset;
@@ -208,6 +209,34 @@ begin
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
+end;
+
+procedure TArm64Tests.TestNativeLeafFrameBranches;
+var
+  Buf: TWasmCodeBuffer;
+  CoreLabel, ExternalLabel: TWasmJitLabel;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    CoreLabel := Buf.NewLabel;
+    ExternalLabel := Buf.NewLabel;
+    Arm64EmitNativeLeafEntry(Buf, 10, CoreLabel, ExternalLabel);
+    Buf.BindLabel(ExternalLabel);
+    Buf.EmitU32(Arm64Ret);
+    Buf.BindLabel(CoreLabel);
+    Buf.EmitU32(Arm64Ret);
+    Arm64ResolvePatches(Buf);
+    { Both entry paths must follow the expanded epilogue's labels. The
+      lightweight path restores the original register file and all 96 stack
+      bytes before returning; its paired reload has no SP writeback. }
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe($350000E4);
+    Expect<UInt32>(EmittedWord(Buf, 3)).ToBe($94000005);
+    Expect<UInt32>(EmittedWord(Buf, 4)).ToBe($A9407BF3);
+    Expect<UInt32>(EmittedWord(Buf, 5)).ToBe($910183FF);
+    Expect<UInt32>(EmittedWord(Buf, 6)).ToBe($D65F03C0);
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TArm64Tests.TestStaticCacheKeepsFourTemporaries;
@@ -1060,6 +1089,8 @@ procedure TArm64Tests.SetupTests;
 begin
   Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
+  Test('native leaf entry branches follow the restored stack frame',
+    TestNativeLeafFrameBranches);
   Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
   Test('local BL patches stay position-independent', TestLocalCallPatch);
   Test('slot byte offset is register*8', TestSlotOffset);

@@ -804,7 +804,10 @@ begin
   ABuf.EmitU32(Arm64StpX19LrPre(FrameBytes));
   ABuf.EmitU32(Arm64AddImmX(ARM64_REG_REGFILE, ARM64_REG_SP, 16));
   Arm64EmitBlTo(ABuf, ACoreLabel);
-  ABuf.EmitU32(Arm64LdpX19LrPost(FrameBytes));
+  { Separate SP writeback from the paired reload: the post-indexed form
+    produces unstable scalar-leaf call latency on Apple M5 Max. }
+  ABuf.EmitU32(Arm64LdpX19Lr(0));
+  ABuf.EmitU32(Arm64AddImmX(ARM64_REG_SP, ARM64_REG_SP, FrameBytes));
   Arm64EmitRet(ABuf);
 end;
 
