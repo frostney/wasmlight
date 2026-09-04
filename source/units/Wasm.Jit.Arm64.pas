@@ -501,6 +501,15 @@ procedure Arm64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
 procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
   const ARegisterCount: UInt32; const ACoreLabel,
   AExternalLabel: TWasmJitLabel);
+{ Screen output of the proven numeric-leaf emitter for copying at a call site:
+  exclude spills, literals, branches, PC-relative addressing and pinned writes.
+  Operand provenance comes from the existing core cache (x12/x13 parameters,
+  x14-x17 dynamic values, x9-x11 scratch); this is not an arbitrary-code verifier. }
+function Arm64CanInlineScalarBody(const ACode: TWasmBytes): Boolean;
+procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const ACode: TWasmBytes; const ARegisterCount: UInt32;
+  var ACache: TArm64RegCache);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer);
 
@@ -5288,6 +5297,79 @@ begin
   EmitNativeScalarSelfCallReg(ABuf, ARegisterCount, ACoreLabel,
     AExhaustedLabel);
   StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
+end;
+
+function Arm64CanInlineScalarBody(const ACode: TWasmBytes): Boolean;
+var
+  I: Integer;
+  Word: UInt32;
+begin
+  Result := False;
+  if (Length(ACode) = 0) or (Length(ACode) > 256) or
+    ((Length(ACode) and 3) <> 0) then
+    Exit;
+  I := 0;
+  while I < Length(ACode) do
+  begin
+    Word := UInt32(ACode[I]) or (UInt32(ACode[I + 1]) shl 8) or
+      (UInt32(ACode[I + 2]) shl 16) or (UInt32(ACode[I + 3]) shl 24);
+    { Arm DDI 0602, Index by Encoding: op1[28:25] = 100x is
+      data-processing immediate; x101 is data-processing register. The
+      former includes ADR/ADRP (bits[28:24] = 10000), excluded explicitly.
+      https://developer.arm.com/documentation/ddi0602/2023-12/Index-by-Encoding
+      This is an encoder-output fence, not another wasm semantic proof. }
+    if not (((Word and $1C000000) = $10000000) or
+      ((Word and $0E000000) = $0A000000)) or
+      ((Word and $1F000000) = $10000000) then
+      Exit;
+    { The existing scalar core ABI uses x9-x17, plus the zero register for
+      comparisons. A future allocator must not silently clobber caller state. }
+    if not ((Word and 31) in [9..17, 31]) or
+      (((Word and 31) = 31) and ((Word and $20000000) = 0)) then
+      Exit;
+    Inc(I, 4);
+  end;
+  Result := True;
+end;
+
+procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const ACode: TWasmBytes; const ARegisterCount: UInt32;
+  var ACache: TArm64RegCache);
+var
+  FO: TWasmJitFrameOffsets;
+  Exhausted, Done: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  Exhausted := ABuf.NewLabel;
+  Done := ABuf.NewLabel;
+  Arm64FlushRegCache(ABuf, ACache);
+  Arm64InvalidateRegCache(ACache);
+
+  { Keep the same two logical-frame limits at the call site, before the
+    scalar computation. The body cannot allocate, trap, or expose a frame;
+    it needs neither a published activation nor native stack scratch. Calls
+    do not add epoch polls: the shared IR-marked backedges remain unchanged. }
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxDepthCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HS, Exhausted);
+  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxValueTop));
+  ABuf.EmitU32(Arm64AddImmX(1, 1, ARegisterCount));
+  Arm64EmitLdrX(ABuf, 8, ARM64_REG_MEMORY, UInt32(FO.CtxValueCap));
+  ABuf.EmitU32(Arm64CmpX(1, 8));
+  EmitBCondTo(ABuf, ARM64_COND_HI, Exhausted);
+
+  LdX(ABuf, 12, IrAuxBlockItem(AAux, AIns.A, 0));
+  if IrAuxBlockCount(AAux, AIns.A) = 2 then
+    LdX(ABuf, 13, IrAuxBlockItem(AAux, AIns.A, 1));
+  ABuf.EmitBytes(ACode);
+  StX(ABuf, 12, IrAuxBlockItem(AAux, AIns.B, 0));
+  EmitBranchTo(ABuf, UInt32(Done));
+  ABuf.BindLabel(Exhausted);
+  Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
+  Arm64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(Done);
 end;
 
 { A compiled numeric leaf has no call, allocation, reference, handler,

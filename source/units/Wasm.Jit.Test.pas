@@ -1679,6 +1679,8 @@ type
     procedure TestNativeScalarSelfProofGate;
     procedure TestNativeScalarSelfSelectLiveness;
     procedure TestNativeScalarLeafProofAndExhaustion;
+    procedure TestInlineScalarBodyRelocation;
+    procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
     procedure TestLargeRegisterFileCompiles;
@@ -3128,6 +3130,82 @@ begin
     [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestInlineScalarBodyRelocation;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Code, GenericCode: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  Param, Res: TWasmValue;
+  Kind: TWasmExternKind;
+  Addr, HelperAddr: UInt32;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := CallPairModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[1], 1,
+    EntryOffset, RegisterCount);
+  GenericCode := JitStageFunctionBytes(FStore, @FIr.Functions[1], 1,
+    EntryOffset, RegisterCount);
+  {$IFDEF WASM_JIT_ARM64}
+  Expect<Boolean>(Length(Code) < Length(GenericCode)).ToBe(True);
+  {$ENDIF}
+  { Allocate an earlier instance before loading the staged caller, so its
+    funcidx-to-store-address mapping differs from the module's indices. The
+    target remains uncompiled: inline identity comes from the defined body. }
+  InstantiateModule(FStore, FIr, @FBytes[0], Length(FBytes), FImports);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FInstance.FindExport('helper', Kind, HelperAddr)).ToBe(True);
+  Expect<Boolean>(FStore.Funcs[HelperAddr].CompiledEntry = nil).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, 0)).ToBe(True);
+  Param := MakeValueI32(20);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<UInt64>(Res.Bits).ToBe(14); { (20 - 7) + 1 }
+  Expect<Boolean>(FStore.Funcs[HelperAddr].CompiledEntry = nil).ToBe(True);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestInlineScalarBodyEpochAndMemory;
+var
+  Bytes: TWasmBytes;
+begin
+  { A host bump before an acyclic scalar call must not invent an epoch poll;
+    current interpreter semantics poll the IR-marked loop backedges. }
+  Bytes := AssembleWatText('(module ' +
+    '(import "e" "bump" (func $bump)) ' +
+    '(func $leaf (param i32) (result i32) ' +
+    '(i32.add (local.get 0) (i32.const 1))) ' +
+    '(func (export "run") (param i32) (result i32) ' +
+    '(call $bump) (call $leaf (local.get 0))))');
+  FDiffHost := @JitBumpEpochCallback;
+  CompileExports(['run']);
+  Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(40)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  FDiffHost := nil;
+
+  { Preserve arguments across the body and a caller's live memory context;
+    compare separate stores so a previous tier cannot seed the load result. }
+  Bytes := AssembleWatText('(module (memory 1) ' +
+    '(func $leaf (param i32 i32) (result i32) ' +
+    '(i32.sub (local.get 1) (local.get 0))) ' +
+    '(func (export "run") (param i32) (result i32) ' +
+    '(i32.store (i32.const 0) (local.get 0)) ' +
+    '(i32.add (call $leaf (local.get 0) (local.get 0)) ' +
+    '(i32.load (i32.const 0)))))');
+  CompileExports(['run']);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(42)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 procedure TJitTests.TestNativeScalarLeafProofAndExhaustion;
 var
   Bytes: TWasmBytes;
@@ -3937,6 +4015,10 @@ begin
     TestNativeScalarSelfSelectLiveness);
   Test('native scalar leaf calls preserve proof and exhaustion boundaries',
     TestNativeScalarLeafProofAndExhaustion);
+  Test('inlined scalar body survives relocation without a compiled target',
+    TestInlineScalarBodyRelocation);
+  Test('inlined scalar calls preserve epoch and caller memory behavior',
+    TestInlineScalarBodyEpochAndMemory);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',

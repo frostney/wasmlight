@@ -522,6 +522,10 @@ var
   UseNativeScalarCall: Boolean;
   UseX64ExtendedFrame: Boolean;
   NativeScalarCall: Boolean;
+  {$IFDEF WASM_JIT_ARM64}
+  InlineBodies: array of TWasmBytes;
+  InlineRegisterCounts: array of UInt32;
+  {$ENDIF}
   UseExtendedFrame: Boolean;
   NativeParamCount: UInt32;
   NativeParamReg: UInt32;
@@ -636,6 +640,67 @@ var
       Exit;
     Result := JitCanNativeScalarLeaf(@AIr.Functions[DefinedIdx]);
   end;
+
+  {$IFDEF WASM_JIT_ARM64}
+  procedure PrepareInlineBodies;
+  var
+    K, N, UsedBytes, StartOffset: Integer;
+    Target: UInt32;
+    Leaf: PWasmIrFunctionRec;
+    LeafBuffer: TWasmCodeBuffer;
+    Body: TWasmBytes;
+    SingleReturn: Boolean;
+  begin
+    SetLength(InlineBodies, Length(AFn^.Code));
+    SetLength(InlineRegisterCounts, Length(AFn^.Code));
+    UsedBytes := 0;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if (AFn^.Code[K].Op <> iroCall) or (UsedBytes >= 256) then
+        Continue;
+      Target := UInt32(AFn^.Code[K].Imm);
+      if not NativeScalarLeafTarget(Target) then
+        Continue;
+      Leaf := @AIr.Functions[Target - AIr.FuncImportCount];
+      if (Length(Leaf^.Code) = 0) or (Length(Leaf^.Code) > 24) or
+        (Leaf^.Code[High(Leaf^.Code)].Op <> iroReturn) then
+        Continue;
+      SingleReturn := True;
+      for N := 0 to High(Leaf^.Code) - 1 do
+        if Leaf^.Code[N].Op = iroReturn then
+          SingleReturn := False;
+      if not SingleReturn then
+        Continue;
+      { A defined funcidx denotes the immutable body in this module, unlike
+        an import. Use the existing numeric-leaf proof and emitter; neither a
+        live compiled entry nor a store address is part of these semantics
+        (pinned core exec-call / exec-invoke). No process pointer is copied. }
+      LeafBuffer := JitCompileToBuffer(AIr, Leaf, Target, AEpochOffset,
+        ASnapshotOffset, AHelperTableOffset, False);
+      try
+        StartOffset := LeafBuffer.LabelOffset(0);
+        Body := LeafBuffer.SnapshotBytes;
+        { All core paths end in exactly one RET. Keep its result move but
+          replace the return itself with ordinary caller fallthrough. }
+        if (Length(Body) < StartOffset + 4) or
+          (Body[High(Body) - 3] <> $C0) or
+          (Body[High(Body) - 2] <> $03) or
+          (Body[High(Body) - 1] <> $5F) or
+          (Body[High(Body)] <> $D6) then
+          Continue;
+        Body := Copy(Body, StartOffset, Length(Body) - StartOffset - 4);
+        if (UsedBytes + Length(Body) > 256) or
+          not Arm64CanInlineScalarBody(Body) then
+          Continue;
+        InlineBodies[K] := Body;
+        InlineRegisterCounts[K] := Leaf^.RegisterCount;
+        Inc(UsedBytes, Length(Body));
+      finally
+        LeafBuffer.Free;
+      end;
+    end;
+  end;
+  {$ENDIF}
 
   procedure AnalyzeAdjacentMoves;
   var
@@ -1963,6 +2028,9 @@ begin
       EhEndLabel := 0;
     end;
     {$IFDEF WASM_JIT_ARM64}
+    { Recursive leaf emission must finish before installing the caller's EH
+      labels in the backend emission context. }
+    PrepareInlineBodies;
     Arm64BeginEhEmit(HasHandlers, EhTableLabel, EhEndLabel,
       UInt32(Length(AFn^.Code)));
     {$ENDIF}
@@ -2153,7 +2221,13 @@ begin
         base (x23/rbp), which the entry receives freshly per invocation — no
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      if MaskedShiftSource[I] >= 0 then
+      if not UsePinnedMemory and (Length(InlineBodies[I]) <> 0) then
+      begin
+        Arm64EmitScalarBodyCall(Buf, AFn^.Code[I], AFn^.AuxU32,
+          InlineBodies[I], InlineRegisterCounts[I], ArmCache);
+        Emitted := True;
+      end
+      else if MaskedShiftSource[I] >= 0 then
       begin
         Arm64EmitMaskedShiftCached(Buf, UInt32(MaskedShiftSource[I]),
           PlannedCode[I].Dest, Byte(MaskedShiftShape[I] and $FF),
