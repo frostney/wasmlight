@@ -2081,9 +2081,12 @@ begin
       Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
       if ConstSlots[0] <> High(UInt32) then
         Arm64EnableConstSlots(Buf, ArmCache, ConstSlots, ConstSlotBits);
-      if UsePinnedMemoryBase then
-        Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
-          @VisibleSlots[0], AFn^.RegisterCount);
+      { StaticCacheOp admits only helper-free scalar operations or base-pinned
+        memory. Both retain the same dynamic registers and can defer temporary
+        stores: locals, results, and loop-carried values stay visible to the
+        existing branch/exit reconciliation plan. }
+      Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
     end;
     if UseNativeScalarCore then
       { The closed helper-free native core may defer block-local numeric
