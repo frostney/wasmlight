@@ -1682,6 +1682,8 @@ type
     procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
+    procedure TestInlineCallCacheAcrossBranches;
+    procedure TestInlineCallCacheWideLiveTemporary;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
     procedure TestLargeRegisterFileCompiles;
@@ -3182,6 +3184,144 @@ begin
     [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestInlineCallCacheWideLiveTemporary;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_BACKEND}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  Param, Res: TWasmValue;
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  {$ENDIF}
+begin
+  { The multiply result is a dynamic temporary live while the right-hand
+    operand calls a non-commuting i64 leaf. Both arguments and the expected
+    result have significant high32 bits: a caller spill or narrow move loses
+    observable state, even when the loop locals themselves are preserved. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (param i64 i64) (result i64) ' +
+    '(i64.sub (local.get 0) (local.get 1))) ' +
+    '(func (export "run") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) ' +
+    '(local.set $acc (i64.const 4294967296)) ' +
+    '(loop $again ' +
+    '(local.set $acc (i64.add ' +
+    '(i64.mul (local.get $i) (i64.const 4294967297)) ' +
+    '(call $leaf (local.get $acc) (i64.const 8589934595)))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $again (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  CompileExports(['run']);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(3)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := Bytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[1], 1,
+    EntryOffset, RegisterCount);
+  {$IFDEF WASM_JIT_ARM64}
+  Expect<UInt32>(UInt32(Code[0]) or (UInt32(Code[1]) shl 8) or
+    (UInt32(Code[2]) shl 16) or (UInt32(Code[3]) shl 24)).ToBe($D10083FF);
+  {$ENDIF}
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Param := MakeValueI64(3);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<UInt64>(Res.Bits).ToBe(UInt64($FFFFFFFDFFFFFFFA));
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestInlineCallCacheAcrossBranches;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_BACKEND}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  Param, Res: TWasmValue;
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  {$ENDIF}
+begin
+  { Two non-commuting argument orders meet at a join, with the accumulator,
+    loop index and limit all live across the inlined calls and backedge. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (param i32 i32) (result i32) ' +
+    '(i32.sub (local.get 0) (local.get 1))) ' +
+    '(func (export "run") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 100)) ' +
+    '(loop $again ' +
+    '(local.set $acc (if (result i32) ' +
+    '(i32.and (local.get $i) (i32.const 1)) ' +
+    '(then (call $leaf (local.get $acc) (local.get $i))) ' +
+    '(else (call $leaf (local.get $i) (local.get $acc))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $again (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (local.get $acc) (local.get $i))))');
+  CompileExports(['run']);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(5)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(17)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := Bytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[1], 1,
+    EntryOffset, RegisterCount);
+  {$IFDEF WASM_JIT_ARM64}
+  { The new preserved-cache frame reserves32 extra aligned bytes. This keeps
+    the regression on the optimized path as eligibility evolves. }
+  Expect<UInt32>(UInt32(Code[0]) or (UInt32(Code[1]) shl 8) or
+    (UInt32(Code[2]) shl 16) or (UInt32(Code[3]) shl 24)).ToBe($D10083FF);
+  {$ENDIF}
+  InstantiateModule(FStore, FIr, @FBytes[0], Length(FBytes), FImports);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Param := MakeValueI32(5);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<UInt64>(Res.Bits).ToBe(UInt32($FFFFFFA5)); { -91 }
+
+  { Exact positive value/depth boundaries plus both exhaustion routes, with
+    fresh contexts in the differential helper. The native cache never changes
+    the interpreter's required register count or logical depth. }
+  WasmInterpMaxDepth := 2;
+  WasmInterpValueSlots := FIr.Functions[0].RegisterCount + RegisterCount;
+  try
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(5)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Dec(WasmInterpValueSlots);
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(5)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(5)]))
+      .ToBe('call stack exhausted');
+    WasmInterpValueSlots := 1 shl 16;
+    WasmInterpMaxDepth := 1;
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(5)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    WasmInterpMaxDepth := 256;
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestInlineScalarBodyRelocation;
 {$IFDEF WASM_JIT_BACKEND}
 var
@@ -4073,6 +4213,10 @@ begin
     TestInlineScalarBodyRelocation);
   Test('inlined scalar calls preserve epoch and caller memory behavior',
     TestInlineScalarBodyEpochAndMemory);
+  Test('inline call cache preserves locals across branches and relocation',
+    TestInlineCallCacheAcrossBranches);
+  Test('inline call cache preserves wide arguments and a live dynamic temporary',
+    TestInlineCallCacheWideLiveTemporary);
   Test('deep non-tail recursion exhausts at the same logical depth',
     TestDeepRecursionExhausts);
   Test('a throw crosses a compiled seam frame and is caught by the interp handler',

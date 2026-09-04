@@ -54,6 +54,7 @@ type
     procedure TestFrameWordBits;
     procedure TestNativeLeafFrameBranches;
     procedure TestInlineScalarBodyFence;
+    procedure TestPreservedInlineFrame;
     procedure TestBranchPlaceholderBits;
     procedure TestLocalCallPatch;
     procedure TestSlotOffset;
@@ -98,6 +99,29 @@ function EmittedWord(const ABuf: TWasmCodeBuffer;
   const AIndex: Integer): UInt32; forward;
 
 { --- portable bit assertions -------------------------------------------- }
+
+procedure TArm64Tests.TestPreservedInlineFrame;
+var
+  Buf: TWasmCodeBuffer;
+  Epilogue: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitPrologueExtended(Buf, True);
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe($D10083FF); { sub sp,sp,#32 }
+    Expect<UInt32>(EmittedWord(Buf, 10)).ToBe(Arm64StrX(26, 31, 64));
+    Expect<UInt32>(EmittedWord(Buf, 11)).ToBe(Arm64StrX(27, 31, 72));
+    Expect<UInt32>(EmittedWord(Buf, 12)).ToBe(Arm64StrX(28, 31, 80));
+    Epilogue := Buf.Size div 4;
+    Arm64EmitEpilogueExtended(Buf, True);
+    Expect<UInt32>(EmittedWord(Buf, Epilogue)).ToBe(Arm64LdrX(27, 31, 72));
+    Expect<UInt32>(EmittedWord(Buf, Epilogue + 1)).ToBe(Arm64LdrX(28, 31, 80));
+    Expect<UInt32>(EmittedWord(Buf, Epilogue + 2)).ToBe(Arm64LdrX(26, 31, 64));
+    Expect<UInt32>(EmittedWord(Buf, Buf.Size div 4 - 2)).ToBe($910083FF);
+  finally
+    Buf.Free;
+  end;
+end;
 
 procedure TArm64Tests.TestInlineScalarBodyFence;
 var
@@ -1132,6 +1156,8 @@ begin
   Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
   Test('scalar body fence excludes spills, control flow and pinned writes',
     TestInlineScalarBodyFence);
+  Test('inline-call cache preserves x26-x28 in an aligned frame',
+    TestPreservedInlineFrame);
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
   Test('native leaf entry branches follow the restored stack frame',
     TestNativeLeafFrameBranches);

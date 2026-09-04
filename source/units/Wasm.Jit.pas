@@ -525,6 +525,7 @@ var
   {$IFDEF WASM_JIT_ARM64}
   InlineBodies: array of TWasmBytes;
   InlineRegisterCounts: array of UInt32;
+  UsePreservedInlineCache: Boolean;
   {$ENDIF}
   UseExtendedFrame: Boolean;
   NativeParamCount: UInt32;
@@ -1466,22 +1467,47 @@ var
   var
     K, Best, Second, Third: Integer;
     HasBackEdge, Eligible: Boolean;
+    {$IFDEF WASM_JIT_ARM64}
+    HasInlineCall: Boolean;
+    {$ENDIF}
   begin
     UseStaticCache := False;
+    {$IFDEF WASM_JIT_ARM64}
+    UsePreservedInlineCache := False;
+    {$ENDIF}
     AllocatedSlots[2] := High(UInt32);
     if AFn^.RegisterCount = 0 then
       Exit;
     SetLength(SlotScores, AFn^.RegisterCount);
     HasBackEdge := False;
     Eligible := True;
+    {$IFDEF WASM_JIT_ARM64}
+    HasInlineCall := False;
+    {$ENDIF}
     for K := 0 to High(AFn^.Code) do
     begin
-      Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
+      {$IFDEF WASM_JIT_ARM64}
+      if (AFn^.Code[K].Op = iroCall) and
+        (Length(InlineBodies[K]) <> 0) then
+        HasInlineCall := True
+      else
+      {$ENDIF}
+        Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
       if (AFn^.Code[K].Op = iroJump) and
         (AFn^.Code[K].A <= UInt32(K)) then
         HasBackEdge := True;
       ScoreInstruction(AFn^.Code[K]);
     end;
+    {$IFDEF WASM_JIT_ARM64}
+    if HasInlineCall then
+    begin
+      Eligible := Eligible and not UsePinnedMemory and not HasHandlers;
+      for K := 0 to High(AFn^.RegTypes) do
+        Eligible := Eligible and (AFn^.RegTypes[K].Kind = wvkNum) and
+          ((AFn^.RegTypes[K].Num = wntI32) or
+          (AFn^.RegTypes[K].Num = wntI64));
+    end;
+    {$ENDIF}
     if not Eligible or not HasBackEdge then
       Exit;
 
@@ -1514,6 +1540,13 @@ var
       AllocatedSlots[2] := UInt32(Third)
     else
       AllocatedSlots[2] := High(UInt32);
+    {$IFDEF WASM_JIT_ARM64}
+    UsePreservedInlineCache := HasInlineCall;
+    if UsePreservedInlineCache then
+      { Reserve the third preserved host for the existing one-constant plan;
+        every dynamic host remains inside the body's x14-x17 clobber set. }
+      AllocatedSlots[2] := High(UInt32);
+    {$ENDIF}
     UseStaticCache := True;
   end;
 
@@ -2114,7 +2147,8 @@ begin
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
-    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
+    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf or
+      UsePreservedInlineCache;
     if UseNativeScalarLeaf then
     begin
       Arm64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeCoreLabel,
@@ -2122,7 +2156,7 @@ begin
       Buf.BindLabel(NativeExternalLabel);
     end;
     if UseExtendedFrame then
-      Arm64EmitPrologueExtended(Buf)
+      Arm64EmitPrologueExtended(Buf, UsePreservedInlineCache)
     else
       Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
@@ -2146,7 +2180,8 @@ begin
     Arm64InitRegCache(ArmCache);
     if UseStaticCache then
     begin
-      Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
+      Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots,
+        UsePreservedInlineCache);
       if ConstSlots[0] <> High(UInt32) then
         Arm64EnableConstSlots(Buf, ArmCache, ConstSlots, ConstSlotBits);
       { StaticCacheOp admits only helper-free scalar operations or base-pinned
