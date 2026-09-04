@@ -1656,6 +1656,7 @@ type
     procedure TestSelect;
     procedure TestNestedIf;
     procedure TestLoopSum;
+    procedure TestScalarLoopCarriedCache;
     procedure TestBrTable;
     procedure TestUnreachable;
     procedure TestEpochInterruptDifferential;
@@ -2524,6 +2525,57 @@ begin
   { Many back-edges -> the epoch check runs 100 times and never false-trips. }
   DiffModule(OneFunc(BLit([$60, $01, $7F, $01, $7F]), Body, 'sum'), 'sum',
     [MakeValueI32(100)]);
+end;
+
+procedure TJitTests.TestScalarLoopCarriedCache;
+const
+  Inputs: array[0 .. 5] of Integer = (0, 1, 2, 3, 17, 100);
+  Expected: array[0 .. 5] of Integer = (12, 12, 11, 14, 28, 109);
+var
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  Param, Res: TWasmValue;
+  I: Integer;
+begin
+  { The loop parameter remains live through an if/else and a backward edge,
+    while hotter locals occupy the fixed cache. The cold local's selected
+    branch value must survive the join and the final return. Pinned core
+    d7b37e4: exec-loop, exec-br_if, exec-local.tee. }
+  FBytes := OneFunc(BLit([$60, $01, $7F, $01, $7F]), BLit([
+    $01, $04, $7F,                { locals: i, seen, hot1, hot2 }
+    $41, $07, $03, $00,           { 7; loop (param i32) (result i32) }
+    $22, $02, $41, $01, $6A,     { seen = carried; carried += 1 }
+    $20, $03, $41, $01, $6A, $21, $03,
+    $20, $03, $41, $01, $6A, $21, $03,
+    $20, $04, $41, $01, $6A, $21, $04,
+    $20, $04, $41, $01, $6A, $21, $04,
+    $20, $01, $41, $01, $71, $04, $40, { if i is odd }
+    $20, $02, $41, $03, $6A, $21, $02, { seen += 3 }
+    $05,
+    $20, $02, $41, $05, $6A, $21, $02, { otherwise seen += 5 }
+    $0B,
+    $20, $01, $41, $01, $6A, $22, $01, { ++i }
+    $20, $00, $49, $0D, $00,     { continue while i < n }
+    $0B, $1A, $20, $02, $0B]), 'run');
+  for I := 0 to High(Inputs) do
+    Expect<Boolean>(DiffModule(FBytes, 'run', [MakeValueI32(Inputs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    NativeUInt(Length(FBytes)), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+  for I := 0 to High(Inputs) do
+  begin
+    Param := MakeValueI32(Inputs[I]);
+    Res.Bits := High(UInt64);
+    InterpInvoke(FStore, Addr, @Param, @Res);
+    Expect<Integer>(Res.I32).ToBe(Expected[I]);
+  end;
 end;
 
 procedure TJitTests.TestBrTable;
@@ -3980,6 +4032,8 @@ begin
   Test('select matches the interpreter', TestSelect);
   Test('an if/else matches the interpreter', TestNestedIf);
   Test('a loop with a back-edge epoch safepoint matches', TestLoopSum);
+  Test('a scalar loop preserves dynamic carried values through branch joins',
+    TestScalarLoopCarriedCache);
   Test('br_table matches the interpreter', TestBrTable);
   Test('unreachable traps identically', TestUnreachable);
   Test('a shared epoch snapshot traps interrupt in a compiled leaf identically',
