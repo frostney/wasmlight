@@ -742,12 +742,13 @@ var
       if (PlannedCode[K].Op = iroMove) and
         PlannedProducer(PlannedCode[K - 1].Op) and
         (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
-        (SimpleUseCount(PlannedCode[K].A) = 1) and
+        (RegisterUseCount(PlannedCode[K].A) = 1) and
         IsVisibleFrameReg(PlannedCode[K].Dest) and
         not Targets[K - 1] and not Targets[K] then
       begin
         { Fold a single-use expression result directly into the local/result
-          slot that the following lowering move would populate. The original
+          slot that the following lowering move would populate. Call argument
+          aux lists count as uses too: local.tee can feed both. The original
           IR and its instruction labels remain intact; the skipped move binds
           an empty label at the producer's fallthrough address. }
         PlannedCode[K - 1].Dest := PlannedCode[K].Dest;

@@ -1685,6 +1685,7 @@ type
     procedure TestInlineCallCacheAcrossBranches;
     procedure TestInlineCallCacheWideLiveTemporary;
     procedure TestInlineResultCopiesAndAuxUses;
+    procedure TestAdjacentMoveRetainsCallArgument;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
@@ -3186,6 +3187,66 @@ begin
     [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_BACKEND}
+  Code: TWasmBytes;
+  OriginalAux: TWasmIrAuxU32;
+  EntryOffset: NativeUInt;
+  RegisterCount, Addr: UInt32;
+  Kind: TWasmExternKind;
+  Param, Res: TWasmValue;
+  K: Integer;
+  {$ENDIF}
+begin
+  { The local.tee arithmetic result feeds both its local assignment and the
+    call argument list. Redirecting it solely to the local loses that argument
+    snapshot. The next call reverses the cached index/accumulator order. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (param i64 i64) (result i64) ' +
+    '(i64.sub (local.get 0) (local.get 1))) ' +
+    '(func (export "run") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) (local $seen i64) ' +
+    '(local.set $acc (i64.const 8589934595)) ' +
+    '(loop $again ' +
+    '(local.set $seen (i64.add (local.get $seen) ' +
+    '(call $leaf (local.get $acc) ' +
+    '(local.tee $acc (i64.add (local.get $acc) (i64.const 4294967297)))))) ' +
+    '(local.set $acc (call $leaf (local.get $i) (local.get $acc))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $again (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.add (local.get $seen) (local.get $acc))))');
+  CompileExports(['run']);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(3)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := Bytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  OriginalAux := Copy(FIr.Functions[1].AuxU32, 0,
+    Length(FIr.Functions[1].AuxU32));
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[1], 1,
+    EntryOffset, RegisterCount);
+  Expect<Integer>(Length(FIr.Functions[1].AuxU32)).ToBe(Length(OriginalAux));
+  for K := 0 to High(OriginalAux) do
+    Expect<UInt32>(FIr.Functions[1].AuxU32[K]).ToBe(OriginalAux[K]);
+  InstantiateModule(FStore, FIr, @FBytes[0], Length(FBytes), FImports);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Param := MakeValueI64(3);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<UInt64>(Res.Bits).ToBe(UInt64($FFFFFFF9FFFFFFFA));
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestNativeResultAcrossDroppedComputations;
 var
   Bytes: TWasmBytes;
@@ -4271,6 +4332,8 @@ end;
 
 procedure TJitTests.SetupTests;
 begin
+  Test('adjacent result moves retain call argument snapshots',
+    TestAdjacentMoveRetainsCallArgument);
   Test('native return retains a value across dropped computations',
     TestNativeResultAcrossDroppedComputations);
   Test('inline results preserve external slots and aux-list uses',
