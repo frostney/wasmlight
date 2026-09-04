@@ -1,5 +1,78 @@
 # Handoff
 
+Updated: 2026-09-05 (Wave 16 optimization loop in progress)
+
+## Wave 16 — accepted changes and current experiments
+
+- User authorized implementing the diagnosis and continuing optimization
+  autonomously, targeting **0.6–0.8x Wasmtime elapsed time**. This target is
+  not yet met across the suite. Delivery branch is
+  `codex/optimize-runtime-wave16`; accepted runtime integration is
+  `fdce139de69b236d771b92822352a032d17d673a`, based on the verified
+  `8b43e254` fetched-main baseline described below. No push or PR yet.
+- Accepted production changes, each measured against its retained immediate
+  predecessor and remeasured after integration:
+  - `c2a9574`: separate the ARM64 native-leaf paired reload and SP adjustment.
+    Direct-call medians improved about **172–176 -> 133 ms** in both orders.
+    The original denominator was unstable; use the stabilized predecessor
+    for subsequent acceptance, not a sum of isolated percentages.
+  - `c9bb0ed`: inline bounded, no-spill scalar bodies using the existing leaf
+    proof and emitter. **132.263 -> 119.419 ms**; reverse
+    **132.796 -> 116.985 ms**. Exact depth/value limits, immutable same-module
+    target identity, ordinary fallbacks, and position independence remain.
+  - `9a3126a`: enable existing deferred temporary stores for already-eligible
+    helper-free scalar static-cache loops. **377.619 -> 353.785 ms**; reverse
+    **376.512 -> 356.895 ms**. Branch, result, local, and loop-carried
+    reconciliation remains shared with the existing implementation.
+  - `a2cd3c9`: preserve two scalar caller locals and one constant in x26–x28
+    across eligible inlined bodies. **118.333 -> 107.034 ms**; reverse
+    **116.741 -> 106.180 ms**. The aligned 96-byte frame restores all saved
+    registers; argument aliasing, live i64 temporaries, relocation, and exact
+    exhaustion boundaries have focused coverage.
+- Latest combined schedule `integration-call-cache-bench`: direct calls
+  **104.197 ms** versus predecessor **118.463 ms**, Wasmtime **64.519 ms**
+  (**1.615x**); integer loop **338.287 ms**, Wasmtime **338.336 ms**
+  (**1.000x**). Guards have no material repeatable regression. Memory guard
+  fluctuations sometimes reverse order despite byte-identical artifacts.
+- All timings use retained release binaries, identical self-checking modules,
+  precompiled artifacts outside timing, one warmup, seven ABBA blocks
+  (14 samples per Wasmlight binary, seven Wasmtime samples), and the shared
+  `/tmp/wasmlight-perf-gate.lock`. Native host is Apple M5 Max, macOS 26.6.2,
+  arm64, lwpt 0.6.0/FPC 3.2.2, Wasmtime 47.0.3. Scoped `caffeinate` assertions
+  prevent sleep during schedules. External toolkit builds are never stopped.
+  A partial contended schedule is retained but wholly excluded under
+  `excluded-call-cache-contended`, including its harness shutdown diagnostic.
+- Rejected candidates: loop-bound static-cache priority eliminated the load
+  but measured **358.812 -> 357.687 ms**, then **352.327 -> 353.040 ms**.
+  Integer MADD fusion emitted the intended instruction but measured
+  **336.517 -> 340.096 ms**, then **339.012 -> 343.748 ms**. Neither belongs
+  in accepted source. Patches, binaries, test limitations, and raw schedules
+  remain in durable evidence.
+- Current isolated experiments: `call-budget-lane` moves exact invariant
+  capacity checks to entry only when a first scalar call is unavoidable;
+  `loop-alias-lane` investigates reusing the existing local-alias pass for
+  helper-free scalar loops. Neither is accepted. Serialize their timing;
+  merge only repeatable wins with flat guards into the disposable
+  `integration` worktree, then advance the delivery branch.
+- Full correctness is currently complete for **c2a9574 only**: all 62 test
+  programs and all three pinned corpus tiers pass on macOS/arm64 and emulated
+  Linux/x64, each `files=257 errors=0 pass=65188 fail=0 skip=0 staged=0`;
+  compiled counts are 0/8763/8763. The existing Linux container needed FCL
+  and clang test prerequisites, now installed; original diagnostics and
+  completed rerun logs are retained. Container `wasmx64-w15-container` was
+  restored to stopped state after all evidence was copied and hash-verified.
+  Final combined full gates and the ordinary six-platform CI are still due.
+- Durable evidence root:
+  `/Users/jstein/.local/share/wasmlight-evidence/wave16-8b43e254`.
+  Current retained predecessor `wasmlight-integration-call-cache` SHA-256:
+  `ef0b3576320c0175ec8b8efbb9c64828a0b8f7a110d685cb092c3f163f3c0494`.
+  Read `progress.md`, candidate manifests/notes, and individual schedule JSON.
+- Epoch contract discrepancy: ADR-0006 mentions entry polls, but shipped
+  interpreter/JIT tests intentionally permit acyclic calls after a host epoch
+  bump. These optimizations preserve current tier-identical behavior and
+  existing IR-marked backedge checks; they add no new entry poll. Pinned spec
+  and source evidence are in `call-spec.json` and `call-body-notes.md`.
+
 Updated: 2026-09-04 (Wave 16 baseline instability localized)
 
 ## Wave 16 diagnosis — ARM64 leaf epilogue post-indexed reload
