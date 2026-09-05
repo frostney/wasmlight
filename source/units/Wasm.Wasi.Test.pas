@@ -747,11 +747,14 @@ begin
 end;
 
 procedure TWasiTests.TestClockTimeGet;
+const
+  Expected: array[0..7] of Byte = ($EF, $CD, $AB, $89, $67, $45, $23, $01);
 var
   Cfg: TWasmWasiConfig;
   Fn: TWasmFunc;
   Args, Results: array of TWasmValue;
   Nanos: UInt64;
+  I: Integer;
 begin
   Cfg := TWasmWasiConfig.Create;
   Cfg.Clock := TWasmWasiClock(Inject(TFixedClock.Create));
@@ -767,6 +770,21 @@ begin
   Expect<Int32>(Results[0].I32).ToBe(Ord(weSuccess));
   Expect<Boolean>(MemReadU64(FMem, 0, Nanos)).ToBe(True);
   Expect<Boolean>(Nanos = FIXED_NANOS).ToBe(True);
+  { The WASI result pointer need not be naturally aligned. Judge its bytes
+    directly so the u64 read helper cannot mask a matching endian defect. }
+  Args[2] := MakeValueI32(3);
+  Call(Fn, Args, Results);
+  Expect<Int32>(Results[0].I32).ToBe(Ord(weSuccess));
+  for I := 0 to 7 do
+    Expect<Byte>(GuestByte(UInt32(3 + I))).ToBe(Expected[I]);
+  Args[2] := MakeValueI32(65528);
+  Call(Fn, Args, Results);
+  Expect<Int32>(Results[0].I32).ToBe(Ord(weSuccess));
+  Args[2] := MakeValueI32(65529);
+  Call(Fn, Args, Results);
+  Expect<Int32>(Results[0].I32).ToBe(Ord(weFault));
+  for I := 0 to 7 do
+    Expect<Byte>(GuestByte(UInt32(65528 + I))).ToBe(Expected[I]);
 end;
 
 procedure TWasiTests.TestClockResGet;
