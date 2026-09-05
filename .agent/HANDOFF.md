@@ -101,10 +101,13 @@ Updated: 2026-09-05 (Wave 16 optimization results)
   builds, all 62 test programs, and the pinned 257 top-level scripts in all
   three tiers on macOS/arm64 and Linux/x64. Required stable signature:
   `files=257 errors=0 pass=65188 fail=0 skip=0 staged=0`; compiled counts are
-  separate (0/8763/8763). Local Linux uses x64 emulation in OrbStack, not
-  native-x64 performance. Source and retained evidence hashes are verified
-  before the container is stopped. Final six-platform CI and local gate
-  source identities are recorded in `correctness/final-summary.json`.
+  separate (0/8763/8763). Earlier Linux checkpoints used x64 emulation in
+  OrbStack. Final container and dedicated VM startup both stalled before
+  executing tests, so the exact-source core gate moved to a native GitHub
+  x64 runner on a diagnostic workflow branch. Its checkout is pinned to the
+  delivery source; it does not substitute the ordinary CI recursive tally
+  for the 257-script gate. Final gate identities, logs, source hashes and
+  local-instance restoration status are in `correctness/final-summary.json`.
 - Durable evidence root:
   `/Users/jstein/.local/share/wasmlight-evidence/wave16-8b43e254`.
   `optimization-report.md` contains the comparison table, spreads, accepted
@@ -113,8 +116,10 @@ Updated: 2026-09-05 (Wave 16 optimization results)
 - Next work: use the final accepted binary as baseline, profile remaining
   costs, and retain only repeatable gains toward 0.6–0.8x. The optional final
   body-result design and every rejected patch are recorded; check their
-  measured outcomes before retrying. No current benchmark or VM is left
-  running after this wave's gates.
+  measured outcomes before retrying. Benchmark processes have finished.
+  Check `correctness/final-summary.json` for the dedicated local instances'
+  state after their startup failure; shared OrbStack and unrelated machines
+  were not restarted.
 - Epoch contract discrepancy: ADR-0006 mentions entry polls, but shipped
   interpreter/JIT tests permit acyclic calls after a host epoch bump. This
   wave preserves current tier-identical behavior and IR-marked backedge
