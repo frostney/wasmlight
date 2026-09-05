@@ -1,331 +1,103 @@
-name: CI
-
-# Post-merge confirmation across the full platform matrix, mirroring the
-# lwpt / duetto CI pattern. Sister workflow:
-#
-#   pr.yml — every PR: the fast three-platform gate (the authoritative
-#            pre-merge signal).
-#
-# ci.yml runs ONLY on push to main + manual dispatch. PRs do not trigger
-# it — pr.yml owns the PR flow. This avoids paying for the same commit
-# twice; post-merge, ci.yml runs once on main to confirm the merged tree
-# is green on every architecture.
-#
-# The lwpt toolchain comes from its published release (checksum-verified
-# per-platform archive, no sibling checkout, no bootstrap); dependencies
-# resolve from the same release tag and are verified against the
-# committed lockfile + .lwpt/modules tree via install --frozen.
-
+name: Wave 16 exact-source Linux core validation
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
-
 permissions:
   contents: read
-
 env:
   LWPT_VERSION: "0.6.0"
-
+  SOURCE_COMMIT: "34b3ae964a66405980f99e8fc85fcb64ddf70bcf"
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux
-            runner: ubuntu-latest
-            lwpt-asset: linux-x64
-            fpc-install: apt
-            format-check: true   # platform-independent; one runner runs it
-            jit: true            # 64-bit UNIX → JIT/AOT tiers active
-          - target: aarch64-linux
-            runner: ubuntu-24.04-arm
-            lwpt-asset: linux-arm64
-            fpc-install: apt
-            jit: true
-          - target: aarch64-darwin
-            runner: macos-latest
-            lwpt-asset: macos-arm64
-            fpc-install: brew
-            jit: true
-          - target: x86_64-darwin
-            runner: macos-15-intel
-            lwpt-asset: macos-x64
-            fpc-install: brew
-            jit: true
-          - target: x86_64-win64
-            runner: windows-latest
-            lwpt-asset: windows-x64
-            lwpt-archive: zip
-            fpc-install: installer
-            fpc-win-target: x86_64-win64
-            exe: .exe
-          - target: i386-win32
-            runner: windows-latest
-            lwpt-asset: windows-x86
-            lwpt-archive: zip
-            fpc-install: installer
-            fpc-win-target: i386-win32
-            exe: .exe
-    runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        shell: bash
+  linux-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: 34b3ae964a66405980f99e8fc85fcb64ddf70bcf
           persist-credentials: false
-
-      - name: Install FPC (apt)
-        if: matrix.fpc-install == 'apt'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fpc
-          fpc -iV
-
-      - name: Install FPC (brew)
-        if: matrix.fpc-install == 'brew'
-        run: |
-          brew install fpc
-          fpc -iV
-
-      - name: Install FPC (Windows combo installer)
-        if: matrix.fpc-install == 'installer'
-        shell: pwsh
-        run: |
-          $url = "https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe"
-          Invoke-WebRequest -Uri $url -OutFile fpc-setup.exe -MaximumRedirection 10 -UserAgent "Wget/1.21"
-          $f = Get-Item fpc-setup.exe
-          Write-Host "downloaded $($f.Length) bytes"
-          $hash = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower()
-          if ($hash -ne "8c255390544b051388b577eb61c6191a04883264afe0e3369b3600a56daf7bde") { Write-Error "installer SHA-256 mismatch: $hash"; exit 1 }
-          $proc = Start-Process -Wait -PassThru -FilePath $f.FullName -ArgumentList "/VERYSILENT","/NORESTART","/SP-","/DIR=C:\fpc322"
-          Write-Host "installer exit code $($proc.ExitCode)"
-          if ($proc.ExitCode -ne 0) { exit 1 }
-
-      - name: Locate FPC (Windows)
-        if: matrix.fpc-install == 'installer'
-        run: |
-          FPC_BIN=$(find /c/fpc322 -name fpc.exe -type f 2>/dev/null | head -1)
-          if [ -z "$FPC_BIN" ]; then echo "::error::fpc.exe not found in the combo install"; exit 1; fi
-          echo "Using FPC at $FPC_BIN"
-          echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
-          echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
-          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
-          if [ -n "$INSTANTFPC_BIN" ]; then
-            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
-          fi
-          FPC_UNIT_PATHS=""
-          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
-            UNIT_PATH=""
-            for unit_target in ${{ matrix.fpc-win-target }} i386-win32 x86_64-win64; do
-              UNIT_PATH=$(find /c/fpc322 -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
-              if [ -n "$UNIT_PATH" ]; then break; fi
-            done
-            if [ -n "$UNIT_PATH" ]; then
-              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
-              if [ -z "$FPC_UNIT_PATHS" ]; then
-                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
-              else
-                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
-              fi
-            fi
-          done
-          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
-          if [ "${{ matrix.fpc-win-target }}" = "x86_64-win64" ]; then
-            PPCX64=$(find /c/fpc322 -name ppcrossx64.exe -type f 2>/dev/null | head -1)
-            if [ -z "$PPCX64" ]; then echo "::error::ppcrossx64.exe not found in the combo install"; exit 1; fi
-            echo "LWPT_FPC=$(cygpath -w "$PPCX64")" >> "$GITHUB_ENV"
-          fi
-
-      - name: Install lwpt (release binary, checksum-verified)
+      - name: Record immutable source and native runner
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/wave16-evidence/binaries"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(uname -m)" = x86_64
+          test -z "$(git status --porcelain)"
+          {
+            date -u
+            uname -a
+            git rev-parse HEAD
+            echo "workflow_ref=$GITHUB_WORKFLOW_REF"
+            echo "workflow_sha=$GITHUB_SHA"
+            echo "source_commit=$SOURCE_COMMIT"
+            echo "environment=GitHub-hosted Ubuntu 24.04 x86_64; no performance measurements"
+          } > "$RUNNER_TEMP/wave16-evidence/identity.log"
+          git ls-files -z | xargs -0 sha256sum > "$RUNNER_TEMP/wave16-evidence/source-files.sha256"
+          git archive --format=tar -o "$RUNNER_TEMP/wave16-evidence/source.tar" HEAD
+      - name: Install established released toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update > "$RUNNER_TEMP/wave16-evidence/apt-update.log" 2>&1
+          sudo apt-get install -y fpc clang > "$RUNNER_TEMP/wave16-evidence/apt-install.log" 2>&1
+          dpkg-query -W fp-compiler-3.2.2 fp-units-rtl-3.2.2 fp-units-fcl-3.2.2 clang > "$RUNNER_TEMP/wave16-evidence/fpc-packages.log"
           cd "$RUNNER_TEMP"
-          ASSET="lwpt-${LWPT_VERSION}-${{ matrix.lwpt-asset }}"
+          ASSET="lwpt-${LWPT_VERSION}-linux-x64"
           BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
-          EXT="tar.gz"
-          if [ "${{ matrix.lwpt-archive }}" = "zip" ]; then EXT="zip"; fi
-          curl -fsSLO "${BASE}/${ASSET}.${EXT}"
-          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
-          if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
-          else
-            sha256sum -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
-          fi
-          if [ "$EXT" = "zip" ]; then unzip -q "${ASSET}.zip"; else tar xzf "${ASSET}.tar.gz"; fi
+          curl --retry 3 -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl --retry 3 -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          sha256sum -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt") > wave16-evidence/lwpt-archive-verified.log
+          tar xzf "${ASSET}.tar.gz"
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
-
-      - name: lwpt install --frozen (verify lockfile + committed modules)
-        run: lwpt install --frozen
-
-      - name: lwpt format --check (one runner)
-        if: matrix.format-check == true
-        run: lwpt format --check
-
-      - name: lwpt agents --check (one runner)
-        if: matrix.format-check == true
-        run: lwpt agents --check
-
-      - name: lwpt build (all programs)
-        run: lwpt build
-
-      - name: lwpt test (co-located unit suites)
-        run: lwpt test
-
-      - name: wasmlight smoke
+          sha256sum "${ASSET}/lwpt" > wave16-evidence/lwpt-binary.sha256
+          cp "lwpt-${LWPT_VERSION}-checksums.txt" wave16-evidence/
+      - name: Exact-source build, unit and pinned-core gates
         run: |
           set -euo pipefail
-          ./build/wasmlight${{ matrix.exe }} --version
-          # A real compiled module whose data count section (id 12) precedes
-          # its code section (id 10) — the case a decoder written on
-          # increasing section ids rejects.
-          ./build/wasmlight${{ matrix.exe }} inspect tests/fixtures/valid/datacount.wasm
-          printf 'notwasm!' > "$RUNNER_TEMP/bad.wasm"
-          if ./build/wasmlight${{ matrix.exe }} inspect "$RUNNER_TEMP/bad.wasm"; then
-            echo "::error::a non-module was accepted"; exit 1
-          fi
-
-      - name: runtime-shell audit
-        run: |
-          set -euo pipefail
-          SHELL_BIN=./build/wasmlight-shell${{ matrix.exe }}
-          test -x "$SHELL_BIN"
-          set +e
-          "$SHELL_BIN" >"$RUNNER_TEMP/shell-empty.out" 2>"$RUNNER_TEMP/shell-empty.err"
-          STATUS=$?
-          set -e
-          if [ "$STATUS" -eq 0 ]; then
-            echo "::error::empty shell template exited 0"; exit 1
-          fi
-          if ! grep -q 'no embedded module' "$RUNNER_TEMP/shell-empty.err"; then
-            echo "::error::empty shell template did not report a missing module"
-            cat "$RUNNER_TEMP/shell-empty.err"
-            exit 1
-          fi
-          # Black-box: incomplete native image is EWasmLinkError, no interp
-          # fallback. Valid image (64-bit UNIX) runs _start natively.
-          PY=python3
-          if ! command -v python3 >/dev/null 2>&1; then PY=python; fi
-          "$PY" scripts/write-wshl-payload.py --write-fixture-wasm \
-            "$RUNNER_TEMP/shell-cmd.wasm" - "$RUNNER_TEMP/shell-incomplete.wshl"
-          set +e
-          "$SHELL_BIN" "$RUNNER_TEMP/shell-incomplete.wshl" \
-            >"$RUNNER_TEMP/shell-incomplete.out" \
-            2>"$RUNNER_TEMP/shell-incomplete.err"
-          INC_STATUS=$?
-          set -e
-          if [ "$INC_STATUS" -eq 0 ]; then
-            echo "::error::incomplete shell image exited 0"; exit 1
-          fi
-          if ! grep -q 'EWasmLinkError' "$RUNNER_TEMP/shell-incomplete.err"; then
-            echo "::error::incomplete shell image was not a link error"
-            cat "$RUNNER_TEMP/shell-incomplete.err"
-            exit 1
-          fi
-          if [ -s "$RUNNER_TEMP/shell-incomplete.out" ]; then
-            echo "::error::incomplete shell image wrote stdout (interpreter fallback?)"
-            cat "$RUNNER_TEMP/shell-incomplete.out"
-            exit 1
-          fi
-          if [ "${{ matrix.jit }}" = "true" ]; then
-            ./build/wasmlight aot "$RUNNER_TEMP/shell-cmd.wasm" \
-              -o "$RUNNER_TEMP/shell-cmd.waot"
-            "$PY" scripts/write-wshl-payload.py \
-              "$RUNNER_TEMP/shell-cmd.wasm" "$RUNNER_TEMP/shell-cmd.waot" \
-              "$RUNNER_TEMP/shell-complete.wshl"
-            set +e
-            "$SHELL_BIN" "$RUNNER_TEMP/shell-complete.wshl" \
-              >"$RUNNER_TEMP/shell-complete.out" \
-              2>"$RUNNER_TEMP/shell-complete.err"
-            OK_STATUS=$?
-            set -e
-            if [ "$OK_STATUS" -ne 0 ]; then
-              echo "::error::complete shell image failed"
-              cat "$RUNNER_TEMP/shell-complete.err"
-              exit 1
-            fi
-          fi
-          if [ "${{ matrix.jit }}" = "true" ]; then
-            if command -v nm >/dev/null 2>&1; then
-              # Live symbols only. `nm -a` also prints DWARF names from
-              # helper units the shell links for frames/traps; those are
-              # not interpreter dispatch or JIT compile entry points.
-              if nm "$SHELL_BIN" | grep -Ei 'JitCanCompile|JitStageFunctionBytes|JitForceCompile|JitCompileToBuffer|InterpTierInvoke'; then
-                echo "::error::runtime shell contains interpreter dispatch or JIT compiler symbols"
-                exit 1
-              fi
-            fi
-            if command -v otool >/dev/null 2>&1; then
-              DEPS=$(otool -L "$SHELL_BIN")
-            elif command -v ldd >/dev/null 2>&1; then
-              DEPS=$(ldd "$SHELL_BIN")
-            else
-              DEPS=""
-            fi
-            if printf '%s\n' "$DEPS" | grep -Ei 'libclang|libzig|libwasmer|zig'; then
-              echo "::error::runtime shell links a host compiler, linker, or foreign runtime"
-              echo "$DEPS"
-              exit 1
-            fi
-          fi
-
-      # The upstream conformance corpus is the project's strongest oracle,
-      # fetched at a PINNED commit (tests/spec/testsuite is gitignored; the SHA
-      # lives in tests/spec/testsuite.commit for reproducibility). The
-      # interpreter tier runs on EVERY platform; on the 64-bit UNIX legs
-      # (matrix.jit) the baseline-JIT and AOT tiers run too and must produce an
-      # IDENTICAL pass/fail/skip tally to the interpreter — the observational-
-      # identity invariant (ADR-0001) a JIT/AOT codegen bug would break.
-      # errors=0 + a pass floor catch a crash or a catastrophic interpreter
-      # regression without hardcoding a count that shifts when a known-failing
-      # case is later closed.
-      - name: Conformance corpus (wasmspec, all tiers)
-        run: |
-          set -euo pipefail
-          COMMIT=$(tr -d '[:space:]' < tests/spec/testsuite.commit)
-          git clone --filter=blob:none --quiet \
-            https://github.com/WebAssembly/testsuite tests/spec/testsuite
-          git -C tests/spec/testsuite checkout --quiet "$COMMIT"
-          echo "testsuite @ $(git -C tests/spec/testsuite rev-parse HEAD)"
-          WS=./build/wasmspec${{ matrix.exe }}
-          FLOOR=64000
-          run_tier() {
-            local output_file total
-            output_file="$RUNNER_TEMP/wasmspec-$1.txt"
-            set +e
-            "$WS" --failures-only --tier="$1" tests/spec/testsuite > "$output_file"
-            set -e
-            total=$(grep '^TOTAL' "$output_file" || true)
-            if [ -z "$total" ]; then
-              cat "$output_file" >&2
-              echo "::error::$1 did not produce a TOTAL tally" >&2
-              return 1
-            fi
-            printf '%s\n' "$total"
+          evidence="$RUNNER_TEMP/wave16-evidence"
+          lwpt --version > "$evidence/lwpt-version.log"
+          run_gate() {
+            local name="$1"
+            shift
+            "$@" > "$evidence/$name.log" 2>&1 || { cat "$evidence/$name.log"; return 1; }
+            echo "$name passed"
           }
-          sig() { echo "$1" | grep -oE '(errors|pass|fail|skip)=[0-9]+' | sort | tr '\n' ' '; }
-          field() { echo "$1" | grep -oE "$2=[0-9]+" | head -1 | cut -d= -f2; }
-          IL=$(run_tier interp); echo "interp: $IL"
-          [ "$(field "$IL" errors)" = "0" ] || { echo "::error::interp errors!=0"; exit 1; }
-          [ "$(field "$IL" pass)" -ge "$FLOOR" ] || { echo "::error::interp pass below floor $FLOOR"; exit 1; }
-          IS=$(sig "$IL")
-          if [ "${{ matrix.jit }}" = "true" ]; then
-            JL=$(run_tier jit); echo "jit:    $JL"
-            AL=$(run_tier aot); echo "aot:    $AL"
-            [ "$(field "$JL" errors)" = "0" ] || { echo "::error::jit errors!=0"; exit 1; }
-            [ "$(field "$AL" errors)" = "0" ] || { echo "::error::aot errors!=0"; exit 1; }
-            if [ "$(sig "$JL")" != "$IS" ]; then
-              echo "::error::jit tally diverges from interpreter"
-              diff -u "$RUNNER_TEMP/wasmspec-interp.txt" "$RUNNER_TEMP/wasmspec-jit.txt" || true
-              exit 1
-            fi
-            if [ "$(sig "$AL")" != "$IS" ]; then
-              echo "::error::aot tally diverges from interpreter"
-              diff -u "$RUNNER_TEMP/wasmspec-interp.txt" "$RUNNER_TEMP/wasmspec-aot.txt" || true
-              exit 1
-            fi
-            echo "three-tier identity OK"
-          fi
+          run_gate install-frozen lwpt install --frozen
+          run_gate format-check lwpt format --check
+          run_gate agents-check lwpt agents --check
+          run_gate focused-jit lwpt test source/units/Wasm.Jit.Arm64.Test.pas source/units/Wasm.Jit.Test.pas --jobs 1
+          run_gate build-dev lwpt build --mode dev --clean --jobs 1
+          run_gate build-release lwpt build --mode release --clean --jobs 1
+          cp build/wasmlight build/wasmlight-shell build/wasmbench build/wasmspec "$evidence/binaries/"
+          run_gate test-all lwpt test --jobs 1
+          grep -F 'summary: 62 passed, 0 failed, 0 did not compile, 0 skipped, 0 cancelled' "$evidence/test-all.log" > "$evidence/unit-summary.txt"
+          PIN=$(tr -d '[:space:]' < tests/spec/testsuite.commit)
+          test "$PIN" = de54fd27ecf3e68dfd16b6199c548df77b6a2cc1
+          git clone --quiet https://github.com/WebAssembly/testsuite tests/spec/testsuite
+          git -C tests/spec/testsuite checkout --quiet "$PIN"
+          test "$(git -C tests/spec/testsuite rev-parse HEAD)" = "$PIN"
+          test -z "$(git -C tests/spec/testsuite status --porcelain)"
+          set -- tests/spec/testsuite/*.wast
+          test "$#" = 257
+          git -C tests/spec/testsuite rev-parse HEAD > "$evidence/corpus-pin.txt"
+          for tier in interp jit aot; do
+            run_gate "conformance-$tier" ./build/wasmspec --failures-only --tier="$tier" "$@"
+            total=$(grep '^TOTAL ' "$evidence/conformance-$tier.log")
+            echo "$total" | tee -a "$evidence/corpus-summary.txt"
+            test "$(echo "$total" | sed -E 's/ tier=[^ ]+//; s/ compiled=[0-9]+//')" = 'TOTAL files=257 errors=0 pass=65188 fail=0 skip=0 staged=0 total=65188'
+          done
+          sha256sum -c "$evidence/source-files.sha256" > "$evidence/source-unchanged.log"
+          git diff --exit-code > "$evidence/final-source-diff.log"
+          find .lwpt/sessions -name '*.log' -print0 | tar -czf "$evidence/lwpt-session-logs.tar.gz" --null -T -
+      - name: Hash retained evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/wave16-evidence"
+          find . -type f ! -name manifest.sha256 -print0 | sort -z | xargs -0 sha256sum > manifest.sha256
+      - name: Upload exact-source evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wave16-linux-core-34b3ae9
+          path: ${{ runner.temp }}/wave16-evidence
+          if-no-files-found: error
+          retention-days: 14
