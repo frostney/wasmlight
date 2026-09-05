@@ -511,9 +511,8 @@ procedure Arm64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
   x14-x17 dynamic values, x9-x11 scratch); this is not an arbitrary-code verifier. }
 function Arm64CanInlineScalarBody(const ACode: TWasmBytes): Boolean;
 procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const ACode: TWasmBytes; const ARegisterCount, AResultSlot: UInt32;
-  var ACache: TArm64RegCache);
+  const ACode: TWasmBytes; const ARegisterCount, AArgCount,
+  AArg0Slot, AArg1Slot, AResultSlot: UInt32; var ACache: TArm64RegCache);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer;
   const APreservedInlineStatics: Boolean = False);
@@ -5363,9 +5362,8 @@ begin
 end;
 
 procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
-  const ACode: TWasmBytes; const ARegisterCount, AResultSlot: UInt32;
-  var ACache: TArm64RegCache);
+  const ACode: TWasmBytes; const ARegisterCount, AArgCount,
+  AArg0Slot, AArg1Slot, AResultSlot: UInt32; var ACache: TArm64RegCache);
 var
   FO: TWasmJitFrameOffsets;
   Exhausted, Done: TWasmJitLabel;
@@ -5377,9 +5375,9 @@ begin
   begin
     { Sources live in preserved statics or x14-x17, never the destination
       argument pair. Read both before discarding dynamic metadata. }
-    Arm64CachedLoad(ABuf, ACache, 12, IrAuxBlockItem(AAux, AIns.A, 0));
-    if IrAuxBlockCount(AAux, AIns.A) = 2 then
-      Arm64CachedLoad(ABuf, ACache, 13, IrAuxBlockItem(AAux, AIns.A, 1));
+    Arm64CachedLoad(ABuf, ACache, 12, AArg0Slot);
+    if AArgCount = 2 then
+      Arm64CachedLoad(ABuf, ACache, 13, AArg1Slot);
     Arm64FlushDynamicRegCache(ABuf, ACache);
   end
   else
@@ -5402,9 +5400,9 @@ begin
 
   if not ACache.PreservedInlineStatics then
   begin
-    LdX(ABuf, 12, IrAuxBlockItem(AAux, AIns.A, 0));
-    if IrAuxBlockCount(AAux, AIns.A) = 2 then
-      LdX(ABuf, 13, IrAuxBlockItem(AAux, AIns.A, 1));
+    LdX(ABuf, 12, AArg0Slot);
+    if AArgCount = 2 then
+      LdX(ABuf, 13, AArg1Slot);
   end;
   ABuf.EmitBytes(ACode);
   if ACache.PreservedInlineStatics then
