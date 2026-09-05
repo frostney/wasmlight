@@ -763,6 +763,50 @@ var
   end;
 
   {$IFDEF WASM_JIT_ARM64}
+  procedure AnalyzeNativeSelfReturnTail;
+  var
+    K, Last, Tail: Integer;
+    Source: UInt32;
+  begin
+    if not UseNativeScalarSelf then
+      Exit;
+    Last := High(PlannedCode);
+    Tail := Last - 1;
+    if (Tail < 0) or (PlannedCode[Last].Op <> iroReturn) or
+      (PlannedCode[Tail].Op <> iroMove) or
+      (PlannedCode[Tail].Dest <> NativeResultReg) or
+      SkipPlanned[Tail] or not Targets[Tail] or Targets[Last] or
+      IrInstrIsSafepoint(PlannedCode[Tail]) or
+      IrInstrIsSafepoint(PlannedCode[Last]) then
+      Exit;
+    Source := PlannedCode[Tail].A;
+    if (Source >= UInt32(Length(AFn^.RegTypes))) or
+      (AFn^.RegTypes[Source].Kind <> wvkNum) then
+      Exit;
+    for K := 0 to Tail - 1 do
+      case PlannedCode[K].Op of
+        iroReturn, iroBrTable: Exit;
+        iroBranchIf, iroBranchIfNot:
+          if PlannedCode[K].B = UInt32(Tail) then
+            Exit;
+        iroJump:
+          if (PlannedCode[K].A = UInt32(Tail)) and
+            ((K >= Tail) or (PlannedCode[K].Imm <> 0)) then
+            Exit;
+      end;
+    { Every incoming edge is now a forward, unflagged terminal jump. Return
+      its cached join value directly; the only remaining tail predecessor is
+      lexical fallthrough. No cache state is carried across a branch. The
+      wrapper still publishes x12 to the canonical result slot. }
+    NativeResultSource := Source;
+    for K := 0 to Tail - 1 do
+      if (PlannedCode[K].Op = iroJump) and
+        (PlannedCode[K].A = UInt32(Tail)) then
+        PlannedCode[K].Op := iroReturn;
+    Targets[Tail] := False;
+    SkipPlanned[Tail] := True;
+  end;
+
   procedure AnalyzeResultCopies;
   var
     K, Last: Integer;
@@ -770,6 +814,7 @@ var
     ResultSlot: UInt32;
   begin
     NativeResultSource := NativeResultReg;
+    AnalyzeNativeSelfReturnTail;
     Last := High(PlannedCode);
     if UseNativeScalarLeaf and (Last >= 1) and (Last < 24) and
       (PlannedCode[Last].Op = iroReturn) and
@@ -1446,6 +1491,11 @@ var
               MarkUse(Ins.B);
               MarkUse(UInt32(Ins.Imm));
             end;
+          {$IFDEF WASM_JIT_ARM64}
+          iroReturn:
+            if UseNativeScalarCore then
+              MarkUse(NativeResultSource);
+          {$ENDIF}
           iroCall:
             for J := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.A)) - 1 do
               {$IFDEF WASM_JIT_ARM64}
