@@ -5096,6 +5096,30 @@ begin
   end;
 end;
 
+{ Resolve the current caller's function index into x3, preserving x0 and
+  clobbering x1, x2 and x8. Unpinned callers keep the context in x25;
+  a memory-pinned caller supplies a separate scratch context register. }
+procedure EmitResolveDirectFunc(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AFO: TWasmJitFrameOffsets;
+  const AContextReg: Byte = ARM64_REG_MEMORY);
+begin
+  Arm64EmitLdrX(ABuf, 1, AContextReg, UInt32(AFO.CtxDepth));
+  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
+  Arm64EmitLoadImm64(ABuf, 3, AFO.ActStride);
+  ABuf.EmitU32(Arm64MulX(2, 2, 3));
+  Arm64EmitLdrX(ABuf, 3, AContextReg, UInt32(AFO.CtxActs));
+  ABuf.EmitU32(Arm64AddX(2, 3, 2));
+  Arm64EmitLdrX(ABuf, 1, 2, UInt32(AFO.ActFuncAddrs));
+  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
+  ABuf.EmitU32(Arm64AddX(1, 1, 8));
+  Arm64EmitLdrW(ABuf, 2, 1, 0);
+  Arm64EmitLdrX(ABuf, 1, AContextReg, UInt32(AFO.CtxFuncsSlot));
+  Arm64EmitLdrX(ABuf, 1, 1, 0);
+  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
+  ABuf.EmitU32(Arm64MulX(2, 2, 8));
+  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+end;
+
 { A one- or two-slot-parameter/one-result static call can publish and retire
   its logical frame entirely in generated code. Resolution stays
   instance-relative and position-independent: the caller activation supplies
@@ -5157,21 +5181,7 @@ begin
 
   { x25 is the current context for functions without pinned memory. Resolve
     caller funcidx -> store address -> live function instance. }
-  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
-  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
-  Arm64EmitLoadImm64(ABuf, 3, FO.ActStride);
-  ABuf.EmitU32(Arm64MulX(2, 2, 3));
-  Arm64EmitLdrX(ABuf, 3, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
-  ABuf.EmitU32(Arm64AddX(2, 3, 2));
-  Arm64EmitLdrX(ABuf, 1, 2, UInt32(FO.ActFuncAddrs));
-  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
-  ABuf.EmitU32(Arm64AddX(1, 1, 8));
-  Arm64EmitLdrW(ABuf, 2, 1, 0);
-  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxFuncsSlot));
-  Arm64EmitLdrX(ABuf, 1, 1, 0);
-  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
-  ABuf.EmitU32(Arm64MulX(2, 2, 8));
-  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+  EmitResolveDirectFunc(ABuf, AIns, FO);
   Arm64EmitLdrX(ABuf, 9, 3, FuncDirectEntry);
   ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_ZR));
   EmitBCondTo(ABuf, ARM64_COND_EQ, AFallback);
@@ -5458,21 +5468,7 @@ begin
   Exhausted := ABuf.NewLabel;
 
   { Resolve caller funcidx -> store address -> live function instance. }
-  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxDepth));
-  ABuf.EmitU32(Arm64SubImmX(2, 1, 1));
-  Arm64EmitLoadImm64(ABuf, 3, FO.ActStride);
-  ABuf.EmitU32(Arm64MulX(2, 2, 3));
-  Arm64EmitLdrX(ABuf, 3, ARM64_REG_MEMORY, UInt32(FO.CtxActs));
-  ABuf.EmitU32(Arm64AddX(2, 3, 2));
-  Arm64EmitLdrX(ABuf, 1, 2, UInt32(FO.ActFuncAddrs));
-  Arm64EmitLoadImm64(ABuf, 8, UInt64(UInt32(AIns.Imm)) * 4);
-  ABuf.EmitU32(Arm64AddX(1, 1, 8));
-  Arm64EmitLdrW(ABuf, 2, 1, 0);
-  Arm64EmitLdrX(ABuf, 1, ARM64_REG_MEMORY, UInt32(FO.CtxFuncsSlot));
-  Arm64EmitLdrX(ABuf, 1, 1, 0);
-  Arm64EmitLoadImm64(ABuf, 8, SizeOf(TWasmFuncInst));
-  ABuf.EmitU32(Arm64MulX(2, 2, 8));
-  ABuf.EmitU32(Arm64AddX(3, 1, 2));
+  EmitResolveDirectFunc(ABuf, AIns, FO);
   Arm64EmitLdrX(ABuf, 9, 3, FuncNativeEntry);
   ABuf.EmitU32(Arm64CmpX(9, ARM64_REG_ZR));
   EmitBCondTo(ABuf, ARM64_COND_EQ, AFallback);
@@ -5500,6 +5496,54 @@ begin
   ABuf.BindLabel(Exhausted);
   Arm64EmitLoadImm32(ABuf, 0, UInt32(Ord(wtkStackExhausted)));
   Arm64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
+{ The generic direct-call path can resolve a host callback without first
+  attempting to enter a wasm frame. The current context and function address
+  map remain live: an import linked to wasm still takes the original path. }
+procedure EmitNativeHostCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AArgBytes: UInt32;
+  const AUsePinnedMemory: Boolean;
+  const ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  Layout: TWasmFuncInst;
+  KindOffset, CallbackOffset, DataOffset: UInt32;
+  NotHost: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  KindOffset := UInt32(PtrUInt(@Layout.Kind) - PtrUInt(@Layout));
+  CallbackOffset := UInt32(PtrUInt(@@Layout.Callback) - PtrUInt(@Layout));
+  DataOffset := UInt32(PtrUInt(@Layout.HostData) - PtrUInt(@Layout));
+  NotHost := ABuf.NewLabel;
+  if AUsePinnedMemory then
+  begin
+    Arm64EmitLdrX(ABuf, 9, ARM64_REG_STORE,
+      UInt32(WasmJitStoreAllocOffsets.TierContextOffset));
+    EmitResolveDirectFunc(ABuf, AIns, FO, 9);
+  end
+  else
+    EmitResolveDirectFunc(ABuf, AIns, FO);
+  case SizeOf(TWasmFuncKind) of
+    1: ABuf.EmitU32($39400000 or (KindOffset shl 10) or (3 shl 5) or 9);
+    2: ABuf.EmitU32($79400000 or ((KindOffset div 2) shl 10) or (3 shl 5) or 9);
+  else
+    Arm64EmitLdrW(ABuf, 9, 3, KindOffset);
+  end;
+  Arm64EmitLoadImm32(ABuf, 8, Ord(wfkHost));
+  ABuf.EmitU32(Arm64CmpW(9, 8));
+  EmitBCondTo(ABuf, ARM64_COND_NE, NotHost);
+  { IP is already published, and args/results use the unchanged flat buffers.
+    As in Arm64DispatchCall, host traps and nested calls stay on this caller's
+    activation until the callback returns or the invocation trampoline unwinds. }
+  Arm64EmitLdrX(ABuf, 8, 3, CallbackOffset);
+  Arm64EmitLdrX(ABuf, 1, 3, DataOffset);
+  ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+  ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
+  Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, AArgBytes);
+  ABuf.EmitU32(Arm64Blr(8));
+  EmitBranchTo(ABuf, UInt32(ADone));
+  ABuf.BindLabel(NotHost);
 end;
 
 { iroCall / iroCallIndirect / iroCallRef. x0 is always the store (pinned in
@@ -5567,6 +5611,7 @@ begin
             FallbackLabel, DoneLabel)
         else
         begin
+          EmitNativeHostCall(ABuf, AIns, ArgBytes, AUsePinnedMemory, DoneLabel);
           Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
           ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
           Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, ArgBytes);

@@ -833,6 +833,35 @@ begin
   AResults[0] := MakeValueI32(AParams[0].I32 + 100);
 end;
 
+type
+  PHostDispatchProbe = ^THostDispatchProbe;
+  THostDispatchProbe = record
+    Mode: Integer;
+    Nested: TWasmFuncAddr;
+    Calls: Integer;
+    IpPublished: Boolean;
+  end;
+
+procedure JitDispatchProbeCallback(const AStore: TWasmStore;
+  const AData: Pointer; const AParams, AResults: PWasmValue);
+var
+  Probe: PHostDispatchProbe;
+  NestedResult: TWasmValue;
+begin
+  Probe := PHostDispatchProbe(AData);
+  Inc(Probe^.Calls);
+  Probe^.IpPublished := InterpContextFor(AStore)^.Acts[
+    InterpContextFor(AStore)^.Depth - 1].IP > 0;
+  if Probe^.Mode = 1 then
+    raise EWasmTrap.Create('host dispatch probe');
+  NestedResult := MakeValueI64(0);
+  if Probe^.Mode = 2 then
+    InterpInvoke(AStore, Probe^.Nested, nil, @NestedResult);
+  AResults[0] := MakeValueI64(AParams[0].I64 - AParams[1].I64 +
+    AParams[2].I64 + NestedResult.I64);
+  AResults[1].Bits := AParams[0].Bits xor AParams[1].Bits xor AParams[2].Bits;
+end;
+
 { --- Waves 4/5 modules: memory / table / reference / global / GC --------
 
   Each is a complete module in literal bytes so the shape under test reads next
@@ -1674,6 +1703,7 @@ type
     procedure TestMultiValueCall;
     procedure TestVecThroughCall;
     procedure TestHostCallInterop;
+    procedure TestGenericHostAndLinkedWasmDispatch;
     procedure TestTailCallSelfIsBounded;
     procedure TestTailCallMutual;
     procedure TestTailCallCrossTierBounded;
@@ -3100,6 +3130,149 @@ begin
   CompileExports(['callhost']);
   Expect<Boolean>(DiffModule(HostCallModuleBytes, 'callhost',
     [MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestGenericHostAndLinkedWasmDispatch;
+var
+  CallerBytes, ProviderBytes: TWasmBytes;
+  Mode, Tier, Pinned: Integer;
+  MemoryDecl, MemoryWrite: string;
+
+  procedure RunCase;
+  var
+    CallerModule, ProviderModule: TWasmModule;
+    CallerIr, ProviderIr: TWasmIrModule;
+    Engine: TWasmEngine;
+    Store: TWasmStore;
+    Imports: TWasmImports;
+    Caller, Provider: TWasmModuleInstance;
+    Jit: TWasmJitContext;
+    Canon, TypeIds: TWasmEngineTypeIds;
+    Kind: TWasmExternKind;
+    Addr, ProviderAddr: UInt32;
+    Probe: THostDispatchProbe;
+    Res: array[0..1] of TWasmValue;
+    Msg: string;
+    {$IFDEF WASM_JIT_BACKEND}
+    Code: TWasmBytes;
+    EntryOffset: NativeUInt;
+    RegisterCount: UInt32;
+    {$ENDIF}
+  begin
+    CallerModule := TWasmModule.Create;
+    ProviderModule := TWasmModule.Create;
+    CallerIr := nil;
+    ProviderIr := nil;
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Jit := nil;
+    Imports := Default(TWasmImports);
+    Probe := Default(THostDispatchProbe);
+    Probe.Mode := Mode;
+    try
+      DecodeModule(ProviderBytes, ProviderModule);
+      ProviderIr := ValidateModule(ProviderModule, ProviderBytes);
+      Provider := InstantiateModule(Store, ProviderIr, @ProviderBytes[0],
+        Length(ProviderBytes), Imports);
+      Expect<Boolean>(Provider.FindExport('target', Kind, ProviderAddr)).ToBe(True);
+      Expect<Boolean>(Provider.FindExport('nested', Kind, Probe.Nested)).ToBe(True);
+      DecodeModule(CallerBytes, CallerModule);
+      CallerIr := ValidateModule(CallerModule, CallerBytes);
+      Engine.InternModule(CallerIr, Canon, TypeIds);
+      SetLength(Imports.Funcs, 1);
+      if Mode < 3 then
+        Imports.Funcs[0] := Store.AddHostFunc(TypeIds[0],
+          @JitDispatchProbeCallback, @Probe)
+      else
+        Imports.Funcs[0] := ProviderAddr;
+      Caller := InstantiateModule(Store, CallerIr, @CallerBytes[0],
+        Length(CallerBytes), Imports);
+      RegisterInterpreter(Store);
+      Expect<Boolean>(Caller.FindExport('run', Kind, Addr)).ToBe(True);
+      Jit := RegisterJit(Store);
+      if Mode in [2, 3] then
+      begin
+        Expect<Boolean>(Jit.ForceCompile(Probe.Nested)).ToBe(JIT_BACKEND_AVAILABLE);
+        Expect<Boolean>(Jit.ForceCompile(ProviderAddr)).ToBe(JIT_BACKEND_AVAILABLE);
+      end;
+      if Tier = 0 then
+        Expect<Boolean>(Jit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE)
+      else
+      begin
+        {$IFDEF WASM_JIT_BACKEND}
+        Code := JitStageFunctionBytes(Store, CallerIr, @CallerIr.Functions[0],
+          1, EntryOffset, RegisterCount);
+        Expect<Boolean>(Length(Code) > 0).ToBe(True);
+        Expect<Boolean>(Jit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+        {$ENDIF}
+      end;
+      Res[0].Bits := High(UInt64);
+      Res[1].Bits := High(UInt64);
+      Msg := '';
+      try
+        InterpInvoke(Store, Addr, nil, @Res[0]);
+      except
+        on E: EWasmTrap do Msg := E.Message;
+      end;
+      if Mode = 1 then
+        Expect<string>(Msg).ToBe('host dispatch probe')
+      else
+      begin
+        Expect<string>(Msg).ToBe('');
+        if Mode = 2 then
+          Expect<UInt64>(Res[0].Bits).ToBe(186)
+        else
+          Expect<UInt64>(Res[0].Bits).ToBe(63);
+        Expect<UInt64>(Res[1].Bits).ToBe(79);
+      end;
+      if Mode < 3 then
+      begin
+        Expect<Integer>(Probe.Calls).ToBe(1);
+        Expect<Boolean>(Probe.IpPublished).ToBe(True);
+      end
+      else
+        Expect<Integer>(Probe.Calls).ToBe(0);
+      Expect<NativeUInt>(InterpContextFor(Store)^.Depth).ToBe(0);
+      Expect<NativeUInt>(InterpContextFor(Store)^.ValueTop).ToBe(0);
+      Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
+    finally
+      Jit.Free;
+      Store.Free;
+      Engine.Free;
+      CallerIr.Free;
+      ProviderIr.Free;
+      CallerModule.Free;
+      ProviderModule.Free;
+    end;
+  end;
+
+begin
+  { Three args and two results exercise the generic call path. The same caller
+    links to a host, a compiled wasm import, or an interpreted wasm import.
+    Host data, IP publication, exceptions and nested guest entry all survive;
+    the arithmetic expectations do not depend on a second runtime tier. }
+  ProviderBytes := AssembleWatText('(module ' +
+    '(func (export "target") (param i64 i64 i64) (result i64 i64) ' +
+    '(i64.add (i64.sub (local.get 0) (local.get 1)) (local.get 2)) ' +
+    '(i64.xor (i64.xor (local.get 0) (local.get 1)) (local.get 2))) ' +
+    '(func (export "nested") (result i64) (i64.const 123)))');
+  for Pinned := 0 to 1 do
+  begin
+    MemoryDecl := '';
+    MemoryWrite := '';
+    if Pinned = 1 then
+    begin
+      MemoryDecl := '(memory 1) ';
+      MemoryWrite := '(i64.store (i32.const 0) (i64.const 99)) ';
+    end;
+    CallerBytes := AssembleWatText('(module ' +
+      '(import "e" "target" (func $target (param i64 i64 i64) (result i64 i64))) ' +
+      MemoryDecl + '(func (export "run") (result i64 i64) ' +
+      MemoryWrite + '(call $target (i64.const 71) (i64.const 13) (i64.const 5))))');
+    for Tier := 0 to 1 do
+      for Mode := 0 to 4 do
+        RunCase;
+  end;
 end;
 
 procedure TJitTests.TestTailCallSelfIsBounded;
@@ -4545,6 +4718,8 @@ begin
   Test('a multi-value call marshals every result slot', TestMultiValueCall);
   Test('a v128 rides a call as two flat slots', TestVecThroughCall);
   Test('a compiled function calling a host import matches', TestHostCallInterop);
+  Test('generic host calls preserve buffers and linked wasm dispatch',
+    TestGenericHostAndLinkedWasmDispatch);
   Test('1e6 self return_calls run in bounded native stack',
     TestTailCallSelfIsBounded);
   Test('mutual return_call recursion runs in bounded native stack',
