@@ -1,108 +1,125 @@
 # Handoff
 
-Updated: 2026-09-05 (Wave 16 optimization loop in progress)
+Updated: 2026-09-05 (Wave 16 optimization results)
 
-## Wave 16 — accepted changes and current experiments
+## Wave 16 — retained outcome
 
-- User authorized implementing the diagnosis and continuing optimization
-  autonomously, targeting **0.6–0.8x Wasmtime elapsed time**. This target is
-  not yet met across the suite. Delivery branch is
-  `codex/optimize-runtime-wave16`; accepted runtime integration is
-  `f58d0d713cf51e53e0c093152d43818599bdf956`, based on the verified
-  `8b43e254` fetched-main baseline described below. No push or PR yet.
-- Accepted production changes, each measured against its retained immediate
-  predecessor and remeasured after integration:
-  - `c2a9574`: separate the ARM64 native-leaf paired reload and SP adjustment.
-    Direct-call medians improved about **172–176 -> 133 ms** in both orders.
-    The original denominator was unstable; use the stabilized predecessor
-    for subsequent acceptance, not a sum of isolated percentages.
-  - `c9bb0ed`: inline bounded, no-spill scalar bodies using the existing leaf
-    proof and emitter. **132.263 -> 119.419 ms**; reverse
-    **132.796 -> 116.985 ms**. Exact depth/value limits, immutable same-module
-    target identity, ordinary fallbacks, and position independence remain.
-  - `9a3126a`: enable existing deferred temporary stores for already-eligible
-    helper-free scalar static-cache loops. **377.619 -> 353.785 ms**; reverse
-    **376.512 -> 356.895 ms**. Branch, result, local, and loop-carried
-    reconciliation remains shared with the existing implementation.
+- User authorized diagnosing baseline instability, implementing the fix, and
+  continuing the optimization loop without approval pauses. Target means
+  **Wasmlight elapsed / Wasmtime elapsed = 0.6–0.8**. It remains unmet across
+  the suite. Delivery branch is `codex/optimize-runtime-wave16`, based on
+  exact fetched-main `8b43e25447d3200ff9f86d48add5411ab355df54`, whose six-target
+  push-to-main CI passed in run `32890633665`. No PR or main merge was made.
+- Current accepted source, final comparison and exact-head platform records
+  are linked from `live-checkpoint.json` and `correctness/final-summary.json`
+  under the durable evidence root below. Read those records before reusing
+  any prior checkpoint's gate status.
+- Retained mechanisms, each measured against its immediate predecessor and
+  remeasured after isolated integration:
+  - `c2a9574`: separate ARM64 native-leaf paired reload and SP adjustment.
+    Calls **172–176 -> 133 ms** in both orders. The original denominator was
+    unstable; later comparisons use the stabilized predecessor.
+  - `c9bb0ed`: inline bounded no-spill scalar bodies through the existing
+    native-leaf proof/emitter. Calls **132.263 -> 119.419 ms**, reverse
+    **132.796 -> 116.985 ms**. Exact capacity checks and fallbacks remain.
+  - `9a3126a`: reuse deferred temporary stores in eligible helper-free scalar
+    loops. **377.619 -> 353.785 ms**, reverse **376.512 -> 356.895 ms**;
+    existing branch, local/result and loop-carried reconciliation is shared.
   - `a2cd3c9`: preserve two scalar caller locals and one constant in x26–x28
-    across eligible inlined bodies. **118.333 -> 107.034 ms**; reverse
-    **116.741 -> 106.180 ms**. The aligned 96-byte frame restores all saved
-    registers; argument aliasing, live i64 temporaries, relocation, and exact
-    exhaustion boundaries have focused coverage.
-  - `979e214`: remove bounded scalar result copies while retaining the actual
-    native return source in dynamic use counts. **109.097 -> 84.402 ms**;
-    reverse **108.368 -> 86.492 ms**. Review first exposed a missing return
-    use; a retained expression under dropped-computation pressure reproduced
-    it, then the existing use counter was corrected. External result ABI,
-    aux-list aliases, labels, exact caps, and epoch behavior are covered.
-- Latest combined schedule `integration-call-result-bench`: direct calls
-  **83.129 ms** versus predecessor **105.888 ms**, Wasmtime **63.857 ms**
-  (**1.302x**); integer loop **359.573 ms**, Wasmtime **356.296 ms**
-  (**1.009x**). All ten guard artifacts are byte-identical before/after;
-  observed guard shifts remain within prior spread or reverse in other runs.
-  Memory timing variance remains unresolved and must not be called stable.
-- All timings use retained release binaries, identical self-checking modules,
+    across eligible inlined bodies. **118.333 -> 107.034 ms**, reverse
+    **116.741 -> 106.180 ms**. Aligned 96-byte frame restores saved registers.
+  - `979e214`: eliminate bounded scalar result copies while retaining the
+    actual native return expression in use counts. **109.097 -> 84.402 ms**,
+    reverse **108.368 -> 86.492 ms**. The standalone result ABI remains.
+  - `365dc978`: repair an aux-use counting bug introduced when preserved-cache
+    eligibility expanded in `a2cd3c9`. `AnalyzeAdjacentMoves` used
+    `SimpleUseCount`, omitting a `local.tee` result's additional call-argument
+    use. It now uses `RegisterUseCount`. A high-bit i64 snapshot regression
+    fails before the fix; bisection confirms `9d05fe7` passes and `a2cd3c9`
+    fails. Full macOS and Linux gates passed the repair before timing resumed.
+  - `038b357`: forward bounded argument and loop-index aliases using private
+    planned argument slots. Canonical aux data, source-write/control/label
+    fences and both-arguments-before-clobber ordering remain. Calls
+    **80.488 -> 59.238 ms**, reverse **76.991 -> 58.091 ms**.
+
+- Latest accepted combined comparison: `integration-call-argument-bench`: calls
+  **57.956 ms** versus predecessor **77.220 ms**, Wasmtime **58.780 ms**
+  (**0.986x**); loop **333.915 ms**, Wasmtime **334.287 ms** (**0.999x**).
+  All ten guard artifacts are identical before/after. Memory guard shifts
+  overlap observed ranges and reverse across schedules; memory remains noisy.
+- Measurements use retained release binaries, identical self-checking modules,
   precompiled artifacts outside timing, one warmup, seven ABBA blocks
   (14 samples per Wasmlight binary, seven Wasmtime samples), and the shared
-  `/tmp/wasmlight-perf-gate.lock`. Native host is Apple M5 Max, macOS 26.6.2,
-  arm64, lwpt 0.6.0/FPC 3.2.2, Wasmtime 47.0.3. Scoped `caffeinate` assertions
-  prevent sleep during schedules. External toolkit builds are never stopped.
-  A partial contended schedule is retained but wholly excluded under
-  `excluded-call-cache-contended`, including its harness shutdown diagnostic.
-- Rejected candidates, all restored and uncommitted:
-  - Loop-bound static-cache priority: **358.812 -> 357.687 ms**, then
-    **352.327 -> 353.040 ms**; load removal did not improve elapsed time.
-  - Integer MADD fusion: **336.517 -> 340.096 ms**, then
-    **339.012 -> 343.748 ms**; intended instruction emitted but slightly slower.
-  - Invariant inline capacity-check hoist: **101.495 -> 99.720 ms**, then
-    **101.071 -> 100.618 ms**; gain did not exceed observed noise.
-  - Scalar-loop local aliases: **337.658 -> 337.727 ms**, then
-    **336.972 -> 337.386 ms**; five loop MOVs removed without a timing win.
-  - Memory constant ranking: short load runs appeared positive, but a ten-call
-    schedule measured **343.415 -> 321.032 ms** with candidate range
-    **287.800–450.739 ms** and median absolute deviation **32.746 ms**.
-    Wasmtime was **284.980 ms**, range **280.797–288.378 ms**. The target
-    improvement was smaller than observed variance; rejection is **unproven
-    under an unstable baseline**, not a confirmed regression. Store guards
-    also varied greatly despite identical code. All patches/binaries/raw
-    schedules remain in durable evidence; no favorable subset was accepted.
-- Current experiment: bounded argument and loop-index alias forwarding in a
-  fresh lane at `f58d0d7`, using explicit planned argument slots and existing
-  four-instruction source/target/safepoint fences. No candidate accepted yet.
-  Fresh accepted-code profile `call-result-profile-map.json` locates samples
-  at the loop-index copy and capacity loads; it is not a hardware-stall claim.
-- Memory diagnostic: `memory-process-variance.py` runs the unchanged accepted
-  memory-load-long artifact once-loaded per process, six processes with one
-  warmup and four measured invocations. All 30 calls passed their independent
-  result checks. Ranges within each process were **316–332, 308–312,
-  388–457, 329–370, 448–471, and 316–392 ms**. Instructions, cycles, core-class
-  counters, QoS, and addresses are retained in `memory-process-variance.json`;
-  analysis is in `memory-process-variance-analysis.md`. Instruction totals
-  varied only about 0.03%, cycles about 54%, and cycles per CPU nanosecond
-  about 2%; over 99.225% of instructions were on perflevel0, with QoS33.
-  Addresses were stable within each process, and memory base was identical
-  across all six. Startup, descheduling, path count, frequency alone, bulk
-  core-class shifts, and fixed virtual layout alone are insufficient
-  explanations. The hardware mechanism remains unresolved. No opcode
-  intervention or QoS change was made.
-- Full correctness is complete for **f58d0d7**: all 62 test programs,
-  frozen/format/agents/markdown checks, development and release builds, and
-  all three pinned corpus tiers pass on macOS/arm64 and emulated Linux/x64.
-  Every tier reports `files=257 errors=0 pass=65188 fail=0 skip=0 staged=0`;
-  compiled counts are 0/8763/8763. Linux's 331 archive files were unchanged,
-  and all 18 evidence files were copied and hash-verified before its container
-  was restored to stopped state. Logs are under `correctness/*-f58d0d7`.
-  The ordinary six-platform CI is still due on the final combined head.
+  `/tmp/wasmlight-perf-gate.lock`. Native host: Apple M5 Max, macOS 26.6.2,
+  arm64, lwpt 0.6.0/FPC 3.2.2, Wasmtime 47.0.3. Scoped `caffeinate` prevents
+  sleep. Do not add isolated percentages or call sample ranges confidence
+  intervals. Competing external builds were allowed to finish before timing.
+- Rejected candidates are restored and uncommitted; patches, binaries and
+  deciding schedules remain in durable evidence:
+  - Loop-bound cache priority: **358.812 -> 357.687 ms**, reverse
+    **352.327 -> 353.040 ms**; no repeatable gain.
+  - Integer MADD: **336.517 -> 340.096 ms**, reverse
+    **339.012 -> 343.748 ms**; emitted as intended but slower.
+  - Earlier capacity hoist: **101.495 -> 99.720 ms**, reverse
+    **101.071 -> 100.618 ms**; gain overlapped noise.
+  - Capacity retry on argument baseline: **64.886 -> 71.744 ms**, reverse
+    **58.491 -> 65.352 ms**; repeatable regression. A fresh profile justified
+    this retry, but sampled capacity PCs did not predict an elapsed gain.
+    Review caught reused identity leaves bypassing inline eligibility; the
+    retained rejection patch uses nonempty leaves and asserts actual hoist,
+    larger-call checks and conditional fallback. Corrected focused tests pass.
+  - Scalar-loop aliases: **337.658 -> 337.727 ms**, reverse
+    **336.972 -> 337.386 ms**; five MOVs removed without a timing gain.
+  - Memory constant priority: long load **343.415 -> 321.032 ms**, candidate
+    range **287.800–450.739 ms**, MAD **32.746 ms**, Wasmtime **284.980 ms**.
+    Improvement is smaller than observed variance: unproven under an unstable
+    baseline, not a confirmed regression. Store guards varied with identical
+    code; no favorable subset was accepted.
+  - Final inline-body result MOV removal: **64.337 -> 63.875 ms**, reverse
+    **63.624 -> 63.517 ms**; improvement overlaps noise. The caller shrank
+    300 -> 296 bytes and correctness checks passed, but no repeatable speedup
+    justified integration. Some external test activity resumed after a quiet
+    start window; retain that host caveat, not a favorable sample subset.
+- Original call instability is causally sensitive to paired post-index LDP
+  with SP writeback. Same-address, equal-instruction-count control gave
+  **174.770 vs 128.699 ms**, 84 measured samples per variant; instructions
+  stayed about 4.902B while cycles fell 751.371M -> 549.165M. All checks passed.
+  The exact silicon mechanism remains unproven. A separate laptop-sleep
+  schedule was excluded. See `diagnosis.md` and `final-layout-control.json`.
+- Memory variance remains unresolved. Six once-loaded processes with one
+  warmup and four measured invocations each all verified their results.
+  Within-process ranges: **316–332, 308–312, 388–457, 329–370, 448–471,
+  316–392 ms**. Instructions varied about 0.03%, cycles about 54%, cycles per
+  CPU nanosecond about 2%; over 99.225% of instructions were on perflevel0,
+  QoS33, wall/CPU <=1.0075. Addresses stayed fixed within each process; memory
+  base was identical across all six. Startup, path count, descheduling,
+  frequency alone, bulk core-class changes and fixed virtual layout alone
+  cannot explain the spread. No hardware-stall/cache cause is established.
+  See `memory-process-variance-analysis.md` and its raw JSON. Do not restart
+  memory optimization until a repeatable comparison can distinguish a gain.
+- Gate records cover frozen install, format, agents, markdown, dev/release
+  builds, all 62 test programs, and the pinned 257 top-level scripts in all
+  three tiers on macOS/arm64 and Linux/x64. Required stable signature:
+  `files=257 errors=0 pass=65188 fail=0 skip=0 staged=0`; compiled counts are
+  separate (0/8763/8763). Local Linux uses x64 emulation in OrbStack, not
+  native-x64 performance. Source and retained evidence hashes are verified
+  before the container is stopped. Final six-platform CI and local gate
+  source identities are recorded in `correctness/final-summary.json`.
 - Durable evidence root:
   `/Users/jstein/.local/share/wasmlight-evidence/wave16-8b43e254`.
-  Current retained predecessor `wasmlight-integration-call-result` SHA-256:
-  `af02a450501b8ca9cb42b462e6acce669cae56e75335fe567607a8314631ebde`.
-  Read `progress.md`, candidate manifests/notes, and individual schedule JSON.
+  `optimization-report.md` contains the comparison table, spreads, accepted
+  and rejected mechanisms, limitations and gate links. Raw results and
+  binaries remain outside the repository.
+- Next work: use the final accepted binary as baseline, profile remaining
+  costs, and retain only repeatable gains toward 0.6–0.8x. The optional final
+  body-result design and every rejected patch are recorded; check their
+  measured outcomes before retrying. No current benchmark or VM is left
+  running after this wave's gates.
 - Epoch contract discrepancy: ADR-0006 mentions entry polls, but shipped
-  interpreter/JIT tests intentionally permit acyclic calls after a host epoch
-  bump. These optimizations preserve current tier-identical behavior and
-  existing IR-marked backedge checks; they add no new entry poll. Pinned spec
-  and source evidence are in `call-spec.json` and `call-body-notes.md`.
+  interpreter/JIT tests permit acyclic calls after a host epoch bump. This
+  wave preserves current tier-identical behavior and IR-marked backedge
+  checks; it adds no entry poll. Evidence is in `call-spec.json` and
+  `call-body-notes.md`.
 
 Updated: 2026-09-04 (Wave 16 baseline instability localized)
 
