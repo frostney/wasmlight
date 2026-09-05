@@ -709,6 +709,8 @@ procedure EmitCbzTo(const ABuf: TWasmCodeBuffer; const ARt: Byte;
   const ATarget: UInt32); forward;
 procedure EmitBranchTo(const ABuf: TWasmCodeBuffer;
   const ATarget: UInt32); forward;
+procedure EmitEpochJump(const ABuf: TWasmCodeBuffer;
+  const ATarget: TWasmJitLabel); forward;
 procedure EmitNativeScalarSelfCallReg(const ABuf: TWasmCodeBuffer;
   const ARegisterCount: UInt32;
   const ACoreLabel, AExhaustedLabel: TWasmJitLabel); forward;
@@ -1460,7 +1462,13 @@ begin
           slots is a reference. Keep numeric values in registers here; exits
           still flush the canonical logical frame below. }
         Arm64FlushDynamicRegCache(ABuf, ACache);
-        Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
+        if AUsePinnedMemoryBase and ACache.StaticAllocation and
+          ((AIns.Imm and IR_JUMP_SAFEPOINT) <> 0) then
+          { In the helper-free pinned-base memory shape, carry the back-edge
+            on the epoch-success branch after the same cache reconciliation. }
+          EmitEpochJump(ABuf, AIns.A)
+        else
+          Result := Arm64EmitOp(ABuf, AIns, AAux, AInsIndex);
       end;
     iroCall:
       if ANativeScalarSelf then
@@ -4711,18 +4719,25 @@ begin
 end;
 
 { The back-edge epoch check (§6): if Store.Epoch <> the captured snapshot,
-  call TrapNow(wtkEpochInterrupt) (which never returns); otherwise fall through.
+  call TrapNow(wtkEpochInterrupt) (which never returns); otherwise branch to
+  ATarget. A caller can use either the original back-edge or a continuation.
   Requires x21 (&Epoch) and x22 (snapshot) set by the prologue's EpochCapture. }
+procedure EmitEpochJump(const ABuf: TWasmCodeBuffer;
+  const ATarget: TWasmJitLabel);
+begin
+  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_EPOCHADDR, 0); { x9 := *x21 }
+  ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_EPOCH));    { cmp x9,x22 }
+  EmitBCondTo(ABuf, ARM64_COND_EQ, ATarget);
+  ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(wtkEpochInterrupt)), 0)); { w0 := kind }
+  Arm64EmitCallHelper(ABuf, aohTrapKind);                    { blr -> no return }
+end;
+
 procedure EmitEpochCheck(const ABuf: TWasmCodeBuffer);
 var
   Cont: TWasmJitLabel;
 begin
-  Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_EPOCHADDR, 0); { x9 := *x21 }
-  ABuf.EmitU32(Arm64CmpX(ARM64_REG_T0, ARM64_REG_EPOCH));    { cmp x9,x22 }
   Cont := ABuf.NewLabel;
-  EmitBCondTo(ABuf, ARM64_COND_EQ, Cont);                    { b.eq Cont }
-  ABuf.EmitU32(Arm64MovzW(0, UInt16(Ord(wtkEpochInterrupt)), 0)); { w0 := kind }
-  Arm64EmitCallHelper(ABuf, aohTrapKind);                    { blr -> no return }
+  EmitEpochJump(ABuf, Cont);
   ABuf.BindLabel(Cont);
 end;
 

@@ -1660,6 +1660,7 @@ type
     procedure TestBrTable;
     procedure TestUnreachable;
     procedure TestEpochInterruptDifferential;
+    procedure TestPinnedMemoryEpochInterrupt;
     procedure TestEpochInterruptAcrossSeamToInterpCallee;
     procedure TestEpochBumpBeforeAcyclicNativeRecursion;
 
@@ -2755,6 +2756,45 @@ begin
   {$ENDIF}
 end;
 
+
+procedure TJitTests.TestPinnedMemoryEpochInterrupt;
+var
+  Bytes: TWasmBytes;
+begin
+  { The interpreted caller bumps the invocation epoch before entering a
+    helper-free pinned-memory leaf. A taken back-edge must interrupt; an
+    untaken back-edge must finish; an earlier bad load must trap first. The
+    normal path also checks its literal result independently inside wasm. }
+  Bytes := AssembleWatText('(module (import "e" "bump" (func $bump)) ' +
+    '(memory 1) (data (i32.const 0) "\2a\00\00\00") ' +
+    '(func $leaf (export "leaf") (param $n i32) (param $addr i32) ' +
+    '(result i32) (local $i i32) (local $acc i32) ' +
+    '(loop $again ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $addr)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $again (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "run") (param $n i32) (param $addr i32) (result i32) ' +
+    '(local $result i32) (call $bump) ' +
+    '(local.set $result (call $leaf (local.get $n) (local.get $addr))) ' +
+    '(if (i32.ne (local.get $result) (i32.const 42)) (then unreachable)) ' +
+    '(local.get $result)))');
+  FDiffHost := @JitBumpEpochCallback;
+  CompileExports(['leaf']);
+  Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(1), MakeValueI32(0)]))
+    .ToBe('');
+  Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(1), MakeValueI32(0)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(2), MakeValueI32(0)]))
+    .ToBe('interrupt');
+  Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(2), MakeValueI32(0)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(65536)])).ToBe('out of bounds memory access');
+  Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(2), MakeValueI32(65536)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  FDiffHost := nil;
+end;
 
 procedure TJitTests.TestEpochInterruptAcrossSeamToInterpCallee;
 
@@ -3944,10 +3984,11 @@ begin
   Code := JitStageFunctionBytes(FStore, @FIr.Functions[0], EntryOffset,
     RegisterCount);
   { The bounded local aliases remove seven loop-body copies while every
-    original IR label remains represented. Pin the resulting A64 shape so the
+    original IR label remains represented. The epoch success branch carries
+    this pinned-memory back-edge directly. Pin the resulting A64 shape so the
     transform cannot silently stop applying while differential behavior stays
     correct. }
-  Expect<Integer>(Length(Code)).ToBe(196);
+  Expect<Integer>(Length(Code)).ToBe(192);
   Expect<NativeUInt>(EntryOffset).ToBe(0);
   Expect<UInt32>(RegisterCount).ToBe(FIr.Functions[0].RegisterCount);
   {$ELSE}
@@ -4363,6 +4404,8 @@ begin
   Test('unreachable traps identically', TestUnreachable);
   Test('a shared epoch snapshot traps interrupt in a compiled leaf identically',
     TestEpochInterruptDifferential);
+  Test('pinned memory loops preserve taken epoch and earlier load traps',
+    TestPinnedMemoryEpochInterrupt);
   Test('a compiled caller''s interrupt reaches an interpreted callee across the seam',
     TestEpochInterruptAcrossSeamToInterpCallee);
   Test('an epoch bump before acyclic native recursion does not invent a safepoint',

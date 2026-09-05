@@ -64,6 +64,7 @@ type
     procedure TestLargeSlotEncoding;
     procedure TestCondBranchVeneer;
     procedure TestMixedDirectionVeneers;
+    procedure TestPinnedMemoryEpochJump;
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
@@ -850,6 +851,79 @@ begin
   end;
 end;
 
+{ Only the pinned-base static-cache path may carry the back-edge on the
+  success branch. Raw, instance-pinned, dynamic and unmarked paths retain
+  their old templates. The final case crosses the conditional branch range. }
+procedure TArm64Tests.TestPinnedMemoryEpochJump;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  Target: TWasmJitLabel;
+  Jump: TWasmIrInstr;
+  CaseIndex, I, NopCount, Site, TrapSite: Integer;
+begin
+  for CaseIndex := 0 to 5 do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      Target := Buf.NewLabel;
+      Buf.BindLabel(Target);
+      if CaseIndex = 5 then
+        NopCount := 262143
+      else
+        NopCount := 1;
+      for I := 1 to NopCount do
+        Buf.EmitU32($D503201F);
+      Site := Buf.CurrentOffset;
+      Jump := Ins(iroJump, 0, UInt32(Target), 0);
+      if CaseIndex <> 4 then
+        Jump.Imm := IR_JUMP_SAFEPOINT;
+      Arm64InitRegCache(Cache);
+      if CaseIndex <> 2 then
+        Arm64EnableStaticRegCache(Buf, Cache, []);
+      if CaseIndex = 0 then
+        Expect<Boolean>(Arm64EmitOp(Buf, Jump, nil, 0, True)).ToBe(True)
+      else
+        Expect<Boolean>(Arm64EmitOpCached(Buf, Jump, nil, 0, False,
+          True, CaseIndex <> 1, False, Cache)).ToBe(True);
+      Arm64ResolvePatches(Buf);
+      if CaseIndex = 4 then
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site)).ToBe($17FFFFFF);
+        Expect<Integer>(Buf.Size).ToBe(8);
+        Continue;
+      end;
+      Expect<UInt32>(Arm64WordAt(Buf, Site)).ToBe(Arm64LdrX(9, 21, 0));
+      Expect<UInt32>(Arm64WordAt(Buf, Site + 4)).ToBe(Arm64CmpX(9, 22));
+      TrapSite := Site + 12;
+      if CaseIndex < 3 then
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 8)).ToBe($54000080);
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 24)).ToBe($17FFFFF9);
+        Expect<Integer>(Buf.Size).ToBe(32);
+      end
+      else if CaseIndex = 3 then
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 8)).ToBe($54FFFFA0);
+        Expect<Integer>(Buf.Size).ToBe(28);
+      end
+      else
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 8)).ToBe($54000041);
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 12))
+          .ToBe(Arm64BPlaceholder or (UInt32(Int32(-262146)) and $03FFFFFF));
+        TrapSite := Site + 16;
+        Expect<Integer>(Buf.Size).ToBe(TrapSite + 12);
+      end;
+      Expect<UInt32>(Arm64WordAt(Buf, TrapSite)).ToBe($52800240);
+      Expect<UInt32>(Arm64WordAt(Buf, TrapSite + 4)).ToBe(Arm64LdrX(9, 24, 0));
+      Expect<UInt32>(Arm64WordAt(Buf, TrapSite + 8)).ToBe(Arm64Blr(9));
+    finally
+      Buf.Free;
+    end;
+  end;
+end;
+
 { The branch-displacement range predicate (jit-spec §4.3). imm19 overflow is
   rewritten to invert+B; imm26 overflow on B/BL remains the fault boundary.
   The two's-complement edges are asserted here; the cond veneer is a separate
@@ -1227,6 +1301,8 @@ begin
     TestCondBranchVeneer);
   Test('mixed-direction veneers settle earlier branch displacements',
     TestMixedDirectionVeneers);
+  Test('only pinned-base static memory loops use the direct epoch branch',
+    TestPinnedMemoryEpochJump);
   Test('branch-offset range guard fits imm19/imm26 at the boundaries',
     TestBranchOffsetRangeGuard);
   Test('helper calls and the IR pointer are position-independent',
