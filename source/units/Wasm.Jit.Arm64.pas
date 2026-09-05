@@ -5498,9 +5498,9 @@ begin
   Arm64EmitCallHelper(ABuf, aohTrapKind);
 end;
 
-{ The generic direct-call path can resolve a host callback without first
-  attempting to enter a wasm frame. The current context and function address
-  map remain live: an import linked to wasm still takes the original path. }
+{ A generic direct call that could not prepare a compiled wasm frame can
+  resolve its host callback without the generic dispatcher. The current
+  function map remains live: a linked wasm import still uses the fallback. }
 procedure EmitNativeHostCall(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AArgBytes: UInt32;
   const AUsePinnedMemory: Boolean;
@@ -5611,7 +5611,6 @@ begin
             FallbackLabel, DoneLabel)
         else
         begin
-          EmitNativeHostCall(ABuf, AIns, ArgBytes, AUsePinnedMemory, DoneLabel);
           Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
           ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
           Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, ArgBytes);
@@ -5653,6 +5652,11 @@ begin
         end;
         ABuf.BindLabel(FallbackLabel);
         ABuf.EmitU32(Arm64MovReg(0, ARM64_REG_STORE));
+        { Leave the successful compiled-call path unchanged. Only the generic
+          fallback tries host dispatch; the scalar call paths retain their
+          existing fallback, and x0 remains the store on a nonhost miss. }
+        if not UseNativeLeaf then
+          EmitNativeHostCall(ABuf, AIns, ArgBytes, AUsePinnedMemory, DoneLabel);
         Arm64EmitLoadImm32(ABuf, 1, UInt32(AIns.Imm));
         ABuf.EmitU32(Arm64AddImmX(2, ARM64_REG_SP, 0));
         Arm64EmitAddImmXAny(ABuf, 3, ARM64_REG_SP, ArgBytes);
