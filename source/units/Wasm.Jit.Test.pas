@@ -1679,6 +1679,7 @@ type
     procedure TestTailCallToHost;
     procedure TestNativeScalarSelfProofGate;
     procedure TestNativeScalarSelfSelectLiveness;
+    procedure TestNativeSelfReturnTail;
     procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
@@ -3187,6 +3188,126 @@ begin
     [MakeValueI32(8)])).ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestNativeSelfReturnTail;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_BACKEND}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount, Addr: UInt32;
+  Kind: TWasmExternKind;
+  Param, Res: TWasmValue;
+  {$ENDIF}
+  {$IFDEF WASM_JIT_ARM64}
+  K, Tail, Edge: Integer;
+  Condition: UInt32;
+  Saved: TWasmIrInstr;
+
+  function ReturnCount(const ACode: TWasmBytes): Integer;
+  var
+    N: Integer;
+    Word: UInt32;
+  begin
+    Result := 0;
+    for N := 0 to Length(ACode) div 4 - 1 do
+    begin
+      Move(ACode[N * 4], Word, SizeOf(Word));
+      if Word = Arm64Ret then
+        Inc(Result);
+    end;
+  end;
+  {$ENDIF}
+begin
+  { spec/main d7b37e4170d8315f2f1283aed4e8076591a9a333: exec-br,
+    exec-return. Both paths deliver the same terminal block result. Distinct
+    high halves and subtraction make swapped or truncated recursive results
+    observable independently of the differential oracle. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $rec (export "rec") (param $n i64) (result i64) ' +
+    '(if (result i64) (i64.lt_u (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 8589934595))) ' +
+    '(else (i64.sub ' +
+    '(call $rec (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(call $rec (i64.sub (local.get $n) (i64.const 2))))))))');
+  CompileExports(['rec']);
+  Expect<Boolean>(DiffFresh(Bytes, 'rec', [MakeValueI64(4)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'rec', [MakeValueI64(6)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := Bytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Expect<Boolean>(JitCanNativeScalarSelf(@FIr.Functions[0], 0)).ToBe(True);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+    EntryOffset, RegisterCount);
+  {$IFDEF WASM_JIT_ARM64}
+  { External wrapper plus both terminal arms; the baseline has only its
+    wrapper and common-tail RET. This asserts the optimization is exercised. }
+  Expect<Integer>(ReturnCount(Code)).ToBe(3);
+  Tail := High(FIr.Functions[0].Code) - 1;
+  Expect<TWasmIrOp>(FIr.Functions[0].Code[Tail].Op).ToBe(iroMove);
+  Edge := -1;
+  Condition := High(UInt32);
+  for K := 0 to Tail - 1 do
+  begin
+    if (FIr.Functions[0].Code[K].Op = iroJump) and
+      (FIr.Functions[0].Code[K].A = UInt32(Tail)) then
+      Edge := K;
+    if FIr.Functions[0].Code[K].Op in [iroBranchIf, iroBranchIfNot] then
+      Condition := FIr.Functions[0].Code[K].A;
+  end;
+  Expect<Boolean>(Edge >= 0).ToBe(True);
+  Expect<Boolean>(Condition <> High(UInt32)).ToBe(True);
+  {$ENDIF}
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    Length(FBytes), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('rec', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Param := MakeValueI64(0);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<Int64>(Res.I64).ToBe(8589934595);
+  Param := MakeValueI64(1);
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<Int64>(Res.I64).ToBe(8589934596);
+  Param := MakeValueI64(4);
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<Int64>(Res.I64).ToBe(-8589934596);
+  Param := MakeValueI64(6);
+  InterpInvoke(FStore, Addr, @Param, @Res);
+  Expect<Int64>(Res.I64).ToBe(8589934595);
+  {$IFDEF WASM_JIT_ARM64}
+  { Challenge the planner with individual edge metadata changes. These
+    staged-only IR variants are never executed; the original validated
+    instruction is restored after every fence check. }
+  if Edge >= 0 then
+  begin
+    Saved := FIr.Functions[0].Code[Edge];
+    FIr.Functions[0].Code[Edge].Imm := IR_JUMP_SAFEPOINT;
+    Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount);
+    Expect<Integer>(ReturnCount(Code)).ToBe(2);
+    FIr.Functions[0].Code[Edge] := Saved;
+    FIr.Functions[0].Code[Edge].Op := iroBranchIf;
+    FIr.Functions[0].Code[Edge].A := Condition;
+    FIr.Functions[0].Code[Edge].B := UInt32(Tail);
+    Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount);
+    Expect<Integer>(ReturnCount(Code)).ToBe(2);
+    FIr.Functions[0].Code[Edge] := Saved;
+    FIr.Functions[0].Code[Edge].A := UInt32(Tail + 1);
+    Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount);
+    Expect<Integer>(ReturnCount(Code)).ToBe(2);
+    FIr.Functions[0].Code[Edge] := Saved;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
 var
   Bytes: TWasmBytes;
@@ -4392,6 +4513,8 @@ begin
     TestNativeScalarSelfProofGate);
   Test('native scalar self-call keeps both select inputs live',
     TestNativeScalarSelfSelectLiveness);
+  Test('native recursive return tails preserve wide results and edge fences',
+    TestNativeSelfReturnTail);
   Test('native scalar leaf calls preserve proof and exhaustion boundaries',
     TestNativeScalarLeafProofAndExhaustion);
   Test('inlined scalar body survives relocation without a compiled target',
