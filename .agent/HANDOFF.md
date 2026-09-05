@@ -1,6 +1,129 @@
 # Handoff
 
-Updated: 2026-09-05 (Wave 16 optimization results)
+Updated: 2026-09-05 (Wave 17 optimization results)
+
+## Wave 17 — retained outcome
+
+- User authorized further implementation and autonomous optimization toward
+  **Wasmlight elapsed / Wasmtime elapsed = 0.6–0.8**. The target is not met
+  across the suite. Delivery continues on `codex/optimize-runtime-wave16`;
+  wave start was `34b3ae964a66405980f99e8fc85fcb64ddf70bcf`. Fetched main is
+  `8b43e25447d3200ff9f86d48add5411ab355df54`, with exact successful six-target
+  push CI `32890633665`. No PR or main merge was requested.
+- Durable evidence root:
+  `/Users/jstein/.local/share/wasmlight-evidence/wave17-34b3ae9`.
+  `live-checkpoint.json` identifies current accepted source and binaries;
+  `correctness/final-summary.json` records final gate status, source heads,
+  run URLs and retained verification records. Read those records before
+  treating any intermediate gate as final.
+- Accepted changes, measured against each immediate predecessor and then
+  confirmed in the combined integration:
+  - `1c41718`: restart ARM64 patch resolution after inserting a conditional
+    branch veneer. Insertion shifts already-patched forward branches; the
+    regression forces an earlier branch to need a second veneer. The test
+    failed before the fix. All eleven benchmark AOT artifacts are unchanged.
+  - `7a869dc`, integrated by `3d801c4`: thread eligible recursive terminal
+    branches directly to native returns. The existing closed scalar proof,
+    actual return-source liveness, canonical IR and wrapper ABI remain.
+    Combined Fibonacci **36.102 -> 28.968 ms**, Wasmtime **37.306 ms**
+    (**0.7765x**); ranges **33.458–37.889 -> 27.646–30.168 ms**.
+    All ten guard artifacts are identical.
+  - `50080de`, integrated by `b228466`: branch directly to the loop target
+    on epoch success only for proven stable pinned-memory, static-cache
+    loops. The same poll, trap path and memory chokepoint remain. Long load
+    **325.005 -> 272.949 ms** in isolation. Combined long load
+    **379.085 -> 311.581 ms**, reverse **494.885 -> 391.483 ms**;
+    all fourteen paired block ratios **0.733–0.878**. Eight nonmemory guard
+    artifacts are identical. Short store **34.644 -> 27.963 ms**, reverse
+    **34.345 -> 27.513 ms**. Earlier OOB versus epoch ordering is tested.
+  - `ce03cd7` (following `691618c`): call a live host callback directly only
+    after generic compiled preparation returns nil. Successful compiled
+    calls skip the new lookup. Published IP, buffers, pinned memory state,
+    reentry, trap cleanup and cross-module fallbacks remain covered. Combined
+    long host calls **341.025 -> 322.335 ms**; long three-argument Wasm guard
+    **165.274 -> 164.190 ms**. Isolated reverse-order confirmation passed.
+  - `203b619`: on little-endian hosts pass the existing U64 value through
+    `MemWrite`, replacing byte serialization while preserving its checked,
+    alignment-independent copy. Big-endian serialization remains. Raw-byte,
+    unaligned, exact-end and rejected-write tests cover Engine and WASI.
+    Long host calls **381.904 -> 362.240 ms**, reverse
+    **392.426 -> 368.944 ms**; every paired block favors the candidate.
+    Combined **304.227 -> 284.397 ms**, Wasmtime **337.066 ms**; the long
+    Wasm guard **157.058 -> 157.291 ms** is flat. Release rebuild hash
+    matches the isolated binary. Target AOT artifacts are identical.
+- Method: native Apple M5 Max, macOS 26.6.2 (25G83), arm64, released
+  lwpt 0.6.0/FPC 3.2.2, release builds. Identical self-checking modules and
+  entry points, compilation excluded for both runtimes, retained precompiled
+  artifacts, one warmup and seven ABBA blocks (fourteen samples per
+  Wasmlight binary, seven Wasmtime samples), shared process lock and scoped
+  `caffeinate`. Wasmtime is pinned at **48.0.1**, SHA256
+  `62c9c9644d690f3615c842e6bfa977588c4eac905622508507821fadce385681`.
+  Final Wasmlight runtime commit is `203b6199fef6ccff8b10f0eb3570ff7e82ab55c0`,
+  release SHA256
+  `27c7cdd34b60f742a4335aee8876cf7d1e2a64a169b267557fec6fad1e9b3750`.
+- External TypeScript builds and UI activity varied during this wave. Own
+  benchmarks were serialized; unrelated processes were not terminated.
+  Same-binary controls, reverse order, paired blocks and identical guard
+  artifacts distinguish accepted gains from that load. Absolute Wasmtime
+  ratios vary with host activity; do not cherry-pick favorable ratios or
+  call sample ranges confidence intervals. Original memory variance and
+  its exact hardware cause remain unresolved. The narrower scoped memory
+  change repeatedly wins despite that variance.
+- Rejected experiments remain outside delivery ancestry, with patches,
+  binaries and raw deciding schedules retained:
+  - Splitting the recursive post-index LDP: only **0.8–1.3%**, overlapping
+    noise; the earlier wave's leaf-frame result did not transfer here.
+  - Broad epoch-success backedges: scalar loop **358.096 -> 358.457 ms**,
+    reverse **361.719 -> 362.722 ms**, and calls roughly **18% slower**.
+    Fresh profiling led to the narrower accepted pinned-memory scope.
+  - Broad host probing before compiled preparation: long host calls won,
+    but the added long three-argument Wasm guard regressed **1.5–2.4%** in
+    both orders. That integration (`7147cbb`) was never advanced onto the
+    delivery branch. The fallback-only accepted variant removes that cost.
+- Focused regressions and independent combined source review passed. Final
+  completion requires frozen install, format, agent registry, markdown,
+  clean dev/release builds, all 62 test programs, exact top-level 257-script
+  interpreter/JIT/AOT gates on macOS arm64 and native Linux x64, and all six
+  ordinary CI targets at the final source head. Gate records below the
+  evidence root distinguish completed results from pending validation.
+  Required stable tally is `files=257 errors=0 pass=65188 fail=0 skip=0 staged=0`;
+  compiled counts are recorded separately. The native GitHub x64 runner is
+  correctness evidence only. No Linux performance or emulated timing claim
+  is made; the previously stuck local VM was not restarted or repurposed.
+- Next bottleneck: generic three-or-more-argument Wasm calls. The new long
+  guard remains much slower than Wasmtime (roughly 13–15x in recent runs),
+  despite ordinary one/two-argument calls approaching parity. Profile that
+  specific call path before expanding any scalar proof. SIMD and scalar
+  loop also remain outside the target. Do not infer whole-suite performance
+  from Fibonacci or host-call ratios, or add isolated percentage wins.
+
+- Final combined comparison against the wave start: `wave17-final-overall`
+  (all times in milliseconds; ratios are final Wasmlight / Wasmtime).
+
+| Workload | Wave start | Final | Wasmtime | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| startup | 2.772 | 2.811 | 4.609 | 0.610x |
+| loop | 356.984 | 351.065 | 345.830 | 1.015x |
+| fib | 32.681 | 25.907 | 35.150 | 0.737x |
+| memory | 19.072 | 17.183 | 19.027 | 0.903x |
+| memory-load | 35.531 | 29.268 | 31.791 | 0.921x |
+| memory-store | 32.111 | 26.184 | 29.104 | 0.900x |
+| call | 61.969 | 61.006 | 61.249 | 0.996x |
+| memory-grow | 14.023 | 13.601 | 15.918 | 0.854x |
+| gc | 26.452 | 26.593 | 28.984 | 0.917x |
+| simd | 5.833 | 5.906 | 4.981 | 1.186x |
+| host-call | 35.618 | 31.620 | 40.525 | 0.780x |
+| host-call-10repeat | 328.391 | 287.818 | 342.704 | 0.840x |
+| host-dispatch-3arg-wasm-10repeat | 161.452 | 164.150 | 11.680 | 14.054x |
+| memory-load-10repeat | 339.967 | 281.357 | 293.797 | 0.958x |
+
+Reverse confirmation (`wave17-final-reverse-guards`) gave Fibonacci
+31.073 -> 24.273 ms, host calls 34.998 -> 31.207 ms, and long memory loads
+323.546 -> 272.514 ms. SIMD was flat (5.758 -> 5.760 ms). The long
+three-argument guard shifted +1.7% forward and +0.7% reverse against the
+wave start, with overlapping ranges and mixed paired-block directions;
+this is not a confirmed regression, but retain it in the next call-path
+baseline. Its immediate-predecessor integration checks were flat.
 
 ## Wave 16 — retained outcome
 
