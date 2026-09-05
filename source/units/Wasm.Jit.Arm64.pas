@@ -3854,6 +3854,12 @@ begin
         ABuf.PatchU32(P.SiteOffset, Inverted or (UInt32(2) shl 5));
         ABuf.AddPatch(P.SiteOffset + 4, P.Target, Integer(Arm64BPlaceholder));
         ABuf.SetPatchKind(I, 0);
+        { Insertion moves labels and sites, including targets of branches
+          already encoded earlier in this walk. Revisit every live patch:
+          an earlier conditional can now need its own veneer. Consumed
+          conditionals keep their fixed eight-byte skip over the inserted B. }
+        I := 0;
+        Continue;
       end;
     end;
     Inc(I);

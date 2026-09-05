@@ -63,6 +63,7 @@ type
     procedure TestSpZeroAdjustCopiesSp;
     procedure TestLargeSlotEncoding;
     procedure TestCondBranchVeneer;
+    procedure TestMixedDirectionVeneers;
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
@@ -799,6 +800,56 @@ begin
   end;
 end;
 
+{ A backward veneer moves a forward target across the imm19 boundary. Both
+  the earlier B and the newly overflowing CBNZ must use the final layout. }
+procedure TArm64Tests.TestMixedDirectionVeneers;
+var
+  Buf: TWasmCodeBuffer;
+  BackTarget, EndTarget: TWasmJitLabel;
+  I, Site: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    BackTarget := Buf.NewLabel;
+    EndTarget := Buf.NewLabel;
+    Buf.BindLabel(BackTarget);
+    Buf.AddPatch(0, EndTarget, Integer(Arm64BPlaceholder));
+    Buf.EmitU32(Arm64BPlaceholder);
+    Buf.EmitU32($D503201F);
+    Buf.EmitU32($D503201F);
+    Buf.AddPatch(12, EndTarget, Integer(Arm64CbnzWPlaceholder(0)));
+    Buf.EmitU32(Arm64CbnzWPlaceholder(0));
+    for I := 1 to 262141 do
+      Buf.EmitU32($D503201F);
+    Site := Buf.CurrentOffset;
+    Buf.AddPatch(Site, BackTarget,
+      Integer(Arm64BCondPlaceholder(ARM64_COND_EQ)));
+    Buf.EmitU32(Arm64BCondPlaceholder(ARM64_COND_EQ));
+    Buf.BindLabel(EndTarget);
+    Buf.EmitU32(Arm64Ret);
+    Expect<Integer>(Site).ToBe(1048580);
+    Expect<Integer>(Buf.PatchDelta(1) div 4).ToBe(262143);
+    Expect<Integer>(Buf.PatchDelta(2) div 4).ToBe(-262145);
+
+    Arm64ResolvePatches(Buf);
+    Expect<Integer>(Buf.LabelOffset(EndTarget)).ToBe(1048592);
+    Expect<Integer>(Buf.Size).ToBe(1048596);
+    Expect<UInt32>(Arm64WordAt(Buf, 0))
+      .ToBe(Arm64BPlaceholder or UInt32(262148));
+    Expect<UInt32>(Arm64WordAt(Buf, 12))
+      .ToBe(Arm64CbzWPlaceholder(0) or (UInt32(2) shl 5));
+    Expect<UInt32>(Arm64WordAt(Buf, 16))
+      .ToBe(Arm64BPlaceholder or UInt32(262144));
+    Expect<UInt32>(Arm64WordAt(Buf, 1048584))
+      .ToBe(Arm64BCondPlaceholder(ARM64_COND_NE) or (UInt32(2) shl 5));
+    Expect<UInt32>(Arm64WordAt(Buf, 1048588))
+      .ToBe(Arm64BPlaceholder or (UInt32(Int32(-262147)) and $03FFFFFF));
+    Expect<UInt32>(Arm64WordAt(Buf, 1048592)).ToBe(Arm64Ret);
+  finally
+    Buf.Free;
+  end;
+end;
+
 { The branch-displacement range predicate (jit-spec §4.3). imm19 overflow is
   rewritten to invert+B; imm26 overflow on B/BL remains the fault boundary.
   The two's-complement edges are asserted here; the cond veneer is a separate
@@ -1174,6 +1225,8 @@ begin
     TestLargeSlotEncoding);
   Test('an out-of-range CBNZ is rewritten to invert+B',
     TestCondBranchVeneer);
+  Test('mixed-direction veneers settle earlier branch displacements',
+    TestMixedDirectionVeneers);
   Test('branch-offset range guard fits imm19/imm26 at the boundaries',
     TestBranchOffsetRangeGuard);
   Test('helper calls and the IR pointer are position-independent',
