@@ -31,7 +31,14 @@ jobs:
             echo "source_commit=$SOURCE_COMMIT"
             echo "environment=GitHub-hosted Ubuntu 24.04 x86_64; no performance measurements"
           } > "$RUNNER_TEMP/wave16-evidence/identity.log"
-          git ls-files -z | xargs -0 sha256sum > "$RUNNER_TEMP/wave16-evidence/source-files.sha256"
+          git ls-files --stage > "$RUNNER_TEMP/wave16-evidence/source-index.txt"
+          git ls-files -z | while IFS= read -r -d '' file; do
+            if [ -L "$file" ]; then
+              echo "$file -> $(readlink "$file")" >> "$RUNNER_TEMP/wave16-evidence/source-symlinks.txt"
+            else
+              sha256sum "$file"
+            fi
+          done > "$RUNNER_TEMP/wave16-evidence/source-files.sha256"
           git archive --format=tar -o "$RUNNER_TEMP/wave16-evidence/source.tar" HEAD
       - name: Install established released toolchain
         run: |
