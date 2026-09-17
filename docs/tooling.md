@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - FPC **3.2.2** (Delphi mode) is the pinned compiler; the
-  [lwpt](https://github.com/frostney/lwpt) **0.6.0 release binary** is the
+  [lwpt](https://github.com/frostney/lwpt) **0.7.0 release binary** is the
   single toolchain entry point for install / build / test / format.
 - Lefthook runs `lwpt format` and `lwpt agents` pre-commit; markdownlint and
   the PR workflow are the blocking gates.
@@ -17,7 +17,7 @@
 | Tool | Version / source | Role |
 | --- | --- | --- |
 | FPC | 3.2.2 (brew / apt / choco) | compiler, Delphi mode via `source/units/Shared.inc` |
-| lwpt | 0.6.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball; pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
+| lwpt | 0.7.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball). Local/docs pin is 0.7.0; CI `LWPT_VERSION` is still 0.6.0 until a token with `workflow` scope can move it. | build, test, format, agents, health, duplication, outdated/update |
 | InstantFPC | ships with FPC | runs `scripts/stamp-version.pas` as a build hook |
 | Lefthook | ≥ 1.5 | pre-commit formatter + agent-reference hooks (`lefthook install`) |
 | markdownlint-cli2 | latest | blocking docs gate |
@@ -35,8 +35,12 @@ lwpt format            # rewrite Pascal sources in place
 lwpt format --check    # CI / hook form: exit non-zero on drift
 lwpt agents             # refresh the machine-owned AGENTS.md command block
 lwpt agents --check     # CI form: exit non-zero when the block is stale
-lwpt build [target]    # binaries land under build/
-lwpt test              # discovers source/units/*.Test.pas
+lwpt health            # complexity ratchet ([health] in lwpt.toml)
+lwpt duplication       # clone ratchet ([duplication] in lwpt.toml)
+lwpt outdated          # git-host deps vs advertised tags (exit 1 if behind)
+lwpt update            # sanctioned constraint+lock bump (do not hand-edit the lock)
+lwpt build [target]    # binaries land under build/ (verified-result cache is default)
+lwpt test              # discovers source/units/*.Test.pas (executable cache is default)
 ./build/wasmlight inspect <module.wasm>
 ./build/wasmlight compile <module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...
 # compile is registered; native emission still fails with structured errors
