@@ -88,12 +88,12 @@
   CI has now passed all six configured targets; the four 64-bit UNIX legs
   proved interpreter/JIT/AOT tally identity and the Windows legs proved the
   interpreter.
-- **`0.1.0` has shipped.** The next product spine is native application
-  compilation: `wasmlight compile` produces a complete native executable
-  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)). That
-  command is planned, not shipped. The compiled capability-set model
-  (`Wasm.Compile.Capabilities`) is a shipped library unit the command will
-  consume. Merged work after `0.1.0` — JIT/GC performance, CI hardening,
+- **`0.1.0` has shipped.** Native application compilation now emits a
+  WASI command executable on the four released 64-bit UNIX targets
+  (`wasmlight compile`,
+  [ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)).
+  Connector host functions and compiled `--dir`/`--env` are not yet
+  embedded. Merged work after `0.1.0` — JIT/GC performance, CI hardening,
   and documentation — folds into `0.2.0` rather than a `0.1.1` patch.
 - **Next sequence:** `0.2.0` strict native compiler, connectors,
   64-bit Unix cross-compilation, and Homebrew; `0.3.0` Win64 native
@@ -178,7 +178,7 @@ Spec counts below come from `wasm-mcp` at pinned `spec/main`
 | WASI preview1 host module: args/environ, clock, a real-CSPRNG `random_get`, stdio, and the wave-2 filesystem behind preopen containment — deny-by-default, no ambient authority | `Wasm.Wasi` (+ `Wasm.Wasi.Types`, `Wasm.Wasi.Memory`) | `Wasm.Wasi.Test` (+ `Wasm.Wasi.Types.Test`, `Wasm.Wasi.Memory.Test`) |
 | `wasmlight run`: decode + validate a WASI command, link it deny-by-default, run `_start`, map the outcome to a process exit code (`run --aot <artifact.waot>` loads an AOT artifact for instant startup, `--no-aot` forces interpret) | `Wasm.Run` + `source/apps/wasmlight.pas` | `Wasm.Run.Test` + manual |
 | `wasmlight aot`: compile a module ahead of time to a `.waot` artifact | `Wasm.Aot` + `source/apps/wasmlight.pas` | `Wasm.Aot.Test` + manual |
-| ELF runtime-shell packager for `aarch64-linux` and `x86_64-linux` (append payload + trailer; no host linker). The interpreter-free shell, payload format, and `wasmlight compile` are not shipped | `Wasm.Package.Elf` | `Wasm.Package.Elf.Test` |
+| ELF runtime-shell packager for `aarch64-linux` and `x86_64-linux` (append payload + trailer; no host linker). The compile command packages a complete native payload into a catalog shell or a host-sibling shell | `Wasm.Package.Elf` | `Wasm.Package.Elf.Test` |
 | Cross-check against 22 real compiled modules | `tests/fixtures/` | `Wasm.Fixtures.Test` |
 | `wasmlight inspect` (sections + entity counts) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |
 | `wasmlight validate` (decode + validate, reporting the lowered IR) | `source/apps/wasmlight.pas` | `Wasm.Fixtures.Test` + manual |

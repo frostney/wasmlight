@@ -159,14 +159,22 @@ function AotCompileModuleIr(const AStore: TWasmStore; const AIr: TWasmIrModule;
 { Strict whole-module compile (ADR-0015): every defined function must have
   native code or the call raises EWasmAotError and returns no bytes. Distinct
   from AotCompileModule, which records JitCanCompile / late backend declines
-  as uncompiled cache records for interpreter fallback. }
+  as uncompiled cache records for interpreter fallback. The no-target
+  overload compiles for the compiler host. }
 function AotCompileModuleStrict(const AStore: TWasmStore;
-  const ALoaded: TWasmLoadedModule): TWasmBytes;
+  const ALoaded: TWasmLoadedModule): TWasmBytes; overload;
+function AotCompileModuleStrict(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const ATarget: TWasmTarget): TWasmBytes; overload;
 
 { The raw-IR form of AotCompileModuleStrict. }
 function AotCompileModuleIrStrict(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const ABytesPtr: PByte;
-  const ABytesLength: NativeUInt): TWasmBytes;
+  const ABytesLength: NativeUInt): TWasmBytes; overload;
+function AotCompileModuleIrStrict(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const ABytesPtr: PByte;
+  const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget): TWasmBytes; overload;
 
 { Visibility-atomic publication: write ABytes to a sibling staging file, then
   rename over APath so a reader never sees a partial artifact. Compile
@@ -396,16 +404,32 @@ end;
 function AotCompileModuleStrict(const AStore: TWasmStore;
   const ALoaded: TWasmLoadedModule): TWasmBytes;
 begin
+  Result := AotCompileModuleStrict(AStore, ALoaded, WasmTargetHost);
+end;
+
+function AotCompileModuleStrict(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const ATarget: TWasmTarget): TWasmBytes;
+begin
   Result := AotCompileModuleIrStrict(AStore, ALoaded.Ir, ALoaded.BytesPtr,
-    ALoaded.BytesLength);
+    ALoaded.BytesLength, ATarget);
 end;
 
 function AotCompileModuleIrStrict(const AStore: TWasmStore;
   const AIr: TWasmIrModule; const ABytesPtr: PByte;
   const ABytesLength: NativeUInt): TWasmBytes;
 begin
-  Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength,
-    WasmTargetHost, CompileModuleFunctions(AStore, AIr, WasmTargetHost, True));
+  Result := AotCompileModuleIrStrict(AStore, AIr, ABytesPtr, ABytesLength,
+    WasmTargetHost);
+end;
+
+function AotCompileModuleIrStrict(const AStore: TWasmStore;
+  const AIr: TWasmIrModule; const ABytesPtr: PByte;
+  const ABytesLength: NativeUInt;
+  const ATarget: TWasmTarget): TWasmBytes;
+begin
+  Result := SerializeCompiled(AStore, AIr, ABytesPtr, ABytesLength, ATarget,
+    CompileModuleFunctions(AStore, AIr, ATarget, True));
 end;
 
 procedure AotPublishArtifact(const APath: string; const ABytes: TWasmBytes);

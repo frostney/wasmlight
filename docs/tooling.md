@@ -17,7 +17,7 @@
 | Tool | Version / source | Role |
 | --- | --- | --- |
 | FPC | 3.2.2 (brew / apt / choco) | compiler, Delphi mode via `source/units/Shared.inc` |
-| lwpt | 0.7.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball). Local/docs pin is 0.7.0; CI `LWPT_VERSION` is still 0.6.0 until a token with `workflow` scope can move it. | build, test, format, agents, health, duplication, outdated/update |
+| lwpt | 0.7.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball). Local and CI versions are pinned to 0.7.0. | build, test, format, agents, health, duplication, outdated/update |
 | InstantFPC | ships with FPC | runs `scripts/stamp-version.pas` as a build hook |
 | Lefthook | ≥ 1.5 | pre-commit formatter + agent-reference hooks (`lefthook install`) |
 | markdownlint-cli2 | latest | blocking docs gate |
@@ -43,8 +43,8 @@ lwpt build [target]    # binaries land under build/ (verified-result cache is de
 lwpt test              # discovers source/units/*.Test.pas (executable cache is default)
 ./build/wasmlight inspect <module.wasm>
 ./build/wasmlight compile <module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...
-# compile is registered; native emission still fails with structured errors
-# until the remaining ADR-0015 stages land — never a .waot/JIT fallback
+# native WASI executable onto a catalog or sibling wasmlight-shell
+# never a .waot/JIT/interpreter fallback
 ./build/wasmlight-shell [<payload.wshl> [guest-args...]]  # runtime-shell template
 ./build/wasmbench      # execution workloads and tiers (measurement only)
 # isolate with --workload loop|fib|memory|numeric|simd|startup and --tier

@@ -56,15 +56,13 @@ Component Model — component decode and canonical ABI lowering — is
 deferred to post-v1, deferred rather than dropped
 ([ADR-0014](docs/adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
-The next product spine, not yet shipped, is native application
-compilation: `wasmlight compile` produces a complete native executable
-from a validated module
+Native application compilation is shipped for WASI command modules:
+`wasmlight compile` produces a complete native executable from a
+validated module on the four released 64-bit UNIX targets
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-That work is sequenced in [roadmap.md](docs/roadmap.md). The `compile`
-verb is registered with `--target` and `--connector`, but producing a
-native executable is not shipped: the command reports structured errors
-until the remaining compiler stages land. The shipped execution CLI
-remains `inspect` / `validate` / `run` / `aot`.
+Connector host functions and compiled `--dir`/`--env` are not yet
+embedded. The shipped execution CLI remains `inspect` / `validate` /
+`run` / `aot` / `compile`.
 
 wasmlight is a member of the lwpt ecosystem: built, tested, formatted, and
 released through lwpt, and consumable by any lwpt project.

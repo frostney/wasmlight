@@ -56,7 +56,7 @@ lwpt test            # co-located unit suites
 ./build/wasmlight inspect module.wasm    # section table + entity counts
 ./build/wasmlight validate module.wasm   # decode + validate, report the IR
 ./build/wasmlight run module.wasm        # run a WASI preview1 command
-./build/wasmlight compile module.wasm -o app  # CLI is registered; native emission is not shipped
+./build/wasmlight compile module.wasm -o app  # native WASI executable (needs wasmlight-shell beside the compiler, or a catalog)
 ./build/wasmlight --version
 ./build/wasmbench --workload loop --tier jit --samples 5
 # workloads: decode, leb128, startup, loop, fib, memory, numeric, simd
