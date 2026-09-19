@@ -1,4 +1,6 @@
-# PR maintenance, 2026-09-19
+# Handoff
+
+## PR maintenance, 2026-09-19
 
 - User requested review and fixes for every open PR, following frostney/me.
 - Current workflow: known-good-route deliver at default deployed endpoint.
@@ -19,7 +21,7 @@
 
 ---
 
-# Handoff
+## Prior handoff
 
 Updated: 2026-08-24 (roadmap and GitHub records created)
 
