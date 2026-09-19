@@ -120,7 +120,8 @@ function TargetArchName(const AArch: TWasmTargetArch): string;
 function TargetOsName(const AOs: TWasmTargetOs): string;
 function ShellFormatName(const AFormat: TWasmShellFormat): string;
 
-{ `<compiler-dir>/shells`. The CLI supplies ParamStr(0); tests pass a fixture. }
+{ Distribution share/wasmlight/shells, installed prefix share directory, or
+  the development <compiler-dir>/shells. The CLI supplies ParamStr(0). }
 function CompilerCatalogRoot(const ACompilerPath: string): string;
 
 { FNV-1a-64 of the shell bytes — a corruption guard, not authentication.
@@ -357,9 +358,18 @@ end;
 
 function CompilerCatalogRoot(const ACompilerPath: string): string;
 var
-  Dir: string;
+  Dir, Candidate: string;
 begin
   Dir := ExtractFileDir(ACompilerPath);
+  Candidate := IncludeTrailingPathDelimiter(Dir) + 'share/wasmlight/shells';
+  if FileExists(IncludeTrailingPathDelimiter(Candidate) + SHELL_CATALOG_FILENAME) then
+    Exit(Candidate);
+  if ExtractFileName(Dir) = 'bin' then
+  begin
+    Candidate := IncludeTrailingPathDelimiter(ExtractFileDir(Dir)) + 'share/wasmlight/shells';
+    if FileExists(IncludeTrailingPathDelimiter(Candidate) + SHELL_CATALOG_FILENAME) then
+      Exit(Candidate);
+  end;
   if Dir = '' then
     Result := 'shells'
   else

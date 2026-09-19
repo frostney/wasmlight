@@ -35,6 +35,7 @@ type
     procedure TestUnknownTripleRejected;
     procedure TestHostDefaultIsReleasedOrEmpty;
     procedure TestCompilerCatalogRootIsBesideCompiler;
+    procedure TestDistributionCatalogRoots;
     procedure TestChecksumEmptyIsOffsetBasis;
     procedure TestChecksumDeterministic;
     procedure TestCatalogRoundTrip;
@@ -250,6 +251,19 @@ begin
   Expect<string>(CompilerCatalogRoot(CompilerPath)
     ).ToBe(IncludeTrailingPathDelimiter('bindir') + 'shells');
   Expect<string>(CompilerCatalogRoot('wasmlight')).ToBe('shells');
+end;
+
+procedure TCatalogTests.TestDistributionCatalogRoots;
+var
+  Root: string;
+begin
+  Root := IncludeTrailingPathDelimiter(FTempDir) + 'share/wasmlight/shells';
+  ForceDirectories(Root);
+  WriteReleaseCatalog(Root);
+  Expect<string>(CompilerCatalogRoot(IncludeTrailingPathDelimiter(FTempDir) +
+    'wasmlight')).ToBe(Root);
+  Expect<string>(CompilerCatalogRoot(IncludeTrailingPathDelimiter(FTempDir) +
+    'bin/wasmlight')).ToBe(Root);
 end;
 
 procedure TCatalogTests.TestChecksumEmptyIsOffsetBasis;
@@ -607,6 +621,7 @@ end;
 
 procedure TCatalogTests.SetupTests;
 begin
+  Test('archives and installed prefixes discover their shared catalog', TestDistributionCatalogRoots);
   Test('released triples are the four 64-bit Unix targets',
     TestReleasedTripleCountAndNames);
   Test('an unknown triple is not a released target', TestUnknownTripleRejected);
