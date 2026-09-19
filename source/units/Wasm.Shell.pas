@@ -96,7 +96,8 @@ function RunShellFile(const APath: string;
 
 { Copy the attached native-executable payload out of a packaged ELF or
   Mach-O image. False when ABytes is not a packaged shell or the payload
-  is empty (the unfilled template). }
+  is empty (the unfilled template). A recognized but damaged container
+  raises EWasmDecodeError instead of reopening the attach seam. }
 function ExtractPackagedPayload(const ABytes: TWasmBytes;
   out APayload: TWasmBytes): Boolean;
 
@@ -382,21 +383,35 @@ function ExtractPackagedPayload(const ABytes: TWasmBytes;
 var
   Elf: TWasmElfPackageInfo;
   Mach, Appended: TWasmBytes;
+  MachRes: TWasmMachOResult;
 begin
   APayload := nil;
   Result := False;
-  if ParseElfPackage(ABytes, Elf) = eprOk then
-    APayload := Elf.Payload
-  else if ExtractMachOPayload(ABytes, Mach) = mmrOk then
-    APayload := Mach
-  else if ParseAppendedPayload(ABytes, Appended) = eprOk then
-    APayload := Appended
+  if HasPayloadTrailer(ABytes) then
+  begin
+    if ParseElfPackage(ABytes, Elf) = eprOk then
+      APayload := Elf.Payload
+    else if ParseAppendedPayload(ABytes, Appended) = eprOk then
+      APayload := Appended
+    else
+      raise EWasmDecodeError.Create('malformed embedded payload trailer');
+  end
   else
-    Exit;
+  begin
+    MachRes := ExtractMachOPayload(ABytes, Mach);
+    if MachRes = mmrOk then
+      APayload := Mach
+    else if MachRes in [mmrMalformed, mmrTruncated, mmrSignatureInvalid] then
+      raise EWasmDecodeError.Create('malformed embedded Mach-O payload')
+    else
+      Exit;
+  end;
   { An unfilled template may reserve `__WSHL,__payload` with a dummy byte.
     Only a WNEP or WSHL magic is a real attach. }
   if Length(APayload) < 4 then
   begin
+    if HasPayloadTrailer(ABytes) then
+      raise EWasmDecodeError.Create('truncated embedded payload');
     APayload := nil;
     Exit;
   end;
@@ -406,7 +421,7 @@ begin
     (APayload[2] = WSHL_MAGIC2) and (APayload[3] = WSHL_MAGIC3)) then
     Result := True
   else
-    APayload := nil;
+    raise EWasmDecodeError.Create('malformed embedded payload magic');
 end;
 
 function ExtractPackagedPayloadFromFile(const APath: string;
@@ -479,10 +494,15 @@ begin
     on E: Exception do
       Exit(FailResult('EWasmDecodeError: ' + E.Message));
   end;
-  if ExtractPackagedPayload(Bytes, Extracted) then
-    Result := RunShellBytes(Extracted, AConfig)
-  else
-    Result := RunShellBytes(Bytes, AConfig);
+  try
+    if ExtractPackagedPayload(Bytes, Extracted) then
+      Result := RunShellBytes(Extracted, AConfig)
+    else
+      Result := RunShellBytes(Bytes, AConfig);
+  except
+    on E: EWasmDecodeError do
+      Result := FailResult(E.ClassName + ': ' + E.Message);
+  end;
 end;
 
 end.

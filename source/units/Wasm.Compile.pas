@@ -164,7 +164,8 @@ uses
   Wasm.Native.Payload,
   Wasm.Package.Elf,
   Wasm.Runtime.Store,
-  Wasm.Target;
+  Wasm.Target,
+  Wasm.Wasi;
 
 const
   WASM_COMPILE_EXIT_ERROR = 1;
@@ -375,6 +376,11 @@ var
   Docs: array of TWlcDocument;
   Plan: TWlcConnectorPlan;
   BuiltIn: array[0..0] of string;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Linker: TWasmLinker;
+  Config: TWasmWasiConfig;
+  Context: TWasmWasiContext;
 begin
   SetLength(Docs, Length(AConnectors));
   for I := 0 to High(AConnectors) do
@@ -404,6 +410,27 @@ begin
   if Length(Plan.Thunks) > 0 then
     raise EWasmLinkError.Create(
       'compiled executables grant WASI only; connector host functions are not embedded');
+  Engine := TWasmEngine.Create;
+  Store := nil;
+  Linker := nil;
+  Config := nil;
+  Context := nil;
+  try
+    Store := TWasmStore.Create(Engine);
+    Config := TWasmWasiConfig.Create;
+    Context := TWasmWasiContext.Create(Config);
+    Linker := TWasmLinker.Create(Store);
+    WasiDefineAll(Linker, Context);
+    { Resolve the shell's actual names, kinds and signatures without
+      instantiating the module or executing its start function. }
+    Linker.ResolveImports(ALoaded);
+  finally
+    Linker.Free;
+    Context.Free;
+    Config.Free;
+    Store.Free;
+    Engine.Free;
+  end;
 end;
 
 function CompileWasmTarget(const ATriple: string;
@@ -451,7 +478,8 @@ begin
   Sel := ResolveShell(Root, ATarget, Entry);
   if Sel = ssrOk then
     Exit(ReadAllBytes(Entry.ShellPath));
-  if (ACatalogRoot = '') and (ATarget = CompileHostTarget) then
+  if (ACatalogRoot = '') and (ATarget = CompileHostTarget) and
+    not FileExists(IncludeTrailingPathDelimiter(Root) + SHELL_CATALOG_FILENAME) then
   begin
     Sibling := IncludeTrailingPathDelimiter(ExtractFileDir(ParamStr(0))) +
       'wasmlight-shell';
@@ -586,6 +614,7 @@ var
   ElfRes: TWasmElfPackageResult;
   MachRes: TWasmMachOResult;
   Ident: string;
+  MachInfo: TWasmMachOInfo;
 begin
   Template := LoadCompileTemplate(ATarget, ACatalogRoot);
   if (ATarget = WASM_COMPILE_TARGET_AARCH64_LINUX) or
@@ -603,6 +632,11 @@ begin
     Result := Packaged;
     Exit;
   end;
+  MachRes := InspectMachO(Template, MachInfo);
+  if MachRes <> mmrOk then
+    raise EWasmPackagingError.Create(MachOPackageFailText(MachRes));
+  if MachOTargetName(MachInfo.Target) <> ATarget then
+    raise EWasmPackagingError.Create('Mach-O template target mismatch');
   Ident := ExtractFileName(AOutputPath);
   if Ident = '' then
     Ident := MACHO_DEFAULT_IDENT;
@@ -632,8 +666,8 @@ begin
     raise EStreamError.Create('cannot write executable "' + APath +
       '": path is a directory');
 
-  TmpPath := APath + '.tmp';
-  BackupPath := APath + '.bak';
+  TmpPath := GetTempFileName(ExtractFileDir(ExpandFileName(APath)), '.wasmlight-');
+  BackupPath := TmpPath + '.bak';
   Stream := TFileStream.Create(TmpPath, fmCreate);
   try
     try
@@ -642,13 +676,17 @@ begin
     finally
       Stream.Free;
     end;
+    {$IFDEF UNIX}
+    if FpChmod(TmpPath, &755) <> 0 then
+      raise EStreamError.Create('cannot mark executable "' + APath + '"');
+    {$ENDIF}
+    {$IFNDEF UNIX}
     if FileExists(APath) then
     begin
-      if FileExists(BackupPath) then
-        DeleteFile(BackupPath);
       if not RenameFile(APath, BackupPath) then
         raise EStreamError.Create('cannot replace "' + APath + '"');
     end;
+    {$ENDIF}
     if not RenameFile(TmpPath, APath) then
     begin
       if FileExists(BackupPath) then
@@ -662,10 +700,6 @@ begin
       DeleteFile(TmpPath);
     raise;
   end;
-  {$IFDEF UNIX}
-  if FpChmod(APath, &755) <> 0 then
-    raise EStreamError.Create('cannot mark executable "' + APath + '"');
-  {$ENDIF}
 end;
 
 function CompileLoaded(const ALoaded: TWasmLoadedModule;

@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.6.0"
+  LWPT_VERSION: "0.7.0"
 
 jobs:
   test:
@@ -171,6 +171,13 @@ jobs:
 
       - name: lwpt build (all programs)
         run: lwpt build
+
+      - name: Compile and run a native WASI command
+        if: matrix.jit
+        run: |
+          set -euo pipefail
+          ./build/wasmlight compile tests/fixtures/wasi/hello.wasm -o build/hello-native
+          test "$(./build/hello-native)" = "hello"
 
       - name: lwpt test (co-located unit suites)
         run: lwpt test

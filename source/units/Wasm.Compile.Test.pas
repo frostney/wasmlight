@@ -66,7 +66,8 @@ type
     procedure WriteUtf8File(const APath, AText: string);
     function ReadUtf8File(const APath: string): string;
     procedure WriteBytes(const APath: string; const ABytes: TWasmBytes);
-    procedure WritePackagingCatalog(const ARoot: string);
+    procedure WritePackagingCatalog(const ARoot: string;
+      const AWrongMachOTarget: Boolean = False);
     procedure BeginOptions;
     procedure EndOptions;
   protected
@@ -94,6 +95,8 @@ type
     procedure TestValidationFailure;
     procedure TestImportWithoutConnectorIsLinkError;
     procedure TestWasiImportIsBuiltIn;
+    procedure TestUnknownWasiImportIsLinkError;
+    procedure TestWrongWasiSignatureIsLinkError;
     procedure TestEmptyModuleFailsClosedWithoutCatalog;
     procedure TestFailedCompileLeavesNoOutput;
     procedure TestFailedCompileLeavesExistingOutput;
@@ -102,6 +105,7 @@ type
     procedure TestWriteOutputIsAtomic;
     procedure TestPackageWithoutCatalogIsPackagingError;
     procedure TestHostTargetEmitsNativeExecutable;
+    procedure TestWrongMachOTemplateFails;
   end;
 
 function TCompileTests.NewRequest(const ATarget: string): TWasmCompileRequest;
@@ -186,7 +190,8 @@ begin
   end;
 end;
 
-procedure TCompileTests.WritePackagingCatalog(const ARoot: string);
+procedure TCompileTests.WritePackagingCatalog(const ARoot: string;
+  const AWrongMachOTarget: Boolean);
 var
   I: Integer;
   Id: TWasmTargetId;
@@ -212,6 +217,8 @@ begin
     else
       Bytes_ := WriteMachOShellTemplate(wmtX86_64Darwin);
     end;
+    if AWrongMachOTarget and (Id = wtiAArch64Darwin) then
+      Bytes_ := WriteMachOShellTemplate(wmtX86_64Darwin);
     WriteBytes(IncludeTrailingPathDelimiter(ARoot) + FileName, Bytes_);
     Entry.Target := Id;
     Entry.Triple := TargetTriple(Id);
@@ -619,6 +626,28 @@ begin
   Expect<Boolean>(OutputExists).ToBe(False);
 end;
 
+procedure TCompileTests.TestUnknownWasiImportIsLinkError;
+var
+  Res: TWasmCompileResult;
+begin
+  Res := CompileWat(StringReplace(WASI_WAT, 'proc_exit', 'missing',
+    [rfReplaceAll]));
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(OutputExists).ToBe(False);
+end;
+
+procedure TCompileTests.TestWrongWasiSignatureIsLinkError;
+var
+  Res: TWasmCompileResult;
+begin
+  Res := CompileWat('(module (import "wasi_snapshot_preview1" "proc_exit"' +
+    ' (func)) (memory (export "memory") 1) (func (export "_start")))');
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(OutputExists).ToBe(False);
+end;
+
 procedure TCompileTests.TestEmptyModuleFailsClosedWithoutCatalog;
 var
   Res: TWasmCompileResult;
@@ -709,9 +738,14 @@ begin
   Payload[2] := Byte('S');
   Payload[3] := Byte('M');
   WriteUtf8File(FOutputPath, 'old');
+  WriteUtf8File(FOutputPath + '.tmp', 'unrelated temp');
+  WriteUtf8File(FOutputPath + '.bak', 'unrelated backup');
   WriteCompileOutput(FOutputPath, Payload);
   Expect<string>(ReadUtf8File(FOutputPath)).ToBe('WASM');
-  Expect<Boolean>(FileExists(FOutputPath + '.tmp')).ToBe(False);
+  Expect<string>(ReadUtf8File(FOutputPath + '.tmp')).ToBe('unrelated temp');
+  Expect<string>(ReadUtf8File(FOutputPath + '.bak')).ToBe('unrelated backup');
+  DeleteFile(FOutputPath + '.tmp');
+  DeleteFile(FOutputPath + '.bak');
 end;
 
 procedure TCompileTests.TestPackageWithoutCatalogIsPackagingError;
@@ -767,8 +801,27 @@ begin
   Expect<Boolean>(Length(Parsed.Funcs) > 0).ToBe(True);
 end;
 
+procedure TCompileTests.TestWrongMachOTemplateFails;
+var
+  Raised: Boolean;
+begin
+  WritePackagingCatalog(FCatalogRoot, True);
+  Raised := False;
+  try
+    PackageCompilePayload(WASM_COMPILE_TARGET_AARCH64_DARWIN, nil,
+      FCatalogRoot, FOutputPath);
+  except
+    on E: EWasmPackagingError do
+      Raised := Pos('target mismatch', E.Message) > 0;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
 procedure TCompileTests.SetupTests;
 begin
+  Test('Mach-O templates must match the selected architecture', TestWrongMachOTemplateFails);
+  Test('unknown WASI imports fail before native emission', TestUnknownWasiImportIsLinkError);
+  Test('WASI signature mismatches fail before native emission', TestWrongWasiSignatureIsLinkError);
   Test('compile error classes are siblings under EWasmError',
     TestErrorClassesAreSiblings);
   Test('help documents every owned compile option',

@@ -31,6 +31,7 @@ uses
   Wasm.Core,
   Wasm.Engine,
   Wasm.Jit.CodeBuffer,
+  Wasm.Package.Elf,
   Wasm.Runtime.Store,
   Wasm.Shell,
   Wasm.Shell.Payload,
@@ -110,6 +111,7 @@ type
     procedure SetupTests; override;
     procedure TestEmptyPayload;
     procedure TestMalformedPayload;
+    procedure TestCorruptEmbeddedTrailer;
     procedure TestGarbageModuleIsDecodeError;
     procedure TestInvalidModuleIsValidationError;
     procedure TestIncompleteNativeRejected;
@@ -495,8 +497,34 @@ begin
   end;
 end;
 
+procedure TShellTests.TestCorruptEmbeddedTrailer;
+var
+  Payload, Packaged: TWasmBytes;
+  Path: string;
+  Res: TWasmShellResult;
+begin
+  SetLength(Payload, 4);
+  Payload[0] := Byte('W');
+  Payload[1] := Byte('N');
+  Payload[2] := Byte('E');
+  Payload[3] := Byte('P');
+  Expect<Integer>(Ord(PackageAppendedPayload(nil, Payload, Packaged))).ToBe(Ord(eprOk));
+  Packaged[Length(Packaged) - WLSHELF_TRAILER_SIZE + 16] :=
+    Packaged[Length(Packaged) - WLSHELF_TRAILER_SIZE + 16] xor 1;
+  Path := WriteTempPayload(Packaged);
+  FConfig := TWasmWasiConfig.Create;
+  try
+    Res := RunShellFile(Path, FConfig);
+    Expect<Integer>(Res.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('malformed embedded payload trailer', Res.Diagnostic) > 0).ToBe(True);
+  finally
+    DeleteFile(Path);
+  end;
+end;
+
 procedure TShellTests.SetupTests;
 begin
+  Test('corrupt embedded trailers fail before the attach seam', TestCorruptEmbeddedTrailer);
   Test('an empty payload is the unfilled template', TestEmptyPayload);
   Test('a malformed envelope is rejected before decode', TestMalformedPayload);
   Test('garbage module bytes are EWasmDecodeError', TestGarbageModuleIsDecodeError);

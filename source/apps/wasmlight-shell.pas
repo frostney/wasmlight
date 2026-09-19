@@ -56,7 +56,15 @@ begin
   GuestStart := 1;
   AttachPath := '';
   if Length(Payload) = 0 then
-    ExtractPackagedPayloadFromFile(ParamStr(0), Payload);
+    try
+      ExtractPackagedPayloadFromFile(ParamStr(0), Payload);
+    except
+      on E: EWasmDecodeError do
+      begin
+        WriteLn(ErrOutput, PROGRAM_NAME + '-shell: ' + E.ClassName + ': ' + E.Message);
+        Halt(WASM_SHELL_EXIT_ERROR);
+      end;
+    end;
   if Length(Payload) = 0 then
   begin
     if ParamCount < 1 then

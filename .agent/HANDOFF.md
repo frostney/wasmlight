@@ -1,3 +1,24 @@
+# PR maintenance, 2026-09-19
+
+- User requested review and fixes for every open PR, following frostney/me.
+- Current workflow: known-good-route deliver at default deployed endpoint.
+- PR #115: merged origin/main 80f06c8 locally; fixed WASI import linking,
+  corrupt payload fallback, output sibling deletion, executable publication
+  permissions, corrupt catalog fallback, and Mach-O target mismatch.
+- Validation: frozen install, format, all four builds, 62 test suites and
+  Markdown lint pass. CLI hello, exit 42, unreachable, invalid WASI names and
+  signatures, corrupt payload/catalog, and sibling preservation verified.
+- Added native compile/run smoke to PR and post-merge platform workflows.
+- PR #98 remains to repair: archive catalog compatibility and strict verify.
+- Both PRs have no posted external review. Definition of Done requires it
+  before merge. No separate integration destination is configured; deliver
+  explicitly prohibits substituting a release for integration delivery.
+- lwpt 0.7.0 shared worker/cache state stalled. Successful gates used the
+  released binary with LWPT_CACHE_DIR=/tmp/wasmlight-pr-cache-20260919 and
+  LWPT_WORKER_STATE_DIR=/tmp/wasmlight-pr-workers-20260919, one worker.
+
+---
+
 # Handoff
 
 Updated: 2026-08-24 (roadmap and GitHub records created)

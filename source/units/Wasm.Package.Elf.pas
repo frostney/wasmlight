@@ -143,6 +143,10 @@ function ParseElfPackage(const ABytes: TWasmBytes;
 function PackageAppendedPayload(const ATemplate, APayload: TWasmBytes;
   out APackaged: TWasmBytes): TWasmElfPackageResult;
 
+{ True when a complete trailer magic is present, even if its payload is
+  corrupt. A damaged executable must not revert to the empty attach seam. }
+function HasPayloadTrailer(const ABytes: TWasmBytes): Boolean;
+
 { Read a WLSHELF trailer whose prefix is not necessarily ELF. }
 function ParseAppendedPayload(const ABytes: TWasmBytes;
   out APayload: TWasmBytes): TWasmElfPackageResult;
@@ -617,6 +621,12 @@ begin
   APackaged[Off + 34] := WLSHELF_MAGIC6;
   APackaged[Off + 35] := WLSHELF_MAGIC7;
   Result := eprOk;
+end;
+
+function HasPayloadTrailer(const ABytes: TWasmBytes): Boolean;
+begin
+  Result := (Length(ABytes) >= WLSHELF_TRAILER_SIZE) and
+    TrailerMagicAt(ABytes, Length(ABytes) - 8);
 end;
 
 function ParseAppendedPayload(const ABytes: TWasmBytes;
