@@ -13,6 +13,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Wasm.Compile.Catalog,
+  Wasm.Core,
   Wasm.Distro;
 
 type
@@ -35,6 +37,8 @@ type
     procedure TestElfAndMachOMagic;
     procedure TestSwappedShellImage;
     procedure TestValidateTree;
+    procedure TestCompilerCatalogIsLoadable;
+    procedure TestArchivePathsStayContained;
     procedure TestForbiddenAppleDouble;
     procedure TestChecksumsCoverFourArchives;
     procedure TestChecksumsRejectPath;
@@ -71,6 +75,7 @@ var
 begin
   Expect<Boolean>(DistroFindHost(AHost, Host)).ToBe(True);
   DistroSynthesizeCatalog(ARoot);
+  DistroWriteCatalog(ARoot, AVersion);
   WriteText(DistroJoin(ARoot, DISTRO_COMPILER_NAME), 'compiler-placeholder');
   Result.Version := AVersion;
   Result.HostTriple := Host.Triple;
@@ -340,8 +345,47 @@ begin
     'wasmlight: unknown command: compile')).ToBe(True);
 end;
 
+procedure TDistroTests.TestCompilerCatalogIsLoadable;
+var
+  Root: string;
+  Entry: TWasmShellEntry;
+  I: Integer;
+begin
+  Root := TempRoot;
+  BuildValidTree(Root, PROGRAM_VERSION, 'aarch64-darwin', wdcFixture);
+  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+    Expect<Integer>(Ord(ResolveShell(DistroJoin(Root, DISTRO_SHELL_ROOT),
+      DistroShell(I).Triple, Entry))).ToBe(Ord(ssrOk));
+  DeleteFile(DistroJoin(Root, DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME));
+  Expect<Integer>(Ord(DistroValidateTree(Root).Status)).ToBe(Ord(ddsIncompleteCatalog));
+end;
+
+procedure TDistroTests.TestArchivePathsStayContained;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    DistroJoin(TempRoot, '../outside');
+  except
+    on E: EArgumentException do
+      Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Raised := False;
+  try
+    DistroArchiveBase('../../outside', 'macos-arm64');
+  except
+    on E: EArgumentException do
+      Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
 procedure TDistroTests.SetupTests;
 begin
+  Test('archive catalogs load through the compiler selector', TestCompilerCatalogIsLoadable);
+  Test('archive paths and staging versions stay contained', TestArchivePathsStayContained);
   Test('four Unix hosts resolve by triple and display name', TestHostLookup);
   Test('archive and checksum names follow the lwpt pattern', TestArchiveNames);
   Test('a valid MANIFEST round-trips', TestManifestRoundTrip);

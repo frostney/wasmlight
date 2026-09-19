@@ -18,6 +18,7 @@ uses
   Process,
   SysUtils,
 
+  Wasm.Compile.Catalog,
   Wasm.Distro;
 
 const
@@ -183,9 +184,38 @@ end;
 procedure VerifyManifestHashes(const ARoot: string;
   const AManifest: TWasmDistroManifest);
 var
-  I: Integer;
+  I, J, Count: Integer;
   Digest: string;
+
+  procedure RequireFile(const APath: string);
+  var
+    Index: Integer;
+  begin
+    for Index := 0 to High(AManifest.Files) do
+      if AManifest.Files[Index] = APath then
+        Exit;
+    Fail('MANIFEST does not cover required file ' + APath);
+  end;
+
 begin
+  RequireFile(DISTRO_COMPILER_NAME);
+  RequireFile(DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME);
+  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  begin
+    RequireFile(DistroShellRelPath(DistroShell(I).Triple));
+    RequireFile(DistroMetaRelPath(DistroShell(I).Triple));
+  end;
+  for I := 0 to High(AManifest.Files) do
+  begin
+    Count := 0;
+    for J := 0 to High(AManifest.Hashes) do
+      if AManifest.Hashes[J].RelPath = AManifest.Files[I] then
+        Inc(Count);
+    if Count <> 1 then
+      Fail('MANIFEST needs exactly one hash for ' + AManifest.Files[I]);
+  end;
+  if Length(AManifest.Hashes) <> Length(AManifest.Files) then
+    Fail('MANIFEST hash coverage differs from its file list');
   if Length(AManifest.Hashes) = 0 then
     Fail('MANIFEST has no per-file hashes');
   for I := 0 to High(AManifest.Hashes) do
@@ -204,20 +234,23 @@ begin
   if not RunTool(ACompiler, ['--version'], Output) then
     Fail(ACompiler + ' --version failed');
   Output := Trim(Output);
-  if Pos(AVersion, Output) = 0 then
-    Fail('compiler version "' + Output + '" does not contain ' + AVersion);
+  if Output <> 'wasmlight ' + AVersion then
+    Fail('compiler version "' + Output + '" does not match wasmlight ' + AVersion);
 end;
 
-procedure WriteEmptyStartModule(const APath: string);
+procedure WriteProbeModule(const APath: string);
 const
-  { (module (func (export "_start"))) — no imports, so deny-by-default
-    compile linking does not raise EWasmLinkError before the emission stub. }
-  WASM: array[0..35] of Byte = (
-    $00, $61, $73, $6D, $01, $00, $00, $00,
-    $01, $04, $01, $60, $00, $00,
-    $03, $02, $01, $00,
-    $07, $0A, $01, $06, $5F, $73, $74, $61, $72, $74, $00, $00,
-    $0A, $04, $01, $02, $00, $0B
+  { proc_exit(37) proves the packaged shell ran the embedded command;
+    an exit-zero placeholder cannot satisfy this execution check. }
+  WASM: array[0..95] of Byte = (
+    $00, $61, $73, $6D, $01, $00, $00, $00, $01, $08, $02, $60,
+    $01, $7F, $00, $60, $00, $00, $02, $24, $01, $16, $77, $61,
+    $73, $69, $5F, $73, $6E, $61, $70, $73, $68, $6F, $74, $5F,
+    $70, $72, $65, $76, $69, $65, $77, $31, $09, $70, $72, $6F,
+    $63, $5F, $65, $78, $69, $74, $00, $00, $03, $02, $01, $01,
+    $05, $03, $01, $00, $01, $07, $13, $02, $06, $6D, $65, $6D,
+    $6F, $72, $79, $02, $00, $06, $5F, $73, $74, $61, $72, $74,
+    $00, $01, $0A, $08, $01, $06, $00, $41, $25, $10, $00, $0B
   );
 var
   Stream: TFileStream;
@@ -242,8 +275,8 @@ var
 begin
   if not DistroCurrentHost(Host) then
     Fail('compile gates need a 0.2.0 Unix host');
-  Module := IncludeTrailingPathDelimiter(AWork) + 'empty-start.wasm';
-  WriteEmptyStartModule(Module);
+  Module := IncludeTrailingPathDelimiter(AWork) + 'native-probe.wasm';
+  WriteProbeModule(Module);
   for I := 0 to DISTRO_SHELL_COUNT - 1 do
   begin
     Target := DistroShell(I).Triple;
@@ -253,11 +286,6 @@ begin
       Fail('could not invoke compile for ' + Target);
     if Code <> 0 then
     begin
-      if DistroCompileEmissionNotShipped(Text) then
-      begin
-        WriteLn('verify-archive: compile gates deferred (native emission not shipped)');
-        Exit;
-      end;
       Fail('compile --target ' + Target + ' failed: ' + Trim(Text));
     end;
     if not FileExists(OutFile) then
@@ -277,8 +305,8 @@ begin
     begin
       if not CombinedOutput(OutFile, [], Text, Code) then
         Fail('native compiled program did not start');
-      if Code <> 0 then
-        Fail('native compiled program exited ' + IntToStr(Code) + ': ' +
+      if Code <> 37 then
+        Fail('native compiled program expected exit 37, got ' + IntToStr(Code) + ': ' +
           Trim(Text));
       WriteLn('verify-archive: native compile execution ok for ', Target);
     end;
@@ -377,12 +405,14 @@ begin
     else
       WriteLn('verify-archive: skipped native --version (foreign host archive)');
 
-    if CompilerHasCompile(Compiler) then
+    if RequireCompile and (Manifest.Catalog = wdcFixture) then
+      Fail('compile verification requires a live runtime-shell catalog');
+    if (Manifest.Catalog = wdcFixture) and not RequireCompile then
+      WriteLn('verify-archive: fixture structure verified; native compile is unverified')
+    else if CompilerHasCompile(Compiler) then
       VerifyCompileGates(Compiler, Work)
-    else if RequireCompile then
-      Fail('compile subcommand is required but not present')
     else
-      WriteLn('verify-archive: compile gates deferred (compile not shipped)');
+      Fail('compile subcommand is required for a live archive');
 
     WriteLn('verify-archive: ok');
   except

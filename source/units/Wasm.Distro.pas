@@ -124,6 +124,7 @@ function DistroIsForbiddenName(const AName: string): Boolean;
 function DistroValidateTree(const ARoot: string;
   const AExpectedVersion: string = ''): TWasmDistroResult;
 function DistroSynthesizeCatalog(const ARoot: string): TWasmDistroResult;
+procedure DistroWriteCatalog(const ARoot, AVersion: string);
 
 function DistroHelpListsCompile(const AHelpText: string): Boolean;
 function DistroUnknownCompileCommand(const AText: string): Boolean;
@@ -134,7 +135,12 @@ function DistroCompileEmissionNotShipped(const AText: string): Boolean;
 implementation
 
 uses
-  Classes;
+  Classes,
+
+  Wasm.Compile.Catalog,
+  Wasm.Core,
+  Wasm.MachO,
+  Wasm.Package.Elf;
 
 const
   ELF_MAGIC: array[0..3] of Byte = ($7F, $45, $4C, $46);
@@ -238,6 +244,9 @@ end;
 
 function DistroArchiveBase(const AVersion, ADisplay: string): string;
 begin
+  if (AVersion = '') or (Pos('/', AVersion) > 0) or
+    (Pos('\', AVersion) > 0) or (Pos('..', AVersion) > 0) then
+    raise EArgumentException.Create('version must be a path-free release version');
   Result := DISTRO_PACKAGE + '-' + AVersion + '-' + ADisplay;
 end;
 
@@ -263,10 +272,17 @@ end;
 
 function DistroJoin(const ARoot, ARel: string): string;
 var
-  Normalized: string;
+  Normalized, Root: string;
 begin
   Normalized := StringReplace(ARel, '/', PathDelim, [rfReplaceAll]);
+  Normalized := StringReplace(Normalized, '\', PathDelim, [rfReplaceAll]);
+  if (Normalized = '') or (Normalized[1] = PathDelim) or
+    (Pos(':', Normalized) > 0) then
+    raise EArgumentException.Create('archive path must be relative: ' + ARel);
   Result := IncludeTrailingPathDelimiter(ARoot) + Normalized;
+  Root := IncludeTrailingPathDelimiter(ExpandFileName(ARoot));
+  if Copy(ExpandFileName(Result), 1, Length(Root)) <> Root then
+    raise EArgumentException.Create('archive path escapes its root: ' + ARel);
 end;
 
 procedure AppendLine(var AText: string; const ALine: string);
@@ -497,35 +513,14 @@ var
 begin
   if not DistroFindShell(ATriple, Shell) then
     raise EArgumentException.Create('unknown shell target: ' + ATriple);
-  if Shell.Image = wdiElf64 then
-  begin
-    SetLength(Bytes, 64);
-    FillChar(Bytes[0], Length(Bytes), 0);
-    Bytes[0] := ELF_MAGIC[0];
-    Bytes[1] := ELF_MAGIC[1];
-    Bytes[2] := ELF_MAGIC[2];
-    Bytes[3] := ELF_MAGIC[3];
-    Bytes[4] := ELF_CLASS64;
-    Bytes[5] := ELF_DATA2LSB;
-    Bytes[6] := 1;
-    Bytes[16] := ELF_ET_EXEC;
-    Bytes[18] := Byte(Shell.Machine);
-    Bytes[19] := Byte(Shell.Machine shr 8);
-  end
+  if ATriple = 'aarch64-linux' then
+    Bytes := PlaceholderElfTemplate(weptAarch64Linux)
+  else if ATriple = 'x86_64-linux' then
+    Bytes := PlaceholderElfTemplate(weptX86_64Linux)
+  else if ATriple = 'aarch64-darwin' then
+    Bytes := WriteMachOShellTemplate(wmtAarch64Darwin)
   else
-  begin
-    SetLength(Bytes, 32);
-    FillChar(Bytes[0], Length(Bytes), 0);
-    Bytes[0] := MACHO_MAGIC_64_0;
-    Bytes[1] := MACHO_MAGIC_64_1;
-    Bytes[2] := MACHO_MAGIC_64_2;
-    Bytes[3] := MACHO_MAGIC_64_3;
-    Bytes[4] := Byte(Shell.Machine);
-    Bytes[5] := Byte(Shell.Machine shr 8);
-    Bytes[6] := Byte(Shell.Machine shr 16);
-    Bytes[7] := Byte(Shell.Machine shr 24);
-    Bytes[12] := MACHO_MH_EXECUTE;
-  end;
+    Bytes := WriteMachOShellTemplate(wmtX86_64Darwin);
   WriteBytes(APath, Bytes);
 end;
 
@@ -744,6 +739,10 @@ var
   I: Integer;
   Bytes: TBytes;
   MetaTriple: string;
+  Catalog: TWasmShellCatalog;
+  Entry: TWasmShellEntry;
+  J: Integer;
+  Found: Boolean;
 begin
   ManifestPath := DistroJoin(ARoot, DISTRO_MANIFEST_NAME);
   if not FileExists(ManifestPath) then
@@ -763,6 +762,10 @@ begin
   Result := WalkForbidden(ARoot);
   if not Result.IsOk then
     Exit;
+  if LoadShellCatalog(DistroJoin(ARoot, DISTRO_SHELL_ROOT), Catalog) <> slrOk then
+    Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, 'invalid compiler shell catalog'));
+  if Length(Catalog.Entries) <> DISTRO_SHELL_COUNT then
+    Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, 'compiler catalog needs four targets'));
   CompilerPath := DistroJoin(ARoot, DISTRO_COMPILER_NAME);
   if not FileExists(CompilerPath) then
     Exit(TWasmDistroResult.Fail(ddsMissingFile, DISTRO_COMPILER_NAME));
@@ -770,6 +773,20 @@ begin
   begin
     ShellPath := DistroJoin(ARoot, DistroShellRelPath(SHELLS[I].Triple));
     MetaPath := DistroJoin(ARoot, DistroMetaRelPath(SHELLS[I].Triple));
+    Found := False;
+    for J := 0 to High(Catalog.Entries) do
+      if Catalog.Entries[J].Triple = SHELLS[I].Triple then
+      begin
+        Entry := Catalog.Entries[J];
+        Found := True;
+        Break;
+      end;
+    if not Found then
+      Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, SHELLS[I].Triple));
+    if Entry.Version <> Manifest.Version then
+      Exit(TWasmDistroResult.Fail(ddsVersionMismatch, Entry.Triple));
+    if Entry.FileName <> SHELLS[I].Triple + '/' + DISTRO_SHELL_NAME then
+      Exit(TWasmDistroResult.Fail(ddsBadMeta, Entry.FileName));
     if not FileExists(ShellPath) then
       Exit(TWasmDistroResult.Fail(ddsMissingFile, DistroShellRelPath(SHELLS[I].Triple)));
     if not FileExists(MetaPath) then
@@ -777,6 +794,8 @@ begin
     Bytes := LoadBytes(ShellPath);
     if not DistroImageMatchesShell(Bytes, SHELLS[I].Triple) then
       Exit(TWasmDistroResult.Fail(ddsBadShellImage, SHELLS[I].Triple));
+    if Entry.Checksum <> ShellChecksumBytes(Bytes) then
+      Exit(TWasmDistroResult.Fail(ddsChecksumMismatch, Entry.Triple));
     Text := TStringList.Create;
     try
       Text.LoadFromFile(MetaPath);
@@ -796,6 +815,45 @@ begin
   Result := TWasmDistroResult.Ok;
 end;
 
+procedure DistroWriteCatalog(const ARoot, AVersion: string);
+var
+  Entries: TWasmShellEntries;
+  I: Integer;
+  Lines: TStringList;
+begin
+  SetLength(Entries, DISTRO_SHELL_COUNT);
+  for I := 0 to High(Entries) do
+  begin
+    ParseTargetTriple(SHELLS[I].Triple, Entries[I].Target);
+    Entries[I].Triple := SHELLS[I].Triple;
+    Entries[I].Version := AVersion;
+    if Pos('aarch64-', SHELLS[I].Triple) = 1 then
+      Entries[I].Arch := wtaAArch64
+    else
+      Entries[I].Arch := wtaX64;
+    if SHELLS[I].Image = wdiElf64 then
+    begin
+      Entries[I].Os := wtoLinux;
+      Entries[I].Format := wsfElf;
+    end
+    else
+    begin
+      Entries[I].Os := wtoDarwin;
+      Entries[I].Format := wsfMachO;
+    end;
+    Entries[I].FileName := SHELLS[I].Triple + '/' + DISTRO_SHELL_NAME;
+    Entries[I].Checksum := ShellChecksumBytes(
+      LoadBytes(DistroJoin(ARoot, DistroShellRelPath(SHELLS[I].Triple))));
+  end;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := WriteShellCatalogText(Entries);
+    Lines.SaveToFile(DistroJoin(ARoot, DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME));
+  finally
+    Lines.Free;
+  end;
+end;
+
 function DistroSynthesizeCatalog(const ARoot: string): TWasmDistroResult;
 var
   I: Integer;
@@ -807,6 +865,7 @@ begin
     DistroWriteShellMeta(DistroJoin(ARoot, DistroMetaRelPath(SHELLS[I].Triple)),
       SHELLS[I].Triple);
   end;
+  DistroWriteCatalog(ARoot, PROGRAM_VERSION);
   Result := TWasmDistroResult.Ok;
 end;
 

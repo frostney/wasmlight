@@ -15,6 +15,8 @@ uses
   Process,
   SysUtils,
 
+  Wasm.Compile.Catalog,
+  Wasm.Core,
   Wasm.Distro;
 
 const
@@ -118,27 +120,28 @@ begin
   end;
 end;
 
-procedure CopyTree(const ASrc, ADst: string);
+procedure CopyCatalogShell(const AEntry: TWasmShellEntry; const ADestination: string);
 var
-  Search: TSearchRec;
-  ChildSrc, ChildDst: string;
+  Stream: TFileStream;
+  Bytes: TWasmBytes;
 begin
-  ForceDirectories(ADst);
-  if FindFirst(IncludeTrailingPathDelimiter(ASrc) + '*', faAnyFile, Search) <> 0 then
-    Exit;
+  Stream := TFileStream.Create(AEntry.ShellPath, fmOpenRead or fmShareDenyWrite);
   try
-    repeat
-      if (Search.Name = '.') or (Search.Name = '..') then
-        Continue;
-      ChildSrc := IncludeTrailingPathDelimiter(ASrc) + Search.Name;
-      ChildDst := IncludeTrailingPathDelimiter(ADst) + Search.Name;
-      if (Search.Attr and faDirectory) <> 0 then
-        CopyTree(ChildSrc, ChildDst)
-      else
-        CopyFileTo(ChildSrc, ChildDst);
-    until FindNext(Search) <> 0;
+    SetLength(Bytes, Stream.Size);
+    if Length(Bytes) > 0 then
+      Stream.ReadBuffer(Bytes[0], Length(Bytes));
   finally
-    FindClose(Search);
+    Stream.Free;
+  end;
+  if ShellChecksumBytes(Bytes) <> AEntry.Checksum then
+    raise Exception.Create('shell checksum mismatch: ' + AEntry.Triple);
+  ForceDirectories(ExtractFilePath(ADestination));
+  Stream := TFileStream.Create(ADestination, fmCreate);
+  try
+    if Length(Bytes) > 0 then
+      Stream.WriteBuffer(Bytes[0], Length(Bytes));
+  finally
+    Stream.Free;
   end;
 end;
 
@@ -203,6 +206,10 @@ var
   CatalogKind: TWasmDistroCatalog;
   Status: TWasmDistroResult;
   Lines: TStringList;
+  Catalog: TWasmShellCatalog;
+  Entry: TWasmShellEntry;
+  J: Integer;
+  Found: Boolean;
 begin
   try
     if HasFlag('help') or HasFlag('h') then
@@ -290,10 +297,29 @@ begin
       Halt(1);
     end;
     if DirectoryExists(DistroJoin(CatalogDir, DISTRO_SHELL_ROOT)) then
-      CopyTree(DistroJoin(CatalogDir, DISTRO_SHELL_ROOT),
-        DistroJoin(Stage, DISTRO_SHELL_ROOT))
-    else
-      CopyTree(CatalogDir, DistroJoin(Stage, DISTRO_SHELL_ROOT));
+      CatalogDir := DistroJoin(CatalogDir, DISTRO_SHELL_ROOT);
+    if LoadShellCatalog(CatalogDir, Catalog) <> slrOk then
+      raise Exception.Create('invalid compiler shell catalog: ' + CatalogDir);
+    if Length(Catalog.Entries) <> DISTRO_SHELL_COUNT then
+      raise Exception.Create('compiler shell catalog must contain four targets');
+    for I := 0 to DISTRO_SHELL_COUNT - 1 do
+    begin
+      Found := False;
+      for J := 0 to High(Catalog.Entries) do
+        if Catalog.Entries[J].Triple = DistroShell(I).Triple then
+        begin
+          Entry := Catalog.Entries[J];
+          Found := True;
+          Break;
+        end;
+      if not Found then
+        raise Exception.Create('missing shell: ' + DistroShell(I).Triple);
+      if Entry.Version <> Version then
+        raise Exception.Create('shell version mismatch: ' + Entry.Triple);
+      CopyCatalogShell(Entry, DistroJoin(Stage, DistroShellRelPath(Entry.Triple)));
+      DistroWriteShellMeta(DistroJoin(Stage, DistroMetaRelPath(Entry.Triple)), Entry.Triple);
+    end;
+    DistroWriteCatalog(Stage, Version);
     if FileExists('README.md') then
     begin
       CopyFileTo('README.md', DistroJoin(Stage, 'README.md'));
@@ -307,6 +333,7 @@ begin
     SetLength(Manifest.Files, 0);
     SetLength(Manifest.Hashes, 0);
     AddFile(Manifest.Files, DISTRO_COMPILER_NAME);
+    AddFile(Manifest.Files, DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME);
     if FileExists(DistroJoin(Stage, 'README.md')) then
       AddFile(Manifest.Files, 'README.md');
     for I := 0 to DISTRO_SHELL_COUNT - 1 do

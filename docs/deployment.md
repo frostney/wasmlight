@@ -57,6 +57,7 @@ wasmlight-<version>-<display>/
   wasmlight
   MANIFEST
   README.md
+  share/wasmlight/shells/catalog
   share/wasmlight/shells/<triple>/shell
   share/wasmlight/shells/<triple>/META
 ```
@@ -86,16 +87,18 @@ Same-host verify runs `--version` (and compile gates, when present) on the
 packed compiler. `--compiler` is only a foreign-host fallback.
 `--synthesize-catalog` builds structural placeholder shells so the packer
 and verifier can run before live shells exist. `--require-compile` makes
-the compile gates mandatory.
+the compile gates mandatory and rejects fixture catalogs. Live archives always
+require successful compile and execution gates. Fixture verification reports
+native compilation as unverified.
 
-CI on each Unix host packs that host's archive and verifies version,
-manifest, checksums, and shell structure. When `wasmlight compile` can
-emit a native executable, the same job also compiles one no-import
-module for every target and checks image magic, then executes only the
-host-native output. That is four structural emissions plus one native
-run per host — not a 16-cell execution matrix. Until native emission
-ships, verify records that the compile CLI is present and defers those
-gates.
+CI on each Unix host currently packs a fixture archive and verifies version,
+manifest, per-file checksums, the compiler-readable catalog, and shell
+structure. These fixtures do not establish distribution or release readiness.
+A live archive must compile a WASI command for every target and verify the
+image structure, then execute the host-native output and observe its requested
+exit code 37. This catches placeholder executables that simply exit zero.
+Foreign-ISA emission, live shell assembly, external tap publication, and the
+release assets remain prerequisites for issue #46.
 
 ## Release checklist
 

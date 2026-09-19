@@ -1,5 +1,25 @@
 # Handoff
 
+## Open PR maintenance, 2026-09-19
+
+- User requested fixes for both open PRs and the frostney/me delivery loop.
+- PR #115 fixes are pushed at 2756f7065da83791eaa0e9c9efd7b0a16523c30a.
+  All 62 suites and real native CLI probes passed; exact-head CI is running.
+- PR #98 now writes and verifies the canonical compiler shell catalog,
+  resolves archive/Homebrew share layouts, validates source-shell checksums,
+  contains archive paths, and requires complete per-file hash coverage.
+- Fixture archives explicitly provide structural evidence only. Strict/live
+  verification rejects absent emission and checks guest-requested exit 37,
+  preventing an exit-zero placeholder from passing as a real runtime shell.
+- Issue #46 remains incomplete: foreign-ISA emission, assembled live shells,
+  published release assets and external Homebrew installation remain absent.
+- Both PRs have no external review; the repository Definition of Done requires
+  external review before merge. No non-release integration destination is
+  configured. Deliver forbids substituting release publication for integration.
+- Local lwpt 0.7.0 gates use LWPT_CACHE_DIR=/tmp/wasmlight-pr-cache-20260919
+  and LWPT_WORKER_STATE_DIR=/tmp/wasmlight-pr-workers-20260919 with one worker
+  after shared worker/cache locks prevented progress. No shared state deleted.
+
 Updated: 2026-08-24 (roadmap and GitHub records created)
 
 ## Proposed 0.2.0 native compiler and connectors

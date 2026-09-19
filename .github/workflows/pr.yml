@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.6.0"
+  LWPT_VERSION: "0.7.0"
 
 jobs:
   # Branches come from main only. A PR head must CONTAIN the current default
@@ -305,8 +305,8 @@ jobs:
 
       # One archive per Unix compiler host: layout, MANIFEST, checksums, and
       # ELF/Mach-O shell structure. Compile gates run when `wasmlight compile`
-      # can emit; until then verify defers them. Cross-emission is structural,
-      # native execution is host-only (not a 16-cell matrix). Windows is a
+      # can emit with live shells. Fixtures prove structure only; live archive
+      # execution gates are host-only (not a 16-cell matrix). Windows is a
       # later release and has no 0.2.0 archive.
       - name: Pack and verify release archive
         if: runner.os != 'Windows'

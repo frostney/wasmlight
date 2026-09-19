@@ -48,7 +48,8 @@ class Wasmlight < Formula
     chmod 0755, "wasmlight"
     bin.install "wasmlight"
     shells = Pathname("share/wasmlight/shells")
-    (pkgshare/"shells").install Dir[shells/"*"] if shells.directory?
+    raise "Missing compiler shell catalog" unless (shells/"catalog").file?
+    (pkgshare/"shells").install Dir[shells/"*"]
   end
 
   test do
