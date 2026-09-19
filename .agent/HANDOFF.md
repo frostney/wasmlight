@@ -3,8 +3,14 @@
 ## Open PR maintenance, 2026-09-19
 
 - User requested fixes for both open PRs and the frostney/me delivery loop.
-- PR #115 fixes are pushed at 2756f7065da83791eaa0e9c9efd7b0a16523c30a.
-  All 62 suites and real native CLI probes passed; exact-head CI is running.
+- PR #115 is merged on main as d801f1c. PR #98 now merges that base,
+  preserving native emission and canonical archive-catalog support.
+- Current request: update PR #98, validate the merged result, push normally,
+  and refresh its metadata. Only documentation required conflict resolution.
+- After the base merge, all 63 suites, four builds, frozen install, format,
+  agent-reference and Markdown gates passed, including four focused suites.
+  Archive verification checked 11 file hashes; an archive using the real host
+  shell compiled and ran native hello. Foreign-target shells remain fixtures.
 - PR #98 now writes and verifies the canonical compiler shell catalog,
   resolves archive/Homebrew share layouts, validates source-shell checksums,
   contains archive paths, and requires complete per-file hash coverage.
@@ -13,8 +19,7 @@
   preventing an exit-zero placeholder from passing as a real runtime shell.
 - Issue #46 remains incomplete: foreign-ISA emission, assembled live shells,
   published release assets and external Homebrew installation remain absent.
-- Both PRs have no external review; the repository Definition of Done requires
-  external review before merge. No non-release integration destination is
+- PR #98 still requires external review before merge under Definition of Done. No non-release integration destination is
   configured. Deliver forbids substituting release publication for integration.
 - Local lwpt 0.7.0 gates use LWPT_CACHE_DIR=/tmp/wasmlight-pr-cache-20260919
   and LWPT_WORKER_STATE_DIR=/tmp/wasmlight-pr-workers-20260919 with one worker
