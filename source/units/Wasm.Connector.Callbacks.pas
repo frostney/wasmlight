@@ -92,8 +92,10 @@ type
   TWasmCallbackFilter = function(AUserData: Pointer;
     AEvent: Pointer): Int32; cdecl;
 
-  { One hub per store. The cdecl thunks outlive the hub: after Destroy
-    they return zero and do not touch the store. }
+  { One hub per store. Native callers must unregister a callback and finish
+    any in-flight call before Unbind, EndScope, or Destroy. Released thunk
+    addresses may be reused; calling an old pointer is outside the contract
+    (ADR-0017). Queued notifications never outlive their binding. }
   TWasmCallbackHub = class
   private
     FStore: TWasmStore;
@@ -141,10 +143,12 @@ type
     Lifetime: TWlcCallbackKind;
     ScopeDepth: Integer;
     Root: TWasmRootHandle;
+    Generation: UInt64;
   end;
 
   TQueuedNote = record
     Slot: Integer;
+    Generation: UInt64;
     A0: Int64;
     A1: Int64;
   end;
@@ -213,6 +217,7 @@ begin
       SetLength(GNotes, Length(GNotes) * 2);
   end;
   GNotes[GNoteCount].Slot := ASlot;
+  GNotes[GNoteCount].Generation := GSlots[ASlot].Generation;
   GNotes[GNoteCount].A0 := AA0;
   GNotes[GNoteCount].A1 := AA1;
   Inc(GNoteCount);
@@ -238,6 +243,8 @@ begin
 end;
 
 procedure TWasmCallbackHub.ReleaseSlot(const AIndex: Integer);
+var
+  ReadIndex, WriteIndex: Integer;
 begin
   if (AIndex < 0) or (AIndex >= WASM_CALLBACK_SLOT_COUNT) then
     Exit;
@@ -247,6 +254,16 @@ begin
       RootRelease(GSlots[AIndex].Store, GSlots[AIndex].Root);
     GSlots[AIndex].Root := WASM_NO_ROOT;
   end;
+  { Drop pending work before this slot can acquire a new owner. A drain may
+    already hold a private batch; its generation check covers that case. }
+  WriteIndex := 0;
+  for ReadIndex := 0 to GNoteCount - 1 do
+    if GNotes[ReadIndex].Slot <> AIndex then
+    begin
+      GNotes[WriteIndex] := GNotes[ReadIndex];
+      Inc(WriteIndex);
+    end;
+  GNoteCount := WriteIndex;
   GSlots[AIndex].Used := False;
   GSlots[AIndex].Hub := nil;
   GSlots[AIndex].Store := nil;
@@ -305,7 +322,8 @@ begin
   inherited Destroy;
 end;
 
-function InvokeBound(const ASlot: Integer; const AA0, AA1: Int64): Int64;
+function InvokeBound(const ASlot: Integer; const AA0, AA1: Int64;
+  const AGeneration: UInt64 = 0): Int64;
 var
   Hub: TWasmCallbackHub;
   Func: TWasmFunc;
@@ -323,6 +341,9 @@ begin
       Exit;
     if not GSlots[ASlot].Used or (GSlots[ASlot].Hub = nil) or
       GSlots[ASlot].Hub.FDead then
+      Exit;
+    if (AGeneration <> 0) and
+      (GSlots[ASlot].Generation <> AGeneration) then
       Exit;
     Hub := GSlots[ASlot].Hub;
     Func := GSlots[ASlot].Func;
@@ -792,13 +813,15 @@ begin
         (GSlots[Index].Lifetime = ALifetime) and
         ((ALifetime <> wckScoped) or (GSlots[Index].ScopeDepth = FScopeDepth)) then
         Exit(ThunkOf(AShape, Index));
-      if (not GSlots[Index].Used) and (FreeSlot < 0) then
+      if (not GSlots[Index].Used) and
+        (GSlots[Index].Generation < High(UInt64)) and (FreeSlot < 0) then
         FreeSlot := Index;
     end;
     if FreeSlot < 0 then
       raise EWasmCallbackError.Create(MSG_CALLBACK_SLOTS);
 
     Ref := FStore.Funcs[AFunc.Addr].RefObject;
+    Inc(GSlots[FreeSlot].Generation);
     GSlots[FreeSlot].Used := True;
     GSlots[FreeSlot].Hub := Self;
     GSlots[FreeSlot].Store := FStore;
@@ -817,6 +840,7 @@ procedure TWasmCallbackHub.Unbind(const AThunk: Pointer);
 var
   Slot: Integer;
 begin
+  FStore.CheckThread;
   Slot := SlotOfThunk(AThunk);
   EnterCriticalSection(GLock);
   try
@@ -860,7 +884,7 @@ end;
 procedure TWasmCallbackHub.DrainQueued;
 var
   Local: array of TQueuedNote;
-  Count, Index: Integer;
+  Count, Index, KeepCount: Integer;
 begin
   if FStore <> nil then
     FStore.CheckThread;
@@ -868,25 +892,28 @@ begin
   try
     Count := 0;
     SetLength(Local, GNoteCount);
-    Index := 0;
-    while Index < GNoteCount do
+    KeepCount := 0;
+    for Index := 0 to GNoteCount - 1 do
       if (GNotes[Index].Slot >= 0) and
         (GNotes[Index].Slot < WASM_CALLBACK_SLOT_COUNT) and
         (GSlots[GNotes[Index].Slot].Hub = Self) then
       begin
         Local[Count] := GNotes[Index];
         Inc(Count);
-        GNotes[Index] := GNotes[GNoteCount - 1];
-        Dec(GNoteCount);
       end
       else
-        Inc(Index);
+      begin
+        GNotes[KeepCount] := GNotes[Index];
+        Inc(KeepCount);
+      end;
+    GNoteCount := KeepCount;
   finally
     LeaveCriticalSection(GLock);
   end;
 
   for Index := 0 to Count - 1 do
-    InvokeBound(Local[Index].Slot, Local[Index].A0, Local[Index].A1);
+    InvokeBound(Local[Index].Slot, Local[Index].A0, Local[Index].A1,
+      Local[Index].Generation);
   RethrowDeferred;
 end;
 
