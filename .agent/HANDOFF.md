@@ -1,34 +1,42 @@
 # Handoff
 
-## Skills migration and codebase audit, 2026-09-22
+## Skills migration and audit remediation, 2026-09-22
 
-- User requested all project skills updated/migrated, followed by an audit.
-- Clean fetched base: `aef1e9c21979b5e15063fa1a159986443853427e`.
-  Branch: `codex/migrate-skills-codebase-audit`; changes remain uncommitted.
-- Updated through pinned `skills@1.5.23`, following upstream maintenance runbook.
-  KGR main: `bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c`; Matt Pocock main:
-  `c55ee46073ed923f86ce59a5eb3b6d895095d1b7`. Rechecked both remote tips.
-- Migrated PR/stack feedback to `address-feedback`, issue/idea implementation
-  to `implement`, and retired `render-html` according to upstream `5207cc3`.
-  Added companions `deliver`, `agent-writing`, `test-against-spec`, and
-  `maintain-project-skills`. All 24 locked payloads and hashes match upstream;
-  repository-owned `optimize-runtime` remains unchanged (25 total skills).
-- Audit used the updated `codebase-audit` skill, without subagents or fixes.
-  Report/evidence: `/tmp/wasmlight-audit-20260922/report.md`.
-- Findings: CA-1 callback slot reuse redirects queued work and stale thunks;
-  CA-2 both conformance CI gates accept a failing runner; CA-3 native shell
-  invokes non-void `_start` signatures with nil buffers and faults; CA-4
-  duplicate ISA-independent memory/GC helpers in high-churn backends; CA-5
-  VISION incorrectly describes shipped native compilation as future work.
-- Frozen install, format, agent reference, four builds, all 63 suites,
-  Markdown, health and duplication gates pass. Duplication is 7.71%.
-  Pinned 257-script core: all tiers 65,188 pass, zero fail/skip/staged.
-  Recursive proposal/legacy results match documented out-of-scope residuals.
-  Native hello executes; fixture archive verifies 11 hashes, structure only.
-- Two callback regression probes failed in a disposable source copy while
-  all original 14 callback tests passed. No product source/tests/CI were edited.
-- Next step: user selects a focused remediation batch or requests publication
-  of the skill migration. No commit, push, PR, merge or release was performed.
+- User authorized implementing all five audit findings and shipping a native
+  GitHub stack, including the project-skill migration. Base remains fetched
+  `aef1e9c21979b5e15063fa1a159986443853427e`.
+- Native `gh stack` order: `codex/migrate-skills-codebase-audit`,
+  `codex/audit-core-conformance-gate`, `codex/audit-callback-lifetimes`,
+  `codex/audit-native-entry-contract`, `codex/audit-shared-runtime-helpers`,
+  `codex/audit-native-vision`. Publication and hosted verification are next.
+- Skills: KGR `bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c`, Matt Pocock
+  `c55ee46073ed923f86ce59a5eb3b6d895095d1b7`; 24 locked payloads verified,
+  local `optimize-runtime` retained. Migration used pinned `skills@1.5.23`.
+- CA-1: user selected caller-owned callback pointer lifetimes. Native callers
+  must stop and finish calls before Unbind/EndScope/Destroy; released addresses
+  may be reused. Pending notes are removed and private drain batches carry
+  binding generations. ADR-0017 records the decision; 16 callback tests pass.
+- CA-2: both workflows use the shared strict pinned-core process/tally gate;
+  five regression tests cover failing runners, bad/missing/duplicate tallies,
+  root-only corpus selection and missing scripts.
+- CA-3: compile and runtime shell reject non-void `_start` signatures with
+  EWasmLinkError before native emission/invocation. Regression tests preserve
+  preexisting output; real CLI repros create no executable; valid command runs.
+- CA-4: memory/GC bodies now live in `Wasm.Jit.Runtime`; backend ABI entrypoints
+  and ARM64 small-struct batching choice retained. No performance claim.
+- CA-5: VISION describes shipped native compilation and links open #46 for
+  remaining cross-target release delivery.
+- Local evidence: four builds, focused suites, all three tiers 65,188 pass
+  with zero fail/skip/staged, frozen install, format, agents, Markdown, health,
+  duplication. Duplication fell from 7.71% to 7.34%. Full unit log:
+  `/tmp/wasmlight-final-tests.log`; corpus `/tmp/wasmlight-final-conformance.log`.
+- Audit and repros: `/tmp/wasmlight-audit-20260922/report.md`; bounded review:
+  `/tmp/wasmlight-review-20260922.md`. x64/Windows behavior needs hosted CI.
+- No new release is requested; #46 is not completed by this remediation.
+  Narrated video remains absent: say/asciinema exist, ffmpeg/agg do not.
+- Next: guarded native submission, attach every PR, reconcile metadata, await
+  each exact-head CI, mark ready, triage external review, then complete the
+  authorized delivery endpoint. Never infer merge readiness from local tests.
 
 ## Open PR maintenance, 2026-09-19
 
