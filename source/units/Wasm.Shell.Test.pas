@@ -119,6 +119,8 @@ type
     procedure TestConnectorStubRejected;
     procedure TestCapabilityStubRejected;
     procedure TestNoStart;
+    procedure TestStartParameter;
+    procedure TestStartResult;
     procedure TestReactor;
     procedure TestBadImport;
     procedure TestHelloNativeOrClosed;
@@ -522,6 +524,30 @@ begin
   end;
 end;
 
+procedure TShellTests.TestStartParameter;
+var
+  Res: TWasmShellResult;
+begin
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellBytes(PayloadForWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (param i32)))'), FConfig);
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+end;
+
+procedure TShellTests.TestStartResult;
+var
+  Res: TWasmShellResult;
+begin
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellBytes(PayloadForWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (result i32) i32.const 7))'), FConfig);
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+end;
+
 procedure TShellTests.SetupTests;
 begin
   Test('corrupt embedded trailers fail before the attach seam', TestCorruptEmbeddedTrailer);
@@ -539,6 +565,8 @@ begin
   Test('a non-empty capability set is rejected (stub until #40)',
     TestCapabilityStubRejected);
   Test('a module with no _start is rejected', TestNoStart);
+  Test('_start parameters fail the command contract', TestStartParameter);
+  Test('_start results fail the command contract', TestStartResult);
   Test('a reactor is rejected', TestReactor);
   Test('an import outside WASI fails to link', TestBadImport);
   Test('hello writes through native entries, or fails closed off-backend',

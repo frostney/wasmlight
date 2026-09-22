@@ -713,6 +713,7 @@ begin
 
   try
     CheckConnectorsAndLink(ALoaded, ARequest.Connectors);
+    WasiCheckCommandEntry(ALoaded);
     Artifact := StrictCompileNative(ALoaded, Target);
     Template := LoadCompileTemplate(Target, ARequest.CatalogRoot);
     Payload := NativePayloadFromArtifact(ALoaded, Artifact, Template, Target);
