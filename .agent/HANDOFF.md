@@ -8,7 +8,10 @@
 - Native `gh stack` order: `codex/migrate-skills-codebase-audit`,
   `codex/audit-core-conformance-gate`, `codex/audit-callback-lifetimes`,
   `codex/audit-native-entry-contract`, `codex/audit-shared-runtime-helpers`,
-  `codex/audit-native-vision`. Publication and hosted verification are next.
+  `codex/audit-native-vision`. Published through the protected native helper
+  as stack #123, bottom-to-top PRs #117, #118, #119, #120, #121, #122.
+  All PRs are attached to the task and contain reconciled validation evidence.
+  Read live GitHub heads/checks/review state before continuing.
 - Skills: KGR `bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c`, Matt Pocock
   `c55ee46073ed923f86ce59a5eb3b6d895095d1b7`; 24 locked payloads verified,
   local `optimize-runtime` retained. Migration used pinned `skills@1.5.23`.
@@ -26,7 +29,7 @@
   and ARM64 small-struct batching choice retained. No performance claim.
 - CA-5: VISION describes shipped native compilation and links open #46 for
   remaining cross-target release delivery.
-- Local evidence: four builds, focused suites, all three tiers 65,188 pass
+- Local evidence: all 63 unit suites, four builds, focused suites, all three tiers 65,188 pass
   with zero fail/skip/staged, frozen install, format, agents, Markdown, health,
   duplication. Duplication fell from 7.71% to 7.34%. Full unit log:
   `/tmp/wasmlight-final-tests.log`; corpus `/tmp/wasmlight-final-conformance.log`.
@@ -34,9 +37,17 @@
   `/tmp/wasmlight-review-20260922.md`. x64/Windows behavior needs hosted CI.
 - No new release is requested; #46 is not completed by this remediation.
   Narrated video remains absent: say/asciinema exist, ffmpeg/agg do not.
-- Next: guarded native submission, attach every PR, reconcile metadata, await
-  each exact-head CI, mark ready, triage external review, then complete the
-  authorized delivery endpoint. Never infer merge readiness from local tests.
+- Hosted checks are awaited with `delivery_wait.py` at each PR's exact head.
+  Native snapshot: `/tmp/wasmlight-native-snapshot.json`; CI receipts:
+  `/tmp/wasmlight-ci-117.json` through `122.json`. Guard publication receipt:
+  Git worktree `kgr-push-guards/24a8984a-1a99-409b-83be-a7ec149c7321`.
+- No configured external review provider or requested reviewer was found.
+  The user has been asked which reviewer/provider should review the stack,
+  as DEFINITION_OF_DONE requires external review before merge.
+- Next: await every current-head CI, mark ready, obtain and triage external
+  review, then complete the authorized delivery endpoint. Native stack #123
+  contains the whole remediation; never merge a prefix below a required fix.
+  Never infer merge readiness from local tests or absent reviewer findings.
 
 ## Open PR maintenance, 2026-09-19
 
