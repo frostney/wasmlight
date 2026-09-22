@@ -1,5 +1,35 @@
 # Handoff
 
+## Skills migration and codebase audit, 2026-09-22
+
+- User requested all project skills updated/migrated, followed by an audit.
+- Clean fetched base: `aef1e9c21979b5e15063fa1a159986443853427e`.
+  Branch: `codex/migrate-skills-codebase-audit`; changes remain uncommitted.
+- Updated through pinned `skills@1.5.23`, following upstream maintenance runbook.
+  KGR main: `bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c`; Matt Pocock main:
+  `c55ee46073ed923f86ce59a5eb3b6d895095d1b7`. Rechecked both remote tips.
+- Migrated PR/stack feedback to `address-feedback`, issue/idea implementation
+  to `implement`, and retired `render-html` according to upstream `5207cc3`.
+  Added companions `deliver`, `agent-writing`, `test-against-spec`, and
+  `maintain-project-skills`. All 24 locked payloads and hashes match upstream;
+  repository-owned `optimize-runtime` remains unchanged (25 total skills).
+- Audit used the updated `codebase-audit` skill, without subagents or fixes.
+  Report/evidence: `/tmp/wasmlight-audit-20260922/report.md`.
+- Findings: CA-1 callback slot reuse redirects queued work and stale thunks;
+  CA-2 both conformance CI gates accept a failing runner; CA-3 native shell
+  invokes non-void `_start` signatures with nil buffers and faults; CA-4
+  duplicate ISA-independent memory/GC helpers in high-churn backends; CA-5
+  VISION incorrectly describes shipped native compilation as future work.
+- Frozen install, format, agent reference, four builds, all 63 suites,
+  Markdown, health and duplication gates pass. Duplication is 7.71%.
+  Pinned 257-script core: all tiers 65,188 pass, zero fail/skip/staged.
+  Recursive proposal/legacy results match documented out-of-scope residuals.
+  Native hello executes; fixture archive verifies 11 hashes, structure only.
+- Two callback regression probes failed in a disposable source copy while
+  all original 14 callback tests passed. No product source/tests/CI were edited.
+- Next step: user selects a focused remediation batch or requests publication
+  of the skill migration. No commit, push, PR, merge or release was performed.
+
 ## Open PR maintenance, 2026-09-19
 
 - User requested fixes for both open PRs and the frostney/me delivery loop.
