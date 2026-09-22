@@ -5,7 +5,7 @@
 - User authorized implementing all five audit findings and shipping a native
   GitHub stack, including the project-skill migration. Base remains fetched
   `aef1e9c21979b5e15063fa1a159986443853427e`.
-- Native `gh stack` order: `codex/migrate-skills-codebase-audit`,
+- Initial native `gh stack` publication: `codex/migrate-skills-codebase-audit`,
   `codex/audit-core-conformance-gate`, `codex/audit-callback-lifetimes`,
   `codex/audit-native-entry-contract`, `codex/audit-shared-runtime-helpers`,
   `codex/audit-native-vision`. Published through the protected native helper
@@ -35,6 +35,16 @@
   `/tmp/wasmlight-final-tests.log`; corpus `/tmp/wasmlight-final-conformance.log`.
 - Audit and repros: `/tmp/wasmlight-audit-20260922/report.md`; bounded review:
   `/tmp/wasmlight-review-20260922.md`. x64/Windows behavior needs hosted CI.
+- The strict hosted gate exposed 13 previously hidden Windows i386 failures:
+  two array.new_data source-range/allocation precedence cases and eleven x87
+  binary64 subnormal multiply/divide double-rounding cases. The added
+  `codex/audit-win32-conformance` layer checks data bounds before allocation
+  and uses exact integer rounding only at the f64 underflow boundary.
+  The independent Fraction oracle passes 5,000 cases; committed tests cover
+  the eleven corpus vectors, ties, signed zero and the normal boundary.
+- The stricter gate must follow the Win32 fixes in native stack order so every
+  intermediate PR is independently green. No member has an external review;
+  record heads/topology and use official native restructuring before resubmit.
 - No new release is requested; #46 is not completed by this remediation.
   Narrated video remains absent: say/asciinema exist, ffmpeg/agg do not.
 - Hosted checks are awaited with `delivery_wait.py` at each PR's exact head.
