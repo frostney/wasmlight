@@ -6350,7 +6350,7 @@ begin
   { mov byte [rdx+ActNative], 1 = C6 42 78 01: only the inline direct-call
     frame publication writes the Native bit from generated code. -1 off x64. }
   Result := -1;
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Result := 0;
   Module := TWasmModule.Create;
   Ir := nil;
@@ -6512,7 +6512,7 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<Boolean>(FDiffJitOut.Trapped).ToBe(False);
   Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64($13FC00015));
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 4)).ToBe(4);
   {$ENDIF}
 end;
@@ -6541,7 +6541,7 @@ begin
   Expect<string>(TrapMessageOf(Bytes, 'check', [])).ToBe('');
   CompileExports(['z', 'check']);
   Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(2);
   {$ENDIF}
 end;
@@ -6594,7 +6594,7 @@ begin
       [MakeValueI32(Kinds[I]), MakeValueI32(Addrs[I])]))
       .ToBe(JIT_BACKEND_AVAILABLE);
   end;
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
   {$ENDIF}
 end;
@@ -6624,7 +6624,7 @@ begin
     level. run is depth 1 and rec(n) needs depth n + 2, so a 64-activation cap
     admits n = 62 and traps at n = 63; the sweep crosses it in both tiers. }
   Bytes := AssembleWatText(RecWat);
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 0)).ToBe(1);
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
   {$ENDIF}
@@ -6747,7 +6747,7 @@ begin
     CompileExports(['spin', 'run']);
     Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(2)]))
       .ToBe(JIT_BACKEND_AVAILABLE);
-    {$IFDEF CPUX86_64}
+    {$IFDEF WASM_JIT_X64}
     Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
     {$ENDIF}
   finally
@@ -6842,7 +6842,7 @@ begin
   Expect<Boolean>(DiffFresh(Bytes, 'uncaught', [MakeValueI32(5)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<Boolean>(FDiffJitOut.Exceptional).ToBe(True);
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   { caught -> mid, outer -> mid2, mid2 -> mid, uncaught -> mid are inline;
     mid -> thrower keeps the helper (a throwing body has no direct entry). }
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(0);
@@ -6895,7 +6895,7 @@ begin
   finally
     FDiffThreshold := -1;
   end;
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 2)).ToBe(2);
   {$ENDIF}
 end;
@@ -6928,7 +6928,7 @@ begin
   Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
   Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
   Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
   {$ENDIF}
 
@@ -6943,7 +6943,7 @@ begin
     '(call $g (i32.const 4) (i64.const 0) (i32.const 5))))');
   CompileExports(['g', 'run']);
   Expect<Boolean>(DiffModule(Declined, 'run', [])).ToBe(JIT_BACKEND_AVAILABLE);
-  {$IFDEF CPUX86_64}
+  {$IFDEF WASM_JIT_X64}
   Expect<Integer>(X64GenericDirectCallSites(Declined, 1)).ToBe(0);
   {$ENDIF}
 end;

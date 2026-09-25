@@ -698,7 +698,12 @@ begin
   { PinMemory: resolve Store.FMemories[Acts[Depth-1].Instance.MemAddrs[7]]
     inline and retain it in the first frame slot. Offsets are the published
     LP64 layout (Wasm.Target): TierContext 168, Depth 56, ActStride 128, Acts
-    40, ActInstance 8, MemAddrs 48, MemInstStride 80, FMemories 64. }
+    40, ActInstance 8, MemAddrs 48, MemInstStride 80, FMemories 64. The
+    emitter reads the host's live record offsets, which equal that layout on
+    every 64-bit host the x64 backend runs on; a 32-bit host's records are
+    smaller (the encoder tests still run there), so the literal bytes are
+    asserted on 64-bit hosts only. }
+  {$IFDEF CPU64}
   Buf := TWasmCodeBuffer.Create;
   try
     X64EmitPinMemory(Buf, 7);
@@ -716,6 +721,7 @@ begin
   finally
     Buf.Free;
   end;
+  {$ENDIF}
 
   { CallHelper: call qword [r15 + k*8] — the code holds only the slot index k.
     k = Ord(aohRtDispatch) = 3, disp = 24: 41 FF 57 18. }
