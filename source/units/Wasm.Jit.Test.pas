@@ -1720,6 +1720,10 @@ type
     procedure TestAdjacentMoveRetainsCallArgument;
     procedure TestTeeArgumentThroughCompiledLeaf;
     procedure TestTeeInStaticCacheLoop;
+    procedure TestDeferredStoreAcrossJoins;
+    procedure TestDeferredStoreAcrossTrapPoint;
+    procedure TestDeferredStoreLoopCarriedEpoch;
+    procedure TestDeferredStoreEarlyExits;
     procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
@@ -3579,6 +3583,186 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+{ Deferred write-back of static-cache temporaries. Each leaf is a helper-free
+  scalar loop, so every backend takes the function-wide static cache with
+  deferred dynamic stores. Only the leaf is compiled; the interpreted `check`
+  export compares its result with an independently computed literal and
+  traps on a mismatch, so neither tier is the other's only oracle. Pinned
+  core d7b37e4: exec-loop, exec-if, exec-br, exec-br_if, exec-return,
+  exec-unreachable. }
+procedure TJitTests.TestDeferredStoreAcrossJoins;
+const
+  Inputs: array[0 .. 4] of Integer = (0, 1, 2, 5, 16);
+  Expected: array[0 .. 4] of Integer = (26, 26, 82, 2296, 406843999);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  { acc * 3 is an expression temporary held across the if's conditional
+    branch and its join; both arms produce the if result in another
+    temporary that is read only after the join. The condition is a static
+    local, so the product is still in its dynamic host at the branch. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 11)) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 3)) ' +
+    '(if (result i32) (local.get $i) ' +
+    '(then (i32.xor (local.get $i) (i32.const 5))) ' +
+    '(else (i32.const -7))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (param $n i32) (param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Expected[I])])).ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Expected[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
+procedure TJitTests.TestDeferredStoreAcrossTrapPoint;
+var
+  Bytes: TWasmBytes;
+begin
+  { acc * 7 stays live across the branches guarding an unreachable; each
+    join must see it. The outer condition is a static local, so the product
+    is still in its dynamic host when that branch skips the trap check. A
+    taken trap must still fire at the same iteration as the interpreter. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $n i32) (param $bad i32) ' +
+    '(result i32) (local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 5)) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 7)) ' +
+    '(block (result i32) ' +
+    '(if (local.get $i) (then (if (i32.eq (local.get $i) (local.get $bad)) ' +
+    '(then unreachable)))) ' +
+    '(i32.add (local.get $i) (i32.const 3))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (param $n i32) (param $bad i32) ' +
+    '(param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n) ' +
+    '(local.get $bad))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  Expect<string>(TrapMessageOf(Bytes, 'check',
+    [MakeValueI32(6), MakeValueI32(100), MakeValueI32(650336)])).ToBe('');
+  Expect<Boolean>(DiffFresh(Bytes, 'check',
+    [MakeValueI32(6), MakeValueI32(100), MakeValueI32(650336)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'leaf',
+    [MakeValueI32(6), MakeValueI32(3)])).ToBe('unreachable');
+  Expect<Boolean>(DiffFresh(Bytes, 'leaf',
+    [MakeValueI32(6), MakeValueI32(3)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'check',
+    [MakeValueI32(1), MakeValueI32(0), MakeValueI32(38)])).ToBe('');
+  Expect<Boolean>(DiffFresh(Bytes, 'check',
+    [MakeValueI32(1), MakeValueI32(0), MakeValueI32(38)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestDeferredStoreLoopCarriedEpoch;
+var
+  Bytes: TWasmBytes;
+begin
+  { The loop parameter is an expression temporary read at the loop head and
+    redefined by br_if's value, so it crosses the epoch-polled back-edge. With
+    the epoch bumped, the first taken back-edge interrupts; without it, the
+    carried value must survive every iteration. }
+  Bytes := AssembleWatText('(module (import "e" "bump" (func $bump)) ' +
+    '(func $leaf (export "leaf") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $s i32) ' +
+    'i32.const 9 ' +
+    'loop $l (param i32) (result i32) ' +
+    'i32.const 3 i32.mul local.get $i i32.add ' +
+    'local.get $s local.get $i i32.xor local.set $s ' +
+    'local.get $i i32.const 1 i32.add local.tee $i ' +
+    'local.get $n i32.lt_u br_if $l ' +
+    'end ' +
+    'local.get $s i32.add) ' +
+    '(func (export "run") (param $n i32) (param $bump i32) ' +
+    '(param $want i32) (result i32) (local $r i32) ' +
+    '(if (local.get $bump) (then (call $bump))) ' +
+    '(local.set $r (call $leaf (local.get $n))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  FDiffHost := @JitBumpEpochCallback;
+  CompileExports(['leaf']);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(10), MakeValueI32(0), MakeValueI32(546199)])).ToBe('');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(10), MakeValueI32(0), MakeValueI32(546199)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(1), MakeValueI32(1), MakeValueI32(27)])).ToBe('');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(1), MakeValueI32(1), MakeValueI32(27)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(1), MakeValueI32(83)]))
+    .ToBe('interrupt');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(1), MakeValueI32(83)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  FDiffHost := nil;
+end;
+
+procedure TJitTests.TestDeferredStoreEarlyExits;
+const
+  Inputs: array[0 .. 3] of Integer = (10, 10, 4, 10);
+  Stops: array[0 .. 3] of Integer = (100, 3, 100, 0);
+  Expected: array[0 .. 3] of Integer = (83006, -337, 81, -995);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  { A br_if carries an expression value forward out of the loop to the block
+    result, and a return inside the loop publishes an expression result. Both
+    leave the straight line with the value only in a dynamic host. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $n i32) (param $stop i32) ' +
+    '(result i32) (local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 1)) ' +
+    '(i32.add (block $done (result i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 5)) ' +
+    '(local.get $i))) ' +
+    '(if (i32.eq (local.get $i) (local.get $stop)) ' +
+    '(then (return (i32.sub (local.get $acc) (i32.const 1000))))) ' +
+    '(drop (br_if $done (i32.xor (local.get $acc) (local.get $i)) ' +
+    '(i32.eq (local.get $i) (i32.const 6)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.const 77)) (local.get $i))) ' +
+    '(func (export "check") (param $n i32) (param $stop i32) ' +
+    '(param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n) ' +
+    '(local.get $stop))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI32(Inputs[I]),
+      MakeValueI32(Stops[I]), MakeValueI32(Expected[I])])).ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI32(Inputs[I]),
+      MakeValueI32(Stops[I]), MakeValueI32(Expected[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
 var
   Bytes: TWasmBytes;
@@ -4812,6 +4996,14 @@ begin
     TestTeeArgumentThroughCompiledLeaf);
   Test('a tee in a static-cache loop keeps both uses',
     TestTeeInStaticCacheLoop);
+  Test('a deferred static-cache temporary survives branch joins',
+    TestDeferredStoreAcrossJoins);
+  Test('a deferred static-cache temporary survives a trap check',
+    TestDeferredStoreAcrossTrapPoint);
+  Test('loop-carried static-cache temporaries survive the epoch poll',
+    TestDeferredStoreLoopCarriedEpoch);
+  Test('deferred static-cache values reach early br and return exits',
+    TestDeferredStoreEarlyExits);
   Test('a tee stored in a pinned-memory loop keeps the stored value',
     TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
