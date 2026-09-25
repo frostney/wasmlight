@@ -145,6 +145,21 @@ corpus (`valid/` from its `.wat`, `malformed/` by byte-patching), and this
 program stands on its own. Re-assemble it by hand with the `wat2wasm`
 line above if `hello.wat` ever changes.
 
+## `wast/` — tier-identity nets
+
+Text scripts the conformance runner executes, rather than binaries.
+
+| Fixture | What it covers |
+| --- | --- |
+| `x64-writeback.wast` | One module and 76 assertions aimed at the x64 deferred write-back and native return-tail plans: dirty temporaries across `if` joins, eleven-temporary register pressure, early `br_if` / `br` / `return` exits, `unreachable` and integer divide-by-zero traps mid-loop, nested loops with two back-edges, native self-recursion with three arms, and leaves ending in `select` / parameter / constant / `eqz`. |
+
+`x64-writeback.py` generates the `.wast` beside it. Every expected value
+comes from that script's Python model, never from a wasmlight tier, so the
+fixture is an independent oracle. Regenerate with
+`python3 tests/fixtures/wast/x64-writeback.py`; the output is deterministic.
+`Wasm.Wast.Runner.Test` runs the fixture in the interpreter, JIT, and AOT
+tiers and requires every command to pass in each.
+
 ## Feature support notes
 
 Everything requested is covered by this toolchain; nothing had to be
