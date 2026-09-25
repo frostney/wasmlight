@@ -58,8 +58,10 @@ uses
   Wasm.Ir,
   Wasm.Jit,
   Wasm.Jit.CodeBuffer,
+  Wasm.Jit.X64,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
+  Wasm.Runtime.Traps,
   Wasm.Runtime.Values,
   Wasm.Target;
 
@@ -178,6 +180,37 @@ function SubModuleBytes: TWasmBytes;
 begin
   Result := OneFunc(BLit([$60, $02, $7F, $7F, $01, $7F]),
     BLit([$00, $20, $00, $20, $01, $6B, $0B]), 'sub');
+end;
+
+{ run(n): three `acc += 1` then a loop acc := acc*3 + i while ++i < n. }
+function LoopModuleBytes: TWasmBytes;
+begin
+  Result := OneFunc(BLit([$60, $01, $7F, $01, $7F]),
+    BLit([$01, $02, $7F,
+      $20, $01, $41, $01, $6A, $21, $01,
+      $20, $01, $41, $01, $6A, $21, $01,
+      $20, $01, $41, $01, $6A, $21, $01,
+      $03, $40,
+      $20, $01, $41, $03, $6C, $20, $02, $6A, $21, $01,
+      $20, $02, $41, $01, $6A, $22, $02, $20, $00, $49, $0D, $00,
+      $0B,
+      $20, $01, $0B]), 'run');
+end;
+
+function OracleLoop(const AN: UInt32): UInt32;
+var
+  I: UInt32;
+begin
+  {$PUSH}
+  {$OVERFLOWCHECKS OFF}
+  {$RANGECHECKS OFF}
+  Result := 3;
+  I := 0;
+  repeat
+    Result := Result * 3 + I;
+    Inc(I);
+  until I >= AN;
+  {$POP}
 end;
 
 procedure AotBumpEpochCallback(const AStore: TWasmStore;
@@ -376,6 +409,7 @@ type
     procedure TestMultiFunctionWithDeclined;
     procedure TestLargeFrameAllCompiled;
     procedure TestJitAndAotCodeAreByteIdentical;
+    procedure TestLoadedLoopHeadsKeepAlignment;
     procedure TestEpochBumpBeforeAcyclicNativeRecursion;
     procedure TestGuardRejectsWrongIrVersion;
     procedure TestGuardRejectsWrongArch;
@@ -796,6 +830,99 @@ end;
   compilation of a function and the AOT-loaded region for the same function are
   byte-for-byte identical, and both produce the same result. This is the strong
   invariant the unified emitter buys: only WHERE the bytes came from differs. }
+procedure TAotTests.TestLoadedLoopHeadsKeepAlignment;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Bytes_, Artifact: TWasmBytes;
+  Parsed: TWasmAotArtifact;
+  Engine, CompileEngine: TWasmEngine;
+  CompileStore, Store: TWasmStore;
+  CompileLoaded, Loaded: TWasmLoadedModule;
+  Instance: TWasmModuleInstance;
+  Imports: TWasmImports;
+  Jit: TWasmJitContext;
+  LoadRes: TWasmAotLoadResult;
+  Addr: TWasmFuncAddr;
+  Entry: PByte;
+  Params: array[0 .. 0] of TWasmValue;
+  Res: array[0 .. 0] of TWasmValue;
+  {$IFDEF WASM_JIT_X64}
+  Site, Target, Edges: Integer;
+  {$ENDIF}
+begin
+  Bytes_ := LoopModuleBytes;
+  CompileEngine := TWasmEngine.Create;
+  CompileLoaded := nil;
+  CompileStore := nil;
+  Engine := nil;
+  Loaded := nil;
+  Store := nil;
+  Jit := nil;
+  try
+    CompileLoaded := LoadModule(Bytes_);
+    CompileStore := TWasmStore.Create(CompileEngine);
+    Artifact := AotCompileModule(CompileStore, CompileLoaded);
+    Expect<Integer>(Ord(ParseAotArtifact(Artifact, Parsed))).ToBe(Ord(aprOk));
+    Expect<Boolean>(Parsed.Funcs[0].Compiled).ToBe(True);
+    Expect<Integer>(Length(Parsed.Funcs[0].Relocs)).ToBe(0);
+
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    Engine := TWasmEngine.Create;
+    Loaded := LoadModule(Bytes_);
+    Store := TWasmStore.Create(Engine);
+    Instance := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    RegisterInterpreter(Store);
+    Jit := AotLoadAndWire(Store, Loaded, Instance, Artifact, LoadRes);
+    Expect<Integer>(Ord(LoadRes)).ToBe(Ord(alrLoaded));
+    Addr := ExportAddr(Instance, 'run');
+    Entry := PByte(Store.Funcs[Addr].CompiledEntry);
+    Expect<Boolean>(Entry <> nil).ToBe(True);
+    {$IFDEF WASM_JIT_X64}
+    { The artifact carries offsets only; the loader's own page-aligned mapping
+      makes the loop head's ADDRESS land where the emitter placed it. }
+    Edges := 0;
+    for Site := 0 to Length(Parsed.Funcs[0].Code) - 14 do
+      if (Entry[Site] = $0F) and (Entry[Site + 1] = $84) and
+        (Entry[Site + 6] = $BF) and
+        (Entry[Site + 7] = Byte(Ord(wtkEpochInterrupt))) and
+        (Entry[Site + 11] = $41) and (Entry[Site + 12] = $FF) and
+        (Entry[Site + 13] = $17) then
+      begin
+        Target := Site + 6 + Integer(UInt32(Entry[Site + 2]) or
+          (UInt32(Entry[Site + 3]) shl 8) or
+          (UInt32(Entry[Site + 4]) shl 16) or
+          (UInt32(Entry[Site + 5]) shl 24));
+        Expect<PtrUInt>((PtrUInt(Entry) + PtrUInt(Target)) mod
+          X64_LOOP_HEAD_ALIGN).ToBe(X64_LOOP_HEAD_OFFSET);
+        Inc(Edges);
+      end;
+    Expect<Integer>(Edges).ToBe(1);
+    {$ENDIF}
+    Params[0] := MakeValueI32(1000);
+    Res[0].Bits := High(UInt64);
+    InterpInvoke(Store, Addr, @Params[0], @Res[0]);
+    Expect<UInt32>(UInt32(Res[0].I32)).ToBe(OracleLoop(1000));
+  finally
+    FreeAndNil(Jit);
+    FreeAndNil(Store);
+    FreeAndNil(Loaded);
+    FreeAndNil(Engine);
+    FreeAndNil(CompileStore);
+    FreeAndNil(CompileLoaded);
+    FreeAndNil(CompileEngine);
+  end;
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(JitExecMemSupported).ToBe(False);
+end;
+{$ENDIF}
+
 procedure TAotTests.TestJitAndAotCodeAreByteIdentical;
 {$IFDEF WASM_JIT_BACKEND}
 var
@@ -1698,6 +1825,8 @@ begin
     TestLargeFrameAllCompiled);
   Test('AOT-loaded code is byte-identical to a fresh JIT compilation',
     TestJitAndAotCodeAreByteIdentical);
+  Test('an AOT-loaded loop runs with its head at the aligned address',
+    TestLoadedLoopHeadsKeepAlignment);
   Test('an epoch bump before acyclic AOT recursion does not invent a safepoint',
     TestEpochBumpBeforeAcyclicNativeRecursion);
   Test('a wrong IR-version artifact is rejected (interpret fall-back)',

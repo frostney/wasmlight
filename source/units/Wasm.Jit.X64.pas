@@ -218,6 +218,11 @@ const
   X64_PATCH_JMP32 = 5;
   X64_PATCH_JCC32 = 6;
 
+  { Loop-head placement (X64EmitLoopHeadAlign): offset 32 in a 64-byte
+    block. }
+  X64_LOOP_HEAD_ALIGN = 64;
+  X64_LOOP_HEAD_OFFSET = 32;
+
 { --- low-level byte emitters (the encoder; the test asserts their bytes) --- }
 
 { REX prefix (0x40 | W<<3 | R<<2 | X<<1 | B); emitted only when a bit is set
@@ -338,6 +343,29 @@ procedure X64EmitCallTo(const ABuf: TWasmCodeBuffer;
   per instruction, in order). }
 procedure X64EmitJmpTo(const ABuf: TWasmCodeBuffer; const ATarget: UInt32);
 procedure X64EmitJccTo(const ABuf: TWasmCodeBuffer; const ACc: Byte;
+  const ATarget: UInt32);
+
+{ Emit ACount bytes of the recommended multi-byte NOP sequences (SDM Vol. 2
+  NOP: 90, 66 90, 0F 1F /0 with the 1-9 byte ModRM/SIB/disp forms), longest
+  form first. }
+procedure X64EmitNops(const ABuf: TWasmCodeBuffer; const ACount: Integer);
+{ Pad with NOPs so the next byte starts at ABoundary-aligned offset + AOffset
+  (ABoundary a power of two, 0 <= AOffset < ABoundary). }
+procedure X64AlignCode(const ABuf: TWasmCodeBuffer;
+  const ABoundary, AOffset: Integer);
+{ Place a loop head (a back-edge target) at X64_LOOP_HEAD_OFFSET within an
+  X64_LOOP_HEAD_ALIGN-byte block. Buffer offsets are address offsets: every
+  function body gets its own page-aligned mapping (AJIT, AOT load, native
+  image), so the head's address has the same residue. Unaligned heads let hot
+  loop timings swing by up to 1.7x with unrelated code-size changes; on the
+  measured host the second half of a 64-byte line was the fastest or tied
+  position for every measured loop, and a line start never was. The padding
+  runs once per loop entry, on the fall-through path only. }
+procedure X64EmitLoopHeadAlign(const ABuf: TWasmCodeBuffer);
+{ The loop back-edge safepoint (§6): `mov rax,[r13]; cmp rax,r14; je
+  ATarget` then the epoch-interrupt trap call, which does not return. One
+  taken branch per iteration; the trap stays on the fall-through. }
+procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
   const ATarget: UInt32);
 
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
@@ -2096,6 +2124,46 @@ begin
   ABuf.EmitByte($C3);   { RET (SDM: C3). }
 end;
 
+procedure X64EmitNops(const ABuf: TWasmCodeBuffer; const ACount: Integer);
+const
+  { SDM Vol. 2 "NOP": the recommended multi-byte sequences, indexed by
+    length. Forms 3-9 are 0F 1F /0 with a zero displacement / SIB. }
+  Nop: array[1..9, 0..8] of Byte = (
+    ($90, 0, 0, 0, 0, 0, 0, 0, 0),
+    ($66, $90, 0, 0, 0, 0, 0, 0, 0),
+    ($0F, $1F, $00, 0, 0, 0, 0, 0, 0),
+    ($0F, $1F, $40, $00, 0, 0, 0, 0, 0),
+    ($0F, $1F, $44, $00, $00, 0, 0, 0, 0),
+    ($66, $0F, $1F, $44, $00, $00, 0, 0, 0),
+    ($0F, $1F, $80, $00, $00, $00, $00, 0, 0),
+    ($0F, $1F, $84, $00, $00, $00, $00, $00, 0),
+    ($66, $0F, $1F, $84, $00, $00, $00, $00, $00));
+var
+  Left, N, I: Integer;
+begin
+  Left := ACount;
+  while Left > 0 do
+  begin
+    N := Left;
+    if N > 9 then
+      N := 9;
+    for I := 0 to N - 1 do
+      ABuf.EmitByte(Nop[N, I]);
+    Dec(Left, N);
+  end;
+end;
+
+procedure X64AlignCode(const ABuf: TWasmCodeBuffer;
+  const ABoundary, AOffset: Integer);
+begin
+  X64EmitNops(ABuf, (AOffset - ABuf.CurrentOffset) and (ABoundary - 1));
+end;
+
+procedure X64EmitLoopHeadAlign(const ABuf: TWasmCodeBuffer);
+begin
+  X64AlignCode(ABuf, X64_LOOP_HEAD_ALIGN, X64_LOOP_HEAD_OFFSET);
+end;
+
 procedure X64EmitMovRegReg(const ABuf: TWasmCodeBuffer; const ADst, ASrc: Byte);
 begin
   { MOV r/m64, r64 = 89 /r; rm=ADst, reg=ASrc. }
@@ -3235,18 +3303,13 @@ begin
   X64EmitCallHelper(ABuf, aohTrapKind);   { does not return }
 end;
 
-{ The back-edge epoch check (§6): if [r13] (live Store.Epoch) <> r14 (snapshot),
-  call X64TrapKind(wtkEpochInterrupt); otherwise fall through. }
-procedure EmitEpochCheck(const ABuf: TWasmCodeBuffer);
-var
-  Cont: TWasmJitLabel;
+procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
+  const ATarget: UInt32);
 begin
   X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_EPOCHADDR, 0);       { rax := *r13 }
   X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_REG_EPOCH);   { cmp rax, r14 }
-  Cont := ABuf.NewLabel;
-  X64EmitJccTo(ABuf, X64_CC_E, UInt32(Cont));                  { je Cont }
-  EmitTrapCall(ABuf, wtkEpochInterrupt);
-  ABuf.BindLabel(Cont);
+  X64EmitJccTo(ABuf, X64_CC_E, ATarget);                       { je target }
+  EmitTrapCall(ABuf, wtkEpochInterrupt);                       { no return }
 end;
 
 { 32-bit two-operand ALU: eax := op(w[A], w[B]); store the widened slot (the
@@ -4192,11 +4255,10 @@ begin
     iroThrow, iroThrowRef:
       X64EmitEhThrow(ABuf, AInsIndex);
     iroJump:
-      begin
-        if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
-          EmitEpochCheck(ABuf);
+      if (AIns.Imm and IR_JUMP_SAFEPOINT) <> 0 then
+        X64EmitEpochBackEdge(ABuf, AIns.A)
+      else
         X64EmitJmpTo(ABuf, AIns.A);
-      end;
     iroBranchIf:
       begin
         X64EmitLoadSlot32(ABuf, X64_RAX, AIns.A);

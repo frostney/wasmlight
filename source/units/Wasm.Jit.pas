@@ -493,6 +493,9 @@ var
   Emitted: Boolean;
   Targets: array of Boolean;
   TargetCount: UInt32;
+  {$IFDEF WASM_JIT_X64}
+  LoopHeads: array of Boolean;
+  {$ENDIF}
   AllocatedSlots: array[0..2] of UInt32;
   SlotScores: array of UInt32;
   SlotUseCounts: array of UInt32;
@@ -553,6 +556,39 @@ var
     if ATarget < UInt32(Length(Targets)) then
       Targets[ATarget] := True;
   end;
+
+  {$IFDEF WASM_JIT_X64}
+  { A loop head is an instruction some later (or the same) instruction
+    branches back to: the target of a back-edge. }
+  procedure AnalyzeLoopHeads;
+  var
+    K, N: Integer;
+    Count: UInt32;
+
+    procedure MarkBack(const ATarget: UInt32);
+    begin
+      if ATarget <= UInt32(K) then
+        LoopHeads[ATarget] := True;
+    end;
+
+  begin
+    SetLength(LoopHeads, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      case AFn^.Code[K].Op of
+        iroJump: MarkBack(AFn^.Code[K].A);
+        iroBranchIf, iroBranchIfNot,
+        iroBrOnNull, iroBrOnNonNull, iroBrOnCast, iroBrOnCastFail:
+          MarkBack(AFn^.Code[K].B);
+        iroBrTable:
+          begin
+            Count := IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].B);
+            for N := 0 to Integer(Count) - 1 do
+              MarkBack(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].B,
+                UInt32(N)));
+          end;
+      end;
+  end;
+  {$ENDIF}
 
   function IntegerCompare(const AOp: TWasmIrOp): Boolean;
   begin
@@ -2236,6 +2272,9 @@ begin
     end;
     for I := 0 to High(AFn^.HandlerClauses) do
       MarkTarget(AFn^.HandlerClauses[I].TargetInstr);
+    {$IFDEF WASM_JIT_X64}
+    AnalyzeLoopHeads;
+    {$ENDIF}
 
     AnalyzePinnedMemory;
     AnalyzeStaticCache;
@@ -2412,6 +2451,12 @@ begin
         X64InvalidateRegCache(X64Cache);
         {$ENDIF}
       end;
+      {$IFDEF WASM_JIT_X64}
+      { After the join's write-back, so the padding sits on the fall-through
+        entry path only; every back-edge lands on the aligned head. }
+      if LoopHeads[I] then
+        X64EmitLoopHeadAlign(Buf);
+      {$ENDIF}
       Buf.BindLabel(TWasmJitLabel(I));
       if SkipPlanned[I] or (Fusion[I] = -2) then
         Continue;
