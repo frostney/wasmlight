@@ -122,6 +122,16 @@ class ConformanceGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("aot: non-core output differs from interp", result.stderr)
 
+    def test_non_core_divergence_is_located_and_passing_runs_stay_quiet(self):
+        diverged = NESTED.replace("outside.wast:3", "outside.wast:4")
+        result = self.run_gate(tiers=("interp", "jit"), nested={"jit": diverged})
+        self.assertIn("-FAIL proposals/outside.wast:3 assert_return", result.stderr)
+        self.assertIn("+FAIL proposals/outside.wast:4 assert_return", result.stderr)
+        quiet = self.run_gate(tiers=("interp", "jit"))
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertNotIn("FAIL proposals/", quiet.stdout)
+        self.assertEqual(quiet.stdout.count("TOTAL files=1 "), 2)
+
     def test_non_core_exit_status_divergence_fails(self):
         result = self.run_gate(tiers=("interp", "jit"), nested_status={"jit": 0})
         self.assertNotEqual(result.returncode, 0)

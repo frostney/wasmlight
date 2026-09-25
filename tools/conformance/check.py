@@ -7,6 +7,7 @@ tier, apart from the TOTAL line's tier and compiled fields.
 """
 
 import argparse
+import difflib
 from pathlib import Path
 import re
 import subprocess
@@ -25,12 +26,19 @@ EXPECTED = {
 TIER_FIELDS = re.compile(r" tier=\S+ compiled=\d+\b")
 
 
-def run(runner: list[str], tier: str, scripts: list[Path]) -> subprocess.CompletedProcess:
+def run(runner: list[str], tier: str, scripts: list[Path],
+        echo: bool = True) -> subprocess.CompletedProcess:
+    """Run one tier; without echo, show only the TOTAL line and stderr."""
     result = subprocess.run(
         [*runner, "--failures-only", f"--tier={tier}", *map(str, scripts)],
         capture_output=True, text=True, check=False,
     )
-    print(result.stdout, end="")
+    if echo:
+        print(result.stdout, end="")
+    else:
+        for line in result.stdout.splitlines():
+            if line.startswith("TOTAL "):
+                print(line)
     print(result.stderr, end="", file=sys.stderr)
     return result
 
@@ -81,15 +89,27 @@ def check_identity(runner: list[str], corpus: Path, tiers: list[str]) -> None:
         raise ValueError("no non-core scripts found for the tier-identity check")
     reference = None
     for tier in tiers:
-        result = run(runner, tier, scripts)
+        # The non-core scripts fail by design; echoing every expected FAIL line
+        # would bury real output, so only a divergence is shown in full.
+        result = run(runner, tier, scripts, echo=False)
         total = total_line(tier, result.stdout)
         check_tier_ran(tier, total)
         observed = (result.returncode, TIER_FIELDS.sub("", result.stdout))
         if reference is None:
             reference = (tier, observed)
         elif observed != reference[1]:
+            base_tier, (base_status, base_out) = reference
+            status, out = observed
+            if status != base_status:
+                print(f"exit status: {base_tier}={base_status} {tier}={status}",
+                      file=sys.stderr)
+            diff = difflib.unified_diff(
+                base_out.splitlines(), out.splitlines(),
+                fromfile=base_tier, tofile=tier, lineterm="")
+            for line in list(diff)[:200]:
+                print(line, file=sys.stderr)
             raise ValueError(
-                f"{tier}: non-core output differs from {reference[0]} "
+                f"{tier}: non-core output differs from {base_tier} "
                 f"(tiers must be observationally identical)")
 
 
