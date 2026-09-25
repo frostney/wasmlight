@@ -68,6 +68,7 @@ type
     procedure TestPredicateEmitsEh;
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
+    procedure TestStaticCacheDefersDynamicStores;
     procedure TestGcFieldAccessBytes;
     procedure TestGcArrayAccessBytes;
 
@@ -636,6 +637,121 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestStaticCacheDefersDynamicStores;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..5] of UInt32;
+  Visible: array[0..5] of Boolean;
+  BodyEnd: Integer;
+
+  function HasSeq(const AExpected: array of Byte;
+    const AFrom: Integer = 0): Boolean;
+  var
+    I, J: Integer;
+  begin
+    for I := AFrom to Buf.Size - Length(AExpected) do
+    begin
+      Result := True;
+      for J := 0 to High(AExpected) do
+        if Buf.ByteAt(I + J) <> AExpected[J] then
+        begin
+          Result := False;
+          Break;
+        end;
+      if Result then
+        Exit;
+    end;
+    Result := False;
+  end;
+
+begin
+  { Slots 0/1 are static locals, 5 is the result. Slot 2 has one read, slot 3
+    none. Expected stores are MOV [rbx+disp8], r10/r11 (REX 4C, 89 /r,
+    ModRM 53/5B) per SDM Vol. 2 MOV and Table 2-2. }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Visible[0] := True;
+  Visible[1] := True;
+  Visible[5] := True;
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 6);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux,
+      0, False, False, Cache)).ToBe(True);
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Add, 5, 2, 0, 0), Aux,
+      1, False, False, Cache)).ToBe(True);
+    { Evicts slot 2 after its only read: a dead temporary is never stored. }
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, 3, 0, 0, 9), Aux,
+      2, False, False, Cache)).ToBe(True);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $10])).ToBe(False);
+    Expect<Boolean>(HasSeq([$4C, $89, $5B, $28])).ToBe(False);
+    BodyEnd := Buf.Size;
+    { The flush stores the visible result and skips the unread slot 3. }
+    X64FlushDynamicRegCache(Buf, Cache);
+    Expect<Integer>(Buf.Size - BodyEnd).ToBe(4);
+    Expect<Boolean>(HasSeq([$4C, $89, $5B, $28], BodyEnd)).ToBe(True);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $18])).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+
+  { A temporary evicted before its read is written back first. }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  UseCounts[2] := 1;
+  UseCounts[3] := 1;
+  UseCounts[4] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 6);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 2, 0, 0, 1), Aux,
+      0, False, False, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
+      1, False, False, Cache);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $10])).ToBe(False);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 4, 0, 0, 3), Aux,
+      2, False, False, Cache);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $10])).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { Eviction prefers the host whose value is already dead: slot 3's only read
+    frees r11, so the new result does not displace live slot 2 from r10
+    (round-robin order alone would store and later reload it). }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  UseCounts[2] := 1;
+  UseCounts[3] := 1;
+  UseCounts[4] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 6);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 2, 0, 0, 1), Aux,
+      0, False, False, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 3, 0, 0, 2), Aux,
+      1, False, False, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Add, 4, 3, 0, 0), Aux,
+      2, False, False, Cache);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $10])).ToBe(False);
+    Expect<Boolean>(HasSeq([$4C, $89, $5B, $18])).ToBe(False);
+    Expect<Boolean>(Cache.Entries[2].Valid and
+      (Cache.Entries[2].Slot = 2)).ToBe(True);
+    Expect<Boolean>(Cache.Entries[3].Valid and
+      (Cache.Entries[3].Slot = 4)).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestGcFieldAccessBytes;
 var
   Buf: TWasmCodeBuffer;
@@ -897,6 +1013,8 @@ begin
     TestCallArityFence);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
+  Test('static allocation defers dynamic stores and evicts dead values first',
+    TestStaticCacheDefersDynamicStores);
   Test('numeric GC fields use baked native x64 loads and stores',
     TestGcFieldAccessBytes);
   Test('fixed scalar arrays use native x64 loads and stores',

@@ -543,6 +543,31 @@ begin
   ]);
 end;
 
+{ A self-recursive i64 function whose two terminal arms join at the final
+  result move: the then-arm jumps forward to it, the else-arm falls through.
+  Distinct high halves and subtraction make a swapped, stale, or truncated
+  result observable independently of any differential oracle. }
+function NativeSelfReturnTailModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(func $rec (export "rec") (param $n i64) (result i64) ' +
+    '(if (result i64) (i64.lt_u (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 8589934595))) ' +
+    '(else (i64.sub ' +
+    '(call $rec (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(call $rec (i64.sub (local.get $n) (i64.const 2))))))))');
+end;
+
+{ Independent reference for NativeSelfReturnTailModuleBytes' $rec. }
+function NativeSelfReturnTailRef(const AN: Int64): Int64;
+begin
+  if UInt64(AN) < 2 then
+    Result := AN + 8589934595
+  else
+    Result := NativeSelfReturnTailRef(AN - 1) -
+      NativeSelfReturnTailRef(AN - 2);
+end;
+
 { Two recursive results feed a select after both calls. The first result must
   remain live across the second local-core BL even though it is not a visible
   local/result slot and the condition selects it only afterward. Before the
@@ -1711,6 +1736,10 @@ type
     procedure TestNativeScalarSelfProofGate;
     procedure TestNativeScalarSelfSelectLiveness;
     procedure TestNativeSelfReturnTail;
+    procedure TestNativeSelfReturnTailFencesExecute;
+    procedure TestNativeReturnTailBranches;
+    procedure TestNativeReturnTailNearExhaustion;
+    procedure TestNativeLeafResultSource;
     procedure TestNativeScalarLeafProofAndExhaustion;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
@@ -1720,6 +1749,10 @@ type
     procedure TestAdjacentMoveRetainsCallArgument;
     procedure TestTeeArgumentThroughCompiledLeaf;
     procedure TestTeeInStaticCacheLoop;
+    procedure TestDeferredStoreAcrossJoins;
+    procedure TestDeferredStoreAcrossTrapPoint;
+    procedure TestDeferredStoreLoopCarriedEpoch;
+    procedure TestDeferredStoreEarlyExits;
     procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
@@ -3438,13 +3471,7 @@ begin
     exec-return. Both paths deliver the same terminal block result. Distinct
     high halves and subtraction make swapped or truncated recursive results
     observable independently of the differential oracle. }
-  Bytes := AssembleWatText('(module ' +
-    '(func $rec (export "rec") (param $n i64) (result i64) ' +
-    '(if (result i64) (i64.lt_u (local.get $n) (i64.const 2)) ' +
-    '(then (i64.add (local.get $n) (i64.const 8589934595))) ' +
-    '(else (i64.sub ' +
-    '(call $rec (i64.sub (local.get $n) (i64.const 1))) ' +
-    '(call $rec (i64.sub (local.get $n) (i64.const 2))))))))');
+  Bytes := NativeSelfReturnTailModuleBytes;
   CompileExports(['rec']);
   Expect<Boolean>(DiffFresh(Bytes, 'rec', [MakeValueI64(4)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
@@ -3524,6 +3551,370 @@ begin
   {$ENDIF}
 end;
 
+procedure TJitTests.TestNativeSelfReturnTailFencesExecute;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Code, Flagged, Fenced: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  K, Tail, Edge: Integer;
+  Saved, SavedJoin: TWasmIrInstr;
+
+  {$IFDEF WASM_JIT_X64}
+  { `mov rax, [r13]; cmp rax, r14`: the epoch poll a flagged jump emits. }
+  function HasEpochPoll(const ACode: TWasmBytes): Boolean;
+  const
+    POLL: array[0..6] of Byte = ($49, $8B, $45, $00, $4C, $39, $F0);
+  var
+    N, J: Integer;
+  begin
+    Result := False;
+    for N := 0 to Length(ACode) - Length(POLL) do
+    begin
+      J := 0;
+      while (J <= High(POLL)) and (ACode[N + J] = POLL[J]) do
+        Inc(J);
+      if J > High(POLL) then
+        Exit(True);
+    end;
+  end;
+  {$ENDIF}
+
+  { Load staged bytes for $rec into a brand-new store (LoadPrecompiled is
+    idempotent per function) and check every argument against the
+    independent reference. Each IR variant below is semantically identical
+    to the validated IR, so each must produce the reference results. }
+  procedure ExpectStaged(const ACode: TWasmBytes; const AEntry: NativeUInt);
+  const
+    ARGS: array[0..5] of Int64 = (0, 1, 2, 4, 7, 10);
+  var
+    Engine: TWasmEngine;
+    Store: TWasmStore;
+    Instance: TWasmModuleInstance;
+    Jit: TWasmJitContext;
+    Kind: TWasmExternKind;
+    Addr: UInt32;
+    Param, Res: TWasmValue;
+    I: Integer;
+  begin
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Jit := nil;
+    try
+      Instance := InstantiateModule(Store, FIr, @FBytes[0],
+        NativeUInt(Length(FBytes)), FImports);
+      RegisterInterpreter(Store);
+      Jit := RegisterJit(Store);
+      Expect<Boolean>(Instance.FindExport('rec', Kind, Addr)).ToBe(True);
+      Expect<Boolean>(Jit.LoadPrecompiled(Addr, ACode, AEntry)).ToBe(True);
+      for I := 0 to High(ARGS) do
+      begin
+        Param := MakeValueI64(ARGS[I]);
+        Res.Bits := 0;
+        InterpInvoke(Store, Addr, @Param, @Res);
+        Expect<Int64>(Res.I64).ToBe(NativeSelfReturnTailRef(ARGS[I]));
+      end;
+    finally
+      Jit.Free;
+      Store.Free;
+      Engine.Free;
+    end;
+  end;
+{$ENDIF}
+begin
+  { spec/main d7b37e4170d8315f2f1283aed4e8076591a9a333: exec-br, exec-br_if,
+    exec-return. The terminal-return plan must decline every edge it cannot
+    prove: a safepoint-flagged jump, a conditional branch into the join, or a
+    jump that bypasses it. These equivalent IR edits are executed, not only
+    staged, so a planner that ignores a fence returns a stale register. }
+  Expect<Int64>(NativeSelfReturnTailRef(4)).ToBe(-8589934596);
+  {$IFDEF WASM_JIT_BACKEND}
+  FBytes := NativeSelfReturnTailModuleBytes;
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Expect<Boolean>(JitCanNativeScalarSelf(@FIr.Functions[0], 0)).ToBe(True);
+  Tail := High(FIr.Functions[0].Code) - 1;
+  Expect<TWasmIrOp>(FIr.Functions[0].Code[Tail].Op).ToBe(iroMove);
+  Edge := -1;
+  for K := 1 to Tail - 1 do
+    if (FIr.Functions[0].Code[K].Op = iroJump) and
+      (FIr.Functions[0].Code[K].A = UInt32(Tail)) and
+      (FIr.Functions[0].Code[K - 1].Op = iroMove) and
+      (FIr.Functions[0].Code[K - 1].Dest = FIr.Functions[0].Code[Tail].A) then
+      Edge := K;
+  Expect<Boolean>(Edge >= 1).ToBe(True);
+  if Edge < 1 then
+    Exit;
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+    EntryOffset, RegisterCount);
+  ExpectStaged(Code, EntryOffset);
+  Saved := FIr.Functions[0].Code[Edge];
+  SavedJoin := FIr.Functions[0].Code[Edge - 1];
+  try
+    FIr.Functions[0].Code[Edge].Imm := IR_JUMP_SAFEPOINT;
+    Flagged := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount);
+    ExpectStaged(Flagged, EntryOffset);
+    {$IFDEF WASM_JIT_X64}
+    { A flagged edge keeps its poll rather than becoming a return. }
+    Expect<Boolean>(HasEpochPoll(Code)).ToBe(False);
+    Expect<Boolean>(HasEpochPoll(Flagged)).ToBe(True);
+    {$ENDIF}
+    { The then-arm's join value (n + 0x200000003) and its constant operand
+      0x200000003 both have nonzero low bits, so either conditional edge is
+      always taken and lands on the join move. Testing the constant also
+      reloads it, leaving that edge with a different register assignment
+      than the fallthrough into the join. }
+    FIr.Functions[0].Code[Edge] := Saved;
+    FIr.Functions[0].Code[Edge].Op := iroBranchIf;
+    FIr.Functions[0].Code[Edge].A := FIr.Functions[0].Code[Tail].A;
+    FIr.Functions[0].Code[Edge].B := UInt32(Tail);
+    ExpectStaged(JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount), EntryOffset);
+    Expect<TWasmIrOp>(FIr.Functions[0].Code[Edge - 2].Op).ToBe(iroI64Add);
+    FIr.Functions[0].Code[Edge].A := FIr.Functions[0].Code[Edge - 2].B;
+    ExpectStaged(JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount), EntryOffset);
+    { Bypass the join to the bare return, writing the canonical result on
+      that arm instead so the variant stays equivalent. The join is then
+      reached only by fallthrough and must be emitted as an ordinary move. }
+    FIr.Functions[0].Code[Edge] := Saved;
+    FIr.Functions[0].Code[Edge].A := UInt32(Tail + 1);
+    FIr.Functions[0].Code[Edge - 1].Dest := FIr.Functions[0].Code[Tail].Dest;
+    Fenced := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+      EntryOffset, RegisterCount);
+    ExpectStaged(Fenced, EntryOffset);
+    {$IFDEF WASM_JIT_X64}
+    { The threaded plan drops the join move and the forward jump. }
+    Expect<Boolean>(Length(Code) < Length(Fenced)).ToBe(True);
+    {$ENDIF}
+  finally
+    FIr.Functions[0].Code[Edge] := Saved;
+    FIr.Functions[0].Code[Edge - 1] := SavedJoin;
+  end;
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestNativeReturnTailBranches;
+const
+  ARGS: array[0..8] of Int64 = (0, 1, 2, 3, 5, 7, 11, 12, 13);
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  I: Integer;
+begin
+  { spec/main d7b37e4170d8315f2f1283aed4e8076591a9a333: exec-if, exec-br,
+    exec-br_table, exec-return. $multi has two forward br arms straight to
+    the final move plus the fallthrough arm, each with a distinct wide i64
+    value; $nest reaches it through an inner join move instead; $early adds
+    a mid-body return, which must keep reading the canonical result; $brt
+    reaches the final move through br_table and stays generic. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $multi (export "multi") (param $n i64) (result i64) ' +
+    '(block $out (result i64) ' +
+    '(if (i64.lt_u (local.get $n) (i64.const 2)) ' +
+    '(then (br $out (i64.add (local.get $n) (i64.const 8589934595))))) ' +
+    '(if (i64.eq (i64.and (local.get $n) (i64.const 7)) (i64.const 5)) ' +
+    '(then (br $out ' +
+    '(i64.sub (i64.const 9223372032559808513) (local.get $n))))) ' +
+    '(i64.xor (call $multi (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(i64.shl (call $multi (i64.sub (local.get $n) (i64.const 2))) ' +
+    '(i64.const 1))))) ' +
+    '(func $nest (export "nest") (param $n i64) (result i64) ' +
+    '(if (result i64) (i64.lt_u (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 8589934595))) ' +
+    '(else (if (result i64) (i64.eq (local.get $n) (i64.const 5)) ' +
+    '(then (i64.const -8589934587)) ' +
+    '(else (i64.xor ' +
+    '(call $nest (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(i64.shl (call $nest (i64.sub (local.get $n) (i64.const 2))) ' +
+    '(i64.const 1)))))))) ' +
+    '(func $early (export "early") (param $n i64) (result i64) ' +
+    '(if (i64.eq (local.get $n) (i64.const 3)) ' +
+    '(then (return (i64.const -4294967291)))) ' +
+    '(if (result i64) (i64.lt_u (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 8589934595))) ' +
+    '(else (i64.sub ' +
+    '(call $early (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(call $early (i64.sub (local.get $n) (i64.const 2))))))) ' +
+    '(func $brt (export "brt") (param $n i64) (result i64) ' +
+    '(block $out (result i64) ' +
+    '(drop (block $a (result i64) ' +
+    '(br_table $a $out (i64.add (local.get $n) (i64.const 12884901889)) ' +
+    '(i64.lt_u (local.get $n) (i64.const 2))))) ' +
+    '(i64.add (call $brt (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(call $brt (i64.sub (local.get $n) (i64.const 2)))))))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0], 0)).ToBe(
+      JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[1], 1)).ToBe(
+      JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[2], 2)).ToBe(
+      JIT_BACKEND_AVAILABLE);
+    { br_table is outside the closed native proof; it still runs compiled. }
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[3], 3)).ToBe(False);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  for I := 0 to High(ARGS) do
+  begin
+    CompileExports(['multi']);
+    Expect<Boolean>(DiffFresh(Bytes, 'multi', [MakeValueI64(ARGS[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    CompileExports(['nest']);
+    Expect<Boolean>(DiffFresh(Bytes, 'nest', [MakeValueI64(ARGS[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    CompileExports(['early']);
+    Expect<Boolean>(DiffFresh(Bytes, 'early', [MakeValueI64(ARGS[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    CompileExports(['brt']);
+    Expect<Boolean>(DiffFresh(Bytes, 'brt', [MakeValueI64(ARGS[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
+procedure TJitTests.TestNativeReturnTailNearExhaustion;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RegisterCount: UInt32;
+  N: Integer;
+begin
+  { spec/main d7b37e4170d8315f2f1283aed4e8076591a9a333: exec-call,
+    exec-return. Linear recursion whose base arm returns through the
+    threaded terminal return. Sweep across the depth cap and then the value
+    cap: below it every result is exact and wide, above it both tiers trap
+    'call stack exhausted' at the same logical depth. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $lin (export "lin") (param $n i64) (result i64) ' +
+    '(if (result i64) (i64.lt_u (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 8589934595))) ' +
+    '(else (i64.add (call $lin (i64.sub (local.get $n) (i64.const 1))) ' +
+    '(i64.const 4294967297))))))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[0], 0)).ToBe(
+      JIT_BACKEND_AVAILABLE);
+    RegisterCount := Ir.Functions[0].RegisterCount;
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  WasmInterpMaxDepth := 64;
+  try
+    for N := 58 to 70 do
+    begin
+      CompileExports(['lin']);
+      Expect<Boolean>(DiffFresh(Bytes, 'lin', [MakeValueI64(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    Expect<string>(TrapMessageOf(Bytes, 'lin', [MakeValueI64(70)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+  WasmInterpValueSlots := NativeUInt(RegisterCount) * 64;
+  try
+    for N := 58 to 70 do
+    begin
+      CompileExports(['lin']);
+      Expect<Boolean>(DiffFresh(Bytes, 'lin', [MakeValueI64(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+end;
+
+procedure TJitTests.TestNativeLeafResultSource;
+{$IFDEF WASM_JIT_BACKEND}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount, Addr, L0, L1, R, T: UInt32;
+  Kind: TWasmExternKind;
+  Params: array[0..1] of TWasmValue;
+  Res: TWasmValue;
+{$ENDIF}
+begin
+  { spec/main d7b37e4170d8315f2f1283aed4e8076591a9a333: exec-call,
+    exec-return. Native scalar leaves whose final result move is planned
+    away return its source register directly. $mix ends in an expression,
+    $id returns a parameter, and $ret has an explicit return followed by the
+    implicit one, which keeps the canonical copy. Wide multipliers and
+    offsets make a stale or truncated native result register observable. }
+  CompileExports(['run', 'mix', 'id', 'ret']);
+  Expect<Boolean>(DiffFresh(AssembleWatText('(module ' +
+    '(func $mix (export "mix") (param i64 i64) (result i64) ' +
+    '(i64.add (i64.mul (i64.xor (local.get 0) (local.get 1)) ' +
+    '(i64.const 6364136223846793005)) (i64.const 1442695040888963407))) ' +
+    '(func $id (export "id") (param i64) (result i64) (local.get 0)) ' +
+    '(func $ret (export "ret") (param i64 i64) (result i64) ' +
+    '(return (i64.sub (local.get 0) (local.get 1)))) ' +
+    '(func (export "run") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) ' +
+    '(local.set $acc (i64.const 8589934595)) ' +
+    '(loop $l ' +
+    '(local.set $acc (call $mix (local.get $acc) (local.get $i))) ' +
+    '(local.set $acc (i64.add (call $id (local.get $acc)) ' +
+    '(call $ret (local.get $i) (local.get $acc)))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $l (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))'), 'run', [MakeValueI64(9)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF WASM_JIT_BACKEND}
+  { Staged-and-executed IR edit: an earlier return reads the canonical result
+    while a dead move/return pair ends the body. The final move must stay
+    planned, or the live return would read the dead move's unwritten source.
+    The expected value is computed here, not by the interpreter. }
+  FBytes := AssembleWatText('(module ' +
+    '(func $ret (export "ret") (param i64 i64) (result i64) ' +
+    '(return (i64.sub (local.get 0) (local.get 1)))))');
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Expect<Boolean>(JitCanNativeScalarLeaf(@FIr.Functions[0])).ToBe(True);
+  Expect<Integer>(Length(FIr.Functions[0].Code)).ToBe(6);
+  Expect<Boolean>(FIr.Functions[0].RegisterCount >= 5).ToBe(True);
+  if (Length(FIr.Functions[0].Code) <> 6) or
+    (FIr.Functions[0].RegisterCount < 5) then
+    Exit;
+  L0 := FIr.Functions[0].LocalRegs[0];
+  L1 := FIr.Functions[0].LocalRegs[1];
+  R := FIr.Functions[0].ResultRegs[0];
+  T := FIr.Functions[0].RegisterCount - 1;
+  FIr.Functions[0].Code[0] := MakeIrInstr(iroI64Sub, T, L0, L1, 0);
+  FIr.Functions[0].Code[1] := MakeIrInstr(iroMove, R, T, 0, 0);
+  FIr.Functions[0].Code[2] := MakeIrInstr(iroReturn, 0, 0, 0, 0);
+  FIr.Functions[0].Code[3] := MakeIrInstr(iroMove, T - 1, L1, 0, 0);
+  FIr.Functions[0].Code[4] := MakeIrInstr(iroMove, R, T - 1, 0, 0);
+  FIr.Functions[0].Code[5] := MakeIrInstr(iroReturn, 0, 0, 0, 0);
+  Expect<Boolean>(JitCanNativeScalarLeaf(@FIr.Functions[0])).ToBe(True);
+  Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[0], 0,
+    EntryOffset, RegisterCount);
+  FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+    NativeUInt(Length(FBytes)), FImports);
+  RegisterInterpreter(FStore);
+  FJit := RegisterJit(FStore);
+  Expect<Boolean>(FInstance.FindExport('ret', Kind, Addr)).ToBe(True);
+  Expect<Boolean>(FJit.LoadPrecompiled(Addr, Code, EntryOffset)).ToBe(True);
+  Params[0] := MakeValueI64(12884901893);
+  Params[1] := MakeValueI64(4294967297);
+  Res.Bits := 0;
+  InterpInvoke(FStore, Addr, @Params[0], @Res);
+  Expect<Int64>(Res.I64).ToBe(8589934596);
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestTeeArgumentThroughCompiledLeaf;
 var
   Bytes: TWasmBytes;
@@ -3577,6 +3968,186 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(7)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+{ Deferred write-back of static-cache temporaries. Each leaf is a helper-free
+  scalar loop, so every backend takes the function-wide static cache with
+  deferred dynamic stores. Only the leaf is compiled; the interpreted `check`
+  export compares its result with an independently computed literal and
+  traps on a mismatch, so neither tier is the other's only oracle. Pinned
+  core d7b37e4: exec-loop, exec-if, exec-br, exec-br_if, exec-return,
+  exec-unreachable. }
+procedure TJitTests.TestDeferredStoreAcrossJoins;
+const
+  Inputs: array[0 .. 4] of Integer = (0, 1, 2, 5, 16);
+  Expected: array[0 .. 4] of Integer = (26, 26, 82, 2296, 406843999);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  { acc * 3 is an expression temporary held across the if's conditional
+    branch and its join; both arms produce the if result in another
+    temporary that is read only after the join. The condition is a static
+    local, so the product is still in its dynamic host at the branch. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 11)) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 3)) ' +
+    '(if (result i32) (local.get $i) ' +
+    '(then (i32.xor (local.get $i) (i32.const 5))) ' +
+    '(else (i32.const -7))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (param $n i32) (param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Expected[I])])).ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Expected[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
+procedure TJitTests.TestDeferredStoreAcrossTrapPoint;
+var
+  Bytes: TWasmBytes;
+begin
+  { acc * 7 stays live across the branches guarding an unreachable; each
+    join must see it. The outer condition is a static local, so the product
+    is still in its dynamic host when that branch skips the trap check. A
+    taken trap must still fire at the same iteration as the interpreter. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $n i32) (param $bad i32) ' +
+    '(result i32) (local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 5)) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 7)) ' +
+    '(block (result i32) ' +
+    '(if (local.get $i) (then (if (i32.eq (local.get $i) (local.get $bad)) ' +
+    '(then unreachable)))) ' +
+    '(i32.add (local.get $i) (i32.const 3))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (param $n i32) (param $bad i32) ' +
+    '(param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n) ' +
+    '(local.get $bad))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  Expect<string>(TrapMessageOf(Bytes, 'check',
+    [MakeValueI32(6), MakeValueI32(100), MakeValueI32(650336)])).ToBe('');
+  Expect<Boolean>(DiffFresh(Bytes, 'check',
+    [MakeValueI32(6), MakeValueI32(100), MakeValueI32(650336)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'leaf',
+    [MakeValueI32(6), MakeValueI32(3)])).ToBe('unreachable');
+  Expect<Boolean>(DiffFresh(Bytes, 'leaf',
+    [MakeValueI32(6), MakeValueI32(3)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'check',
+    [MakeValueI32(1), MakeValueI32(0), MakeValueI32(38)])).ToBe('');
+  Expect<Boolean>(DiffFresh(Bytes, 'check',
+    [MakeValueI32(1), MakeValueI32(0), MakeValueI32(38)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestDeferredStoreLoopCarriedEpoch;
+var
+  Bytes: TWasmBytes;
+begin
+  { The loop parameter is an expression temporary read at the loop head and
+    redefined by br_if's value, so it crosses the epoch-polled back-edge. With
+    the epoch bumped, the first taken back-edge interrupts; without it, the
+    carried value must survive every iteration. }
+  Bytes := AssembleWatText('(module (import "e" "bump" (func $bump)) ' +
+    '(func $leaf (export "leaf") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $s i32) ' +
+    'i32.const 9 ' +
+    'loop $l (param i32) (result i32) ' +
+    'i32.const 3 i32.mul local.get $i i32.add ' +
+    'local.get $s local.get $i i32.xor local.set $s ' +
+    'local.get $i i32.const 1 i32.add local.tee $i ' +
+    'local.get $n i32.lt_u br_if $l ' +
+    'end ' +
+    'local.get $s i32.add) ' +
+    '(func (export "run") (param $n i32) (param $bump i32) ' +
+    '(param $want i32) (result i32) (local $r i32) ' +
+    '(if (local.get $bump) (then (call $bump))) ' +
+    '(local.set $r (call $leaf (local.get $n))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  FDiffHost := @JitBumpEpochCallback;
+  CompileExports(['leaf']);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(10), MakeValueI32(0), MakeValueI32(546199)])).ToBe('');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(10), MakeValueI32(0), MakeValueI32(546199)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(1), MakeValueI32(1), MakeValueI32(27)])).ToBe('');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(1), MakeValueI32(1), MakeValueI32(27)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(1), MakeValueI32(83)]))
+    .ToBe('interrupt');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(1), MakeValueI32(83)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  FDiffHost := nil;
+end;
+
+procedure TJitTests.TestDeferredStoreEarlyExits;
+const
+  Inputs: array[0 .. 3] of Integer = (10, 10, 4, 10);
+  Stops: array[0 .. 3] of Integer = (100, 3, 100, 0);
+  Expected: array[0 .. 3] of Integer = (83006, -337, 81, -995);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  { A br_if carries an expression value forward out of the loop to the block
+    result, and a return inside the loop publishes an expression result. Both
+    leave the straight line with the value only in a dynamic host. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $n i32) (param $stop i32) ' +
+    '(result i32) (local $i i32) (local $acc i32) ' +
+    '(local.set $acc (i32.const 1)) ' +
+    '(i32.add (block $done (result i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 5)) ' +
+    '(local.get $i))) ' +
+    '(if (i32.eq (local.get $i) (local.get $stop)) ' +
+    '(then (return (i32.sub (local.get $acc) (i32.const 1000))))) ' +
+    '(drop (br_if $done (i32.xor (local.get $acc) (local.get $i)) ' +
+    '(i32.eq (local.get $i) (i32.const 6)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.const 77)) (local.get $i))) ' +
+    '(func (export "check") (param $n i32) (param $stop i32) ' +
+    '(param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n) ' +
+    '(local.get $stop))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI32(Inputs[I]),
+      MakeValueI32(Stops[I]), MakeValueI32(Expected[I])])).ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI32(Inputs[I]),
+      MakeValueI32(Stops[I]), MakeValueI32(Expected[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
 end;
 
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
@@ -4812,6 +5383,14 @@ begin
     TestTeeArgumentThroughCompiledLeaf);
   Test('a tee in a static-cache loop keeps both uses',
     TestTeeInStaticCacheLoop);
+  Test('a deferred static-cache temporary survives branch joins',
+    TestDeferredStoreAcrossJoins);
+  Test('a deferred static-cache temporary survives a trap check',
+    TestDeferredStoreAcrossTrapPoint);
+  Test('loop-carried static-cache temporaries survive the epoch poll',
+    TestDeferredStoreLoopCarriedEpoch);
+  Test('deferred static-cache values reach early br and return exits',
+    TestDeferredStoreEarlyExits);
   Test('a tee stored in a pinned-memory loop keeps the stored value',
     TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
@@ -4878,6 +5457,14 @@ begin
     TestNativeScalarSelfSelectLiveness);
   Test('native recursive return tails preserve wide results and edge fences',
     TestNativeSelfReturnTail);
+  Test('native recursive return-tail fences execute equivalently',
+    TestNativeSelfReturnTailFencesExecute);
+  Test('native recursive terminal branches, early returns and br_table match',
+    TestNativeReturnTailBranches);
+  Test('native recursive terminal returns exhaust at the same depth',
+    TestNativeReturnTailNearExhaustion);
+  Test('native scalar leaves return their planned result source',
+    TestNativeLeafResultSource);
   Test('native scalar leaf calls preserve proof and exhaustion boundaries',
     TestNativeScalarLeafProofAndExhaustion);
   Test('inlined scalar body survives relocation without a compiled target',
