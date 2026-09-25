@@ -69,6 +69,7 @@ type
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheDefersDynamicStores;
+    procedure TestStaticCachePinnedMemoryBytes;
     procedure TestGcFieldAccessBytes;
     procedure TestGcArrayAccessBytes;
 
@@ -752,6 +753,118 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestStaticCachePinnedMemoryBytes;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..5] of UInt32;
+  Visible: array[0..5] of Boolean;
+  Start: Integer;
+
+  function HasSeq(const AExpected: array of Byte;
+    const AFrom: Integer = 0): Boolean;
+  var
+    I, J: Integer;
+  begin
+    for I := AFrom to Buf.Size - Length(AExpected) do
+    begin
+      Result := True;
+      for J := 0 to High(AExpected) do
+        if Buf.ByteAt(I + J) <> AExpected[J] then
+        begin
+          Result := False;
+          Break;
+        end;
+      if Result then
+        Exit;
+    end;
+    Result := False;
+  end;
+
+  procedure CheckFrom(const AFrom: Integer; const AExpected: array of Byte);
+  var
+    J: Integer;
+  begin
+    Expect<Integer>(Buf.Size - AFrom).ToBe(Length(AExpected));
+    for J := 0 to High(AExpected) do
+      Expect<Byte>(Buf.ByteAt(AFrom + J)).ToBe(AExpected[J]);
+  end;
+
+begin
+  { The pin loads Base (TWasmMemoryInst's first field) into rsi only on
+    request: mov [rsp],rax (48 89 04 24); mov rsi,[rax] (48 8B 30). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPinMemory(Buf, 0);
+    Expect<Boolean>(HasSeq([$48, $89, $04, $24, $48, $8B, $30])).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPinMemory(Buf, 0, True);
+    Expect<Boolean>(HasSeq([$48, $89, $04, $24, $48, $8B, $30])).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { Slots 0/1 are the static r8/r9 hosts. Each access zero-extends its i32
+    address into ecx (mov r32,r32 = 89 /r) and addresses [rsi + rcx*1]
+    (ModRM rm=100, SIB 0E) per SDM Vol. 2 Tables 2-2/2-3. }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Visible[0] := True;
+  Visible[1] := True;
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 6);
+    X64EnablePinnedMemoryBase(Cache);
+    Expect<Boolean>(Cache.PinnedMemoryBase).ToBe(True);
+
+    { i32.store8 [r8] := r9b: mov ecx,r8d; mov [rsi+rcx],r9b. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Store8, 1, 0, 0, 0), Aux, 0, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$44, $89, $C1, $44, $88, $0C, $0E]);
+
+    { i64.load8_s from [r9] into rax (REX.W 0F BE), then the dirty dynamic
+      host r10 for slot 2: mov r10,rax. No register-file store. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI64Load8S, 2, 1, 0, 0), Aux, 1, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$44, $89, $C9, $48, $0F, $BE, $04, $0E,
+      $49, $89, $C2]);
+    Expect<Boolean>(Cache.Entries[2].Valid and Cache.Entries[2].Dirty and
+      (Cache.Entries[2].Slot = 2)).ToBe(True);
+
+    { i32.store16 [r8] := r10w consumes the dirty value in place; the
+      guard-page access cannot observe slots, so nothing is flushed. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Store16, 2, 0, 0, 0), Aux, 2, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$44, $89, $C1, $66, $44, $89, $14, $0E]);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $10])).ToBe(False);
+
+    { Uncached operands come from their canonical slots: mov ecx,[rbx+0x28];
+      mov rax,[rbx+0x20]; mov [rsi+rcx],rax. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI64Store, 4, 5, 0, 0), Aux, 3, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$8B, $4B, $28, $48, $8B, $43, $20,
+      $48, $89, $04, $0E]);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestGcFieldAccessBytes;
 var
   Buf: TWasmCodeBuffer;
@@ -1015,6 +1128,8 @@ begin
     TestStaticCacheKeepsShiftResult);
   Test('static allocation defers dynamic stores and evicts dead values first',
     TestStaticCacheDefersDynamicStores);
+  Test('base-pinned scalar memory uses rsi plus cached operands',
+    TestStaticCachePinnedMemoryBytes);
   Test('numeric GC fields use baked native x64 loads and stores',
     TestGcFieldAccessBytes);
   Test('fixed scalar arrays use native x64 loads and stores',

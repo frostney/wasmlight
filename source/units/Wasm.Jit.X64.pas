@@ -123,6 +123,10 @@ type
     UseCounts: PUInt32;
     VisibleSlots: PBoolean;
     SlotCount: UInt32;
+    { Static allocation only: rsi (X64_REG_MEMBASE) holds the pinned memory's
+      Base for the whole activation, so zero-offset i32 scalar accesses read
+      and write the cache hosts directly. }
+    PinnedMemoryBase: Boolean;
   end;
 
   { Per-instruction native-shape words handed over by the driver's
@@ -165,6 +169,10 @@ const
   X64_REG_T0 = X64_RAX;         { rax/eax scratch }
   X64_REG_T1 = X64_RCX;         { rcx/ecx scratch (also CL for variable shifts) }
   X64_REG_T2 = X64_RDX;         { rdx/edx scratch }
+  { rsi = the pinned memory Base, only in a base-pinned static-cache frame
+    (TX64RegCache.PinnedMemoryBase). That frame calls no helper except the
+    non-returning trap entries, so this caller-saved register survives. }
+  X64_REG_MEMBASE = X64_RSI;
 
   { SysV integer argument registers, in order. }
   X64_ARG0 = X64_RDI;
@@ -343,9 +351,11 @@ procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
 { Resolve a single function memory once and keep its stable instance pointer in
   the prologue's memory slot at [rsp]. Scalar accesses
-  still reload live Base/ByteSize fields, so memory.grow semantics are unchanged. }
+  still reload live Base/ByteSize fields, so memory.grow semantics are unchanged.
+  APinBase additionally loads Base into rsi (X64_REG_MEMBASE); the driver asks
+  for it only when the function can neither call nor grow memory. }
 procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
-  const AMemoryIndex: UInt32);
+  const AMemoryIndex: UInt32; const APinBase: Boolean = False);
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer;
@@ -392,6 +402,10 @@ procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
   const AStaticParams: Boolean = True);
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlots: array of UInt32);
+{ Mark a static allocation as base-pinned: rsi holds the memory Base (see
+  X64EmitPinMemory), and scalar memory ops take their address and value from
+  the cache hosts instead of making the register file canonical. }
+procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
 { Enable deferred dynamic write-back on a static allocation. AUseCounts holds
   each slot's remaining planned reads (consumed as the emitter reads them);
   AVisibleSlots marks locals, results, and loop-carried slots, which are
@@ -473,6 +487,9 @@ procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
   AResult64: Boolean); forward;
 procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
   const ASource, ABase: Byte; const ASize: UInt32); forward;
+procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean;
+  var ACache: TX64RegCache); forward;
 
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
@@ -731,6 +748,15 @@ begin
     straight line, so the register file is made canonical first. }
   if X64ScalarMemoryOp(AIns.Op) then
   begin
+    if ACache.PinnedMemoryBase then
+    begin
+      { Base-pinned static cache (the driver's UsePinnedMemoryBase proof): the
+        access touches only rsi, rcx, and rax, cannot call or return, and a
+        guard-page fault unwinds to the trampoline without reading any slot,
+        so deferred values stay in their hosts. }
+      X64EmitScalarMemoryPinned(ABuf, AIns, AAddr64, ACache);
+      Exit;
+    end;
     X64FlushDynamicRegCache(ABuf, ACache);
     X64InvalidateRegCache(ACache);
     X64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
@@ -938,6 +964,12 @@ begin
       ACache.Entries[I].Slot := ASlots[I];
       X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ASlots[I]);
     end;
+end;
+
+procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
+begin
+  if ACache.StaticAllocation then
+    ACache.PinnedMemoryBase := True;
 end;
 
 procedure X64EnableDynamicWriteBack(var ACache: TX64RegCache;
@@ -2123,6 +2155,166 @@ begin
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
 end;
 
+{ The [base + index] memory operand (ModRM rm=100 + SIB, scale 1) per SDM
+  Vol. 2 Table 2-3. A base whose low bits are 101 (rbp/r13) has no mod=00
+  form, so it takes a zero disp8. AIndex must not be rsp (SIB index 100 means
+  "no index"). REX.X/REX.B are the caller's. }
+procedure EmitMemOperandIndexed(const ABuf: TWasmCodeBuffer;
+  const ARegField, ABase, AIndex: Byte);
+var
+  ModB: Byte;
+begin
+  if (ABase and 7) = 5 then
+    ModB := 1
+  else
+    ModB := 0;
+  ABuf.EmitByte((ModB shl 6) or ((ARegField and 7) shl 3) or 4);
+  ABuf.EmitByte(((AIndex and 7) shl 3) or (ABase and 7));
+  if ModB = 1 then
+    ABuf.EmitByte(0);
+end;
+
+{ The scalar load/store encodings of X64EmitLoadScalar/X64EmitStoreScalar
+  (movzx/movsx 0F B6/B7/BE/BF, movsxd 63, mov 8B/89/88, 66-prefixed 16-bit
+  store) over [ABase + AIndex]. }
+procedure X64EmitLoadScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase, AIndex: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean);
+begin
+  case ASize of
+    1, 2:
+      begin
+        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3,
+          AIndex shr 3, ABase shr 3);
+        ABuf.EmitByte($0F);
+        if ASigned then
+          ABuf.EmitByte($BE + Ord(ASize = 2))
+        else
+          ABuf.EmitByte($B6 + Ord(ASize = 2));
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3,
+          AIndex shr 3, ABase shr 3);
+        if ASigned and AResult64 then
+          ABuf.EmitByte($63)                   { movsxd r64, r/m32 }
+        else
+          ABuf.EmitByte($8B);
+      end;
+  else
+    begin
+      X64EmitRex(ABuf, 1, ADest shr 3, AIndex shr 3, ABase shr 3);
+      ABuf.EmitByte($8B);
+    end;
+  end;
+  EmitMemOperandIndexed(ABuf, ADest, ABase, AIndex);
+end;
+
+procedure X64EmitStoreScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase, AIndex: Byte; const ASize: UInt32);
+begin
+  case ASize of
+    1:
+      begin
+        { spl/bpl/sil/dil are byte-addressable only under a REX prefix. }
+        if ASource in [4 .. 7] then
+          ABuf.EmitByte($40 or ((AIndex shr 3) shl 1) or (ABase shr 3))
+        else
+          X64EmitRex(ABuf, 0, ASource shr 3, AIndex shr 3, ABase shr 3);
+        ABuf.EmitByte($88);
+      end;
+    2:
+      begin
+        ABuf.EmitByte($66);
+        X64EmitRex(ABuf, 0, ASource shr 3, AIndex shr 3, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, AIndex shr 3, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+  else
+    begin
+      X64EmitRex(ABuf, 1, ASource shr 3, AIndex shr 3, ABase shr 3);
+      ABuf.EmitByte($89);
+    end;
+  end;
+  EmitMemOperandIndexed(ABuf, ASource, ABase, AIndex);
+end;
+
+function X64CachedHostForSlot(const ACache: TX64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := X64CacheHostReg(I);
+      Exit(True);
+    end;
+  AHost := 0;
+  Result := False;
+end;
+
+{ A scalar access in a base-pinned static-cache frame. The driver admits it
+  only under UsePinnedMemoryBase: one memory, no call, no memory.grow, and
+  every access a zero-offset i32 access. Base therefore cannot change during
+  the activation and lives in rsi. The i32 guard-page strategy needs neither
+  ByteSize nor an explicit check: the reservation plus guard covers every
+  zero-extended index plus the access width (ADR-0005), exactly as in
+  X64EmitScalarMemory's folded i32 branch. An out-of-bounds access faults
+  inside the reservation and WasmFaultHandler unwinds to the invocation
+  trampoline with the same trap kind (ADR-0009); that path reads no
+  register-file slot, so dirty cache hosts need no flush first.
+
+  The address is copied into ecx first: the 32-bit move discards stale high
+  bits of a 64-bit host or slot (an i32 is only its low half), and the copy
+  leaves the value side free to evict the address host. }
+procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean;
+  var ACache: TX64RegCache);
+var
+  Offset: UInt64;
+  Host, ValueReg: Byte;
+begin
+  Move(AIns.Imm, Offset, SizeOf(Offset));
+  if AAddr64 or (Offset <> 0) then
+    raise EWasmInternal.Create(
+      'internal: base-pinned x64 access is not a zero-offset i32 access');
+  if X64CachedHostForSlot(ACache, AIns.A, Host) then
+    X64EmitAluRegReg(ABuf, $89, False, X64_RCX, Host)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.A);
+  X64ConsumeUse(ACache, AIns.A);
+
+  if AIns.Op in [iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32] then
+  begin
+    if X64CachedHostForSlot(ACache, AIns.Dest, Host) then
+      ValueReg := Host
+    else
+    begin
+      { Uncached, so its slot is canonical. }
+      X64EmitLoadSlot64(ABuf, X64_RAX, AIns.Dest);
+      ValueReg := X64_RAX;
+    end;
+    X64ConsumeUse(ACache, AIns.Dest);
+    X64EmitStoreScalarIndexed(ABuf, ValueReg, X64_REG_MEMBASE, X64_RCX,
+      X64MemoryAccessSize(AIns.Op));
+    Exit;
+  end;
+
+  X64EmitLoadScalarIndexed(ABuf, X64_RAX, X64_REG_MEMBASE, X64_RCX,
+    X64MemoryAccessSize(AIns.Op),
+    AIns.Op in [iroI32Load8S, iroI32Load16S, iroI64Load8S, iroI64Load16S,
+      iroI64Load32S],
+    AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S]);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+end;
+
 function X64SlotDispFits(const ASlot: UInt32): Boolean;
 begin
   Result := (UInt64(ASlot) * X64_SLOT_SIZE) <= UInt64(High(Int32));
@@ -2730,12 +2922,17 @@ begin
 end;
 
 procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
-  const AMemoryIndex: UInt32);
+  const AMemoryIndex: UInt32; const APinBase: Boolean);
+var
+  Layout: TWasmMemoryInst;
 begin
   X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
   X64EmitMovRegImm32(ABuf, X64_ARG1, AMemoryIndex);
   X64EmitCallHelper(ABuf, aohResolveMemory);
   X64EmitStoreMem64(ABuf, X64_RAX, X64_RSP, 0);
+  if APinBase then
+    X64EmitLoadMem64(ABuf, X64_REG_MEMBASE, X64_RAX,
+      Int32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
 end;
 
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
