@@ -3851,7 +3851,7 @@ begin
   Code := JitStageFunctionBytes(FStore, FIr, @FIr.Functions[1], 1,
     EntryOffset, RegisterCount);
   {$IFDEF WASM_JIT_ARM64}
-  { The new preserved-cache frame reserves32 extra aligned bytes. This keeps
+  { The new preserved-cache frame reserves 32 extra aligned bytes. This keeps
     the regression on the optimized path as eligibility evolves. }
   Expect<UInt32>(UInt32(Code[0]) or (UInt32(Code[1]) shl 8) or
     (UInt32(Code[2]) shl 16) or (UInt32(Code[3]) shl 24)).ToBe($D10083FF);

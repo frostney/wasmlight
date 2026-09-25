@@ -646,15 +646,65 @@ var
   end;
 
   {$IFDEF WASM_JIT_ARM64}
-  procedure PrepareInlineBodies;
+  { True with ABody set to the leaf's native body minus its final RET when
+    the leaf can be inlined (shape, emitted form, and the inline fence). }
+  function InlinableLeafBody(const ALeaf: PWasmIrFunctionRec;
+    const ATarget: UInt32; out ABody: TWasmBytes): Boolean;
   var
-    K, N, UsedBytes, StartOffset: Integer;
-    Target: UInt32;
-    Leaf: PWasmIrFunctionRec;
+    N, StartOffset: Integer;
     LeafBuffer: TWasmCodeBuffer;
     Body: TWasmBytes;
-    SingleReturn: Boolean;
   begin
+    Result := False;
+    ABody := nil;
+    if (Length(ALeaf^.Code) = 0) or (Length(ALeaf^.Code) > 24) or
+      (ALeaf^.Code[High(ALeaf^.Code)].Op <> iroReturn) then
+      Exit;
+    for N := 0 to High(ALeaf^.Code) - 1 do
+      if ALeaf^.Code[N].Op = iroReturn then
+        Exit;
+    { A defined funcidx denotes the immutable body in this module, unlike
+      an import. Use the existing numeric-leaf proof and emitter; neither a
+      live compiled entry nor a store address is part of these semantics
+      (pinned core exec-call / exec-invoke). No process pointer is copied. }
+    LeafBuffer := JitCompileToBuffer(AIr, ALeaf, ATarget, AEpochOffset,
+      ASnapshotOffset, AHelperTableOffset, False);
+    try
+      StartOffset := LeafBuffer.LabelOffset(0);
+      Body := LeafBuffer.SnapshotBytes;
+      { All core paths end in exactly one RET. Keep its result move but
+        replace the return itself with ordinary caller fallthrough. }
+      if (Length(Body) < StartOffset + 4) or
+        (Body[High(Body) - 3] <> $C0) or
+        (Body[High(Body) - 2] <> $03) or
+        (Body[High(Body) - 1] <> $5F) or
+        (Body[High(Body)] <> $D6) then
+        Exit;
+      Body := Copy(Body, StartOffset, Length(Body) - StartOffset - 4);
+      if (Length(Body) > 256) or not Arm64CanInlineScalarBody(Body) then
+        Exit;
+      ABody := Body;
+      Result := True;
+    finally
+      LeafBuffer.Free;
+    end;
+  end;
+
+  procedure PrepareInlineBodies;
+  var
+    K, N, M, UsedBytes, Memo: Integer;
+    Target: UInt32;
+    Leaf: PWasmIrFunctionRec;
+    Body: TWasmBytes;
+    { One compile per distinct target: a leaf's inlinable body (or its
+      rejection) does not depend on the call site, only the budget does. }
+    MemoTargets: array of UInt32;
+    MemoBodies: array of TWasmBytes;
+    MemoOk: array of Boolean;
+  begin
+    MemoTargets := nil;
+    MemoBodies := nil;
+    MemoOk := nil;
     SetLength(InlineBodies, Length(AFn^.Code));
     SetLength(InlineRegisterCounts, Length(AFn^.Code));
     SetLength(InlineResultSlots, Length(AFn^.Code));
@@ -668,48 +718,31 @@ var
       if not NativeScalarLeafTarget(Target) then
         Continue;
       Leaf := @AIr.Functions[Target - AIr.FuncImportCount];
-      if (Length(Leaf^.Code) = 0) or (Length(Leaf^.Code) > 24) or
-        (Leaf^.Code[High(Leaf^.Code)].Op <> iroReturn) then
-        Continue;
-      SingleReturn := True;
-      for N := 0 to High(Leaf^.Code) - 1 do
-        if Leaf^.Code[N].Op = iroReturn then
-          SingleReturn := False;
-      if not SingleReturn then
-        Continue;
-      { A defined funcidx denotes the immutable body in this module, unlike
-        an import. Use the existing numeric-leaf proof and emitter; neither a
-        live compiled entry nor a store address is part of these semantics
-        (pinned core exec-call / exec-invoke). No process pointer is copied. }
-      LeafBuffer := JitCompileToBuffer(AIr, Leaf, Target, AEpochOffset,
-        ASnapshotOffset, AHelperTableOffset, False);
-      try
-        StartOffset := LeafBuffer.LabelOffset(0);
-        Body := LeafBuffer.SnapshotBytes;
-        { All core paths end in exactly one RET. Keep its result move but
-          replace the return itself with ordinary caller fallthrough. }
-        if (Length(Body) < StartOffset + 4) or
-          (Body[High(Body) - 3] <> $C0) or
-          (Body[High(Body) - 2] <> $03) or
-          (Body[High(Body) - 1] <> $5F) or
-          (Body[High(Body)] <> $D6) then
-          Continue;
-        Body := Copy(Body, StartOffset, Length(Body) - StartOffset - 4);
-        if (UsedBytes + Length(Body) > 256) or
-          not Arm64CanInlineScalarBody(Body) then
-          Continue;
-        InlineBodies[K] := Body;
-        InlineRegisterCounts[K] := Leaf^.RegisterCount;
-        InlineResultSlots[K] := IrAuxBlockItem(AFn^.AuxU32,
-          AFn^.Code[K].B, 0);
-        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
-          AFn^.Code[K].A)) - 1 do
-          InlineArgSlots[K][N] := IrAuxBlockItem(AFn^.AuxU32,
-            AFn^.Code[K].A, UInt32(N));
-        Inc(UsedBytes, Length(Body));
-      finally
-        LeafBuffer.Free;
+      Memo := -1;
+      for M := 0 to High(MemoTargets) do
+        if MemoTargets[M] = Target then
+          Memo := M;
+      if Memo < 0 then
+      begin
+        Memo := Length(MemoTargets);
+        SetLength(MemoTargets, Memo + 1);
+        SetLength(MemoBodies, Memo + 1);
+        SetLength(MemoOk, Memo + 1);
+        MemoTargets[Memo] := Target;
+        MemoOk[Memo] := InlinableLeafBody(Leaf, Target, MemoBodies[Memo]);
       end;
+      Body := MemoBodies[Memo];
+      if not MemoOk[Memo] or (UsedBytes + Length(Body) > 256) then
+        Continue;
+      InlineBodies[K] := Body;
+      InlineRegisterCounts[K] := Leaf^.RegisterCount;
+      InlineResultSlots[K] := IrAuxBlockItem(AFn^.AuxU32,
+        AFn^.Code[K].B, 0);
+      for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+        AFn^.Code[K].A)) - 1 do
+        InlineArgSlots[K][N] := IrAuxBlockItem(AFn^.AuxU32,
+          AFn^.Code[K].A, UInt32(N));
+      Inc(UsedBytes, Length(Body));
     end;
   end;
   {$ENDIF}
