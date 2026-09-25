@@ -213,12 +213,18 @@ through the interpreter and compare. Everything not judged is `SKIP` with a
 reason, and the skip column is never folded into the totals, so a report
 cannot read as more conformance than was measured.
 
-CI runs only the 257 top-level scripts through `tools/conformance/check.py`.
+CI gates the 257 top-level scripts through `tools/conformance/check.py`.
 The shared gate preserves the runner exit status and requires the exact pinned
 pass count with zero errors, failures, skips, and staged cases for every tier.
-`python3 -m unittest discover -s tools/conformance` proves that a failing runner
-or a regressed tally cannot pass the gate. Recursive proposal/legacy runs remain
-separate diagnostics and do not weaken the core gate.
+It also requires each run to report the requested tier, with JIT and AOT
+compiling at least one function and the interpreter compiling none, so a tier
+that silently falls back to the interpreter cannot pass. When more than one
+tier runs, the non-core scripts beneath the corpus root (proposals, legacy,
+custom) must produce byte-identical output and exit status in every tier. Their
+own pass/fail counts are not gated, but a JIT or AOT divergence there fails.
+`python3 -m unittest discover -s tools/conformance` proves that a failing runner,
+a regressed tally, a fallen-back tier, or a non-core divergence cannot pass the
+gate.
 
 The pinned core target (the 257 top-level scripts) is clean:
 
@@ -319,10 +325,10 @@ interpreter runs alone.
 CI now wires this in. The corpus is **fetched at the pinned commit**
 (`tests/spec/testsuite.commit`, gitignored — never vendored) and run on
 **every platform under `--tier=interp`**; on the 64-bit UNIX legs the
-`--tier=jit` and `--tier=aot` runs also execute and CI asserts their tally
-is byte-identical to the interpreter's (a codegen bug would break the
-identity invariant). `errors=0` and a pass floor guard against a silent
-corpus vanishing.
+`--tier=jit` and `--tier=aot` runs also execute. Every tier must reach the
+exact pinned core tally on its own, and the non-core scripts must produce
+identical output in every tier (a codegen bug would break the identity
+invariant); see the gate description above.
 
 **Honest cross-platform status.** Exact-main
 [CI run 31899074165](https://github.com/frostney/wasmlight/actions/runs/31899074165)

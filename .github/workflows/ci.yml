@@ -297,7 +297,8 @@ jobs:
           instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
             --archive "$ARCHIVE" \
             --checksums "$CHECKSUMS"
-      # Core conformance excludes proposals/legacy and fails on any lost case.
+      # Core conformance fails on any lost case in any tier; with several tiers,
+      # non-core scripts (proposals/legacy/custom) must match across tiers.
       - name: Conformance gate regression tests
         run: |
           PY=python3
