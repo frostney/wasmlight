@@ -459,6 +459,10 @@ different.
   Compiled and interpreted functions interoperate transparently across the
   seam (a throw from a compiled callee reaches an outer interpreted
   handler, and a cross-tier tail call stays O(1)).
+  Both backends share memory and GC instruction bodies in `Wasm.Jit.Runtime`
+  and vector bodies in `Wasm.Jit.Vector`; native instruction emission stays
+  in the backend units. The shared bodies retain the memory chokepoint and
+  publish new GC objects into traced slots before filling their fields.
 - **The AOT compiler** (`Wasm.Aot`, `Wasm.Aot.Artifact`) runs the same
   backends ahead of time, emitting **position-independent** code — helper
   calls go through a per-process indirect table and the IR base arrives in
