@@ -1753,6 +1753,9 @@ type
     procedure TestDeferredStoreAcrossTrapPoint;
     procedure TestDeferredStoreLoopCarriedEpoch;
     procedure TestDeferredStoreEarlyExits;
+    procedure TestDirectOperandStaticI32;
+    procedure TestDirectOperandStaticI64;
+    procedure TestDirectOperandWriteThrough;
     procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
@@ -4150,6 +4153,206 @@ begin
   end;
 end;
 
+{ Cached integer ALU, shift, compare, and eqz ops compute on their operands'
+  cache hosts. The leaves wrap at 32 and 64 bits, shift and rotate by counts
+  of at least the width, combine a value with itself, write a result over a
+  still-live right operand of a subtraction, and keep compare results both as
+  branch conditions and as values. Only the leaf is compiled; the interpreted
+  check export compares its result with a literal from an independent model
+  (two's-complement arithmetic per exec-binop / exec-relop / exec-testop,
+  pinned core d7b37e4) and traps on a mismatch. The returned slot is compared
+  bitwise, so an i32 result must stay zero-extended. }
+procedure TJitTests.TestDirectOperandStaticI32;
+const
+  A: array[0 .. 4] of Int32 = (0, 1, 2147483647, -1, 123456789);
+  B: array[0 .. 4] of Int32 = (0, 3, -2147483647, -7, 987654321);
+  N: array[0 .. 4] of Int32 = (1, 5, 9, 17, 64);
+  Want: array[0 .. 4] of Int32 = (3, -618964307, -25768262, -1963988304,
+    -1198936099);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $a i32) (param $b i32) ' +
+    '(param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (local $c i32) (local $t i32) ' +
+    '(local.set $acc (local.get $a)) ' +
+    '(loop $l ' +
+    '(local.set $t (i32.mul (i32.add (local.get $acc) ' +
+    '(i32.const 0x7fffffff)) (local.get $b))) ' +
+    '(local.set $acc (i32.sub (local.get $t) (local.get $acc))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.sub (local.get $t) (local.get $t)))) ' +
+    '(local.set $acc (i32.xor (local.get $acc) ' +
+    '(i32.mul (local.get $t) (local.get $t)))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.shl (local.get $t) ' +
+    '(i32.add (local.get $i) (i32.const 31))))) ' +
+    '(local.set $acc (i32.xor (local.get $acc) ' +
+    '(i32.shr_u (local.get $acc) (i32.const 35)))) ' +
+    '(local.set $acc (i32.sub (local.get $acc) ' +
+    '(i32.rotr (local.get $b) (local.get $t)))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.shr_s (local.get $t) (local.get $acc)))) ' +
+    '(local.set $acc (i32.or (i32.and (local.get $acc) (i32.const -16)) ' +
+    '(i32.and (local.get $t) (i32.const 15)))) ' +
+    '(local.set $t (i32.sub (local.get $b) (local.get $t))) ' +
+    '(if (local.tee $c (i32.lt_s (local.get $acc) (local.get $t))) ' +
+    '(then (local.set $acc (i32.add (local.get $acc) (i32.const 17))))) ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 3)) ' +
+    '(local.get $c))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.eqz (local.get $c)))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.ge_u (local.get $acc) (local.get $acc)))) ' +
+    '(local.set $acc (i32.sub (local.get $acc) ' +
+    '(i32.gt_s (local.get $b) (local.get $acc)))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.gt_u (local.get $acc) (local.get $t)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (param i32 i32 i32 i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get 0) (local.get 1) ' +
+    '(local.get 2))) ' +
+    '(if (i32.ne (local.get $r) (local.get 3)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(A) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI32(A[I]),
+      MakeValueI32(B[I]), MakeValueI32(N[I]), MakeValueI32(Want[I])]))
+      .ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI32(A[I]),
+      MakeValueI32(B[I]), MakeValueI32(N[I]), MakeValueI32(Want[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(DiffFresh(Bytes, 'leaf', [MakeValueI32(A[I]),
+      MakeValueI32(B[I]), MakeValueI32(N[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
+procedure TJitTests.TestDirectOperandStaticI64;
+const
+  A: array[0 .. 4] of Int64 = (0, 1, High(Int64), -1, $0123456789ABCDEF);
+  B: array[0 .. 4] of Int64 = (0, 3, -High(Int64), -7, $0FEDCBA987654321);
+  N: array[0 .. 4] of Int32 = (1, 5, 9, 17, 64);
+  Want: array[0 .. 4] of Int64 = (23121, 7627072344664048961,
+    1335414714118423929, -1622668885738050648, 3716804247996231019);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $a i64) (param $b i64) ' +
+    '(param $n i32) (result i64) ' +
+    '(local $i i32) (local $acc i64) (local $t i64) (local $c i32) ' +
+    '(local.set $acc (local.get $a)) ' +
+    '(loop $l ' +
+    '(local.set $t (i64.mul (i64.add (local.get $acc) ' +
+    '(i64.const 0x7fffffffffffffff)) (local.get $b))) ' +
+    '(local.set $acc (i64.sub (local.get $t) (local.get $acc))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) ' +
+    '(i64.mul (local.get $t) (local.get $t)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) ' +
+    '(i64.shl (local.get $t) (i64.const 65)))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) ' +
+    '(i64.shr_u (local.get $acc) (i64.const 127)))) ' +
+    '(local.set $acc (i64.sub (local.get $acc) ' +
+    '(i64.rotr (local.get $b) (local.get $t)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) ' +
+    '(i64.shr_s (local.get $t) (local.get $acc)))) ' +
+    '(local.set $acc (i64.sub (local.get $acc) ' +
+    '(i64.sub (local.get $t) (local.get $t)))) ' +
+    '(local.set $acc (i64.or (i64.and (local.get $acc) (i64.const -256)) ' +
+    '(i64.and (local.get $t) (i64.const 255)))) ' +
+    '(local.set $t (i64.sub (local.get $b) (local.get $t))) ' +
+    '(local.set $c (i64.lt_u (local.get $acc) (local.get $t))) ' +
+    '(if (local.get $c) (then (local.set $acc ' +
+    '(i64.add (local.get $acc) (local.get $b))))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (if (result i64) ' +
+    '(local.get $c) (then (i64.const 3)) (else (i64.const 11))))) ' +
+    '(local.set $c (i32.add (i32.add (local.get $c) ' +
+    '(i64.eqz (local.get $t))) ' +
+    '(i64.le_s (local.get $acc) (local.get $acc)))) ' +
+    '(if (i64.gt_s (local.get $t) (local.get $acc)) (then (local.set $acc ' +
+    '(i64.rotr (local.get $acc) (i64.const 7))))) ' +
+    '(if (i32.gt_u (local.get $c) (i32.const 1)) (then (local.set $acc ' +
+    '(i64.xor (local.get $acc) (i64.const 0x5a5a))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (param i64 i64 i32 i64) (result i64) ' +
+    '(local $r i64) (local.set $r (call $leaf (local.get 0) (local.get 1) ' +
+    '(local.get 2))) ' +
+    '(if (i64.ne (local.get $r) (local.get 3)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(A) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI64(A[I]),
+      MakeValueI64(B[I]), MakeValueI32(N[I]), MakeValueI64(Want[I])]))
+      .ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI64(A[I]),
+      MakeValueI64(B[I]), MakeValueI32(N[I]), MakeValueI64(Want[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
+{ The same direct forms in a helper-bearing function: rotl, extends, and wrap
+  are not static-cache ops, so the leaf keeps the write-through pair, whose
+  round-robin victim can be an operand's host. i32 results reach i64 context
+  through extend_i32_u/extend_i32_s, which read the stored slot. }
+procedure TJitTests.TestDirectOperandWriteThrough;
+const
+  A: array[0 .. 4] of Int32 = (0, 1, 2147483647, -1, 123456789);
+  B: array[0 .. 4] of Int64 = (0, 3, -1, Low(Int64), $0123456789ABCDEF);
+  N: array[0 .. 4] of Int32 = (1, 5, 9, 17, 64);
+  Want: array[0 .. 4] of Int64 = (-2952790014, 80231910826, -858757689958,
+    -3158587638997, 5596074736245400547);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param $a i32) (param $b i64) ' +
+    '(param $n i32) (result i64) ' +
+    '(local $i i32) (local $x i32) (local $acc i64) ' +
+    '(local.set $acc (local.get $b)) ' +
+    '(local.set $x (local.get $a)) ' +
+    '(loop $l ' +
+    '(local.set $x (i32.add (i32.mul (local.get $x) (i32.const 0x9E3779B1)) ' +
+    '(i32.const 0x7fffffff))) ' +
+    '(local.set $x (i32.rotl (local.get $x) ' +
+    '(i32.add (local.get $i) (i32.const 29)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u ' +
+    '(i32.sub (local.get $x) (local.get $a))))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) (i64.extend_i32_s ' +
+    '(i32.shl (local.get $x) (i32.const 33))))) ' +
+    '(local.set $acc (i64.rotl (local.get $acc) (i64.extend_i32_u ' +
+    '(i32.lt_s (local.get $x) (local.get $a))))) ' +
+    '(local.set $x (i32.xor (local.get $x) (i32.wrap_i64 ' +
+    '(i64.shr_u (local.get $acc) (i64.const 32))))) ' +
+    '(local.set $x (i32.sub (local.get $a) (local.get $x))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.add (local.get $acc) (i64.extend_i32_u (local.get $x)))) ' +
+    '(func (export "check") (param i32 i64 i32 i64) (result i64) ' +
+    '(local $r i64) (local.set $r (call $leaf (local.get 0) (local.get 1) ' +
+    '(local.get 2))) ' +
+    '(if (i64.ne (local.get $r) (local.get 3)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(A) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI32(A[I]),
+      MakeValueI64(B[I]), MakeValueI32(N[I]), MakeValueI64(Want[I])]))
+      .ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI32(A[I]),
+      MakeValueI64(B[I]), MakeValueI32(N[I]), MakeValueI64(Want[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
 var
   Bytes: TWasmBytes;
@@ -5391,6 +5594,12 @@ begin
     TestDeferredStoreLoopCarriedEpoch);
   Test('deferred static-cache values reach early br and return exits',
     TestDeferredStoreEarlyExits);
+  Test('direct-operand i32 ALU and compares match in the static cache',
+    TestDirectOperandStaticI32);
+  Test('direct-operand i64 ALU and compares match in the static cache',
+    TestDirectOperandStaticI64);
+  Test('direct-operand ops match in the write-through cache',
+    TestDirectOperandWriteThrough);
   Test('a tee stored in a pinned-memory loop keeps the stored value',
     TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
