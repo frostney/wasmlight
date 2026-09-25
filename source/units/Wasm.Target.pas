@@ -137,6 +137,7 @@ type
     DirectMetaParam1Reg: UInt64;
     DirectMetaResult0Reg: UInt64;
     FuncCallCount: UInt64;
+    FuncInstance: UInt64;
     MemInstStride: UInt64;
     MemBase: UInt64;
     MemByteSize: UInt64;
@@ -361,6 +362,7 @@ begin
   Result.DirectMetaParam1Reg := 52;
   Result.DirectMetaResult0Reg := 56;
   Result.FuncCallCount := 56;
+  Result.FuncInstance := 16;
   Result.MemInstStride := 80;
   Result.MemBase := 0;
   Result.MemByteSize := 8;
@@ -502,6 +504,7 @@ begin
   Fold(AAbi.Layout.DirectMetaParam1Reg);
   Fold(AAbi.Layout.DirectMetaResult0Reg);
   Fold(AAbi.Layout.FuncCallCount);
+  Fold(AAbi.Layout.FuncInstance);
   Fold(AAbi.Layout.MemInstStride);
   Fold(AAbi.Layout.MemBase);
   Fold(AAbi.Layout.MemByteSize);

@@ -396,7 +396,9 @@ const
   { Revision 17: x64 generic direct calls publish the callee activation,
     including its Native bit (ActNative), in generated code, and the x64
     prologue resolves its pinned memory instance inline (StoreMemories,
-    InstMemAddrs). }
+    InstMemAddrs). The call site also bakes TWasmFuncInst.Instance
+    (FuncInstance) and stores Ord(rtCaller) and a Boolean as single bytes, so
+    SizeOf(TWasmRetKind) = SizeOf(Boolean) = 1 is part of this revision. }
   AOT_ABI_REVISION = 17;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
@@ -3691,6 +3693,7 @@ begin
   Fold(JO.DirectMetaParam1Reg);
   Fold(JO.DirectMetaResult0Reg);
   Fold(JO.FuncCallCount);
+  Fold(JO.FuncInstance);
   Fold(JO.MemInstStride);
   Fold(JO.MemBase);
   Fold(JO.MemByteSize);

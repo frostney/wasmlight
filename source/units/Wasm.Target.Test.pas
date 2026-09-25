@@ -252,6 +252,7 @@ begin
       Expect<Boolean>(Abi.Layout.DirectMetaResult0Reg = JO.DirectMetaResult0Reg)
         .ToBe(True);
       Expect<Boolean>(Abi.Layout.FuncCallCount = JO.FuncCallCount).ToBe(True);
+      Expect<Boolean>(Abi.Layout.FuncInstance = JO.FuncInstance).ToBe(True);
       Expect<Boolean>(Abi.Layout.MemInstStride = JO.MemInstStride).ToBe(True);
       Expect<Boolean>(Abi.Layout.MemBase = JO.MemBase).ToBe(True);
       Expect<Boolean>(Abi.Layout.MemByteSize = JO.MemByteSize).ToBe(True);

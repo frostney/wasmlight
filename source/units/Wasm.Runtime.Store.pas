@@ -974,6 +974,7 @@ type
     DirectMetaParam1Reg: NativeUInt;
     DirectMetaResult0Reg: NativeUInt;
     FuncCallCount: NativeUInt;       { TWasmFuncInst.CallCount }
+    FuncInstance: NativeUInt;        { TWasmFuncInst.Instance }
     MemInstStride: NativeUInt;       { SizeOf(TWasmMemoryInst) }
     MemBase: NativeUInt;             { TWasmMemoryInst.Base }
     MemByteSize: NativeUInt;         { TWasmMemoryInst.ByteSize }
@@ -2434,6 +2435,7 @@ begin
   Result.DirectMetaResult0Reg := PtrUInt(@F.DirectMeta.Result0Reg) -
     PtrUInt(@F.DirectMeta);
   Result.FuncCallCount := PtrUInt(@F.CallCount) - PtrUInt(@F);
+  Result.FuncInstance := PtrUInt(@F.Instance) - PtrUInt(@F);
   Result.MemInstStride := SizeOf(TWasmMemoryInst);
   Result.MemBase := PtrUInt(@M.Base) - PtrUInt(@M);
   Result.MemByteSize := PtrUInt(@M.ByteSize) - PtrUInt(@M);
