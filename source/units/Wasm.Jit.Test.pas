@@ -2101,6 +2101,7 @@ type
     procedure TestDeferredStoreLoopCarriedEpoch;
     procedure TestDeferredStoreEarlyExits;
     procedure TestDirectOperandStaticI32;
+    procedure TestDirectOperandEvictsLiveOperand;
     procedure TestDirectOperandStaticI64;
     procedure TestDirectOperandWriteThrough;
     procedure TestTeeStoredInPinnedMemoryLoop;
@@ -4655,6 +4656,88 @@ begin
   end;
 end;
 
+{ Pinned-memory loops where a live dirty temporary holds one dynamic entry,
+  the left operand is a dead load temporary in the other, and the right
+  operand is an alias-forwarded non-static local that misses the cache:
+  loading the right operand evicts the left operand's register, so the left
+  value must be preserved first. Expected values are derived by hand from
+  the data segment (5, 9, 17, 33, 65, 129), independently of any tier. }
+procedure TJitTests.TestDirectOperandEvictsLiveOperand;
+const
+  Fn: array[0 .. 3] of string = ('ev1', 'ev1', 'ev2', 'ev3');
+  P: array[0 .. 3] of Int32 = (0, 4, 0, 0);
+  C: array[0 .. 3] of Int32 = (2, 0, 1, 6);
+  N: array[0 .. 3] of Int32 = (3, 2, 2, 2);
+  Want: array[0 .. 3] of Int32 = (76, 48, 1400, 23);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+
+  function Check(const AName: string): string;
+  begin
+    Result := '(func (export "check_' + AName + '") ' +
+      '(param i32 i32 i32 i32) (result i32) (local $r i32) ' +
+      '(local.set $r (call $' + AName + ' (local.get 0) (local.get 1) ' +
+      '(local.get 2))) ' +
+      '(if (i32.ne (local.get $r) (local.get 3)) (then unreachable)) ' +
+      '(local.get $r)) ';
+  end;
+
+begin
+  Bytes := AssembleWatText('(module (memory 1 1) ' +
+    '(data (i32.const 0) "\05\00\00\00\09\00\00\00\11\00\00\00' +
+    '\21\00\00\00\41\00\00\00\81\00\00\00") ' +
+    '(func $ev1 (export "ev1") (param $p i32) (param $c i32) (param ' +
+    '$n i32) (result i32) (local $i i32) (local $acc i32) (local $d ' +
+    'i32) (local $q i32) (loop $l (local.set $q (i32.add (local.get ' +
+    '$i) (i32.const 1))) (local.set $d (i32.sub (i32.load (local.get ' +
+    '$p)) (local.get $c))) (local.set $acc (i32.add (i32.mul ' +
+    '(local.get $acc) (i32.const 3)) (i32.add (local.get $d) ' +
+    '(local.get $q)))) (local.set $c (i32.add (local.get $c) ' +
+    '(i32.const 1))) (local.set $p (i32.add (local.get $p) (i32.const ' +
+    '4))) (local.set $p (i32.sub (local.get $p) (i32.const 0))) ' +
+    '(local.set $i (local.get $q)) (local.set $i (i32.add (local.get ' +
+    '$i) (i32.const 0))) (br_if $l (i32.lt_u (local.get $i) ' +
+    '(local.get $n)))) (local.get $acc)) (func $ev2 (export "ev2") ' +
+    '(param $p i32) (param $c i32) (param $n i32) (result i32) (local ' +
+    '$i i32) (local $acc i32) (local $d i32) (local $q i32) (loop $l ' +
+    '(local.set $q (i32.xor (local.get $p) (i32.const 1))) (local.set ' +
+    '$d (i32.sub (i32.load8_u (local.get $p)) (local.get $c))) ' +
+    '(local.set $d (i32.shl (i32.load16_u (local.get $p)) (local.get ' +
+    '$d))) (local.set $acc (i32.add (i32.mul (local.get $acc) ' +
+    '(i32.const 3)) (i32.add (local.get $d) (local.get $q)))) ' +
+    '(local.set $c (i32.add (local.get $c) (i32.const 1))) (local.set ' +
+    '$p (i32.add (local.get $p) (i32.const 4))) (local.set $p ' +
+    '(i32.add (local.get $p) (i32.const 0))) (local.set $i (i32.add ' +
+    '(local.get $i) (i32.const 1))) (local.set $i (i32.add (local.get ' +
+    '$i) (i32.const 0))) (br_if $l (i32.lt_u (local.get $i) ' +
+    '(local.get $n)))) (local.get $acc)) (func $ev3 (export "ev3") ' +
+    '(param $p i32) (param $c i32) (param $n i32) (result i32) (local ' +
+    '$i i32) (local $acc i32) (local $d i32) (local $q i32) (local $r ' +
+    'i32) (loop $l (local.set $q (i32.add (local.get $p) (i32.const ' +
+    '1))) (local.set $r (i32.add (local.get $p) (i32.const 2))) ' +
+    '(local.set $d (i32.lt_u (i32.load (local.get $p)) (local.get ' +
+    '$c))) (local.set $acc (i32.add (i32.mul (local.get $acc) ' +
+    '(i32.const 3)) (i32.add (i32.add (local.get $d) (local.get $q)) ' +
+    '(local.get $r)))) (local.set $c (i32.add (local.get $c) ' +
+    '(i32.const 1))) (local.set $p (i32.add (local.get $p) (i32.const ' +
+    '4))) (local.set $p (i32.add (local.get $p) (i32.const 0))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) (local.set ' +
+    '$i (i32.add (local.get $i) (i32.const 0))) (br_if $l (i32.lt_u ' +
+    '(local.get $i) (local.get $n)))) (local.get $acc)) ' +
+    Check('ev1') + Check('ev2') + Check('ev3') + ')');
+  CompileExports(['ev1', 'ev2', 'ev3']);
+  for I := 0 to High(Fn) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check_' + Fn[I], [MakeValueI32(P[I]),
+      MakeValueI32(C[I]), MakeValueI32(N[I]), MakeValueI32(Want[I])]))
+      .ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check_' + Fn[I], [MakeValueI32(P[I]),
+      MakeValueI32(C[I]), MakeValueI32(N[I]), MakeValueI32(Want[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+end;
+
 procedure TJitTests.TestDirectOperandStaticI64;
 const
   A: array[0 .. 4] of Int64 = (0, 1, High(Int64), -1, $0123456789ABCDEF);
@@ -6223,6 +6306,8 @@ begin
     TestDeferredStoreEarlyExits);
   Test('direct-operand i32 ALU and compares match in the static cache',
     TestDirectOperandStaticI32);
+  Test('a direct operand survives eviction by its partner operand',
+    TestDirectOperandEvictsLiveOperand);
   Test('direct-operand i64 ALU and compares match in the static cache',
     TestDirectOperandStaticI64);
   Test('direct-operand ops match in the write-through cache',
