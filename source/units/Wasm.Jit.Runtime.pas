@@ -21,7 +21,9 @@ procedure JitDoMem(const AStore: TWasmStore; const AReg: PWasmValue;
   const AAct: PWasmActivation; const AIns: PWasmIrInstr);
 
 { Preserve the backends' existing struct initialization choices: Arm64 batches
-  up to eight fields, X64 writes each field. Both use the same GC barriers. }
+  up to eight fields, X64 writes each field. The batched path writes fields
+  without a write barrier, which is sound only because the object is freshly
+  allocated; the per-field path goes through the barriered StructSet. }
 procedure JitDoGc(const AStore: TWasmStore; const AReg: PWasmValue;
   const AAct: PWasmActivation; const AIns: PWasmIrInstr;
   const ABatchStructFields: Boolean);

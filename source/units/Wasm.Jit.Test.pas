@@ -3333,6 +3333,55 @@ begin
     [MakeValueI32(7)])).ToBe('');
 end;
 
+{ struct.new with distinct field values, read back through a weighted sum of
+  every field. Three fields stay within Arm64's batched initialization; ten
+  exceed it, so both backend paths and x64's per-field path are covered. }
+{ array.new_data whose source range is out of bounds for a count too large to
+  allocate: the range trap must win over allocation (exec-array.new_data). }
+function ArrayNewDataRangeModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (type $vec (array i8))' +
+    ' (data $d "\01\02\03\04")' +
+    ' (func (export "fd") (param i32 i32) (result i32)' +
+    ' (drop (array.new_data $vec $d (local.get 0) (local.get 1)))' +
+    ' (i32.const 0)))');
+end;
+
+function WideStructModuleBytes: TWasmBytes;
+
+  function StructFunc(const AName: string; const AFields: Integer): string;
+  var
+    I: Integer;
+  begin
+    Result := ' (func (export "' + AName + '") (param i32) (result i32)' +
+      ' (local $r (ref null $s' + IntToStr(AFields) + '))' +
+      ' (local.set $r (struct.new $s' + IntToStr(AFields);
+    for I := 0 to AFields - 1 do
+      Result := Result + ' (i32.add (local.get 0) (i32.const ' +
+        IntToStr(I + 1) + '))';
+    Result := Result + ')) (i32.const 0)';
+    for I := 0 to AFields - 1 do
+      Result := Result + ' (struct.get $s' + IntToStr(AFields) + ' ' +
+        IntToStr(I) + ' (local.get $r)) (i32.const ' + IntToStr(I + 1) +
+        ') i32.mul i32.add';
+    Result := Result + ')';
+  end;
+
+  function StructType(const AFields: Integer): string;
+  var
+    I: Integer;
+  begin
+    Result := ' (type $s' + IntToStr(AFields) + ' (struct';
+    for I := 1 to AFields do
+      Result := Result + ' (field (mut i32))';
+    Result := Result + '))';
+  end;
+
+begin
+  Result := AssembleWatText('(module' + StructType(3) + StructType(10) +
+    StructFunc('s3', 3) + StructFunc('s10', 10) + ')');
+end;
+
 function LargeRegisterFileModuleBytes: TWasmBytes;
 var
   Text: string;
@@ -3650,7 +3699,12 @@ begin
   Expect<string>(TrapMessageOf(GcStructModuleBytes, 'nullget',
     [MakeValueI32(0)])).ToBe('null structure reference');
   Expect<Boolean>(DiffFresh(GcStructModuleBytes, 'dirty',
-    [MakeValueI32(123)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF})
+    [MakeValueI32(123)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  { Multi-field struct.new must place every field, batched or per field. }
+  Expect<Boolean>(DiffFresh(WideStructModuleBytes, 's3',
+    [MakeValueI32(100)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<Boolean>(DiffFresh(WideStructModuleBytes, 's10',
+    [MakeValueI32(100)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
 procedure TJitTests.TestArrayRoundTrip;
@@ -3669,6 +3723,10 @@ begin
   DiffFresh(GcArrayModuleBytes, 'oobget', [MakeValueI32(9)]);
   Expect<string>(TrapMessageOf(GcArrayModuleBytes, 'oobget',
     [MakeValueI32(9)])).ToBe('out of bounds array access');
+  Expect<Boolean>(DiffFresh(ArrayNewDataRangeModuleBytes, 'fd',
+    [MakeValueI32(0), MakeValueI32(-1)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
+  Expect<string>(TrapMessageOf(ArrayNewDataRangeModuleBytes, 'fd',
+    [MakeValueI32(0), MakeValueI32(-1)])).ToBe('out of bounds memory access');
 end;
 
 procedure TJitTests.TestReferenceArrayStoreGcVisibility;
