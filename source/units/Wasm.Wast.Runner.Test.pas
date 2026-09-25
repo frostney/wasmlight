@@ -269,6 +269,7 @@ type
 
     { AOT corpus mode (Track J, aot-spec §5.1) }
     procedure TestAotModeLoadsAndPasses;
+    procedure TestX64WriteBackFixtureAllTiers;
     procedure TestAotModeMixedTiersCoexist;
     procedure TestAotTallyIdenticalToInterp;
     procedure TestAotLoadedCountMatchesJit;
@@ -1453,6 +1454,44 @@ begin
   end;
 end;
 
+{ The committed adversarial net for the x64 deferred write-back and native
+  return-tail plans (tests/fixtures/wast/x64-writeback.py computes every
+  expected value independently of any wasmlight tier). Each tier must pass
+  every command on its own, and on a backend host the compiled tiers must
+  actually compile the functions rather than silently interpret them. The
+  suite runs with the repo root as its working directory. }
+procedure TWastRunnerTests.TestX64WriteBackFixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'x64-writeback.wast';
+  { One module plus 80 assertions. }
+  COMMANDS = 81;
+  { Every function in the fixture's module is compilable. }
+  COMPILED_FUNCTIONS = 14;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
 procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
   { Handler tables and wide non-tail calls compile, so the declined fixture
     is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
@@ -1702,6 +1741,8 @@ begin
 
   Test('--tier=aot serializes, loads, and passes against the spec',
     TestAotModeLoadsAndPasses);
+  Test('the x64 write-back fixture passes in every tier',
+    TestX64WriteBackFixtureAllTiers);
   Test('--tier=aot lets AOT-loaded and interpreted functions coexist',
     TestAotModeMixedTiersCoexist);
   Test('the --tier=aot tally is identical to the interpreter tally',
