@@ -40,7 +40,7 @@
   global / GC / v128 ops call X64RtDispatch / X64VecDispatch, and the calls go
   through X64DispatchCall / X64InvokeCompiled — all of which reproduce the
   interpreter's Exec* bodies verbatim, calling the identical runtime primitives,
-  so identity is structural (the differential harness §11 proves it). These are
+  so identity is structural (the differential harness §11 proves it). The
   arch-independent memory and GC bodies live in Wasm.Jit.Runtime, and vector
   bodies in Wasm.Jit.Vector. Backend-specific call and dispatch thunks retain
   their own helper-table entries and calling conventions.

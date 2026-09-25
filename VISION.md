@@ -97,10 +97,11 @@ released through lwpt, and consumable by any lwpt project.
   is another tool's job. The sibling project
   [lakon](https://github.com/frostney/lakon) compiles Object Pascal *to*
   WebAssembly — a natural counterpart, but neither project depends on
-  the other. Compiling a validated module *to* a native executable is
-  planned `0.2.0` work
-  ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)),
-  not a shipped command.
+  the other. `wasmlight compile` compiles a validated WASI command *to* an
+  interpreter-free native executable on supported 64-bit UNIX hosts
+  ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+  Cross-target release delivery remains tracked in
+  [issue #46](https://github.com/frostney/wasmlight/issues/46).
 - **Not a browser embedding.** No JavaScript API, no DOM, no `WebAssembly`
   namespace shim. The host is a Pascal program.
 - **Not a general-purpose sandbox for native code.** The isolation
