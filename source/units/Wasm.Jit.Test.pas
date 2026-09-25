@@ -1033,6 +1033,339 @@ begin
   ]);
 end;
 
+{ --- base-pinned static-cache memory loops ---------------------------------
+
+  Every function below is helper-free, calls nothing, never grows memory, and
+  uses only zero-offset i32 accesses, so both backends compile it in the
+  base-pinned static-cache shape: the memory Base stays in a host register and
+  addresses, stored values, and loaded results live in cache hosts. The
+  expectations are computed by the byte-image oracle below, independently of
+  either tier. }
+
+{$PUSH}
+{$OVERFLOWCHECKS OFF}
+{$RANGECHECKS OFF}
+type
+  TMemImage = array of Byte;
+
+function NewMemImage(const ABytes: UInt32): TMemImage;
+begin
+  Result := nil;
+  SetLength(Result, ABytes);
+  if ABytes <> 0 then
+    FillChar(Result[0], ABytes, 0);
+end;
+
+function ImgLoad(const AMem: TMemImage; const AAddr, ASize: UInt32): UInt64;
+var
+  K: Integer;
+begin
+  Result := 0;
+  for K := Integer(ASize) - 1 downto 0 do
+    Result := (Result shl 8) or AMem[AAddr + UInt32(K)];
+end;
+
+procedure ImgStore(var AMem: TMemImage; const AAddr, ASize: UInt32;
+  const AValue: UInt64);
+var
+  K: Integer;
+begin
+  for K := 0 to Integer(ASize) - 1 do
+    AMem[AAddr + UInt32(K)] := Byte(AValue shr (8 * K));
+end;
+
+function SignExtend(const AValue: UInt64; const ABits: Integer): UInt64;
+begin
+  if ((AValue shr (ABits - 1)) and 1) <> 0 then
+    Result := AValue or not ((UInt64(1) shl ABits) - 1)
+  else
+    Result := AValue;
+end;
+
+procedure FillNarrowImage(var AMem: TMemImage; const AN: UInt32);
+var
+  I: UInt32;
+begin
+  for I := 0 to AN - 1 do
+    AMem[I] := Byte(I * 151 + 7);
+end;
+
+function OracleNarrow64(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I: UInt32;
+begin
+  Mem := NewMemImage(65536);
+  FillNarrowImage(Mem, AN);
+  Result := 0;
+  I := 1;
+  repeat
+    Result := Result * 31 + SignExtend(ImgLoad(Mem, I, 1), 8);
+    Result := Result xor SignExtend(ImgLoad(Mem, I, 2), 16);
+    Result := Result + ImgLoad(Mem, I, 2);
+    Result := Result xor SignExtend(ImgLoad(Mem, I, 4), 32);
+    Result := Result + ImgLoad(Mem, I, 4);
+    Result := Result xor ImgLoad(Mem, I, 1);
+    Result := Result + ImgLoad(Mem, I, 8);
+    Inc(I, 3);
+  until not (I < AN - 8);
+end;
+
+function OracleNarrow32(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, Acc: UInt32;
+begin
+  Mem := NewMemImage(65536);
+  FillNarrowImage(Mem, AN);
+  Acc := 0;
+  I := 1;
+  repeat
+    Acc := Acc * 33 + UInt32(SignExtend(ImgLoad(Mem, I, 1), 8));
+    Acc := Acc xor UInt32(ImgLoad(Mem, I, 1));
+    Acc := Acc + UInt32(SignExtend(ImgLoad(Mem, I, 2), 16));
+    Acc := Acc xor UInt32(ImgLoad(Mem, I, 2));
+    Acc := Acc + UInt32(ImgLoad(Mem, I, 4));
+    Inc(I, 3);
+  until not (I < AN - 8);
+  Result := Acc;
+end;
+
+function OracleStores(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, A, J: UInt32;
+  V: UInt64;
+begin
+  Mem := NewMemImage(65536);
+  I := 0;
+  V := 0;
+  repeat
+    A := I * 29 + 1;
+    V := (V * UInt64(6364136223846793005)) xor UInt64(1442695040888963407);
+    ImgStore(Mem, A, 8, V);
+    ImgStore(Mem, A + 5, 4, V);
+    ImgStore(Mem, A + 11, 2, V);
+    ImgStore(Mem, A + 14, 1, V);
+    ImgStore(Mem, A + 17, 4, A * UInt32($FFFFFFF9));
+    ImgStore(Mem, A + 21, 2, A * 977);
+    ImgStore(Mem, A + 24, 1, A * 13);
+    ImgStore(Mem, A + 25, 8, ImgLoad(Mem, A, 8));
+    ImgStore(Mem, A + 33, 4, ImgLoad(Mem, A + 2, 4));
+    Inc(I);
+  until not (I < AN);
+  Result := 0;
+  J := 0;
+  repeat
+    Result := (Result xor ImgLoad(Mem, J, 1)) * UInt64(1099511628211);
+    Inc(J);
+  until not (J < AN * 29 + 40);
+end;
+
+function OracleEdge(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I: UInt32;
+begin
+  Mem := NewMemImage(65536);
+  Result := 0;
+  I := 0;
+  repeat
+    ImgStore(Mem, 65528, 8, Result + UInt64($0102030405060708));
+    ImgStore(Mem, 65535, 1, I);
+    ImgStore(Mem, 65533, 2, I + $1234);
+    Result := Result + ImgLoad(Mem, 65528, 8);
+    Result := Result xor ImgLoad(Mem, 65532, 4);
+    Result := Result + SignExtend(ImgLoad(Mem, 65534, 2), 16);
+    Result := Result + SignExtend(ImgLoad(Mem, 65535, 1), 8);
+    Inc(I);
+  until not (I < AN);
+end;
+{$POP}
+
+{ Narrow signed/unsigned loads of both result widths at unaligned, varying
+  addresses over a byte pattern the first loop stores. }
+function PinnedNarrowModuleBytes: TWasmBytes;
+const
+  FILL = '(loop $fill ' +
+    '(i32.store8 (local.get $i) ' +
+    '(i32.add (i32.mul (local.get $i) (i32.const 151)) (i32.const 7))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.set $i (i32.const 1)) ';
+  UNTIL_END = '(local.set $i (i32.add (local.get $i) (i32.const 3))) ' +
+    '(br_if $fold (i32.lt_u (local.get $i) ' +
+    '(i32.sub (local.get $n) (i32.const 8))))) ';
+begin
+  Result := AssembleWatText('(module (memory 1) ' +
+    '(func (export "narrow64") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $acc i64) ' + FILL +
+    '(loop $fold ' +
+    '(local.set $acc (i64.add (i64.mul (local.get $acc) (i64.const 31)) ' +
+    '(i64.load8_s (local.get $i)))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) (i64.load16_s (local.get $i)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.load16_u (local.get $i)))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) (i64.load32_s (local.get $i)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.load32_u (local.get $i)))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) (i64.load8_u (local.get $i)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.load (local.get $i)))) ' +
+    UNTIL_END + '(local.get $acc)) ' +
+    '(func (export "narrow32") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' + FILL +
+    '(loop $fold ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 33)) ' +
+    '(i32.load8_s (local.get $i)))) ' +
+    '(local.set $acc (i32.xor (local.get $acc) (i32.load8_u (local.get $i)))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load16_s (local.get $i)))) ' +
+    '(local.set $acc (i32.xor (local.get $acc) (i32.load16_u (local.get $i)))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $i)))) ' +
+    UNTIL_END + '(local.get $acc)))');
+end;
+
+{ Every store width, i64 and i32 value sources, and f32/f64 bit copies at
+  unaligned, overlapping addresses; a byte-wise FNV fold reads the image back. }
+function PinnedStoresModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory 1) ' +
+    '(func (export "stores") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $a i32) (local $v i64) (local $acc i64) ' +
+    '(loop $st ' +
+    '(local.set $a (i32.add (i32.mul (local.get $i) (i32.const 29)) ' +
+    '(i32.const 1))) ' +
+    '(local.set $v (i64.xor (i64.mul (local.get $v) ' +
+    '(i64.const 6364136223846793005)) (i64.const 1442695040888963407))) ' +
+    '(i64.store (local.get $a) (local.get $v)) ' +
+    '(i64.store32 (i32.add (local.get $a) (i32.const 5)) (local.get $v)) ' +
+    '(i64.store16 (i32.add (local.get $a) (i32.const 11)) (local.get $v)) ' +
+    '(i64.store8 (i32.add (local.get $a) (i32.const 14)) (local.get $v)) ' +
+    '(i32.store (i32.add (local.get $a) (i32.const 17)) ' +
+    '(i32.mul (local.get $a) (i32.const -7))) ' +
+    '(i32.store16 (i32.add (local.get $a) (i32.const 21)) ' +
+    '(i32.mul (local.get $a) (i32.const 977))) ' +
+    '(i32.store8 (i32.add (local.get $a) (i32.const 24)) ' +
+    '(i32.mul (local.get $a) (i32.const 13))) ' +
+    '(f64.store (i32.add (local.get $a) (i32.const 25)) ' +
+    '(f64.load (local.get $a))) ' +
+    '(f32.store (i32.add (local.get $a) (i32.const 33)) ' +
+    '(f32.load (i32.add (local.get $a) (i32.const 2)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $st (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(loop $sum ' +
+    '(local.set $acc (i64.mul (i64.xor (local.get $acc) ' +
+    '(i64.load8_u (local.get $i))) (i64.const 1099511628211))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $sum (i32.lt_u (local.get $i) ' +
+    '(i32.add (i32.mul (local.get $n) (i32.const 29)) (i32.const 40))))) ' +
+    '(local.get $acc)) ' +
+    { The store's address is read before the tee rewrites the same local, so
+      a forwarded local.get alias must not cross that redefinition. }
+    '(func (export "retee") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $b i32) (local $acc i32) ' +
+    '(local.set $a (i32.const 64)) ' +
+    '(loop $l ' +
+    '(local.set $b (i32.add (local.get $a) (i32.const 4))) ' +
+    '(i32.store (local.get $a) (local.tee $a (local.get $b))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (i32.sub (local.get $a) (i32.const 4))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+end;
+
+{ Accesses of every width ending exactly at the last byte of a maximum-size
+  memory (edge), and single-width probes whose address the caller moves to or
+  past the end (the i32 guard-page path must trap exactly where the
+  interpreter's bounds check does). The data segment makes the final eight
+  bytes non-zero. }
+function PinnedEdgeModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory 1 1) ' +
+    '(data (i32.const 65528) "\01\82\03\84\05\86\07\88") ' +
+    '(func (export "edge") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $acc i64) (local $e i32) ' +
+    '(loop $l ' +
+    '(local.set $e (i32.const 65528)) ' +
+    '(i64.store (local.get $e) (i64.add (local.get $acc) ' +
+    '(i64.const 0x0102030405060708))) ' +
+    '(i32.store8 (i32.const 65535) (local.get $i)) ' +
+    '(i32.store16 (i32.const 65533) (i32.add (local.get $i) (i32.const 0x1234))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.load (i32.const 65528)))) ' +
+    '(local.set $acc (i64.xor (local.get $acc) (i64.load32_u (i32.const 65532)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.load16_s (i32.const 65534)))) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.load8_s (i32.const 65535)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "t32") (param $a i32) (result i32) (local $i i32) (local $acc i32) ' +
+    '(loop $l (local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 7)) ' +
+    '(i32.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) (local.get $acc)) ' +
+    '(func (export "t64") (param $a i32) (result i64) (local $i i32) (local $acc i64) ' +
+    '(loop $l (local.set $acc (i64.add (i64.mul (local.get $acc) (i64.const 7)) ' +
+    '(i64.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) (local.get $acc)) ' +
+    '(func (export "t8") (param $a i32) (result i32) (local $i i32) (local $acc i32) ' +
+    '(loop $l (local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 7)) ' +
+    '(i32.load8_u (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) (local.get $acc)) ' +
+    '(func (export "s16") (param $a i32) (result i32) (local $i i32) (local $acc i32) ' +
+    '(loop $l (i32.store16 (local.get $a) (i32.add (local.get $i) (i32.const 0x7F7E))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (local.get $i))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) (local.get $acc)))');
+end;
+
+{ A walk that stores a dirty temporary, reloads it, and advances until an
+  access leaves memory; peek/peek8 read the resulting image back. With
+  AMemoryPages = 0 the very first access is out of bounds. }
+function PinnedWalkModuleBytes(const AMemoryPages: Integer = 1): TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory ' + IntToStr(AMemoryPages) +
+    ' ' + IntToStr(AMemoryPages) + ') ' +
+    '(func (export "walk") (param $a i32) (param $step i32) (result i32) ' +
+    '(local $acc i32) (local $t i32) ' +
+    '(loop $l ' +
+    '(local.set $t (i32.add (i32.mul (local.get $acc) (i32.const 3)) ' +
+    '(i32.const 0x5A5A5A5B))) ' +
+    '(i32.store (local.get $a) (local.get $t)) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $a)))) ' +
+    '(local.set $a (i32.add (local.get $a) (local.get $step))) ' +
+    '(br_if $l (i32.ne (local.get $t) (i32.const 0)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "scan") (param $a i32) (param $step i32) (result i32) ' +
+    '(local $acc i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 5)) ' +
+    '(i32.load (local.get $a)))) ' +
+    '(local.set $a (i32.add (local.get $a) (local.get $step))) ' +
+    '(br_if $l (i32.ne (local.get $acc) (i32.const 0x7FFFFFFF)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "peek") (param $a i32) (result i32) (i32.load (local.get $a))) ' +
+    '(func (export "peek8") (param $a i32) (result i32) ' +
+    '(i32.load8_u (local.get $a))))');
+end;
+
+{ A memory64 loop is never base-pinned (the proof requires i32 addresses): it
+  keeps the guard-assisted explicit check, including its trap. }
+function Mem64LoopModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory i64 1) ' +
+    '(func (export "sum") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) ' +
+    '(loop $l ' +
+    '(i64.store (i64.mul (local.get $i) (i64.const 8)) ' +
+    '(i64.mul (local.get $i) (local.get $i))) ' +
+    '(local.set $acc (i64.add (local.get $acc) ' +
+    '(i64.load (i64.mul (local.get $i) (i64.const 8))))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $l (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+end;
+
 { memory.init / data.drop over a PASSIVE data segment (needs the datacount
   section). init copies [srcoff..) of the segment to [arg0..); dropinit drops
   the segment then inits a non-empty range, which must trap. }
@@ -1663,6 +1996,10 @@ type
       walkability probe. -1 (default) leaves the heap's own threshold. }
     FDiffThreshold: Int64;
 
+    { The compiled-tier outcome of the latest DiffFresh, so a test can also
+      check it against an independently computed expectation. }
+    FDiffJitOut: TCallOutcome;
+
     procedure BuildAdd;
     function AddAddr: TWasmFuncAddr;
     function CallAdd(const AA, AB: Int32): TWasmValue;
@@ -1688,6 +2025,16 @@ type
       is what lets a test NAME the message rather than only assert the two tiers
       agree on whatever it is. Returns '' when the call did not trap. }
     function TrapMessageOf(const ABytes: TWasmBytes; const AExport: string;
+      const AParams: array of TWasmValue): string;
+
+    { True when the x64 backend stages defined function AFuncIndex of ABytes
+      in the base-pinned static-cache shape: the prologue's memory pin is
+      followed by the Base load into rsi (mov [rsp],rax; mov rsi,[rax]). }
+    function X64PinnedBaseShape(const ABytes: TWasmBytes;
+      const AFuncIndex: Integer): Boolean;
+    { Invoke AExport on the shared FStore, force-compiled; return the trap
+      message ('' when it returned). Memory stays inspectable afterwards. }
+    function RunCompiledOnStore(const AExport: string;
       const AParams: array of TWasmValue): string;
   protected
     procedure BeforeEach; override;
@@ -1776,6 +2123,13 @@ type
     procedure TestMemoryLoopCarriedCache;
     procedure TestMemoryOobTraps;
     procedure TestMemory64MaxOffset;
+    procedure TestPinnedMemoryNarrowLoads;
+    procedure TestPinnedMemoryStoreWidths;
+    procedure TestPinnedMemoryExactEnd;
+    procedure TestPinnedMemoryOobTraps;
+    procedure TestPinnedMemoryTrapKeepsPriorStores;
+    procedure TestPinnedMemoryStoreThenLoad;
+    procedure TestMemory64LoopExplicitChecks;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
     procedure TestMemoryInitDrop;
@@ -2142,6 +2496,7 @@ var
 begin
   InterpOut := RunTier(False, InterpCompiled);   { the oracle }
   JitOut := RunTier(True, Result);               { the compiled tier }
+  FDiffJitOut := JitOut;
 
   Expect<Boolean>(JitOut.Trapped).ToBe(InterpOut.Trapped);
   Expect<Boolean>(JitOut.Exceptional).ToBe(InterpOut.Exceptional);
@@ -3030,6 +3385,75 @@ begin
     FreeAndNil(Engine);
     FreeAndNil(Ir);
     FreeAndNil(Module);
+  end;
+end;
+
+function TJitTests.X64PinnedBaseShape(const ABytes: TWasmBytes;
+  const AFuncIndex: Integer): Boolean;
+var
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  I: Integer;
+begin
+  Result := False;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(ABytes, Module);
+    Ir := ValidateModule(Module, ABytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[AFuncIndex],
+      EntryOffset, RegisterCount);
+    { mov [rsp],rax (48 89 04 24) then mov rsi,[rax] (48 8B 30): TWasmMemoryInst
+      keeps Base first. }
+    for I := 0 to Length(Code) - 7 do
+      if (Code[I] = $48) and (Code[I + 1] = $89) and (Code[I + 2] = $04) and
+        (Code[I + 3] = $24) and (Code[I + 4] = $48) and
+        (Code[I + 5] = $8B) and (Code[I + 6] = $30) then
+        Exit(True);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+end;
+
+function TJitTests.RunCompiledOnStore(const AExport: string;
+  const AParams: array of TWasmValue): string;
+var
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  P: array of TWasmValue;
+  Res: array[0 .. 4] of TWasmValue;
+  I: Integer;
+begin
+  Result := '';
+  if FInstance = nil then
+  begin
+    DecodeModule(FBytes, FModule);
+    FIr := ValidateModule(FModule, FBytes);
+    FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+      NativeUInt(Length(FBytes)), FImports);
+    RegisterInterpreter(FStore);
+    FJit := RegisterJit(FStore);
+  end;
+  if not FInstance.FindExport(AExport, Kind, Addr) then
+    raise EWasmError.CreateFmt('no export named %s', [AExport]);
+  Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+  SetLength(P, Length(AParams));
+  for I := 0 to High(AParams) do
+    P[I] := AParams[I];
+  for I := 0 to High(Res) do
+    Res[I].Bits := 0;
+  try
+    if Length(P) = 0 then
+      InterpInvoke(FStore, Addr, nil, @Res[0])
+    else
+      InterpInvoke(FStore, Addr, @P[0], @Res[0]);
+  except
+    on E: EWasmTrap do
+      Result := E.Message;
   end;
 end;
 
@@ -5034,6 +5458,209 @@ begin
     .ToBe('out of bounds memory access');
 end;
 
+{ --- base-pinned static-cache memory loops (x64 wave 2 lane C) ----------- }
+
+procedure TJitTests.TestPinnedMemoryNarrowLoads;
+var
+  Bytes: TWasmBytes;
+begin
+  Bytes := PinnedNarrowModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 1)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(Bytes, 'narrow64', [MakeValueI32(200)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleNarrow64(200));
+  Expect<Boolean>(DiffFresh(Bytes, 'narrow32', [MakeValueI32(200)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleNarrow32(200));
+end;
+
+procedure TJitTests.TestPinnedMemoryStoreWidths;
+var
+  Bytes: TWasmBytes;
+begin
+  Bytes := PinnedStoresModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(Bytes, 'stores', [MakeValueI32(100)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleStores(100));
+  { Iteration k stores 68 + 4k at 64 + 4k and reads it straight back. }
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 1)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(Bytes, 'retee', [MakeValueI32(100)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(100 * 68 + 4 * (100 * 99 div 2));
+end;
+
+procedure TJitTests.TestPinnedMemoryExactEnd;
+var
+  Bytes: TWasmBytes;
+  Tail32: UInt32;
+  Tail64: UInt64;
+  {$IFDEF WASM_JIT_X64}
+  I: Integer;
+  {$ENDIF}
+begin
+  { (memory 1 1): every width may end exactly at byte 65535, and one byte
+    further must trap exactly as the interpreter's bounds check does
+    (exec-store-val / exec-load-val: ea + width > |data| traps, nothing is
+    written). }
+  Bytes := PinnedEdgeModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  for I := 0 to 4 do
+    Expect<Boolean>(X64PinnedBaseShape(Bytes, I)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(Bytes, 'edge', [MakeValueI32(5)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleEdge(5));
+
+  { "\01\82\03\84\05\86\07\88" at 65528, read three times: acc*7 + x,
+    that is 57 * x in the access width. }
+  {$PUSH}
+  {$OVERFLOWCHECKS OFF}
+  {$RANGECHECKS OFF}
+  Tail32 := $88078605;
+  Tail32 := Tail32 * 57;
+  Tail64 := UInt64($8807860584038201);
+  Tail64 := Tail64 * 57;
+  {$POP}
+  Expect<Boolean>(DiffFresh(Bytes, 't32', [MakeValueI32(65532)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(Tail32);
+  Expect<Boolean>(DiffFresh(Bytes, 't64', [MakeValueI32(65528)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(Tail64);
+  Expect<Boolean>(DiffFresh(Bytes, 't8', [MakeValueI32(65535)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64($88 * 57));
+  Expect<Boolean>(DiffFresh(Bytes, 's16', [MakeValueI32(65534)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(3);
+
+  DiffFresh(Bytes, 't32', [MakeValueI32(65533)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  DiffFresh(Bytes, 't64', [MakeValueI32(65529)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  DiffFresh(Bytes, 't8', [MakeValueI32(65536)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  DiffFresh(Bytes, 's16', [MakeValueI32(65535)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+end;
+
+procedure TJitTests.TestPinnedMemoryOobTraps;
+const
+  OOB = 'out of bounds memory access';
+var
+  Bytes: TWasmBytes;
+begin
+  { The walk keeps a freshly computed temporary dirty across the store that
+    finally leaves memory: at the end, straddling it, one page past it, and at
+    the far ends of the i32 space that the guard reservation still absorbs.
+    The scan does the same with loads. }
+  Bytes := PinnedWalkModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 1)).ToBe(True);
+  {$ENDIF}
+  DiffFresh(Bytes, 'walk', [MakeValueI32(65520), MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'walk', [MakeValueI32(65522), MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'walk', [MakeValueI32(0), MakeValueI32(65536)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'walk', [MakeValueI32(Integer($80000000)),
+    MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'walk', [MakeValueI32(Integer($FFFFFFFD)),
+    MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'scan', [MakeValueI32(65524), MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'scan', [MakeValueI32(65526), MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'scan', [MakeValueI32(Integer($FFFFFFFC)),
+    MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+
+  { A zero-page memory: the very first access of either loop is out of
+    bounds. }
+  Bytes := PinnedWalkModuleBytes(0);
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  {$ENDIF}
+  DiffFresh(Bytes, 'walk', [MakeValueI32(0), MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+  DiffFresh(Bytes, 'scan', [MakeValueI32(0), MakeValueI32(4)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe(OOB);
+end;
+
+procedure TJitTests.TestPinnedMemoryTrapKeepsPriorStores;
+var
+  T1, T2, T3: UInt32;
+begin
+  { Stores before the faulting access remain, and the straddling i32.store
+    at 65534 writes neither of its two in-bounds bytes. }
+  {$PUSH}
+  {$OVERFLOWCHECKS OFF}
+  {$RANGECHECKS OFF}
+  T1 := $5A5A5A5B;
+  T2 := T1 * 3 + $5A5A5A5B;
+  T3 := (T1 + T2) * 3 + $5A5A5A5B;
+  {$POP}
+  FBytes := PinnedWalkModuleBytes;
+  Expect<string>(RunCompiledOnStore('walk',
+    [MakeValueI32(65522), MakeValueI32(4)]))
+    .ToBe('out of bounds memory access');
+  Expect<string>(RunCompiledOnStore('peek', [MakeValueI32(65522)])).ToBe('');
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], 65522,
+    0, 4))^).ToBe(T1);
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], 65526,
+    0, 4))^).ToBe(T2);
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], 65530,
+    0, 4))^).ToBe(T3);
+  Expect<Byte>(PByte(FStore.MemAddressAt(FInstance.MemAddrs[0], 65534,
+    0, 1))^).ToBe(0);
+  Expect<Byte>(PByte(FStore.MemAddressAt(FInstance.MemAddrs[0], 65535,
+    0, 1))^).ToBe(0);
+end;
+
+procedure TJitTests.TestPinnedMemoryStoreThenLoad;
+begin
+  { The store/load pair at one varying address: every load observes the
+    value just stored, so run(n) is 0 + 1 + ... + (n - 1). }
+  Expect<Boolean>(DiffFresh(MemForwardModuleBytes, 'run',
+    [MakeValueI32(1000)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(499500);
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(MemForwardModuleBytes, 0)).ToBe(True);
+  {$ENDIF}
+  { With no pages the first store of the pair is already out of bounds. }
+  DiffFresh(MemForwardModuleBytes(0), 'run', [MakeValueI32(3)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+end;
+
+procedure TJitTests.TestMemory64LoopExplicitChecks;
+var
+  Bytes: TWasmBytes;
+begin
+  Bytes := Mem64LoopModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(False);
+  {$ENDIF}
+  { Sum of i*i for i < 100. }
+  Expect<Boolean>(DiffFresh(Bytes, 'sum', [MakeValueI64(100)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(328350);
+  { i = 8192 stores at 65536: one past the end. }
+  DiffFresh(Bytes, 'sum', [MakeValueI64(8193)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+end;
+
 procedure TJitTests.TestMemorySizeGrow;
 begin
   { size returns the initial page count; grow returns the OLD size (1) then
@@ -5509,6 +6136,20 @@ begin
   Test('out-of-bounds memory access traps identically', TestMemoryOobTraps);
   Test('memory64 maximum offset compiles and traps identically',
     TestMemory64MaxOffset);
+  Test('base-pinned loops load every narrow width and sign',
+    TestPinnedMemoryNarrowLoads);
+  Test('base-pinned loops store every width at unaligned addresses',
+    TestPinnedMemoryStoreWidths);
+  Test('base-pinned loops reach the exact end and trap one past it',
+    TestPinnedMemoryExactEnd);
+  Test('base-pinned out-of-bounds loads and stores trap identically',
+    TestPinnedMemoryOobTraps);
+  Test('a base-pinned trap keeps prior stores and writes no partial store',
+    TestPinnedMemoryTrapKeepsPriorStores);
+  Test('a base-pinned store then load of one address',
+    TestPinnedMemoryStoreThenLoad);
+  Test('memory64 loops keep explicit checks',
+    TestMemory64LoopExplicitChecks);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);
   Test('memory.fill/copy match the interpreter', TestMemoryFillCopy);
   Test('memory.init/data.drop match the interpreter', TestMemoryInitDrop);
