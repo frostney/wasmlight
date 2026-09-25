@@ -187,7 +187,10 @@ type
     { Allocate the page-rounded executable region, copy the stage into it under
       the platform W^X transition, flush the I-cache where required, and mark
       the buffer executable. Raises EWasmError on an unsupported target or an
-      allocation failure. Idempotent: a second call is a no-op. }
+      allocation failure. Idempotent: a second call is a no-op. The region is
+      its own page-aligned mapping starting at stage offset 0, so a stage
+      offset's alignment is its address alignment (x64 loop-head placement
+      relies on this). }
     procedure MakeExecutable;
 
     { The callable entry pointer (the base of the executable region), or nil

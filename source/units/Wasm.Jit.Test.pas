@@ -63,6 +63,7 @@ uses
   Wasm.Ir,
   Wasm.Jit,
   Wasm.Jit.Arm64,
+  Wasm.Jit.X64,
   Wasm.Module,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
@@ -2057,6 +2058,7 @@ type
     procedure TestSelect;
     procedure TestNestedIf;
     procedure TestLoopSum;
+    procedure TestLoopHeadAlignment;
     procedure TestScalarLoopCarriedCache;
     procedure TestBrTable;
     procedure TestUnreachable;
@@ -2957,6 +2959,182 @@ begin
   { Many back-edges -> the epoch check runs 100 times and never false-trips. }
   DiffModule(OneFunc(BLit([$60, $01, $7F, $01, $7F]), Body, 'sum'), 'sum',
     [MakeValueI32(100)]);
+end;
+
+{ Nested loops after APrelude copies of `acc += 1`, so the loop heads start
+  from a different unpadded offset for each prelude length. With ACall the
+  inner body calls an identity function: the generic call-bearing frame
+  rather than the static register cache. run(n) returns OracleLoopHeads. }
+function LoopHeadModuleBytes(const APrelude: Integer;
+  const ACall: Boolean): TWasmBytes;
+var
+  Body, Prelude, CallOps: TWasmBytes;
+  I: Integer;
+begin
+  Prelude := nil;
+  for I := 1 to APrelude do
+    Prelude := Cat([Prelude, BLit([$20, $01, $41, $01, $6A, $21, $01])]);
+  if ACall then
+    CallOps := BLit([$20, $01, $10, $01, $21, $01])   { acc := id(acc) }
+  else
+    CallOps := nil;
+  Body := Cat([
+    BLit([$01, $03, $7F]),              { locals: acc, i, j }
+    Prelude,
+    BLit([$03, $40,                     { loop $outer }
+      $41, $03, $21, $03,               { j := 3 }
+      $03, $40,                         { loop $inner }
+      $20, $01, $41, $03, $6C, $20, $02, $6A, $20, $03, $6A, $21, $01]),
+    CallOps,                            { acc := acc*3 + i + j }
+    BLit([$20, $03, $41, $01, $6B, $22, $03, $0D, $00, { while --j <> 0 }
+      $0B,
+      $20, $02, $41, $01, $6A, $22, $02, $20, $00, $49, $0D, $00, { i < n }
+      $0B,
+      $20, $01, $0B])]);
+  Result := Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([BLit([$60, $01, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$00]), BLit([$00])])),
+    Sect(7, VecOf([ExportEntry('run', $00, 0)])),
+    Sect(10, VecOf([CodeEntry(Body), CodeEntry(BLit([$00, $20, $00, $0B]))]))
+  ]);
+end;
+
+function OracleLoopHeads(const AN: UInt32; const APrelude: Integer): UInt32;
+var
+  I, J: UInt32;
+begin
+  {$PUSH}
+  {$OVERFLOWCHECKS OFF}
+  {$RANGECHECKS OFF}
+  Result := UInt32(APrelude);
+  I := 0;
+  repeat
+    J := 3;
+    repeat
+      Result := Result * 3 + I + J;
+      Dec(J);
+    until J = 0;
+    Inc(I);
+  until I >= AN;
+  {$POP}
+end;
+
+{$IFDEF WASM_JIT_X64}
+{ The NOP padding length ending at AHead, parsed backwards in the emitter's
+  shape: whole 9-byte forms, then one final form. A shorter form can be the
+  suffix of a longer one, so the longest parse wins. }
+function X64PadBefore(const ACode: TWasmBytes; const AHead: Integer): Integer;
+const
+  Forms: array[1 .. 9] of array[0 .. 8] of Byte = (
+    ($90, 0, 0, 0, 0, 0, 0, 0, 0),
+    ($66, $90, 0, 0, 0, 0, 0, 0, 0),
+    ($0F, $1F, $00, 0, 0, 0, 0, 0, 0),
+    ($0F, $1F, $40, $00, 0, 0, 0, 0, 0),
+    ($0F, $1F, $44, $00, $00, 0, 0, 0, 0),
+    ($66, $0F, $1F, $44, $00, $00, 0, 0, 0),
+    ($0F, $1F, $80, $00, $00, $00, $00, 0, 0),
+    ($0F, $1F, $84, $00, $00, $00, $00, $00, 0),
+    ($66, $0F, $1F, $84, $00, $00, $00, $00, $00));
+
+  function FormEndsAt(const AN, AEnd: Integer): Boolean;
+  var
+    K: Integer;
+  begin
+    Result := AEnd - AN >= 0;
+    if Result then
+      for K := 0 to AN - 1 do
+        if ACode[AEnd - AN + K] <> Forms[AN][K] then
+          Exit(False);
+  end;
+
+var
+  Tail, Len: Integer;
+begin
+  Result := 0;
+  for Tail := 1 to 9 do
+    if FormEndsAt(Tail, AHead) then
+    begin
+      Len := Tail;
+      while (Len + 9 <= 63) and FormEndsAt(9, AHead - Len) do
+        Inc(Len, 9);
+      if Len > Result then
+        Result := Len;
+    end;
+end;
+{$ENDIF}
+
+procedure TJitTests.TestLoopHeadAlignment;
+var
+  Bytes: TWasmBytes;
+  Prelude, Pass: Integer;
+  {$IFDEF WASM_JIT_X64}
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  I, Site, Target, Edges: Integer;
+  Pads: array[0 .. 63] of Boolean;
+  PadCount: Integer;
+  {$ENDIF}
+begin
+  {$IFDEF WASM_JIT_X64}
+  for I := 0 to High(Pads) do
+    Pads[I] := False;
+  {$ENDIF}
+  for Pass := 0 to 1 do
+    for Prelude := 0 to 15 do
+    begin
+      Bytes := LoopHeadModuleBytes(Prelude, Pass = 1);
+      {$IFDEF WASM_JIT_X64}
+      { Every epoch back-edge (je rel32; mov edi,epoch-interrupt; call
+        [r15]) targets a head at offset 32 of a 64-byte block, behind it. }
+      Module := TWasmModule.Create;
+      Ir := nil;
+      try
+        DecodeModule(Bytes, Module);
+        Ir := ValidateModule(Module, Bytes);
+        Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+          RegisterCount);
+      finally
+        FreeAndNil(Ir);
+        FreeAndNil(Module);
+      end;
+      Edges := 0;
+      for Site := 0 to Length(Code) - 14 do
+        if (Code[Site] = $0F) and (Code[Site + 1] = $84) and
+          (Code[Site + 6] = $BF) and
+          (Code[Site + 7] = Byte(Ord(wtkEpochInterrupt))) and
+          (Code[Site + 11] = $41) and (Code[Site + 12] = $FF) and
+          (Code[Site + 13] = $17) then
+        begin
+          Target := Site + 6 + Integer(UInt32(Code[Site + 2]) or
+            (UInt32(Code[Site + 3]) shl 8) or
+            (UInt32(Code[Site + 4]) shl 16) or
+            (UInt32(Code[Site + 5]) shl 24));
+          Expect<Integer>(Target mod X64_LOOP_HEAD_ALIGN)
+            .ToBe(X64_LOOP_HEAD_OFFSET);
+          Expect<Boolean>((Target >= 0) and (Target < Site)).ToBe(True);
+          Pads[X64PadBefore(Code, Target)] := True;
+          Inc(Edges);
+        end;
+      Expect<Integer>(Edges).ToBe(2);
+      {$ENDIF}
+      Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(7)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+      Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+        .ToBe(OracleLoopHeads(7, Prelude));
+    end;
+  {$IFDEF WASM_JIT_X64}
+  { The preludes exercise a spread of padding lengths, not one lucky
+    layout. }
+  PadCount := 0;
+  for I := 0 to High(Pads) do
+    if Pads[I] then
+      Inc(PadCount);
+  Expect<Boolean>(PadCount >= 8).ToBe(True);
+  {$ENDIF}
 end;
 
 procedure TJitTests.TestScalarLoopCarriedCache;
@@ -6337,6 +6515,8 @@ begin
   Test('select matches the interpreter', TestSelect);
   Test('an if/else matches the interpreter', TestNestedIf);
   Test('a loop with a back-edge epoch safepoint matches', TestLoopSum);
+  Test('x64 loop heads are aligned and every back-edge still lands',
+    TestLoopHeadAlignment);
   Test('a scalar loop preserves dynamic carried values through branch joins',
     TestScalarLoopCarriedCache);
   Test('br_table matches the interpreter', TestBrTable);
