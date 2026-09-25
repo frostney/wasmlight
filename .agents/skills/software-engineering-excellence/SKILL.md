@@ -74,9 +74,14 @@ obtain a pass. Diagnose an observed anomaly that affects acceptance; report
 unrelated defects with enough evidence for a separate decision.
 
 Write regression tests for observable behavior or consequential invariants,
-with expectations derived from requirements. A correct refactor or equivalent
-instruction rewrite should not break them. Avoid copying implementation logic
-or asserting prose, private calls and source tokens as proof of behavior.
+with expectations derived from independent requirements or invariants. Do not
+write tautological tests: never derive expected results from the implementation
+under test or merely assert that a mock returns its configured value. Do not
+couple tests to implementation details. Precise output or interaction assertions
+are valid when they enforce a specified contract. A correct refactor or
+equivalent instruction rewrite should not break tests. Each test should catch
+a relevant incorrect behavior. Do not assert prose, private calls or source
+tokens as proof of behavior.
 Validate fixture preconditions so a failed setup cannot masquerade as a product
 failure. Keep structural/schema checks distinct from behavioral acceptance.
 
