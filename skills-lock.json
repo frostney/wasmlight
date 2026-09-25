@@ -17,7 +17,7 @@
       "source": "frostney/known-good-route",
       "sourceType": "github",
       "skillPath": "code-review/SKILL.md",
-      "computedHash": "6bd56ad75d3a55541700807421c6a5b0b3d889befe9960f3d5c5714092d427eb"
+      "computedHash": "6ac7d5fce38ea1a4c6e17e31dc65aaf8bd4064fbdd733d6f2e02ea99cb9ef3d0"
     },
     "codebase-audit": {
       "source": "frostney/known-good-route",
@@ -125,7 +125,7 @@
       "source": "frostney/known-good-route",
       "sourceType": "github",
       "skillPath": "software-engineering-excellence/SKILL.md",
-      "computedHash": "060d40908fe1f1081eae823a794a32d1d4df69b48b849de91bcee4d48b1640a8"
+      "computedHash": "82d6dbde5ca1bc08c8306f55347b197c7914624ef209e38bf148cb7cde605337"
     },
     "status-report": {
       "source": "frostney/known-good-route",

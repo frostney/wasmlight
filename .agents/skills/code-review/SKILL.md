@@ -238,6 +238,13 @@ Render every literal repository path, filename including extensionless files,
 variable, function, method, class, type, and other code identifier as inline
 code. Keep prose outside code spans.
 
+A remedy that tells the author how to update, commit, or publish the branch
+names the mechanism the repository documents, not a generic one. Check the
+project's git workflow first: where it forbids rebasing an ordinary branch,
+write "merge the base branch in", and reserve stack commands for branches in a
+confirmed stack. The same applies to review comments and pull request text
+posted from the report.
+
 `BLOCKING` prevents safe shipment. `IMPORTANT` has material correctness,
 security, operability, test-value, maintainability, simplification, or
 comprehension cost. `IMPROVEMENT` is a verified worthwhile simplification or
