@@ -1704,6 +1704,7 @@ var
   Seam: TWasmSeamCatch;
   IrFn: PWasmIrFunction;
   IrBase: PWasmIrInstr;
+  OwnDepth: NativeUInt;
 begin
   Ctx := InterpContextFor(AStore);
   { Fix A: one return/unwind kind for the whole chain (see the aarch64 twin). }
@@ -1736,6 +1737,8 @@ begin
 
     Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults, RetKind);
     JitMarkTopNative(Ctx);
+    { Depth with this invocation's own frame on top; fixed before SetJmp. }
+    OwnDepth := Ctx^.Depth;
     Pend^.Pending := False;
     Entry := TX64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
     { The freshly-decoded IR base @Fn^.Code[0] the body pins in rbp to compute
@@ -1761,7 +1764,13 @@ begin
       if Ctx^.Depth = 0 then
         JitRaiseUncaught(AStore, TWasmRef(Seam.ExnRef));
       if not Seam.Resume then
+      begin
+        { Direct calls this body made ran on the native stack the jump just
+          discarded; pop them so the unwind resumes at this invocation's own
+          frame instead of hopping past its handlers. }
+        JitDropDeadDirectFrames(Ctx, OwnDepth);
         UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
+      end;
       if (Ctx^.Depth > 0) and (Ctx^.Acts[Ctx^.Depth - 1].Fn = IrFn) then
       begin
         JitEhRequestResume;

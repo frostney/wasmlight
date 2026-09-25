@@ -302,6 +302,18 @@ procedure UnwindException(const ACtx: PWasmInterpContext; const AExn: TWasmRef;
   the frame; interpreted entry leaves Native False. }
 procedure JitMarkTopNative(const ACtx: PWasmInterpContext);
 
+{ For a compiled invocation's seam catch, AFTER the LongJmp landed on it and
+  BEFORE it re-enters UnwindException: pop every activation above the
+  invocation's own frame (AOwnDepth = Depth with that frame on top) that is a
+  direct compiled call (rtCaller + Native). Those frames ran on the native
+  stack the jump discarded, and a direct-callable body never has handlers
+  (JitCanDirectCall), so each pop is exactly UnwindException's no-match pop.
+  Without it the unwind would treat the first such frame as a live native
+  barrier and hop PAST this invocation's own handlers. Stops at the first
+  frame of any other kind. }
+procedure JitDropDeadDirectFrames(const ACtx: PWasmInterpContext;
+  const AOwnDepth: NativeUInt);
+
 { Publish the compiled caller's resume IP (call-site + 1) so UnwindException
   scans the call instruction (eh-spec §2.3). cdecl for the helper table. }
 procedure JitPublishIp(const AStore: TWasmStore; const AIp: PtrUInt); cdecl;
@@ -1771,6 +1783,23 @@ end;
 procedure JitMarkTopNative(const ACtx: PWasmInterpContext);
 begin
   ACtx^.Acts[ACtx^.Depth - 1].Native := True;
+end;
+
+procedure JitDropDeadDirectFrames(const ACtx: PWasmInterpContext;
+  const AOwnDepth: NativeUInt);
+var
+  Top: PWasmActivation;
+begin
+  while ACtx^.Depth > AOwnDepth do
+  begin
+    Top := @ACtx^.Acts[ACtx^.Depth - 1];
+    if (Top^.RetKind <> rtCaller) or not Top^.Native or
+      (Length(Top^.Fn^.Handlers) > 0) then
+      Exit;
+    ACtx^.Store.Heap.PopFrame;
+    ACtx^.ValueTop := Top^.Base;
+    Dec(ACtx^.Depth);
+  end;
 end;
 
 procedure JitPublishIp(const AStore: TWasmStore; const AIp: PtrUInt); cdecl;

@@ -2117,6 +2117,7 @@ type
     procedure TestCompiledUncaughtThrow;
     procedure TestCompiledThrowRefNull;
     procedure TestNestedCompiledFramesCatch;
+    procedure TestThrowThroughNestedDirectCalls;
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
@@ -6130,6 +6131,95 @@ begin
     [MakeValueI32(3)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+procedure TJitTests.TestThrowThroughNestedDirectCalls;
+var
+  Bytes: TWasmBytes;
+begin
+  { $mid and $mid2 (3 parameters, no handler, no throw) are entered as direct
+    compiled calls (rtCaller + Native frames); $mid calls the throwing
+    $thrower through the helper path. The exception must unwind through one
+    or two direct-call frames to a compiled try_table (caught: payload 5), or
+    out of the invocation (uncaught). With two nested direct frames the seam
+    catch used to treat the already-abandoned outer one as a live native
+    barrier and hop PAST the catching function's own handler (uncaught).
+    Each catching function first makes a non-throwing call OUTSIDE its
+    try_table, so a call site that failed to publish its own resume IP would
+    leave a stale IP outside the handler range. Expected: caught = 6 +
+    (x ? 5 : 6 + 1000), outer = 12 + (x ? 5 : 12 + 1000), outer3 = 112 +
+    (x ? 5 : 112 + 1000). }
+  Bytes := AssembleWatText('(module (tag $e (param i32)) ' +
+    '(func $thrower (export "thrower") (param $v i32) ' +
+    '(throw $e (local.get $v))) ' +
+    '(func $mid (export "mid") (param $v i32) (param $w i64) (param $x i32) ' +
+    '(result i32) ' +
+    '(if (local.get $x) (then (call $thrower (local.get $v)))) ' +
+    '(i32.add (local.get $v) (i32.const 1))) ' +
+    '(func $mid2 (export "mid2") (param $v i32) (param $w i64) ' +
+    '(param $x i32) (result i32) ' +
+    '(i32.mul (call $mid (local.get $v) (local.get $w) (local.get $x)) ' +
+    '(i32.const 2))) ' +
+    '(func (export "caught") (param $v i32) (param $x i32) (result i32) ' +
+    '(local $pre i32) ' +
+    '(local.set $pre (call $mid (local.get $v) (i64.const 0) (i32.const 0))) ' +
+    '(i32.add (local.get $pre) (block $h (result i32) ' +
+    '(try_table (result i32) (catch $e $h) ' +
+    '(i32.add (call $mid (local.get $v) (i64.const 0) (local.get $x)) ' +
+    '(i32.const 1000)))))) ' +
+    '(func (export "outer") (param $v i32) (param $x i32) (result i32) ' +
+    '(local $pre i32) ' +
+    '(local.set $pre (call $mid2 (local.get $v) (i64.const 0) ' +
+    '(i32.const 0))) ' +
+    '(i32.add (local.get $pre) (block $h (result i32) ' +
+    '(try_table (result i32) (catch $e $h) ' +
+    '(i32.add (call $mid2 (local.get $v) (i64.const 0) (local.get $x)) ' +
+    '(i32.const 1000)))))) ' +
+    '(func (export "uncaught") (param $v i32) (result i32) ' +
+    '(call $mid (local.get $v) (i64.const 0) (i32.const 1))) ' +
+    '(type $t3 (func (param i32 i64 i32) (result i32))) ' +
+    '(table 1 funcref) (elem (i32.const 0) $mid2) ' +
+    '(func $via (export "via") (param $v i32) (param $w i64) (param $x i32) ' +
+    '(result i32) ' +
+    '(i32.add (call_indirect (type $t3) (local.get $v) (local.get $w) ' +
+    '(local.get $x) (i32.const 0)) (i32.const 100))) ' +
+    '(func (export "outer3") (param $v i32) (param $x i32) (result i32) ' +
+    '(local $pre i32) ' +
+    '(local.set $pre (call $via (local.get $v) (i64.const 0) (i32.const 0))) ' +
+    '(i32.add (local.get $pre) (block $h (result i32) ' +
+    '(try_table (result i32) (catch $e $h) ' +
+    '(i32.add (call $via (local.get $v) (i64.const 0) (local.get $x)) ' +
+    '(i32.const 1000)))))))');
+  CompileExports(['thrower', 'mid', 'mid2', 'caught', 'outer', 'uncaught',
+    'via', 'outer3']);
+  Expect<Boolean>(DiffFresh(Bytes, 'caught',
+    [MakeValueI32(5), MakeValueI32(1)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(FDiffJitOut.Trapped or FDiffJitOut.Exceptional).ToBe(False);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(11);
+  Expect<Boolean>(DiffFresh(Bytes, 'caught',
+    [MakeValueI32(5), MakeValueI32(0)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1012);
+  Expect<Boolean>(DiffFresh(Bytes, 'outer',
+    [MakeValueI32(5), MakeValueI32(1)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(FDiffJitOut.Trapped or FDiffJitOut.Exceptional).ToBe(False);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(17);
+  Expect<Boolean>(DiffFresh(Bytes, 'outer',
+    [MakeValueI32(5), MakeValueI32(0)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1024);
+  { outer3 -> via (inline) -> mid2 (call_indirect: a seam of its own) -> mid
+    (inline) -> thrower: dead inline frames on both sides of a live seam. }
+  Expect<Boolean>(DiffFresh(Bytes, 'outer3',
+    [MakeValueI32(5), MakeValueI32(1)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(FDiffJitOut.Trapped or FDiffJitOut.Exceptional).ToBe(False);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(117);
+  Expect<Boolean>(DiffFresh(Bytes, 'outer3',
+    [MakeValueI32(5), MakeValueI32(0)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1224);
+  Expect<Boolean>(DiffModule(Bytes, 'uncaught', [MakeValueI32(5)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'uncaught', [MakeValueI32(5)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(FDiffJitOut.Exceptional).ToBe(True);
+end;
+
 { --- Wave 6: v128 SIMD via the leaves ----------------------------------- }
 
 const
@@ -6415,6 +6505,8 @@ begin
     TestCompiledThrowRefNull);
   Test('a throw across nested compiled frames is caught identically',
     TestNestedCompiledFramesCatch);
+  Test('exceptions unwind through nested direct-call frames identically',
+    TestThrowThroughNestedDirectCalls);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
   Test('a forwarded memory load keeps the store memory effect',
