@@ -122,10 +122,37 @@ class ConformanceGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("aot: non-core output differs from interp", result.stderr)
 
+    def test_non_core_divergence_is_located_and_passing_runs_stay_quiet(self):
+        diverged = NESTED.replace("outside.wast:3", "outside.wast:4")
+        result = self.run_gate(tiers=("interp", "jit"), nested={"jit": diverged})
+        self.assertIn("-FAIL proposals/outside.wast:3 assert_return", result.stderr)
+        self.assertIn("+FAIL proposals/outside.wast:4 assert_return", result.stderr)
+        quiet = self.run_gate(tiers=("interp", "jit"))
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertNotIn("FAIL proposals/", quiet.stdout)
+        self.assertEqual(quiet.stdout.count("TOTAL files=1 "), 2)
+
     def test_non_core_exit_status_divergence_fails(self):
         result = self.run_gate(tiers=("interp", "jit"), nested_status={"jit": 0})
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exit status: interp=1 jit=0", result.stderr)
         self.assertIn("jit: non-core output differs from interp", result.stderr)
+
+    def test_a_tier_that_crashes_before_its_tally_shows_where(self):
+        crashed = "FAIL proposals/outside.wast:9 crashed-here"
+        result = self.run_gate(tiers=("interp", "jit"), nested={"jit": crashed},
+                               nested_status={"jit": 139})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("jit: exit status 139; last output:", result.stderr)
+        self.assertIn(crashed, result.stderr)
+        self.assertIn("jit: expected exactly one TOTAL tally", result.stderr)
+
+    def test_a_long_divergence_is_truncated_visibly(self):
+        long = "\n".join(f"FAIL proposals/outside.wast:{n} x" for n in range(300))
+        result = self.run_gate(tiers=("interp", "jit"),
+                               nested={"jit": long + "\n" + NESTED.splitlines()[1]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r"\.\.\. \d+ more diff lines")
 
     def test_missing_non_core_scripts_fail_the_identity_check(self):
         (self.root / "proposals" / "outside.wast").unlink()
