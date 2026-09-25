@@ -1,30 +1,47 @@
 # Handoff
 
-## Stack #125 status and skill refresh, 2026-09-25
+## Stack #125 review and fix layers, 2026-09-25
 
-- Native stack #125 is now 8 layers: #117 ← #119 ← #120 ← #121 ← #122 ←
-  #124 ← #118 ← **#126**. None is behind `main` (`aef1e9c`); every layer is
-  non-draft, `CLEAN`, and green on its current head. Merge with
-  `gh stack merge --squash`, never layer by layer.
-- #126 refreshes `code-review` (KGR #66) and
-  `software-engineering-excellence` (KGR #65) to KGR
-  `946dc1ecc7cacd62caecfe67ab1a55d109a9154d` via pinned `skills@1.5.23`;
-  payloads byte-match upstream and a second update is a no-op. Lower layers
-  were not rewritten. KGR skills not installed are stack-specific
-  (convex/react/typescript) or optional (agent-behavior-audit, bleeding-edge).
-- **Blocker, still open:** DEFINITION_OF_DONE requires completed, triaged
-  external review before merge. No layer has any review, no reviewer is
-  requested, and no review provider is configured. The 2026-09-22 question
-  of which reviewer/provider to use is unanswered. Do not merge until it is.
-- Tooling now installed on this machine: nvm v0.40.8 + Node v24.21.0 LTS
-  (default; loaded from `~/.bashrc`), `gh stack` extension, `lwpt` 0.7.0
-  (`frostney/tap`), `lefthook` 2.1.14 (hooks installed). The `wasm` MCP
-  server starts via `npx`; T3 Code must be restarted to pick up the PATH.
-- Remote branches with no PR: `codex/optimize-runtime-wave16` (28 ahead),
-  `codex/validate-wave16-core` (20), `codex/validate-wave17-core` (1); last
-  commits 2026-09-05. Intent unconfirmed. Five other `codex/*` branches belong
-  to merged PRs and can be deleted.
+- The user waived an outside reviewer: four parallel subagent reviews count
+  as the external review for stack #125. They reviewed every layer at its exact
+  head: #117/#120/#121/#126 approved with nits; #119, #122, #124, #118 had
+  changes requested. All verified findings are fixed in three new top layers
+  (lower layers untouched):
+  - `fix/stack-125-runtime-review`: hub teardown keeps other hubs' queued
+    notes in order; `run` applies the `_start: () -> ()` check before start;
+    scoped/teardown tests use distinct functions so dedup cannot mask leaks;
+    JIT differential tests for multi-field `struct.new` and
+    `array.new_data` range-before-allocation. Each test was mutation-checked.
+  - `ci/stack-125-gate-review`: `check.py` requires `tier=<requested>`,
+    `compiled>0` for JIT/AOT and `0` for interp, and byte-identical non-core
+    output across tiers (restores cross-tier identity for the 31 non-core
+    scripts). Real run: 65,188 in all tiers; non-core identical.
+  - `docs/stack-125-review`: VISION no longer calls ADR-0015 "planned";
+    `docs/tooling.md` pins `skills@1.5.23`; AGENTS/architecture list
+    `Wasm.Jit.Runtime` and `Wasm.Jit.Vector`.
+- Declined: store `CheckThread` raising `EWasmError` from `Unbind` (the
+  store-wide debug-only ADR-0008 assertion; architecture's "off-thread
+  rejects" means thunk invocation, which already raises
+  `EWasmCallbackError`); the `ReleaseSlot` filter test gap (defense in depth,
+  queue not observable).
+- Local gate: 62/63 suites; `Wasm.Native.Call.Test` needs `clang`, which
+  this host lacks (CI has it; fails identically on the base).
+- #126 refreshed `code-review` and `software-engineering-excellence` to KGR
+  `946dc1ecc7cacd62caecfe67ab1a55d109a9154d` via pinned `skills@1.5.23`.
+- Tooling on this machine: nvm v0.40.8 + Node v24.21.0 LTS (default, from
+  `~/.bashrc`), `gh stack`, `lwpt` 0.7.0 (`frostney/tap`), `lefthook` 2.1.14
+  (hooks installed). The `wasm` MCP server needs a T3 Code restart.
+- Five merged-PR `codex/*` branches were deleted (each at its merged head).
+  Kept, unmerged, no PR: `codex/optimize-runtime-wave16` (28 commits of
+  wave 16/17 JIT optimizations), `codex/validate-wave16-core`,
+  `codex/validate-wave17-core`. They need a decision: deliver or drop.
 - #46 (0.2.0 cross-target gates, archives, Homebrew) remains open.
+- A fifth subagent review approved the fix layers #127–#129 with nits; those
+  nits are fixed in #129 and a top gate-diagnostics layer.
+- Next: once every layer's current-head CI is green, merge all layers
+  atomically with `gh stack merge --squash` (never layer by layer, never a
+  prefix below a fix layer), then sync `main` and delete the merged
+  branches. Then decide the wave 16/17 branches.
 
 ## Skills migration and audit remediation, 2026-09-22
 
