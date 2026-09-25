@@ -1718,6 +1718,8 @@ type
     procedure TestInlineCallCacheWideLiveTemporary;
     procedure TestInlineResultCopiesAndAuxUses;
     procedure TestAdjacentMoveRetainsCallArgument;
+    procedure TestTeeArgumentThroughCompiledLeaf;
+    procedure TestTeeInStaticCacheLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
@@ -3521,6 +3523,61 @@ begin
   {$ENDIF}
 end;
 
+procedure TJitTests.TestTeeArgumentThroughCompiledLeaf;
+var
+  Bytes: TWasmBytes;
+begin
+  { The adjacent-move regression shape, but with the callee exported and
+    compiled too, so a backend that routes proven scalar leaves through a
+    native entry (x64 r8/r9) rather than an inlined body takes that path.
+    local.tee's result is both the local's new value and the second call
+    argument; the next call reverses the cached index/accumulator order. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $leaf (export "leaf") (param i64 i64) (result i64) ' +
+    '(i64.sub (local.get 0) (local.get 1))) ' +
+    '(func (export "run") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) (local $seen i64) ' +
+    '(local.set $acc (i64.const 8589934595)) ' +
+    '(loop $again ' +
+    '(local.set $seen (i64.add (local.get $seen) ' +
+    '(call $leaf (local.get $acc) ' +
+    '(local.tee $acc (i64.add (local.get $acc) (i64.const 4294967297)))))) ' +
+    '(local.set $acc (call $leaf (local.get $i) (local.get $acc))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $again (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.add (local.get $seen) (local.get $acc))))');
+  CompileExports(['run', 'leaf']);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(3)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestTeeInStaticCacheLoop;
+var
+  Bytes: TWasmBytes;
+begin
+  { The same data flow with the leaf manually inlined: a call-free loop is
+    static-cache eligible on every backend, so the shared adjacent-move fold
+    runs. The tee'd sum feeds its local and a later subtraction operand. }
+  Bytes := AssembleWatText('(module ' +
+    '(func (export "run") (param $n i64) (result i64) ' +
+    '(local $i i64) (local $acc i64) (local $seen i64) ' +
+    '(local.set $acc (i64.const 8589934595)) ' +
+    '(loop $again ' +
+    '(local.set $seen (i64.add (local.get $seen) ' +
+    '(i64.sub (local.get $acc) ' +
+    '(local.tee $acc (i64.add (local.get $acc) (i64.const 4294967297)))))) ' +
+    '(local.set $acc (i64.sub (local.get $i) (local.get $acc))) ' +
+    '(local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '(br_if $again (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.add (local.get $seen) (local.get $acc))))');
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(3)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI64(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
 var
   Bytes: TWasmBytes;
@@ -4727,6 +4784,10 @@ procedure TJitTests.SetupTests;
 begin
   Test('adjacent result moves retain call argument snapshots',
     TestAdjacentMoveRetainsCallArgument);
+  Test('a tee argument survives a compiled native leaf call',
+    TestTeeArgumentThroughCompiledLeaf);
+  Test('a tee in a static-cache loop keeps both uses',
+    TestTeeInStaticCacheLoop);
   Test('native return retains a value across dropped computations',
     TestNativeResultAcrossDroppedComputations);
   Test('inline results preserve external slots and aux-list uses',
