@@ -243,7 +243,13 @@ and for a selected connector that cannot be read. `EWasmCallbackError`
 (`Wasm.Connector.Callbacks`) is a further sibling for thunk bind and
 dispatch contract failures (shape, off-thread, exhausted slots). A guest
 trap, `throw`, or `proc_exit` that occurs inside a callback keeps its own
-class and is only rethrown on Pascal ground. `Wasm.Compile` adds two
+class and is only rethrown on Pascal ground. Native callers must unregister
+callbacks and wait for their calls to finish before ending their binding or hub
+lifetime. Released pointers may be reused; queued notifications retain their
+original binding identity and are cancelled on release
+([ADR-0017](adr/0017-callback-callers-own-pointer-lifetimes.md)).
+
+`Wasm.Compile` adds two
 further compile-surface siblings under `EWasmError`: `EWasmCompileError`
 (strict compile declined or is not available) and `EWasmPackagingError`
 (target or runtime-shell packaging). They are not guest faults and are
