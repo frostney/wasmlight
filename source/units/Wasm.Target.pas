@@ -74,7 +74,7 @@ const
   { Must stay equal to AOT_ABI_REVISION in Wasm.Interp. Identity fields
     are folded in addition to this revision, so two OS descriptors of the
     same arch do not share a fingerprint. }
-  WASM_TARGET_ABI_REVISION = UInt32(16);
+  WASM_TARGET_ABI_REVISION = UInt32(17);
 
   WASM_TARGET_POINTER_SIZE = Byte(8);
   WASM_TARGET_PAGE_SIZE_4K = UInt32(4096);
@@ -143,6 +143,8 @@ type
     StoreFHeap: UInt64;
     StoreTierContext: UInt64;
     InstEngineTypeIds: UInt64;
+    StoreMemories: UInt64;
+    InstMemAddrs: UInt64;
     HeapFFree0: UInt64;
     HeapMarkState: UInt64;
     HeapBytesLive: UInt64;
@@ -170,6 +172,7 @@ type
     ActRetCount: UInt64;
     ActRetBase: UInt64;
     ActEntryResults: UInt64;
+    ActNative: UInt64;
     GcFramePrev: UInt64;
     GcFrameSlots: UInt64;
     GcFrameRefRegBits: UInt64;
@@ -364,6 +367,8 @@ begin
   Result.StoreFHeap := 24;
   Result.StoreTierContext := 168;
   Result.InstEngineTypeIds := 88;
+  Result.StoreMemories := 64;
+  Result.InstMemAddrs := 48;
   Result.HeapFFree0 := 48;
   Result.HeapMarkState := 264;
   Result.HeapBytesLive := 280;
@@ -391,6 +396,7 @@ begin
   Result.ActRetCount := 96;
   Result.ActRetBase := 104;
   Result.ActEntryResults := 112;
+  Result.ActNative := 120;
   Result.GcFramePrev := 0;
   Result.GcFrameSlots := 8;
   Result.GcFrameRefRegBits := 16;
@@ -502,6 +508,8 @@ begin
   Fold(AAbi.Layout.StoreFHeap);
   Fold(AAbi.Layout.StoreTierContext);
   Fold(AAbi.Layout.InstEngineTypeIds);
+  Fold(AAbi.Layout.StoreMemories);
+  Fold(AAbi.Layout.InstMemAddrs);
   Fold(AAbi.Layout.HeapFFree0);
   Fold(AAbi.Layout.HeapMarkState);
   Fold(AAbi.Layout.HeapBytesLive);
@@ -530,6 +538,7 @@ begin
   Fold(AAbi.Layout.ActRetCount);
   Fold(AAbi.Layout.ActRetBase);
   Fold(AAbi.Layout.ActEntryResults);
+  Fold(AAbi.Layout.ActNative);
   Fold(AAbi.Layout.GcFramePrev);
   Fold(AAbi.Layout.GcFrameSlots);
   Fold(AAbi.Layout.GcFrameRefRegBits);

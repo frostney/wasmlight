@@ -137,6 +137,23 @@ type
   TX64GcShapeArray = array[0..$FFFFFF] of UInt64;
   PX64GcShapeArray = ^TX64GcShapeArray;
 
+  { The validated layout of a direct call's target when that target is a
+    DEFINED function of the module being compiled: its body is fixed by the
+    module the code (and any AOT artifact, bound by module hash) is built
+    from, so the call site may bake the callee's register-file shape. ArgRegs
+    and ResultRegs map each FLAT slot of the call's dense argument/result
+    blocks to the callee's padded register (a v128 occupies two consecutive
+    entries); ZeroRegs is the callee's EntryZeroRegs. The live function
+    instance, its compiled direct entry, and every pointer are still resolved
+    at run time. }
+  TX64DirectCallee = record
+    RegisterCount: UInt32;
+    ArgRegs: TWasmIrAuxU32;
+    ResultRegs: TWasmIrAuxU32;
+    ZeroRegs: TWasmIrAuxU32;
+  end;
+  PX64DirectCallee = ^TX64DirectCallee;
+
 const
   { --- x86-64 register numbers (SDM Vol. 2 Table 2-2) --------------------- }
   X64_RAX = 0;
@@ -405,7 +422,8 @@ function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32;
   const ARetainContext: Boolean = False;
-  const AUseNativeScalarCall: Boolean = False): Boolean;
+  const AUseNativeScalarCall: Boolean = False;
+  const ADirectCallee: PX64DirectCallee = nil): Boolean;
 procedure X64InitRegCache(out ACache: TX64RegCache);
 procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
   const AParamCount, AParam0Slot, AParam1Slot: UInt32;
@@ -444,7 +462,8 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
-  const AGcShapes: PX64GcShapeArray): Boolean; overload;
+  const AGcShapes: PX64GcShapeArray;
+  const ADirectCallee: PX64DirectCallee = nil): Boolean; overload;
 { Numeric struct field access with a validated baked byte offset. Null refs
   trap before the load; reference and vector fields never receive a shape. }
 procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
@@ -765,7 +784,8 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
-  const AGcShapes: PX64GcShapeArray): Boolean;
+  const AGcShapes: PX64GcShapeArray;
+  const ADirectCallee: PX64DirectCallee): Boolean;
 var
   Host: Byte;
   Moved: Boolean;
@@ -860,7 +880,7 @@ begin
         X64FlushDynamicRegCache(ABuf, ACache);
         X64InvalidateRegCache(ACache);
         Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
-          AUseNativeScalarCall);
+          AUseNativeScalarCall, ADirectCallee);
       end;
     iroReturn:
       begin
@@ -3079,14 +3099,74 @@ begin
     Int32(AHelperTableOffset));
 end;
 
+{ mov byte/dword/qword [ABase + ADisp], imm (C6 /0 ib, C7 /0 id, REX.W C7 /0
+  id — the qword form sign-extends its imm32; callers pass 0 or 1 only). }
+procedure X64EmitStoreMemImm(const ABuf: TWasmCodeBuffer; const AWidth: Byte;
+  const ABase: Byte; const ADisp: Int32; const AImm: UInt32);
+begin
+  if AWidth = 8 then
+    X64EmitRex(ABuf, 1, 0, 0, ABase shr 3)
+  else
+    X64EmitRex(ABuf, 0, 0, 0, ABase shr 3);
+  if AWidth = 1 then
+    ABuf.EmitByte($C6)
+  else
+    ABuf.EmitByte($C7);
+  EmitMemOperand(ABuf, 0, ABase, ADisp);
+  if AWidth = 1 then
+    ABuf.EmitByte(Byte(AImm))
+  else
+    ABuf.EmitU32(AImm);
+end;
+
+{ op r64, [ABase + ADisp] for the two-operand r, r/m forms: 03 (ADD) and 3B
+  (CMP). }
+procedure X64EmitAluRegMem(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
+  const AReg, ABase: Byte; const ADisp: Int32);
+begin
+  X64EmitRex(ABuf, 1, AReg shr 3, 0, ABase shr 3);
+  ABuf.EmitByte(AOpcode);
+  EmitMemOperand(ABuf, AReg, ABase, ADisp);
+end;
+
+{ imul r64, r/m64, imm32 = REX.W 69 /r id. }
+procedure X64EmitImulImm32(const ABuf: TWasmCodeBuffer;
+  const ADst, ASrc: Byte; const AImm: UInt32);
+begin
+  X64EmitRex(ABuf, 1, ADst shr 3, 0, ASrc shr 3);
+  ABuf.EmitByte($69);
+  EmitModRMReg(ABuf, ADst, ASrc);
+  ABuf.EmitU32(AImm);
+end;
+
 procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
   const AMemoryIndex: UInt32; const APinBase: Boolean);
 var
   Layout: TWasmMemoryInst;
+  FO: TWasmJitFrameOffsets;
+  AO: TWasmJitStoreAllocOffsets;
 begin
-  X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
-  X64EmitMovRegImm32(ABuf, X64_ARG1, AMemoryIndex);
-  X64EmitCallHelper(ABuf, aohResolveMemory);
+  { X64ResolveMemory inline, at the prologue's one resolution point:
+    Store.FMemories[Acts[Depth-1].Instance.MemAddrs[AMemoryIndex]]. The top
+    activation is this function's own frame, published by whichever path
+    entered it (InvokeCompiled, the direct-call fast path or the helper
+    prepare, or an EH resume). The result is the same PWasmMemoryInst
+    JitMemoryAt returns; the instance addresses a validated memory index, so
+    its store address is always in range. Every access still reads the live
+    Base/ByteSize through the checked templates. rax/rcx are scratch here. }
+  FO := WasmJitFrameOffsets;
+  AO := WasmJitStoreAllocOffsets;
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_STORE, Int32(AO.TierContextOffset));
+  X64EmitLoadMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
+  X64EmitImulImm32(ABuf, X64_RCX, X64_RCX, UInt32(FO.ActStride));
+  X64EmitAluRegMem(ABuf, $03, X64_RCX, X64_RAX, Int32(FO.CtxActs));
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_RCX,
+    Int32(FO.ActInstance) - Int32(FO.ActStride));
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_RAX, Int32(AO.MemAddrsOffset));
+  X64EmitLoadMem32(ABuf, X64_RAX, X64_RAX, Int32(AMemoryIndex * 4));
+  X64EmitImulImm32(ABuf, X64_RAX, X64_RAX, UInt32(SizeOf(TWasmMemoryInst)));
+  X64EmitAluRegMem(ABuf, $03, X64_RAX, X64_REG_STORE,
+    Int32(AO.MemoriesOffset));
   X64EmitStoreMem64(ABuf, X64_RAX, X64_RSP, 0);
   if APinBase then
     X64EmitLoadMem64(ABuf, X64_REG_MEMBASE, X64_RAX,
@@ -3881,18 +3961,195 @@ begin
   X64EmitCallHelper(ABuf, aohTrapKind);
 end;
 
+{ The generic compiled->compiled direct call, entirely in generated code, for
+  a DEFINED callee (ADirectCallee, the driver's static layout plan) whose
+  compiled direct entry is live. It is JitPublishIp + JitPrepareDirectCall
+  (JitEnterResolvedFrame) + JitFinishDirectCall, field for field and in the
+  same order, with the flat marshal buffers elided:
+
+    1. publish the caller's resume IP (call site + 1) in Acts[Depth-1];
+    2. resolve caller funcidx -> store address -> the live TWasmFuncInst
+       through the caller activation's FuncAddrs and Store.Funcs; a nil
+       CompiledDirectEntry (not compiled, declined, handler-bearing, or a
+       throwing/tail-calling body) jumps to AFallback, the unchanged helper
+       path, before any state changes;
+    3. the exhaustion predicates on Depth/DepthCap and ValueTop +
+       RegisterCount/ValueCap, trapping wtkStackExhausted before any mutation;
+    4. carve the activation (Fn, Instance, FuncAddrs, IP 0, Base, rtCaller,
+       Native, RetDest/RetCount/RetBase 0, EntryResults nil), bump ValueTop,
+       zero EntryZeroRegs, copy each argument slot to its padded parameter
+       register, push the GC frame (published only after every slot it maps
+       is initialised), Inc(Depth);
+    5. call the entry with (regbase, store, IrBase, context) exactly as the
+       helper path does, so the callee's own prologue, epoch capture, memory
+       pin, and safepoints are unchanged;
+    6. on normal return copy each result register into the caller's
+       destination slot, unlink the GC frame, restore ValueTop, Dec(Depth).
+
+  A trap or a hop out of the callee (LongJmp to the invocation trampoline or
+  a seam catch) never reaches step 6; the activation it leaves is the one the
+  helper path leaves, so ResetInterpContext / UnwindException see identical
+  state. rdx (activation) and r8 (register-file base) are preserved across the
+  call on the native stack; two pushes keep the call 16-byte aligned. }
+procedure EmitGenericDirectCall(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; const ACallee: PX64DirectCallee;
+  const AFallback, ADone: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  AO: TWasmJitStoreAllocOffsets;
+  FuncLayout: TWasmFuncInst;
+  ActLayout: TWasmActivation;
+  FuncDirectEntry, FuncInstance, MetaFn, MetaIrBase, MetaFuncAddrs,
+    MetaRefRegBits: Int32;
+  Stride: Int32;
+  I: Integer;
+  Exhausted: TWasmJitLabel;
+begin
+  FO := WasmJitFrameOffsets;
+  AO := WasmJitStoreAllocOffsets;
+  FuncDirectEntry := Int32(PtrUInt(@FuncLayout.CompiledDirectEntry) -
+    PtrUInt(@FuncLayout));
+  FuncInstance := Int32(PtrUInt(@FuncLayout.Instance) - PtrUInt(@FuncLayout));
+  MetaFn := Int32(PtrUInt(@FuncLayout.DirectMeta.Fn) - PtrUInt(@FuncLayout));
+  MetaIrBase := Int32(PtrUInt(@FuncLayout.DirectMeta.IrBase) -
+    PtrUInt(@FuncLayout));
+  MetaFuncAddrs := Int32(PtrUInt(@FuncLayout.DirectMeta.FuncAddrs) -
+    PtrUInt(@FuncLayout));
+  MetaRefRegBits := Int32(PtrUInt(@FuncLayout.DirectMeta.RefRegBits) -
+    PtrUInt(@FuncLayout));
+  Stride := Int32(FO.ActStride);
+  Exhausted := ABuf.NewLabel;
+
+  { rax := context; rcx := Depth; rdx := @Acts[Depth] (the callee slot). }
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_STORE, Int32(AO.TierContextOffset));
+  X64EmitLoadMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
+  X64EmitImulImm32(ABuf, X64_RDX, X64_RCX, UInt32(Stride));
+  X64EmitAluRegMem(ABuf, $03, X64_RDX, X64_RAX, Int32(FO.CtxActs));
+  { 1. JitPublishIp: Acts[Depth-1].IP := call site + 1. }
+  X64EmitStoreMemImm(ABuf, 4, X64_RDX, Int32(FO.ActIP) - Stride,
+    AInsIndex + 1);
+  { 2. rsi := @Store.Funcs[caller.FuncAddrs[funcidx]]; r9 := direct entry. }
+  X64EmitLoadMem64(ABuf, X64_RSI, X64_RDX, Int32(FO.ActFuncAddrs) - Stride);
+  X64EmitLoadMem32(ABuf, X64_RSI, X64_RSI, Int32(UInt32(AIns.Imm) * 4));
+  X64EmitImulImm32(ABuf, X64_RSI, X64_RSI, UInt32(SizeOf(TWasmFuncInst)));
+  X64EmitLoadMem64(ABuf, X64_RDI, X64_RAX, Int32(FO.CtxFuncsSlot));
+  X64EmitAluRegMem(ABuf, $03, X64_RSI, X64_RDI, 0);
+  X64EmitLoadMem64(ABuf, X64_R9, X64_RSI, FuncDirectEntry);
+  X64EmitAluRegReg(ABuf, $85, True, X64_R9, X64_R9);
+  X64EmitJccTo(ABuf, X64_CC_E, UInt32(AFallback));
+
+  { 3. The two exhaustion predicates, before any mutation. }
+  X64EmitAluRegMem(ABuf, $3B, X64_RCX, X64_RAX, Int32(FO.CtxDepthCap));
+  X64EmitJccTo(ABuf, X64_CC_AE, UInt32(Exhausted));
+  X64EmitLoadMem64(ABuf, X64_RDI, X64_RAX, Int32(FO.CtxValueTop));
+  X64EmitLea(ABuf, X64_R8, X64_RDI, Int32(ACallee^.RegisterCount));
+  X64EmitAluRegMem(ABuf, $3B, X64_R8, X64_RAX, Int32(FO.CtxValueCap));
+  X64EmitJccTo(ABuf, X64_CC_A, UInt32(Exhausted));
+
+  { 4. Carve. rdi = Base (old ValueTop), r8 := @Values[Base]. }
+  X64EmitStoreMem64(ABuf, X64_R8, X64_RAX, Int32(FO.CtxValueTop));
+  X64EmitLoadMem64(ABuf, X64_R8, X64_RAX, Int32(FO.CtxValues));
+  X64EmitLeaIndexed(ABuf, X64_R8, X64_R8, X64_RDI, 3, 0);
+  X64EmitLoadMem64(ABuf, X64_R10, X64_RSI, MetaFn);
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RDX, Int32(FO.ActFn));
+  X64EmitLoadMem64(ABuf, X64_R11, X64_RSI, FuncInstance);
+  X64EmitStoreMem64(ABuf, X64_R11, X64_RDX, Int32(FO.ActInstance));
+  X64EmitLoadMem64(ABuf, X64_R10, X64_RSI, MetaFuncAddrs);
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RDX, Int32(FO.ActFuncAddrs));
+  X64EmitStoreMemImm(ABuf, 4, X64_RDX, Int32(FO.ActIP), 0);
+  X64EmitStoreMem64(ABuf, X64_RDI, X64_RDX, Int32(FO.ActBase));
+  { GC-1: default locals and reference slots are zero before publication. }
+  for I := 0 to High(ACallee^.ZeroRegs) do
+    X64EmitStoreMemImm(ABuf, 8, X64_R8,
+      Int32(ACallee^.ZeroRegs[I] * X64_SLOT_SIZE), 0);
+  { Arguments: caller dense block slot i -> callee padded register. }
+  for I := 0 to High(ACallee^.ArgRegs) do
+  begin
+    X64EmitLoadSlot64(ABuf, X64_R10, IrAuxBlockItem(AAux, AIns.A, UInt32(I)));
+    X64EmitStoreMem64(ABuf, X64_R10, X64_R8,
+      Int32(ACallee^.ArgRegs[I] * X64_SLOT_SIZE));
+  end;
+  X64EmitStoreMemImm(ABuf, SizeOf(ActLayout.RetKind), X64_RDX,
+    Int32(FO.ActRetKind), UInt32(Ord(rtCaller)));
+  X64EmitStoreMemImm(ABuf, SizeOf(ActLayout.Native), X64_RDX,
+    Int32(FO.ActNative), 1);
+  X64EmitStoreMemImm(ABuf, 4, X64_RDX, Int32(FO.ActRetCount), 0);
+  X64EmitStoreMemImm(ABuf, 8, X64_RDX, Int32(FO.ActRetDest), 0);
+  X64EmitStoreMemImm(ABuf, 8, X64_RDX, Int32(FO.ActRetBase), 0);
+  X64EmitStoreMemImm(ABuf, 8, X64_RDX, Int32(FO.ActEntryResults), 0);
+  { PushGcFrame: Prev := Heap.FFrames; Slots; RefRegBits; RegisterCount;
+    Instance; Heap.FFrames := @Act.GcFrame. }
+  X64EmitLoadMem64(ABuf, X64_RDI, X64_RAX, Int32(FO.CtxGcFrameSlot));
+  X64EmitLoadMem64(ABuf, X64_R10, X64_RDI, 0);
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RDX,
+    Int32(FO.ActGcFrame + FO.GcFramePrev));
+  X64EmitStoreMem64(ABuf, X64_R8, X64_RDX,
+    Int32(FO.ActGcFrame + FO.GcFrameSlots));
+  X64EmitLoadMem64(ABuf, X64_R10, X64_RSI, MetaRefRegBits);
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RDX,
+    Int32(FO.ActGcFrame + FO.GcFrameRefRegBits));
+  X64EmitStoreMemImm(ABuf, 4, X64_RDX,
+    Int32(FO.ActGcFrame + FO.GcFrameRegisterCount), ACallee^.RegisterCount);
+  X64EmitStoreMem64(ABuf, X64_R11, X64_RDX,
+    Int32(FO.ActGcFrame + FO.GcFrameInstance));
+  X64EmitLea(ABuf, X64_R10, X64_RDX, Int32(FO.ActGcFrame));
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RDI, 0);
+  X64EmitAluRegImm8(ABuf, 0, True, X64_RCX, 1);            { add rcx, 1 }
+  X64EmitStoreMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
+
+  { 5. entry(regbase, store, IrBase, context). }
+  X64EmitPushReg(ABuf, X64_RDX);
+  X64EmitPushReg(ABuf, X64_R8);
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RSI, MetaIrBase);
+  X64EmitMovRegReg(ABuf, X64_RDI, X64_R8);
+  X64EmitMovRegReg(ABuf, X64_RSI, X64_REG_STORE);
+  X64EmitMovRegReg(ABuf, X64_RCX, X64_RAX);
+  X64EmitCallReg(ABuf, X64_R9);
+  X64EmitPopReg(ABuf, X64_R8);
+  X64EmitPopReg(ABuf, X64_RDX);
+
+  { 6. Normal return only: results, then JitFinishDirectCall's pop. }
+  for I := 0 to High(ACallee^.ResultRegs) do
+  begin
+    X64EmitLoadMem64(ABuf, X64_R10, X64_R8,
+      Int32(ACallee^.ResultRegs[I] * X64_SLOT_SIZE));
+    X64EmitStoreSlot64(ABuf, X64_R10, IrAuxBlockItem(AAux, AIns.B, UInt32(I)));
+  end;
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_STORE, Int32(AO.TierContextOffset));
+  X64EmitLoadMem64(ABuf, X64_RDI, X64_RAX, Int32(FO.CtxGcFrameSlot));
+  X64EmitLoadMem64(ABuf, X64_R10, X64_RDX,
+    Int32(FO.ActGcFrame + FO.GcFramePrev));
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RDI, 0);
+  X64EmitLoadMem64(ABuf, X64_R10, X64_RDX, Int32(FO.ActBase));
+  X64EmitStoreMem64(ABuf, X64_R10, X64_RAX, Int32(FO.CtxValueTop));
+  X64EmitLoadMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
+  X64EmitAluRegImm8(ABuf, 5, True, X64_RCX, 1);            { sub rcx, 1 }
+  X64EmitStoreMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
+  X64EmitJmpTo(ABuf, UInt32(ADone));
+
+  ABuf.BindLabel(Exhausted);
+  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+end;
+
 procedure EmitCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32; const AInsIndex: UInt32;
-  const AUseNativeScalarCall: Boolean);
+  const AUseNativeScalarCall: Boolean;
+  const ADirectCallee: PX64DirectCallee);
 var
   ArgN, ResN, ArgBytes, ResBytes, StateOffset, FrameBytes: UInt32;
   FallbackLabel, DoneLabel, NativeFallback, NativeDone: TWasmJitLabel;
-  UseNativeLeaf: Boolean;
+  UseNativeLeaf, UseGenericDirect: Boolean;
 begin
   ArgN := IrAuxBlockCount(AAux, AIns.A);
   ResN := IrAuxBlockCount(AAux, AIns.B);
   UseNativeLeaf := AUseNativeScalarCall and (AIns.Op = iroCall) and
     (ArgN in [1, 2]) and (ResN = 1);
+  UseGenericDirect := not UseNativeLeaf and (AIns.Op = iroCall) and
+    (ADirectCallee <> nil) and
+    (UInt32(Length(ADirectCallee^.ArgRegs)) = ArgN) and
+    (UInt32(Length(ADirectCallee^.ResultRegs)) = ResN);
   NativeFallback := -1;
   NativeDone := -1;
   if UseNativeLeaf then
@@ -3900,6 +4157,16 @@ begin
     NativeFallback := ABuf.NewLabel;
     NativeDone := ABuf.NewLabel;
     EmitNativeScalarLeafDirectCall(ABuf, AIns, AAux, ArgN,
+      NativeFallback, NativeDone);
+    ABuf.BindLabel(NativeFallback);
+  end
+  else if UseGenericDirect then
+  begin
+    { The helper path below stays the fallback for a callee with no live
+      direct entry; it re-publishes the same IP. }
+    NativeFallback := ABuf.NewLabel;
+    NativeDone := ABuf.NewLabel;
+    EmitGenericDirectCall(ABuf, AIns, AAux, AInsIndex, ADirectCallee,
       NativeFallback, NativeDone);
     ABuf.BindLabel(NativeFallback);
   end;
@@ -3986,7 +4253,7 @@ begin
 
   EmitUnmarshalResults(ABuf, AAux, AIns.B, ResN, ArgBytes);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
-  if UseNativeLeaf then
+  if UseNativeLeaf or UseGenericDirect then
     ABuf.BindLabel(NativeDone);
 end;
 
@@ -4185,7 +4452,8 @@ end;
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const ARetainContext,
-  AUseNativeScalarCall: Boolean): Boolean;
+  AUseNativeScalarCall: Boolean;
+  const ADirectCallee: PX64DirectCallee): Boolean;
 begin
   Result := True;
   case AIns.Op of
@@ -4223,7 +4491,8 @@ begin
     iroUnreachable: EmitTrapCall(ABuf, wtkUnreachable);
 
     iroCall, iroCallIndirect, iroCallRef:
-      EmitCall(ABuf, AIns, AAux, AInsIndex, AUseNativeScalarCall);
+      EmitCall(ABuf, AIns, AAux, AInsIndex, AUseNativeScalarCall,
+        ADirectCallee);
     iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
       EmitReturnCall(ABuf, AIns, AAux, ARetainContext);
 

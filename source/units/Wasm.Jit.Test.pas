@@ -2036,6 +2036,16 @@ type
       message ('' when it returned). Memory stays inspectable afterwards. }
     function RunCompiledOnStore(const AExport: string;
       const AParams: array of TWasmValue): string;
+    { The number of inline generic direct-call sites the x64 backend stages
+      for defined function AFuncIndex (module IR supplied, so callee plans
+      are available). -1 off x64. }
+    function X64GenericDirectCallSites(const ABytes: TWasmBytes;
+      const AFuncIndex: Integer): Integer;
+    { AFirst then ASecond on one fresh store, force-compiling FDiffCompile
+      when ACompile; returns '<first trap>|<second trap>'. }
+    function TwoCallOutcome(const ABytes: TWasmBytes; const ACompile: Boolean;
+      const AFirst: string; const AFirstParams: array of TWasmValue;
+      const ASecond: string): string;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -2117,7 +2127,15 @@ type
     procedure TestCompiledUncaughtThrow;
     procedure TestCompiledThrowRefNull;
     procedure TestNestedCompiledFramesCatch;
+    procedure TestGenericDirectCallMixedSignatures;
+    procedure TestGenericDirectCallZeroesLocals;
+    procedure TestGenericDirectCallTrapsKeepState;
+    procedure TestGenericDirectCallExhaustion;
+    procedure TestGenericDirectCallEpochInterrupt;
     procedure TestThrowThroughNestedDirectCalls;
+    procedure TestGenericDirectCallGcRefs;
+    procedure TestGenericDirectCallFallback;
+    procedure TestPinnedMemoryNonZeroIndex;
 
     { --- Waves 4 & 5: memory / table / reference / global / GC ------- }
     procedure TestMemoryLoadStore;
@@ -6131,6 +6149,434 @@ begin
     [MakeValueI32(3)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+{ --- x64 generic direct calls in generated code ---------------------------
+
+  A compiled caller reaches a compiled, DEFINED callee outside the native
+  scalar-leaf proof (3+ parameters, i64/f32/f64/v128/ref values, memory, locals)
+  through a frame publication emitted inline on x64. Every test below states
+  its expected values independently (a `check` export traps `unreachable` on a
+  mismatch, so the interpreter run proves the constants and the compiled run
+  is held to them) and is differential against the interpreter. On x64 the
+  code-shape helper also proves the call site actually took the inline path. }
+
+function TJitTests.X64GenericDirectCallSites(const ABytes: TWasmBytes;
+  const AFuncIndex: Integer): Integer;
+var
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  I: Integer;
+begin
+  { mov byte [rdx+ActNative], 1 = C6 42 78 01: only the inline direct-call
+    frame publication writes the Native bit from generated code. -1 off x64. }
+  Result := -1;
+  {$IFDEF CPUX86_64}
+  Result := 0;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(ABytes, Module);
+    Ir := ValidateModule(Module, ABytes);
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[AFuncIndex],
+      Ir.FuncImportCount + UInt32(AFuncIndex), EntryOffset, RegisterCount);
+    for I := 0 to Length(Code) - 4 do
+      if (Code[I] = $C6) and (Code[I + 1] = $42) and (Code[I + 2] = $78) and
+        (Code[I + 3] = $01) then
+        Inc(Result);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  {$ENDIF}
+end;
+
+function TJitTests.TwoCallOutcome(const ABytes: TWasmBytes;
+  const ACompile: Boolean; const AFirst: string;
+  const AFirstParams: array of TWasmValue; const ASecond: string): string;
+var
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Imports: TWasmImports;
+  Instance: TWasmModuleInstance;
+  Jit: TWasmJitContext;
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  I: Integer;
+  P: array of TWasmValue;
+  Res: array[0 .. 4] of TWasmValue;
+
+  function Run(const AExport: string; const AHasParams: Boolean): string;
+  begin
+    Result := '';
+    if not Instance.FindExport(AExport, Kind, Addr) then
+      raise EWasmError.CreateFmt('no export named %s', [AExport]);
+    try
+      if AHasParams and (Length(P) > 0) then
+        InterpInvoke(Store, Addr, @P[0], @Res[0])
+      else
+        InterpInvoke(Store, Addr, nil, @Res[0]);
+    except
+      on E: EWasmTrap do
+        Result := E.Message;
+    end;
+  end;
+
+begin
+  { Run AFirst, then ASecond, on ONE store (compiled or not), returning
+    '<first trap>|<second trap>'. ASecond inspects the state AFirst left. }
+  Module := TWasmModule.Create;
+  Engine := TWasmEngine.Create;
+  Store := TWasmStore.Create(Engine);
+  Ir := nil;
+  Jit := nil;
+  Imports.Funcs := nil;
+  Imports.Tables := nil;
+  Imports.Mems := nil;
+  Imports.Globals := nil;
+  Imports.Tags := nil;
+  try
+    DecodeModule(ABytes, Module);
+    Ir := ValidateModule(Module, ABytes);
+    Instance := InstantiateModule(Store, Ir, @ABytes[0],
+      NativeUInt(Length(ABytes)), Imports);
+    RegisterInterpreter(Store);
+    if ACompile then
+    begin
+      Jit := RegisterJit(Store);
+      for I := 0 to High(FDiffCompile) do
+      begin
+        if not Instance.FindExport(FDiffCompile[I], Kind, Addr) then
+          raise EWasmError.CreateFmt('no export named %s', [FDiffCompile[I]]);
+        Expect<Boolean>(Jit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+      end;
+    end;
+    SetLength(P, Length(AFirstParams));
+    for I := 0 to High(AFirstParams) do
+      P[I] := AFirstParams[I];
+    for I := 0 to High(Res) do
+      Res[I].Bits := 0;
+    Result := Run(AFirst, True);
+    Expect<Boolean>(Store.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(Store)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(Store)^.ValueTop).ToBe(0);
+    Result := Result + '|' + Run(ASecond, False);
+  finally
+    FreeAndNil(Jit);
+    FreeAndNil(Store);
+    FreeAndNil(Engine);
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+end;
+
+procedure TJitTests.TestGenericDirectCallMixedSignatures;
+var
+  Bytes: TWasmBytes;
+begin
+  { Three, four and five parameters mixing i32/i64/f32/f64, a multi-value
+    result, and a v128 parameter/result whose even-alignment pad moves every
+    later parameter off its flat position (simd-spec §1.5). Expected values:
+    f3(7, 2^32, 1.5f) = 7*3 + (2^32 xor 0x3FC00000) = 0x13FC00015;
+    f4(2.5, 7, -3, 0.25) = 5 + 4 - 0.25 = 8.75;
+    f5(7, 5, 1.5f, 2.25, 10) = (-3, -10, 3.75);
+    fv(7, i32x4 1 2 3 4, 16) = (i64x2 0x200000011 0x400000013, 11). }
+  Bytes := AssembleWatText('(module ' +
+    '(func $f3 (export "f3") (param $a i32) (param $b i64) (param $c f32) ' +
+    '(result i64) ' +
+    '(i64.add (i64.mul (i64.extend_i32_s (local.get $a)) (i64.const 3)) ' +
+    '(i64.xor (local.get $b) ' +
+    '(i64.extend_i32_u (i32.reinterpret_f32 (local.get $c)))))) ' +
+    '(func $f4 (export "f4") (param $d0 f64) (param $a i32) (param $b i64) ' +
+    '(param $d1 f64) (result f64) ' +
+    '(f64.sub (f64.add (f64.mul (local.get $d0) (f64.const 2)) ' +
+    '(f64.add (f64.convert_i32_s (local.get $a)) ' +
+    '(f64.convert_i64_s (local.get $b)))) (local.get $d1))) ' +
+    '(func $f5 (export "f5") (param $a i32) (param $b i64) (param $c f32) ' +
+    '(param $d f64) (param $e i32) (result i32 i64 f64) ' +
+    '(i32.sub (local.get $a) (local.get $e)) ' +
+    '(i64.mul (local.get $b) (i64.const -2)) ' +
+    '(f64.add (local.get $d) (f64.promote_f32 (local.get $c)))) ' +
+    '(func $fv (export "fv") (param $a i32) (param $v v128) (param $b i64) ' +
+    '(result v128 i32) ' +
+    '(i64x2.add (local.get $v) (i64x2.splat (local.get $b))) ' +
+    '(i32.add (local.get $a) (i32x4.extract_lane 3 (local.get $v)))) ' +
+    '(func (export "check") (param $x i32) (result i64) ' +
+    '(local $r i64) (local $q i32) (local $s i64) (local $w f64) ' +
+    '(local $v v128) ' +
+    '(local.set $r (call $f3 (local.get $x) (i64.const 0x100000000) ' +
+    '(f32.const 1.5))) ' +
+    '(if (i64.ne (local.get $r) (i64.const 0x13FC00015)) (then unreachable)) ' +
+    '(if (f64.ne (call $f4 (f64.const 2.5) (local.get $x) (i64.const -3) ' +
+    '(f64.const 0.25)) (f64.const 8.75)) (then unreachable)) ' +
+    '(call $f5 (local.get $x) (i64.const 5) (f32.const 1.5) ' +
+    '(f64.const 2.25) (i32.const 10)) ' +
+    '(local.set $w) (local.set $s) (local.set $q) ' +
+    '(if (i32.ne (local.get $q) (i32.const -3)) (then unreachable)) ' +
+    '(if (i64.ne (local.get $s) (i64.const -10)) (then unreachable)) ' +
+    '(if (f64.ne (local.get $w) (f64.const 3.75)) (then unreachable)) ' +
+    '(call $fv (local.get $x) (v128.const i32x4 1 2 3 4) (i64.const 16)) ' +
+    '(local.set $q) (local.set $v) ' +
+    '(if (i32.ne (local.get $q) (i32.const 11)) (then unreachable)) ' +
+    '(if (i64.ne (i64x2.extract_lane 0 (local.get $v)) ' +
+    '(i64.const 0x200000011)) (then unreachable)) ' +
+    '(if (i64.ne (i64x2.extract_lane 1 (local.get $v)) ' +
+    '(i64.const 0x400000013)) (then unreachable)) ' +
+    '(local.get $r)))');
+  Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI32(7)])).ToBe('');
+  CompileExports(['f3', 'f4', 'f5', 'fv', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [MakeValueI32(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI32(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(FDiffJitOut.Trapped).ToBe(False);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64($13FC00015));
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 4)).ToBe(4);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestGenericDirectCallZeroesLocals;
+var
+  Bytes: TWasmBytes;
+begin
+  { GC-1 through the inline carve: the second call reuses the first call's
+    value-stack slots, which still hold acc = 105 and a non-null funcref.
+    A declared local must read 0 / null again: z(9) = 0 + 9 + 100 = 109, not
+    105 + 9 + 0 = 114. }
+  Bytes := AssembleWatText('(module (elem declare func $z) ' +
+    '(func $z (export "z") (param $p i32) (param $q i32) (param $r i32) ' +
+    '(result i32) (local $acc i32) (local $f funcref) ' +
+    '(local.set $acc (i32.add (i32.add (local.get $acc) (local.get $p)) ' +
+    '(select (i32.const 100) (i32.const 0) (ref.is_null (local.get $f))))) ' +
+    '(local.set $f (ref.func $z)) ' +
+    '(local.get $acc)) ' +
+    '(func (export "check") (result i32) ' +
+    '(if (i32.ne (call $z (i32.const 5) (i32.const 0) (i32.const 0)) ' +
+    '(i32.const 105)) (then unreachable)) ' +
+    '(if (i32.ne (call $z (i32.const 9) (i32.const 0) (i32.const 0)) ' +
+    '(i32.const 109)) (then unreachable)) ' +
+    '(i32.const 1)))');
+  Expect<string>(TrapMessageOf(Bytes, 'check', [])).ToBe('');
+  CompileExports(['z', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(2);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestGenericDirectCallTrapsKeepState;
+const
+  Kinds: array[0 .. 4] of Integer = (0, 1, 2, 2, 3);
+  Addrs: array[0 .. 4] of Integer = (0, 0, 65536, 65528, 0);
+  Msgs: array[0 .. 4] of string = ('unreachable', 'integer divide by zero',
+    'out of bounds memory access', '', '');
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+  InterpOut, JitOut: string;
+begin
+  { A memory-using 3-argument callee traps (unreachable, divide by zero,
+    out-of-bounds store one past the end) or returns (exact-end store, plain
+    return). Both the caller's marker store and the callee's counter update
+    precede the trap and must survive it; `peek` traps unless they do. }
+  Bytes := AssembleWatText('(module (memory 1) ' +
+    '(func $t (export "t") (param $k i32) (param $x i64) (param $addr i32) ' +
+    '(result i32) ' +
+    '(i64.store (i32.const 8) (i64.add (i64.load (i32.const 8)) ' +
+    '(i64.const 1))) ' +
+    '(if (i32.eq (local.get $k) (i32.const 0)) (then unreachable)) ' +
+    '(if (i32.eq (local.get $k) (i32.const 1)) (then (drop (i32.div_s ' +
+    '(i32.const 1) (i32.wrap_i64 (local.get $x)))))) ' +
+    '(if (i32.eq (local.get $k) (i32.const 2)) (then (i64.store ' +
+    '(local.get $addr) (local.get $x)))) ' +
+    '(i32.add (local.get $k) (i32.const 40))) ' +
+    '(func (export "run") (param $k i32) (param $addr i32) (result i32) ' +
+    '(i32.store (i32.const 0) (i32.const 0x55)) ' +
+    '(call $t (local.get $k) (i64.const 0) (local.get $addr))) ' +
+    '(func (export "peek") (result i32) ' +
+    '(if (i32.ne (i32.load (i32.const 0)) (i32.const 0x55)) ' +
+    '(then unreachable)) ' +
+    '(if (i64.ne (i64.load (i32.const 8)) (i64.const 1)) (then unreachable)) ' +
+    '(i32.const 1)))');
+  for I := 0 to High(Kinds) do
+  begin
+    FDiffCompile := nil;
+    InterpOut := TwoCallOutcome(Bytes, False, 'run',
+      [MakeValueI32(Kinds[I]), MakeValueI32(Addrs[I])], 'peek');
+    Expect<string>(InterpOut).ToBe(Msgs[I] + '|');
+    CompileExports(['t', 'run', 'peek']);
+    JitOut := TwoCallOutcome(Bytes, True, 'run',
+      [MakeValueI32(Kinds[I]), MakeValueI32(Addrs[I])], 'peek');
+    Expect<string>(JitOut).ToBe(InterpOut);
+    Expect<Boolean>(DiffModule(Bytes, 'run',
+      [MakeValueI32(Kinds[I]), MakeValueI32(Addrs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestGenericDirectCallExhaustion;
+const
+  RecWat = '(module ' +
+    '(func $rec (export "rec") (param $n i32) (param $a i64) (param $b i32) ' +
+    '(result i32) ' +
+    '(if (result i32) (i32.eqz (local.get $n)) (then (i32.const 0)) ' +
+    '(else (i32.add (call $rec (i32.sub (local.get $n) (i32.const 1)) ' +
+    '(local.get $a) (local.get $b)) (i32.const 1))))) ' +
+    '(func (export "run") (param $n i32) (result i32) ' +
+    '(call $rec (local.get $n) (i64.const 0) (i32.const 0))))';
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RecRegs, RunRegs: UInt32;
+  N: Integer;
+  Kind: TWasmExternKind;
+  Addr: UInt32;
+  Param, Res: TWasmValue;
+  Msg: string;
+begin
+  { Self-recursion with three parameters takes the inline path at every
+    level. run is depth 1 and rec(n) needs depth n + 2, so a 64-activation cap
+    admits n = 62 and traps at n = 63; the sweep crosses it in both tiers. }
+  Bytes := AssembleWatText(RecWat);
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 0)).ToBe(1);
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
+  {$ENDIF}
+  WasmInterpMaxDepth := 64;
+  try
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(62)])).ToBe('');
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(63)]))
+      .ToBe('call stack exhausted');
+    for N := 58 to 68 do
+    begin
+      CompileExports(['rec', 'run']);
+      Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    CompileExports(['rec', 'run']);
+    Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(62)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(62);
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+
+  { The value-slot cap as the only limit: room for run plus exactly 40 rec
+    frames admits n = 39 and traps at n = 40. }
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    RecRegs := Ir.Functions[0].RegisterCount;
+    RunRegs := Ir.Functions[1].RegisterCount;
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  WasmInterpValueSlots := NativeUInt(RunRegs) + NativeUInt(RecRegs) * 40;
+  try
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(39)])).ToBe('');
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(40)]))
+      .ToBe('call stack exhausted');
+    for N := 36 to 44 do
+    begin
+      CompileExports(['rec', 'run']);
+      Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+
+  { Exhaustion inside the inline path unwinds to the trampoline and leaves the
+    store reusable. }
+  WasmInterpMaxDepth := 64;
+  try
+    FBytes := Bytes;
+    DecodeModule(FBytes, FModule);
+    FIr := ValidateModule(FModule, FBytes);
+    FInstance := InstantiateModule(FStore, FIr, @FBytes[0],
+      NativeUInt(Length(FBytes)), FImports);
+    RegisterInterpreter(FStore);
+    FJit := RegisterJit(FStore);
+    Expect<Boolean>(FInstance.FindExport('rec', Kind, Addr)).ToBe(True);
+    Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(FInstance.FindExport('run', Kind, Addr)).ToBe(True);
+    Expect<Boolean>(FJit.ForceCompile(Addr)).ToBe(JIT_BACKEND_AVAILABLE);
+    Param := MakeValueI32(1000);
+    Msg := '';
+    try
+      InterpInvoke(FStore, Addr, @Param, @Res);
+    except
+      on E: EWasmTrap do
+        Msg := E.Message;
+    end;
+    Expect<string>(Msg).ToBe('call stack exhausted');
+    Expect<Boolean>(CurrentTrampoline = nil).ToBe(True);
+    Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
+    Param := MakeValueI32(62);
+    Res.Bits := High(UInt64);
+    InterpInvoke(FStore, Addr, @Param, @Res);
+    Expect<Integer>(Res.I32).ToBe(62);
+    Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+    Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+end;
+
+procedure TJitTests.TestGenericDirectCallEpochInterrupt;
+var
+  Bytes: TWasmBytes;
+begin
+  { run bumps the store epoch AFTER the outermost entry captured its
+    snapshot, then reaches a 3-argument callee through the inline call. The
+    call must not re-seed the invocation snapshot: one iteration (no taken
+    back-edge) returns 3*7 = 21, a taken back-edge traps 'interrupt'. }
+  Bytes := AssembleWatText('(module (import "e" "bump" (func $bump)) ' +
+    '(func $spin (export "spin") (param $n i32) (param $x i64) ' +
+    '(param $k i32) (result i32) (local $i i32) (local $acc i32) ' +
+    '(loop $again ' +
+    '(local.set $acc (i32.add (local.get $acc) (local.get $k))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $again (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (local.get $acc) (i32.wrap_i64 (local.get $x)))) ' +
+    '(func (export "run") (param $n i32) (result i32) (local $r i32) ' +
+    '(call $bump) ' +
+    '(local.set $r (call $spin (local.get $n) (i64.const 14) (i32.const 7))) ' +
+    '(if (i32.ne (local.get $r) (i32.const 21)) (then unreachable)) ' +
+    '(local.get $r)))');
+  FDiffHost := @JitBumpEpochCallback;
+  try
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(1)])).ToBe('');
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(2)]))
+      .ToBe('interrupt');
+    CompileExports(['spin', 'run']);
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(1)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    CompileExports(['spin', 'run']);
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(2)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    {$IFDEF CPUX86_64}
+    Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
+    {$ENDIF}
+  finally
+    FDiffHost := nil;
+  end;
+end;
+
 procedure TJitTests.TestThrowThroughNestedDirectCalls;
 var
   Bytes: TWasmBytes;
@@ -6218,6 +6664,137 @@ begin
   Expect<Boolean>(DiffFresh(Bytes, 'uncaught', [MakeValueI32(5)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<Boolean>(FDiffJitOut.Exceptional).ToBe(True);
+  {$IFDEF CPUX86_64}
+  { caught -> mid, outer -> mid2, mid2 -> mid, uncaught -> mid are inline;
+    mid -> thrower keeps the helper (a throwing body has no direct entry). }
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(0);
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 2)).ToBe(1);
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 3)).ToBe(2);
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 4)).ToBe(2);
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 5)).ToBe(1);
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 7)).ToBe(2);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestGenericDirectCallGcRefs;
+var
+  Bytes: TWasmBytes;
+begin
+  { Reference parameters/results and a callee-only root. With a zero heap
+    threshold every struct.new collects. $keep's own box is live ONLY in its
+    inline-published frame while n further boxes are allocated, so an
+    unpublished or mis-described GC frame frees it and a later allocation
+    reuses the cell (non-moving mark-sweep). $pass receives and returns a
+    ref across the same collections. Expected: 77 + 2*33 = 143. }
+  Bytes := AssembleWatText('(module (type $box (struct (field (mut i32)))) ' +
+    '(func $keep (export "keep") (param $n i32) (param $tag i32) ' +
+    '(param $pad i64) (result i32) (local $b (ref null $box)) (local $i i32) ' +
+    '(local.set $b (struct.new $box (local.get $tag))) ' +
+    '(loop $l (drop (struct.new $box (local.get $i))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(struct.get $box 0 (local.get $b))) ' +
+    '(func $pass (export "pass") (param $r (ref null $box)) (param $n i32) ' +
+    '(param $pad i64) (result (ref null $box)) (local $i i32) ' +
+    '(loop $l (drop (struct.new $box (i32.const -1))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $r)) ' +
+    '(func (export "check") (param $n i32) (result i32) (local $k i32) ' +
+    '(local.set $k (call $keep (local.get $n) (i32.const 77) (i64.const 0))) ' +
+    '(if (i32.ne (local.get $k) (i32.const 77)) (then unreachable)) ' +
+    '(i32.add (local.get $k) (i32.mul (i32.const 2) (struct.get $box 0 ' +
+    '(call $pass (struct.new $box (i32.const 33)) (local.get $n) ' +
+    '(i64.const 0)))))))');
+  FDiffThreshold := 0;
+  try
+    Expect<string>(TrapMessageOf(Bytes, 'check', [MakeValueI32(40)])).ToBe('');
+    CompileExports(['keep', 'pass', 'check']);
+    Expect<Boolean>(DiffFresh(Bytes, 'check', [MakeValueI32(40)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(FDiffJitOut.Trapped).ToBe(False);
+    Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(143);
+  finally
+    FDiffThreshold := -1;
+  end;
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 2)).ToBe(2);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestGenericDirectCallFallback;
+var
+  Bytes, Declined: TWasmBytes;
+begin
+  { $f is outside the scalar-leaf proof. First the caller alone is compiled,
+    so the inline site finds no direct entry and must take the helper path
+    to the interpreted callee; then the callee is compiled on the SAME store
+    and the same site switches to the inline call. f(1,2,3) = 1 + 20 + 300. }
+  FBytes := AssembleWatText('(module ' +
+    '(func $f (export "f") (param $a i32) (param $b i64) (param $c i32) ' +
+    '(result i32) ' +
+    '(i32.add (i32.add (local.get $a) (i32.mul (i32.wrap_i64 (local.get $b)) ' +
+    '(i32.const 10))) (i32.mul (local.get $c) (i32.const 100)))) ' +
+    '(func (export "run") (result i32) ' +
+    '(if (i32.ne (call $f (i32.const 1) (i64.const 2) (i32.const 3)) ' +
+    '(i32.const 321)) (then unreachable)) ' +
+    '(i32.const 1)))');
+  Bytes := FBytes;
+  Expect<string>(TrapMessageOf(Bytes, 'run', [])).ToBe('');
+  Expect<string>(RunCompiledOnStore('run', [])).ToBe('');
+  Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+  Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+  Expect<string>(RunCompiledOnStore('f', [MakeValueI32(1), MakeValueI64(2),
+    MakeValueI32(3)])).ToBe('');
+  Expect<string>(RunCompiledOnStore('run', [])).ToBe('');
+  Expect<Boolean>(FStore.Heap.CurrentFrame = nil).ToBe(True);
+  Expect<NativeUInt>(InterpContextFor(FStore)^.Depth).ToBe(0);
+  Expect<NativeUInt>(InterpContextFor(FStore)^.ValueTop).ToBe(0);
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Bytes, 1)).ToBe(1);
+  {$ENDIF}
+
+  { A handler-bearing callee never receives a direct entry, so its call site
+    keeps only the helper path; and the result still matches. }
+  Declined := AssembleWatText('(module (tag $e) ' +
+    '(func $g (export "g") (param $a i32) (param $b i64) (param $c i32) ' +
+    '(result i32) ' +
+    '(block $h (try_table (catch $e $h) (nop))) ' +
+    '(i32.add (local.get $a) (local.get $c))) ' +
+    '(func (export "run") (result i32) ' +
+    '(call $g (i32.const 4) (i64.const 0) (i32.const 5))))');
+  CompileExports(['g', 'run']);
+  Expect<Boolean>(DiffModule(Declined, 'run', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  {$IFDEF CPUX86_64}
+  Expect<Integer>(X64GenericDirectCallSites(Declined, 1)).ToBe(0);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestPinnedMemoryNonZeroIndex;
+var
+  Bytes: TWasmBytes;
+begin
+  { The prologue resolves the pinned memory inline through the instance's
+    memory address map, so a function using only memory 1 must see memory 1
+    (initialised to 0x2A at offset 4), never memory 0 (0x07). The 3-argument
+    reader is reached through the inline call. }
+  Bytes := AssembleWatText('(module ' +
+    '(memory $m0 1) (memory $m1 1) ' +
+    '(data (memory $m0) (i32.const 4) "\07") ' +
+    '(data (memory $m1) (i32.const 4) "\2a") ' +
+    '(func $rd (export "rd") (param $a i32) (param $b i64) (param $c i32) ' +
+    '(result i32) (i32.load8_u $m1 (local.get $a))) ' +
+    '(func (export "run") (result i32) ' +
+    '(if (i32.ne (call $rd (i32.const 4) (i64.const 0) (i32.const 0)) ' +
+    '(i32.const 42)) (then unreachable)) ' +
+    '(i32.const 42)))');
+  Expect<string>(TrapMessageOf(Bytes, 'run', [])).ToBe('');
+  CompileExports(['rd', 'run']);
+  Expect<Boolean>(DiffModule(Bytes, 'run', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  CompileExports(['rd']);
+  Expect<Boolean>(DiffModule(Bytes, 'rd',
+    [MakeValueI32(4), MakeValueI64(0), MakeValueI32(0)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 { --- Wave 6: v128 SIMD via the leaves ----------------------------------- }
@@ -6505,8 +7082,24 @@ begin
     TestCompiledThrowRefNull);
   Test('a throw across nested compiled frames is caught identically',
     TestNestedCompiledFramesCatch);
+  Test('generic direct calls mix i32/i64/f32/f64/v128 params and results',
+    TestGenericDirectCallMixedSignatures);
+  Test('generic direct calls zero declared locals on every entry',
+    TestGenericDirectCallZeroesLocals);
+  Test('generic direct-call callee traps keep message and memory state',
+    TestGenericDirectCallTrapsKeepState);
+  Test('generic direct-call recursion exhausts at the same depth and slots',
+    TestGenericDirectCallExhaustion);
+  Test('a generic direct call keeps the invocation epoch snapshot',
+    TestGenericDirectCallEpochInterrupt);
   Test('exceptions unwind through nested direct-call frames identically',
     TestThrowThroughNestedDirectCalls);
+  Test('generic direct-call frames are GC roots for refs and locals',
+    TestGenericDirectCallGcRefs);
+  Test('generic direct calls fall back for uncompiled and declined callees',
+    TestGenericDirectCallFallback);
+  Test('an inline memory pin resolves a non-zero memory index',
+    TestPinnedMemoryNonZeroIndex);
 
   Test('memory load/store round-trips identically', TestMemoryLoadStore);
   Test('a forwarded memory load keeps the store memory effect',

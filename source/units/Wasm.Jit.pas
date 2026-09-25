@@ -29,7 +29,10 @@
   Because the carve/zero/push/pop and the param/result marshaling are the
   interpreter's exact code, the exhaustion threshold, the GC contract, and the
   flat-slot calling convention are identical by construction — the observational
-  -identity property (§13). It passes that base and the store to the compiled
+  -identity property (§13). On x64 a direct call to a DEFINED direct-callable
+  callee performs the same publication in generated code (Wasm.Jit.X64
+  EmitGenericDirectCall, planned here by PlanX64DirectCallee from the module's
+  validated IR) and keeps these helpers as its fallback. It passes that base and the store to the compiled
   entry in x0/x1 (AAPCS64); the Wave-2 prologue pins the base in the callee-
   saved x19 (surviving helper calls) and the store in x20 (for the epoch word),
   and the epilogue restores them before returning to JitLeaveFrame.
@@ -546,6 +549,8 @@ var
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   X64Cache: TX64RegCache;
+  X64Callee: TX64DirectCallee;
+  X64CalleePtr: PX64DirectCallee;
   {$ENDIF}
 
   procedure MarkTarget(const ATarget: UInt32);
@@ -624,6 +629,87 @@ var
       Exit;
     Result := JitCanNativeScalarLeaf(@AIr.Functions[DefinedIdx]);
   end;
+
+  {$IFDEF WASM_JIT_X64}
+  { Plan the generated-code direct call for a DEFINED callee (x64 generic
+    direct-call fast path). The callee's validated IR is fixed by this
+    module, so its register-file shape may be baked; the live function
+    instance and compiled entry are still resolved per call. Declines (nil)
+    an import, a native scalar leaf (its own path), a body the JIT declines
+    or that can never receive a CompiledDirectEntry, and any shape whose
+    flat argument/result slots do not match the call site's aux blocks. }
+  function PlanX64DirectCallee(const AIns: TWasmIrInstr;
+    out APlan: TX64DirectCallee): Boolean;
+  const
+    { Beyond this many default-zeroed registers the unrolled stores cost more
+      code than the helper path; keep the helper. }
+    MaxZeroRegs = 64;
+  var
+    DefinedIdx: UInt32;
+    Callee: PWasmIrFunctionRec;
+    K, N: Integer;
+    Reg: UInt32;
+
+    function Add(var AList: TWasmIrAuxU32; const AReg: UInt32): Boolean;
+    begin
+      Result := AReg < Callee^.RegisterCount;
+      if Result then
+      begin
+        SetLength(AList, Length(AList) + 1);
+        AList[High(AList)] := AReg;
+      end;
+    end;
+
+  begin
+    Result := False;
+    APlan.RegisterCount := 0;
+    APlan.ArgRegs := nil;
+    APlan.ResultRegs := nil;
+    APlan.ZeroRegs := nil;
+    if (AIr = nil) or (AIns.Op <> iroCall) or
+      (UInt32(AIns.Imm) < AIr.FuncImportCount) or
+      (UInt64(UInt32(AIns.Imm)) * 4 > UInt64(High(Int32))) or
+      NativeScalarLeafTarget(UInt32(AIns.Imm)) then
+      Exit;
+    DefinedIdx := UInt32(AIns.Imm) - AIr.FuncImportCount;
+    if DefinedIdx >= UInt32(Length(AIr.Functions)) then
+      Exit;
+    Callee := @AIr.Functions[DefinedIdx];
+    if not JitCanCompile(Callee) or not JitCanDirectCall(Callee) or
+      (Callee^.RegisterCount >= X64_MAX_SLOT) or
+      (Length(Callee^.EntryZeroRegs) > MaxZeroRegs) or
+      (UInt32(Length(Callee^.LocalRegs)) < Callee^.ParamCount) or
+      (UInt32(Length(Callee^.ResultRegs)) < Callee^.ResultCount) then
+      Exit;
+    APlan.RegisterCount := Callee^.RegisterCount;
+    for K := 0 to Integer(Callee^.ParamCount) - 1 do
+    begin
+      Reg := Callee^.LocalRegs[K];
+      if not Add(APlan.ArgRegs, Reg) then
+        Exit;
+      if (Callee^.RegTypes[Reg].Kind = wvkVec) and
+        not Add(APlan.ArgRegs, Reg + 1) then
+        Exit;
+    end;
+    for K := 0 to Integer(Callee^.ResultCount) - 1 do
+    begin
+      Reg := Callee^.ResultRegs[K];
+      if not Add(APlan.ResultRegs, Reg) then
+        Exit;
+      if (Callee^.RegTypes[Reg].Kind = wvkVec) and
+        not Add(APlan.ResultRegs, Reg + 1) then
+        Exit;
+    end;
+    for N := 0 to High(Callee^.EntryZeroRegs) do
+      if not Add(APlan.ZeroRegs, Callee^.EntryZeroRegs[N]) then
+        Exit;
+    Result :=
+      (UInt32(Length(APlan.ArgRegs)) =
+        IrAuxBlockCount(AFn^.AuxU32, AIns.A)) and
+      (UInt32(Length(APlan.ResultRegs)) =
+        IrAuxBlockCount(AFn^.AuxU32, AIns.B));
+  end;
+  {$ENDIF}
 
   {$IFDEF WASM_JIT_ARM64}
   { True with ABody set to the leaf's native body minus its final RET when
@@ -2462,6 +2548,10 @@ begin
       {$IFDEF WASM_JIT_X64}
       NativeScalarCall := (AFn^.Code[I].Op = iroCall) and
         NativeScalarLeafTarget(UInt32(AFn^.Code[I].Imm));
+      X64CalleePtr := nil;
+      if not UseNativeScalarCore and not NativeScalarCall and
+        PlanX64DirectCallee(AFn^.Code[I], X64Callee) then
+        X64CalleePtr := @X64Callee;
       if Fusion[I] >= 0 then
       begin
         X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
@@ -2478,7 +2568,7 @@ begin
           AFn^.RegisterCount, NativeParamReg, NativeResultSource,
           NativeCoreLabel, NativeExhaustedLabel, UseX64ExtendedFrame,
           NativeScalarCall,
-          X64Cache, @GcShapes[0]);
+          X64Cache, @GcShapes[0], X64CalleePtr);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an

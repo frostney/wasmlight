@@ -173,6 +173,7 @@ type
     ActRetCount: NativeUInt;         { TWasmActivation.RetCount }
     ActRetBase: NativeUInt;          { TWasmActivation.RetBase }
     ActEntryResults: NativeUInt;     { TWasmActivation.EntryResults }
+    ActNative: NativeUInt;           { TWasmActivation.Native }
     GcFramePrev: NativeUInt;         { TWasmGcFrame.Prev }
     GcFrameSlots: NativeUInt;        { TWasmGcFrame.Slots }
     GcFrameRefRegBits: NativeUInt;   { TWasmGcFrame.RefRegBits }
@@ -392,7 +393,11 @@ const
   { Revision 16: compiled try_table / throw / throw_ref. Appends aohPublishIp,
     aohEhThrow, and aohEhResumeIndex; compiled frames publish a Native bit
     the unwinder consults. Must stay equal to WASM_TARGET_ABI_REVISION. }
-  AOT_ABI_REVISION = 16;
+  { Revision 17: x64 generic direct calls publish the callee activation,
+    including its Native bit (ActNative), in generated code, and the x64
+    prologue resolves its pinned memory instance inline (StoreMemories,
+    InstMemAddrs). }
+  AOT_ABI_REVISION = 17;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -3626,6 +3631,7 @@ begin
   Result.ActRetCount := PtrUInt(@A.RetCount) - PtrUInt(@A);
   Result.ActRetBase := PtrUInt(@A.RetBase) - PtrUInt(@A);
   Result.ActEntryResults := PtrUInt(@A.EntryResults) - PtrUInt(@A);
+  Result.ActNative := PtrUInt(@A.Native) - PtrUInt(@A);
   Result.GcFramePrev := PtrUInt(@G.Prev) - PtrUInt(@G);
   Result.GcFrameSlots := PtrUInt(@G.Slots) - PtrUInt(@G);
   Result.GcFrameRefRegBits := PtrUInt(@G.RefRegBits) - PtrUInt(@G);
@@ -3691,6 +3697,8 @@ begin
   Fold(JO.StoreFHeap);
   Fold(JO.StoreTierContext);
   Fold(JO.InstEngineTypeIds);
+  Fold(JO.StoreMemories);
+  Fold(JO.InstMemAddrs);
 
   { The inline-allocation fast path bakes heap/block offsets too (wave 11). }
   GO := WasmJitGcHeapOffsets;
@@ -3723,6 +3731,7 @@ begin
   Fold(FO.ActRetCount);
   Fold(FO.ActRetBase);
   Fold(FO.ActEntryResults);
+  Fold(FO.ActNative);
   Fold(FO.GcFramePrev);
   Fold(FO.GcFrameSlots);
   Fold(FO.GcFrameRefRegBits);
