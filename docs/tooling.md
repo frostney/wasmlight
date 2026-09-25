@@ -63,7 +63,7 @@ Never hand-edit any of these; change the input and re-run the owner.
 | --- | --- |
 | `lwpt.cfg`, `lwpt.lock`, `.lwpt/modules/` | `lwpt install` |
 | `source/units/Version.inc` | `scripts/stamp-version.pas` (build/test hook) |
-| `.agents/skills/<imported skill>/`, `skills-lock.json` | the `skills` CLI (`npx skills@1.5.17`) |
+| `.agents/skills/<imported skill>/`, `skills-lock.json` | the `skills` CLI (`npx skills@1.5.23`) |
 | `.agents/skills/<repository skill>/` | repository maintainers |
 | `CHANGELOG.md` | `git-cliff` |
 | `build/` | `lwpt build` — and never committed |
@@ -115,8 +115,8 @@ Imported project skills are lock-managed under `.agents/skills/`, with
 CLI rather than editing their generated trees:
 
 ```bash
-npx -y skills@1.5.17 update --project --yes
-npx -y skills@1.5.17 list --json
+npx -y skills@1.5.23 update --project --yes
+npx -y skills@1.5.23 list --json
 ```
 
 Repository-authored skills also live under `.agents/skills/`, but are committed

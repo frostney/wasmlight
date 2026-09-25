@@ -124,6 +124,6 @@ released through lwpt, and consumable by any lwpt project.
 - [Roadmap](docs/roadmap.md) — what is shipped and what is next
 - [Code style](docs/code-style.md) — including the hot-path RTL policy
 - [CONTEXT.md](CONTEXT.md) — canonical glossary
-- [docs/adr/](docs/adr/) — architectural decisions, including the planned
+- [docs/adr/](docs/adr/) — architectural decisions, including the strict
   native-compiler contract
   ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md))
