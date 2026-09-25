@@ -1583,10 +1583,13 @@ begin
   Reg := Frame(ACtx^.Values, AAct^.Base);
   { Imm = IrPack(typeIndex, dataIndex); A = byte offset, B = length. }
   IrUnpack(AIns^.Imm, TypeIdx, DataIdx);
+  { exec-array.new_data checks the byte range before creating the array. }
+  DataAddr := AAct^.Instance.DataAddrs[DataIdx];
+  Store.Heap.CheckArrayDataRange(AAct^.Instance.EngineTypeIds[TypeIdx],
+    Store.Datas[DataAddr].Size, Reg[AIns^.A].U64, Reg[AIns^.B].U32);
   Obj := Store.Heap.AllocArray(AAct^.Instance.EngineTypeIds[TypeIdx],
     Reg[AIns^.B].U32);
   Reg[AIns^.Dest].Bits := UInt64(Obj);
-  DataAddr := AAct^.Instance.DataAddrs[DataIdx];
   Store.Heap.ArrayInitFromData(Obj, 0, Store.Datas[DataAddr].Data,
     Store.Datas[DataAddr].Size, Reg[AIns^.A].U64, Reg[AIns^.B].U32);
 end;

@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.6.0"
+  LWPT_VERSION: "0.7.0"
 
 jobs:
   test:
@@ -172,6 +172,13 @@ jobs:
       - name: lwpt build (all programs)
         run: lwpt build
 
+      - name: Compile and run a native WASI command
+        if: matrix.jit
+        run: |
+          set -euo pipefail
+          ./build/wasmlight compile tests/fixtures/wasi/hello.wasm -o build/hello-native
+          test "$(./build/hello-native)" = "hello"
+
       - name: lwpt test (co-located unit suites)
         run: lwpt test
 
@@ -272,60 +279,45 @@ jobs:
             fi
           fi
 
-      # The upstream conformance corpus is the project's strongest oracle,
-      # fetched at a PINNED commit (tests/spec/testsuite is gitignored; the SHA
-      # lives in tests/spec/testsuite.commit for reproducibility). The
-      # interpreter tier runs on EVERY platform; on the 64-bit UNIX legs
-      # (matrix.jit) the baseline-JIT and AOT tiers run too and must produce an
-      # IDENTICAL pass/fail/skip tally to the interpreter — the observational-
-      # identity invariant (ADR-0001) a JIT/AOT codegen bug would break.
-      # errors=0 + a pass floor catch a crash or a catastrophic interpreter
-      # regression without hardcoding a count that shifts when a known-failing
-      # case is later closed.
-      - name: Conformance corpus (wasmspec, all tiers)
+      # One archive per Unix compiler host: layout, MANIFEST, checksums, and
+      # ELF/Mach-O shell structure. Compile gates run when `wasmlight compile`
+      # can emit with live shells. Fixtures prove structure only; live archive
+      # execution gates are host-only (not a 16-cell matrix). Windows is a
+      # later release and has no 0.2.0 archive.
+      - name: Pack and verify release archive
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas \
+            --compiler ./build/wasmlight \
+            --out "$RUNNER_TEMP/distro" \
+            --synthesize-catalog
+          ARCHIVE="$(ls "$RUNNER_TEMP/distro"/wasmlight-*-*.tar.gz)"
+          CHECKSUMS="$(ls "$RUNNER_TEMP/distro"/wasmlight-*-checksums.txt)"
+          instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
+            --archive "$ARCHIVE" \
+            --checksums "$CHECKSUMS"
+      # Core conformance fails on any lost case in any tier; with several tiers,
+      # non-core scripts (proposals/legacy/custom) must match across tiers.
+      - name: Conformance gate regression tests
+        run: |
+          PY=python3
+          if ! command -v python3 >/dev/null 2>&1; then PY=python; fi
+          "$PY" -m unittest discover -s tools/conformance -p 'test_*.py'
+
+      - name: Pinned core conformance (all supported tiers)
         run: |
           set -euo pipefail
           COMMIT=$(tr -d '[:space:]' < tests/spec/testsuite.commit)
           git clone --filter=blob:none --quiet \
             https://github.com/WebAssembly/testsuite tests/spec/testsuite
           git -C tests/spec/testsuite checkout --quiet "$COMMIT"
-          echo "testsuite @ $(git -C tests/spec/testsuite rev-parse HEAD)"
-          WS=./build/wasmspec${{ matrix.exe }}
-          FLOOR=64000
-          run_tier() {
-            local output_file total
-            output_file="$RUNNER_TEMP/wasmspec-$1.txt"
-            set +e
-            "$WS" --failures-only --tier="$1" tests/spec/testsuite > "$output_file"
-            set -e
-            total=$(grep '^TOTAL' "$output_file" || true)
-            if [ -z "$total" ]; then
-              cat "$output_file" >&2
-              echo "::error::$1 did not produce a TOTAL tally" >&2
-              return 1
-            fi
-            printf '%s\n' "$total"
-          }
-          sig() { echo "$1" | grep -oE '(errors|pass|fail|skip)=[0-9]+' | sort | tr '\n' ' '; }
-          field() { echo "$1" | grep -oE "$2=[0-9]+" | head -1 | cut -d= -f2; }
-          IL=$(run_tier interp); echo "interp: $IL"
-          [ "$(field "$IL" errors)" = "0" ] || { echo "::error::interp errors!=0"; exit 1; }
-          [ "$(field "$IL" pass)" -ge "$FLOOR" ] || { echo "::error::interp pass below floor $FLOOR"; exit 1; }
-          IS=$(sig "$IL")
+          PY=python3
+          if ! command -v python3 >/dev/null 2>&1; then PY=python; fi
+          TIERS=(--tier interp)
           if [ "${{ matrix.jit }}" = "true" ]; then
-            JL=$(run_tier jit); echo "jit:    $JL"
-            AL=$(run_tier aot); echo "aot:    $AL"
-            [ "$(field "$JL" errors)" = "0" ] || { echo "::error::jit errors!=0"; exit 1; }
-            [ "$(field "$AL" errors)" = "0" ] || { echo "::error::aot errors!=0"; exit 1; }
-            if [ "$(sig "$JL")" != "$IS" ]; then
-              echo "::error::jit tally diverges from interpreter"
-              diff -u "$RUNNER_TEMP/wasmspec-interp.txt" "$RUNNER_TEMP/wasmspec-jit.txt" || true
-              exit 1
-            fi
-            if [ "$(sig "$AL")" != "$IS" ]; then
-              echo "::error::aot tally diverges from interpreter"
-              diff -u "$RUNNER_TEMP/wasmspec-interp.txt" "$RUNNER_TEMP/wasmspec-aot.txt" || true
-              exit 1
-            fi
-            echo "three-tier identity OK"
+            TIERS+=(--tier jit --tier aot)
           fi
+          "$PY" tools/conformance/check.py \
+            --runner ./build/wasmspec${{ matrix.exe }} \
+            --corpus tests/spec/testsuite "${TIERS[@]}"

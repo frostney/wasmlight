@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - `lwpt test` discovers, compiles, and runs `source/units/*.Test.pas` as
-  independent programs. Sixty-two suites today, including compiled WASI
+  independent programs. Sixty-three suites today, including compiled WASI
   capability-set coverage, the `wasmlight compile` CLI contract,
   catalog-discovery coverage, the native executable payload format, the
   Connector language lexer, parser, and resolve suites, connector
@@ -11,7 +11,8 @@
   the runtime-shell payload and startup suites, Linux ELF runtime-shell
   packager coverage, the Mach-O packager and SHA-256 known-answer
   suites, 64-bit Unix C-ABI call-plan, local-library, and call-gate
-  coverage, and connector copy/borrow/handle coverage.
+  coverage, connector copy/borrow/handle coverage, and the release-archive
+  contract.
 - Unit suites are co-located with the unit they cover and carry the
   malformed-input cases as literal bytes.
 - The upstream WebAssembly spec testsuite **is wired up** through
@@ -22,6 +23,11 @@
   H), so the `staged` column is 0. The 257 pinned core scripts are fully
   judged: 65,188 pass with no failures or skips.
 - Two framework gotchas bite newcomers; both are listed below.
+
+The pinned core gate also covers i386: its regressions include `array.new_data`
+checking source bounds before allocation and binary64 multiplication/division
+rounding subnormal results once to nearest/even. The latter uses exact integer
+arithmetic at the underflow boundary, preserving support for x87-only hosts.
 
 ## Running
 
@@ -137,21 +143,22 @@ instead.
 | `Wasm.Abi.Test` | 64-bit Unix C-ABI call plans: LP64 layout, AAPCS64 scalar/HFA/B.4/x8 placement, Apple AAPCS64 natural stack packing, SysV register/stack/MEMORY-return placement, and pointer-view as an integer class — every target judged on every host. |
 | `Wasm.Native.Load.Test` | Application-local library resolution: platform filename beside the executable, relative join, literal absolute path, `..` escape, a cwd decoy ignored, and missing library as `EWasmLinkError`. |
 | `Wasm.Native.Call.Test` | Precompiled call gates: Pascal `cdecl` scalars/stack/aggregates/pointer-views, C and Pascal fixture libraries observationally identical on scalars, stack, pairs, HFAs, pointer-views, and large aggregates, missing symbol as `EWasmLinkError`; live calls gated to 64-bit Unix. |
+| `Wasm.Distro.Test` | The release-archive contract: four Unix host/display names, MANIFEST completeness, GNU checksum syntax, ELF/Mach-O shell-image matching, and rejection of AppleDouble names. |
 | `Wasm.Engine.Test` | The embedding facade: load keeping `EWasmDecodeError` and `EWasmValidationError` distinct, the typed linker satisfying imports and raising `EWasmLinkError` for an undefined one (no ambient fallback), call marshalling, guest-memory read/write refused past the bound through the chokepoint, host-root registration across an allocation, and `EWasmExit` propagating distinct from a trap and a `throw`. |
-| `Wasm.Connector.Callbacks.Test` | Connector callback thunks: direct store-thread re-entry and nested trampoline, retained vs scoped lifetimes, teardown-safe dead pointers, queued void notifications copied from a foreign thread, rejection of queued results/borrows and foreign-thread synchronous results as `EWasmCallbackError`, and `EWasmTrap` / `EWasmException` / `EWasmExit` retained at the cdecl boundary then rethrown on Pascal ground. Representative raylib audio and SDL event-filter shapes, without linking those libraries. |
+| `Wasm.Connector.Callbacks.Test` | Connector callback thunks: direct store-thread re-entry and nested trampoline, retained vs scoped lifetimes, safe reuse after teardown and cancellation of queued work on unbind/rebind (including a private drain batch), queued void notifications copied from a foreign thread and drained in queue order after another hub is freed, rejection of queued results/borrows and foreign-thread synchronous results as `EWasmCallbackError`, and `EWasmTrap` / `EWasmException` / `EWasmExit` retained at the cdecl boundary then rethrown on Pascal ground. Representative raylib audio and SDL event-filter shapes, without linking those libraries. |
 | `Wasm.Connector.Memory.Test` | Connector copy-in/out/inout through the chokepoint, scoped-borrow lifetime, and opaque handles: OOB and wrapping transfers trap as `out of bounds memory access` on both i32 and i64 memories; a retained borrow, guest re-entry, and callback while a view is live are `EWasmConnectorError`; stale, zero, and unknown handles fail with one message; a handle is never the raw native pointer. |
 | `Wasm.Connector.Lexer.Test` | The Connector-language tokenizer: punctuation, identifiers, strings, integers, comment trivia, one-token peek, Unix/Windows/classic-Mac newlines, and the unclosed-string / unclosed-comment / illegal-character faults with 1-based positions. |
 | `Wasm.Connector.Test` | `ParseConnector` and the declaration model: static classes, structs, enums, delegates, and `extern` methods; `DllImport` / `EntryPoint` / `MarshalAs` / `In` / `Out` / `Scoped` / `Queued`; unused declarations retained; and a literal-snippet rejection for every excluded construct (method bodies, properties, inheritance, generics, expressions, control flow, allocation). |
 | `Wasm.Wasi.Types.Test` | The frozen preview1 witx constants — errno numbering, filetype, rights, oflags, fdflags, clockid, whence — asserted at their load-bearing values, since a wrong number is a silent ABI break. |
 | `Wasm.Wasi.Memory.Test` | The host-side guest-memory marshalling: iovec/ciovec reads, string and buffer copies, and pointer/length pairs bounds-checked through the chokepoint so a hostile pointer faults rather than escaping. |
 | `Wasm.Wasi.Test` | The host module, hermetically: captured stdio buffers instead of real fds, an injected fixed clock and deterministic random source, and temp-dir preopens for the filesystem — args/environ, `fd_write`/`read`/`seek`/`close`, `clock_time_get`, `random_get`, and `path_open` plus the wave-2 file ops. The deny-by-default negatives carry the weight: a fabricated fd is `weBadf`, an ungranted clock or an absent preopen is `weNotCapable`, and a path that is absolute, escapes via `..`, or escapes via a symlink is `weNotCapable` before any OS call. |
-| `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
-| `Wasm.Compile.Test` | The `wasmlight compile` driver: registry-owned `-o` / `--target` / `--connector` help, flag-shaped option values, host-default and explicit released targets, selected `.wlc` parse through `ParseConnector`, and distinct decode / validation / link / connector / strict-compile / packaging / I/O failures that never write an executable or fall back to `.waot`. Native emission is not claimed. |
+| `Wasm.Run.Test` | The `wasmlight run` driver end to end over injected streams: a command's normal return mapping to exit 0, `proc_exit(n)` (`EWasmExit`) to `n`, a trap to 134, an uncaught exception to 1, and a decode/validate/link failure to 1 with the diagnostic returned rather than printed, including a `_start` that is not `() -> ()`, rejected before any start function runs; `--dir`/`--env` granting exactly what is named; and a reactor's `_initialize`-only shape reported, not run. |
+| `Wasm.Compile.Test` | The `wasmlight compile` driver: registry-owned `-o` / `--target` / `--connector` help, WASI as a built-in, flag-shaped option values, host-default and explicit released targets, selected `.wlc` parse through `ParseConnector`, distinct decode / validation / link / connector / strict-compile / packaging / I/O failures that never write an executable or fall back to `.waot`, and a host-target success path that emits a packaged native-executable payload. |
 | `Wasm.Compile.Capabilities.Test` | The immutable compiled capability set: deny-by-default emptiness, `GUEST=HOST` / `KEY=VALUE` parse rejects, freeze, relative host resolution from the executable directory (not CWD), literal absolute hosts, relocation, POSIX and Windows absolute classification, guest argv forwarding of flag-shaped tokens, no process-env inheritance, apply refusing an already-capable config, and `path_open` containment (`..`, absolute, UNIX escaping symlink) through the shipped WASI host. |
 | `Wasm.Compile.Catalog.Test` | Installed runtime-shell discovery: the four released 64-bit Unix triples, catalog write/parse, FNV-1a-64 checksums, host-default selection through the same path as an explicit triple, release-completeness, and the negative catalog cases (missing, duplicate, stale, mismatched, corrupt, escaping paths). |
 | `Wasm.Connector.Resolve.Test` | Unique import matching into a stripped connector plan: `EntryPoint` aliases the native symbol only, unused libraries/types/classes drop out, built-in WASI imports need no declaration, and missing, duplicate, incompatible, ambiguous, non-function, and unsupported-type bindings raise `EWasmLinkError`. |
 | `Wasm.Shell.Payload.Test` | The temporary runtime-shell envelope: empty and non-empty section round-trips, and malformed cases spelled as literal bytes (bad magic, truncated header/body, unknown version, trailing bytes). |
-| `Wasm.Shell.Test` | The interpreter-free startup path: decode and validation keep their error classes, an incomplete or stale native image is `EWasmLinkError` with no interpreter fallback, connector/capability stubs reject non-empty values, and a valid image runs `_start` through native entries on a 64-bit UNIX host (hello, trap, `17+25` then `proc_exit(42)`). |
+| `Wasm.Shell.Test` | The interpreter-free startup path: decode and validation keep their error classes, an incomplete or stale native image or a `_start` that is not `() -> ()` is `EWasmLinkError` with no interpreter fallback, connector/capability stubs reject non-empty values, and a valid image runs `_start` through native entries on a 64-bit UNIX host (hello, trap, `17+25` then `proc_exit(42)`). |
 
 Malformed modules are assembled byte-by-byte next to the assertion rather
 than loaded from fixtures: each case *is* a specific malformation, and
@@ -205,6 +212,19 @@ the rejection (text operands via `EWasmTextError`, binary via
 through the interpreter and compare. Everything not judged is `SKIP` with a
 reason, and the skip column is never folded into the totals, so a report
 cannot read as more conformance than was measured.
+
+CI gates the 257 top-level scripts through `tools/conformance/check.py`.
+The shared gate preserves the runner exit status and requires the exact pinned
+pass count with zero errors, failures, skips, and staged cases for every tier.
+It also requires each run to report the requested tier, with JIT and AOT
+compiling at least one function and the interpreter compiling none, so a tier
+that silently falls back to the interpreter cannot pass. When more than one
+tier runs, the non-core scripts beneath the corpus root (proposals, legacy,
+custom) must produce byte-identical output and exit status in every tier. Their
+own pass/fail counts are not gated, but a JIT or AOT divergence there fails.
+`python3 -m unittest discover -s tools/conformance` proves that a failing runner,
+a regressed tally, a fallen-back tier, or a non-core divergence cannot pass the
+gate.
 
 The pinned core target (the 257 top-level scripts) is clean:
 
@@ -305,10 +325,10 @@ interpreter runs alone.
 CI now wires this in. The corpus is **fetched at the pinned commit**
 (`tests/spec/testsuite.commit`, gitignored — never vendored) and run on
 **every platform under `--tier=interp`**; on the 64-bit UNIX legs the
-`--tier=jit` and `--tier=aot` runs also execute and CI asserts their tally
-is byte-identical to the interpreter's (a codegen bug would break the
-identity invariant). `errors=0` and a pass floor guard against a silent
-corpus vanishing.
+`--tier=jit` and `--tier=aot` runs also execute. Every tier must reach the
+exact pinned core tally on its own, and the non-core scripts must produce
+identical output in every tier (a codegen bug would break the identity
+invariant); see the gate description above.
 
 **Honest cross-platform status.** Exact-main
 [CI run 31899074165](https://github.com/frostney/wasmlight/actions/runs/31899074165)

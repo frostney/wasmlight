@@ -79,6 +79,14 @@ const
   NO_MEMORY_WAT =
     '(module (func (export "_start")))';
 
+  { A `_start` that takes an argument, plus a start function that traps: a
+    trap (exit 134) would mean the start function ran before the entry
+    signature was checked. }
+  BAD_ENTRY_WAT =
+    '(module (memory (export "memory") 1)' +
+    ' (func $boom unreachable) (start $boom)' +
+    ' (func (export "_start") (param i32)))';
+
   { The committed binary fixture that hello.wat assembles to — the exact
     program the CLI runs, loaded from disk here so the binary stays in sync
     with its behaviour and does not drift from HELLO_WAT. The suite runs with
@@ -164,6 +172,7 @@ type
     procedure TestNoStartIsError;
     procedure TestReactorIsRejected;
     procedure TestMissingMemoryIsError;
+    procedure TestBadEntrySignatureFailsToLink;
     procedure TestNonWasiImportFailsToLink;
     procedure TestGarbageBytesIsError;
 
@@ -297,6 +306,16 @@ begin
   Res := RunWat(NO_MEMORY_WAT);
   Expect<Integer>(Res.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('memory', Res.Diagnostic) > 0).ToBe(True);
+end;
+
+procedure TRunTests.TestBadEntrySignatureFailsToLink;
+var
+  Res: TWasmRunResult;
+begin
+  Res := RunWat(BAD_ENTRY_WAT);
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<string>(Res.Diagnostic).ToBe(
+    'EWasmLinkError: not a command module: "_start" must have type () -> ()');
 end;
 
 procedure TRunTests.TestNonWasiImportFailsToLink;
@@ -466,6 +485,8 @@ begin
   Test('a reactor (_initialize only) is rejected, exit 1', TestReactorIsRejected);
   Test('a command with no exported memory is an error, exit 1',
     TestMissingMemoryIsError);
+  Test('a _start that is not () -> () fails to link before start runs, exit 1',
+    TestBadEntrySignatureFailsToLink);
   Test('an import outside wasi_snapshot_preview1 fails to link, exit 1',
     TestNonWasiImportFailsToLink);
   Test('garbage bytes are a decode error, exit 1, not a crash',

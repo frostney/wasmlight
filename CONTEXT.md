@@ -139,7 +139,8 @@ into which `wasmlight compile` embeds a validated module, complete native
 code, and its connector plan. It retains validation and runtime helpers but
 contains no interpreter or JIT compiler
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-The template is shipped; the compile command that populates it is not.
+The template is shipped; `wasmlight compile` populates it for WASI command
+modules on released 64-bit UNIX targets.
 _Avoid_: launcher, stub, wrapper executable, bundled runtime
 
 **Shell catalog**:
@@ -150,8 +151,8 @@ _Avoid_: sysroot, toolchain, SDK, target cache
 
 **Runtime-shell payload section**:
 The Mach-O section `__WSHL,__payload` where the packager places the compile
-payload. The bytes are opaque until the product record layout lands; an
-altered section fails the embedded ad-hoc CodeDirectory
+payload. The bytes are a native-executable payload; an altered section
+fails the embedded ad-hoc CodeDirectory
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: overlay, resource fork, post-signature trailer
 
@@ -187,6 +188,16 @@ declined functions for interpreter fallback
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 _Avoid_: full AOT, forced AOT, trusted compile
 
+**Release archive**:
+A checksum-pinned per-host tarball that contains the compiler for that
+host and every runtime shell published with the release. The 0.2.0 set is
+the four 64-bit Unix hosts; Windows archives are later releases.
+_Avoid_: bottle, installer package, SDK
+
+**Checksum manifest**:
+The GNU SHA-256 file published beside the release archives, named
+`wasmlight-<version>-checksums.txt`, listing each archive basename.
+_Avoid_: signature file, lockfile, provenance attestation
 **Compiled capability set**:
 The immutable WASI permissions and values embedded by `wasmlight compile` in a
 native executable. Relative host directories resolve from the executable

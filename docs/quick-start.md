@@ -23,11 +23,11 @@ your platform (`linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`
 tarballs, or the `windows-x64` / `windows-x86` zips):
 
 ```bash
-curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.6.0/lwpt-0.6.0-macos-arm64.tar.gz
-curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.6.0/lwpt-0.6.0-checksums.txt
-shasum -a 256 -c <(grep macos-arm64 lwpt-0.6.0-checksums.txt)
-tar xzf lwpt-0.6.0-macos-arm64.tar.gz
-export PATH="$PWD/lwpt-0.6.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.7.0/lwpt-0.7.0-macos-arm64.tar.gz
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.7.0/lwpt-0.7.0-checksums.txt
+shasum -a 256 -c <(grep macos-arm64 lwpt-0.7.0-checksums.txt)
+tar xzf lwpt-0.7.0-macos-arm64.tar.gz
+export PATH="$PWD/lwpt-0.7.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
 ```
 
 Then set up the project:
@@ -56,7 +56,7 @@ lwpt test            # co-located unit suites
 ./build/wasmlight inspect module.wasm    # section table + entity counts
 ./build/wasmlight validate module.wasm   # decode + validate, report the IR
 ./build/wasmlight run module.wasm        # run a WASI preview1 command
-./build/wasmlight compile module.wasm -o app  # CLI is registered; native emission is not shipped
+./build/wasmlight compile module.wasm -o app  # native WASI executable (needs wasmlight-shell beside the compiler, or a catalog)
 ./build/wasmlight --version
 ./build/wasmbench --workload loop --tier jit --samples 5
 # workloads: decode, leb128, startup, loop, fib, memory, numeric, simd

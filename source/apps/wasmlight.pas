@@ -5,9 +5,10 @@
   Flags go through the lwpt `cli` package — no hand-rolled ParamStr loops
   except the documented `run` pre-scan (see AGENTS.md).
 
-  `compile` is registered here so the verb, `--target`, and `--connector`
-  exist and fail with structured diagnostics. Native executable emission
-  is not shipped until the remaining ADR-0015 stages land. }
+  `compile` emits an interpreter-free native executable for a released
+  64-bit UNIX `--target` (WASI preview1 only; connector host functions
+  are not embedded). There is never a `.waot`, JIT, or interpreter
+  fallback. }
 program wasmlight;
 
 {$I Shared.inc}
@@ -815,8 +816,7 @@ begin
 
     { `compile` is the native-executable command (ADR-0015). Options are
       created by Wasm.Compile so `compile --help` and the unit suite share
-      one definition. Backend stages still fail with structured errors
-      until sibling work lands; the command never falls back to `.waot`. }
+      one definition. The command never falls back to `.waot`. }
     CompileOpts := CreateCompileOptions(CompileOutputOpt, CompileTargetOpt,
       CompileConnectorOpt);
     Registry.Add(TSubcommand.Create('compile',

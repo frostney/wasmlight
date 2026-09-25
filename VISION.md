@@ -56,15 +56,13 @@ Component Model — component decode and canonical ABI lowering — is
 deferred to post-v1, deferred rather than dropped
 ([ADR-0014](docs/adr/0014-the-component-model-is-deferred-to-post-v1.md)).
 
-The next product spine, not yet shipped, is native application
-compilation: `wasmlight compile` produces a complete native executable
-from a validated module
+Native application compilation is shipped for WASI command modules:
+`wasmlight compile` produces a complete native executable from a
+validated module on the four released 64-bit UNIX targets
 ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-That work is sequenced in [roadmap.md](docs/roadmap.md). The `compile`
-verb is registered with `--target` and `--connector`, but producing a
-native executable is not shipped: the command reports structured errors
-until the remaining compiler stages land. The shipped execution CLI
-remains `inspect` / `validate` / `run` / `aot`.
+Connector host functions and compiled `--dir`/`--env` are not yet
+embedded. The shipped execution CLI remains `inspect` / `validate` /
+`run` / `aot` / `compile`.
 
 wasmlight is a member of the lwpt ecosystem: built, tested, formatted, and
 released through lwpt, and consumable by any lwpt project.
@@ -99,10 +97,11 @@ released through lwpt, and consumable by any lwpt project.
   is another tool's job. The sibling project
   [lakon](https://github.com/frostney/lakon) compiles Object Pascal *to*
   WebAssembly — a natural counterpart, but neither project depends on
-  the other. Compiling a validated module *to* a native executable is
-  planned `0.2.0` work
-  ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)),
-  not a shipped command.
+  the other. `wasmlight compile` compiles a validated WASI command *to* an
+  interpreter-free native executable on supported 64-bit UNIX hosts
+  ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
+  Cross-target release delivery remains tracked in
+  [issue #46](https://github.com/frostney/wasmlight/issues/46).
 - **Not a browser embedding.** No JavaScript API, no DOM, no `WebAssembly`
   namespace shim. The host is a Pascal program.
 - **Not a general-purpose sandbox for native code.** The isolation
@@ -125,6 +124,6 @@ released through lwpt, and consumable by any lwpt project.
 - [Roadmap](docs/roadmap.md) — what is shipped and what is next
 - [Code style](docs/code-style.md) — including the hot-path RTL policy
 - [CONTEXT.md](CONTEXT.md) — canonical glossary
-- [docs/adr/](docs/adr/) — architectural decisions, including the planned
+- [docs/adr/](docs/adr/) — architectural decisions, including the strict
   native-compiler contract
   ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md))

@@ -1,5 +1,136 @@
 # Handoff
 
+## Stack #125 review and fix layers, 2026-09-25
+
+- The user waived an outside reviewer: four parallel subagent reviews count
+  as the external review for stack #125. They reviewed every layer at its exact
+  head: #117/#120/#121/#126 approved with nits; #119, #122, #124, #118 had
+  changes requested. All verified findings are fixed in three new top layers
+  (lower layers untouched):
+  - `fix/stack-125-runtime-review`: hub teardown keeps other hubs' queued
+    notes in order; `run` applies the `_start: () -> ()` check before start;
+    scoped/teardown tests use distinct functions so dedup cannot mask leaks;
+    JIT differential tests for multi-field `struct.new` and
+    `array.new_data` range-before-allocation. Each test was mutation-checked.
+  - `ci/stack-125-gate-review`: `check.py` requires `tier=<requested>`,
+    `compiled>0` for JIT/AOT and `0` for interp, and byte-identical non-core
+    output across tiers (restores cross-tier identity for the 31 non-core
+    scripts). Real run: 65,188 in all tiers; non-core identical.
+  - `docs/stack-125-review`: VISION no longer calls ADR-0015 "planned";
+    `docs/tooling.md` pins `skills@1.5.23`; AGENTS/architecture list
+    `Wasm.Jit.Runtime` and `Wasm.Jit.Vector`.
+- Declined: store `CheckThread` raising `EWasmError` from `Unbind` (the
+  store-wide debug-only ADR-0008 assertion; architecture's "off-thread
+  rejects" means thunk invocation, which already raises
+  `EWasmCallbackError`); the `ReleaseSlot` filter test gap (defense in depth,
+  queue not observable).
+- Local gate: 62/63 suites; `Wasm.Native.Call.Test` needs `clang`, which
+  this host lacks (CI has it; fails identically on the base).
+- #126 refreshed `code-review` and `software-engineering-excellence` to KGR
+  `946dc1ecc7cacd62caecfe67ab1a55d109a9154d` via pinned `skills@1.5.23`.
+- Tooling on this machine: nvm v0.40.8 + Node v24.21.0 LTS (default, from
+  `~/.bashrc`), `gh stack`, `lwpt` 0.7.0 (`frostney/tap`), `lefthook` 2.1.14
+  (hooks installed). The `wasm` MCP server needs a T3 Code restart.
+- Five merged-PR `codex/*` branches were deleted (each at its merged head).
+  Kept, unmerged, no PR: `codex/optimize-runtime-wave16` (28 commits of
+  wave 16/17 JIT optimizations), `codex/validate-wave16-core`,
+  `codex/validate-wave17-core`. They need a decision: deliver or drop.
+- #46 (0.2.0 cross-target gates, archives, Homebrew) remains open.
+- A fifth subagent review approved the fix layers #127–#129 with nits; those
+  nits are fixed in #129 and a top gate-diagnostics layer.
+- Next: once every layer's current-head CI is green, merge all layers
+  atomically with `gh stack merge --squash` (never layer by layer, never a
+  prefix below a fix layer), then sync `main` and delete the merged
+  branches. Then decide the wave 16/17 branches.
+
+## Skills migration and audit remediation, 2026-09-22
+
+- User authorized implementing all five audit findings and shipping a native
+  GitHub stack, including the project-skill migration. Base remains fetched
+  `aef1e9c21979b5e15063fa1a159986443853427e`.
+- Published native stack **#125**, bottom-to-top: #117 skills, #119 callback
+  lifetimes, #120 native entry, #121 shared helpers, #122 documentation,
+  #124 i386 conformance repairs, #118 strict core gate. All PRs are attached
+  to the task and contain reconciled validation evidence. This supersedes
+  initial stack #123. Official `gh stack modify` moved the strict gate after
+  the runtime repairs; protected `gh stack submit` recreated native topology.
+  The integrated tree was verified identical before/after restructuring.
+  Read live GitHub heads/checks/review state before continuing.
+- Skills: KGR `bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c`, Matt Pocock
+  `c55ee46073ed923f86ce59a5eb3b6d895095d1b7`; 24 locked payloads verified,
+  local `optimize-runtime` retained. Migration used pinned `skills@1.5.23`.
+- CA-1: user selected caller-owned callback pointer lifetimes. Native callers
+  must stop and finish calls before Unbind/EndScope/Destroy; released addresses
+  may be reused. Pending notes are removed and private drain batches carry
+  binding generations. ADR-0017 records the decision; 16 callback tests pass.
+- CA-2: both workflows use the shared strict pinned-core process/tally gate;
+  five regression tests cover failing runners, bad/missing/duplicate tallies,
+  root-only corpus selection and missing scripts.
+- CA-3: compile and runtime shell reject non-void `_start` signatures with
+  EWasmLinkError before native emission/invocation. Regression tests preserve
+  preexisting output; real CLI repros create no executable; valid command runs.
+- CA-4: memory/GC bodies now live in `Wasm.Jit.Runtime`; backend ABI entrypoints
+  and ARM64 small-struct batching choice retained. No performance claim.
+- CA-5: VISION describes shipped native compilation and links open #46 for
+  remaining cross-target release delivery.
+- Local evidence: all 63 unit suites, four builds, focused suites, all three tiers 65,188 pass
+  with zero fail/skip/staged, frozen install, format, agents, Markdown, health,
+  duplication. Duplication fell from 7.71% to 7.34%. Full unit log:
+  `/tmp/wasmlight-final-tests.log`; corpus `/tmp/wasmlight-final-conformance.log`.
+- Audit and repros: `/tmp/wasmlight-audit-20260922/report.md`; bounded review:
+  `/tmp/wasmlight-review-20260922.md`. x64/Windows behavior needs hosted CI.
+- The strict hosted gate exposed 13 previously hidden Windows i386 failures:
+  two array.new_data source-range/allocation precedence cases and eleven x87
+  binary64 subnormal multiply/divide double-rounding cases. The added
+  `codex/audit-win32-conformance` layer checks data bounds before allocation
+  and uses exact integer rounding only at the f64 underflow boundary.
+  The independent Fraction oracle passes 5,000 cases; committed tests cover
+  the eleven corpus vectors, ties, signed zero and the normal boundary.
+- Final local repair validation: 63 suites, four builds and all three pinned
+  core tiers pass. Logs: `/tmp/wasmlight-winfix-alltests.log`,
+  `/tmp/wasmlight-winfix-build.log`, `/tmp/wasmlight-winfix-conformance.log`.
+  The 5,000-case oracle is retained outside the tree in
+  `/tmp/wasmlight-underflow-oracle.Test.pas` and its adjacent `.log`.
+- No new release is requested; #46 is not completed by this remediation.
+  Narrated video remains absent: say/asciinema exist, ffmpeg/agg do not.
+- Hosted checks are awaited with `delivery_wait.py` at each PR's exact head.
+  Native snapshot: `/tmp/wasmlight-final-native-snapshot.json`; CI receipts:
+  `/tmp/wasmlight-ci-<PR>.json`. Reconcile each receipt's head with GitHub.
+  Restructured publication receipt: Git worktree
+  `kgr-push-guards/f1756672-b20d-433e-bb57-8c0e18ded6bd`.
+- No configured external review provider or requested reviewer was found.
+  The user has been asked which reviewer/provider should review the stack,
+  as DEFINITION_OF_DONE requires external review before merge.
+- Next: await every current-head CI, mark ready, obtain and triage external
+  review, then complete the authorized delivery endpoint. Native stack #125
+  contains the whole remediation; never merge a prefix below a required fix.
+  Never infer merge readiness from local tests or absent reviewer findings.
+
+## Open PR maintenance, 2026-09-19
+
+- User requested fixes for both open PRs and the frostney/me delivery loop.
+- PR #115 is merged on main as d801f1c. PR #98 now merges that base,
+  preserving native emission and canonical archive-catalog support.
+- Current request: update PR #98, validate the merged result, push normally,
+  and refresh its metadata. Only documentation required conflict resolution.
+- After the base merge, all 63 suites, four builds, frozen install, format,
+  agent-reference and Markdown gates passed, including four focused suites.
+  Archive verification checked 11 file hashes; an archive using the real host
+  shell compiled and ran native hello. Foreign-target shells remain fixtures.
+- PR #98 now writes and verifies the canonical compiler shell catalog,
+  resolves archive/Homebrew share layouts, validates source-shell checksums,
+  contains archive paths, and requires complete per-file hash coverage.
+- Fixture archives explicitly provide structural evidence only. Strict/live
+  verification rejects absent emission and checks guest-requested exit 37,
+  preventing an exit-zero placeholder from passing as a real runtime shell.
+- Issue #46 remains incomplete: foreign-ISA emission, assembled live shells,
+  published release assets and external Homebrew installation remain absent.
+- PR #98 still requires external review before merge under Definition of Done. No non-release integration destination is
+  configured. Deliver forbids substituting release publication for integration.
+- Local lwpt 0.7.0 gates use LWPT_CACHE_DIR=/tmp/wasmlight-pr-cache-20260919
+  and LWPT_WORKER_STATE_DIR=/tmp/wasmlight-pr-workers-20260919 with one worker
+  after shared worker/cache locks prevented progress. No shared state deleted.
+
 Updated: 2026-09-05 (Wave 17 optimization results)
 
 ## Wave 17 — retained outcome

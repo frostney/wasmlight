@@ -1,11 +1,12 @@
 { Unit suite for Wasm.Compile — the `wasmlight compile` core (ADR-0015).
 
-  The command is wired before the strict AOT and runtime-shell work
-  land: these tests prove the CLI contract, selected-connector parse,
-  and the structured failure stages, not a shipped native executable. Every module
-  is assembled from wat through the shipped assembler. Output paths are
-  temp files that must stay absent (or unchanged) after a failed compile.
-  No network, no `.waot` fallback, no interpreter/JIT execution. }
+  The command validates once, strict-AOTs every function for `--target`,
+  writes a native-executable payload, and packages it onto a catalog (or
+  host-sibling) runtime shell. These tests prove the CLI contract, WASI
+  as a built-in, selected-connector parse, structured failure stages that
+  never write an executable, and a host-target success path that emits a
+  packaged image. Every module is assembled from wat. No network, no
+  `.waot` fallback, no interpreter/JIT execution of the guest. }
 program Wasm.Compile.Test;
 
 {$I Shared.inc}
@@ -17,8 +18,13 @@ uses
   CLI.Options,
   TestingPascalLibrary,
   Wasm.Compile,
+  Wasm.Compile.Catalog,
   Wasm.Connector,
   Wasm.Core,
+  Wasm.MachO,
+  Wasm.Native.Payload,
+  Wasm.Package.Elf,
+  Wasm.Shell,
   Wasm.Wat.Assembler;
 
 const
@@ -45,6 +51,7 @@ type
     FTempDir: string;
     FOutputPath: string;
     FModulePath: string;
+    FCatalogRoot: string;
 
     FPositionals: TStringList;
     FOptions: TOptionArray;
@@ -58,6 +65,9 @@ type
     function OutputExists: Boolean;
     procedure WriteUtf8File(const APath, AText: string);
     function ReadUtf8File(const APath: string): string;
+    procedure WriteBytes(const APath: string; const ABytes: TWasmBytes);
+    procedure WritePackagingCatalog(const ARoot: string;
+      const AWrongMachOTarget: Boolean = False);
     procedure BeginOptions;
     procedure EndOptions;
   protected
@@ -84,14 +94,20 @@ type
     procedure TestDecodeFailure;
     procedure TestValidationFailure;
     procedure TestImportWithoutConnectorIsLinkError;
-    procedure TestWasiImportWithoutConnectorIsLinkError;
-    procedure TestEmptyModuleFailsAtStrictCompile;
+    procedure TestWasiImportIsBuiltIn;
+    procedure TestUnknownWasiImportIsLinkError;
+    procedure TestWrongWasiSignatureIsLinkError;
+    procedure TestStartParameter;
+    procedure TestStartResult;
+    procedure TestEmptyModuleFailsClosedWithoutCatalog;
     procedure TestFailedCompileLeavesNoOutput;
     procedure TestFailedCompileLeavesExistingOutput;
     procedure TestSiblingWaotIsIgnored;
     procedure TestWriteOutputRejectsDirectory;
     procedure TestWriteOutputIsAtomic;
-    procedure TestPackageStubIsPackagingError;
+    procedure TestPackageWithoutCatalogIsPackagingError;
+    procedure TestHostTargetEmitsNativeExecutable;
+    procedure TestWrongMachOTemplateFails;
   end;
 
 function TCompileTests.NewRequest(const ATarget: string): TWasmCompileRequest;
@@ -100,6 +116,9 @@ begin
   Result.OutputPath := FOutputPath;
   Result.Target := ATarget;
   Result.Connectors := nil;
+  { A missing catalog root, not empty: empty would consult the compiler
+    catalog and, for the host target, a sibling `wasmlight-shell`. }
+  Result.CatalogRoot := IncludeTrailingPathDelimiter(FTempDir) + 'no-catalog';
 end;
 
 function TCompileTests.CompileWat(const AWat: string): TWasmCompileResult;
@@ -160,6 +179,79 @@ begin
   end;
 end;
 
+procedure TCompileTests.WriteBytes(const APath: string; const ABytes: TWasmBytes);
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if Length(ABytes) > 0 then
+      Stream.WriteBuffer(ABytes[0], Length(ABytes));
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure TCompileTests.WritePackagingCatalog(const ARoot: string;
+  const AWrongMachOTarget: Boolean);
+var
+  I: Integer;
+  Id: TWasmTargetId;
+  Bytes_: TWasmBytes;
+  Entries: TWasmShellEntries;
+  FileName: string;
+  Entry: TWasmShellEntry;
+begin
+  if not DirectoryExists(ARoot) then
+    CreateDir(ARoot);
+  SetLength(Entries, RELEASED_TARGET_COUNT);
+  for I := 0 to RELEASED_TARGET_COUNT - 1 do
+  begin
+    Id := ReleasedTargetId(I);
+    FileName := TargetTriple(Id) + '.shell';
+    case Id of
+      wtiAArch64Linux:
+        Bytes_ := PlaceholderElfTemplate(weptAarch64Linux);
+      wtiX64Linux:
+        Bytes_ := PlaceholderElfTemplate(weptX86_64Linux);
+      wtiAArch64Darwin:
+        Bytes_ := WriteMachOShellTemplate(wmtAarch64Darwin);
+    else
+      Bytes_ := WriteMachOShellTemplate(wmtX86_64Darwin);
+    end;
+    if AWrongMachOTarget and (Id = wtiAArch64Darwin) then
+      Bytes_ := WriteMachOShellTemplate(wmtX86_64Darwin);
+    WriteBytes(IncludeTrailingPathDelimiter(ARoot) + FileName, Bytes_);
+    Entry.Target := Id;
+    Entry.Triple := TargetTriple(Id);
+    Entry.Version := PROGRAM_VERSION;
+    case Id of
+      wtiAArch64Linux, wtiAArch64Darwin:
+        Entry.Arch := wtaAArch64;
+    else
+      Entry.Arch := wtaX64;
+    end;
+    case Id of
+      wtiAArch64Linux, wtiX64Linux:
+        begin
+          Entry.Os := wtoLinux;
+          Entry.Format := wsfElf;
+        end;
+    else
+      begin
+        Entry.Os := wtoDarwin;
+        Entry.Format := wsfMachO;
+      end;
+    end;
+    Entry.FileName := FileName;
+    Entry.Checksum := ShellChecksumBytes(Bytes_);
+    Entry.ShellPath := '';
+    Entries[I] := Entry;
+  end;
+  WriteUtf8File(IncludeTrailingPathDelimiter(ARoot) + SHELL_CATALOG_FILENAME,
+    WriteShellCatalogText(Entries));
+end;
+
 procedure TCompileTests.BeginOptions;
 begin
   FPositionals := TStringList.Create;
@@ -185,6 +277,8 @@ begin
   CreateDir(FTempDir);
   FOutputPath := IncludeTrailingPathDelimiter(FTempDir) + 'app';
   FModulePath := IncludeTrailingPathDelimiter(FTempDir) + 'mod.wasm';
+  FCatalogRoot := FTempDir;
+  WritePackagingCatalog(FCatalogRoot);
 end;
 
 procedure TCompileTests.AfterEach;
@@ -314,7 +408,9 @@ begin
   Request := NewRequest(WASM_COMPILE_TARGET_X64_LINUX);
   Res := CompileModuleBytes(AssembleWatText(EMPTY_WAT), Request);
   Expect<Integer>(Res.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('EWasmCompileError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('unknown compile target', Res.Diagnostic) > 0).ToBe(False);
+  Expect<Boolean>((Pos('EWasmCompileError', Res.Diagnostic) > 0) or
+    (Pos('EWasmPackagingError', Res.Diagnostic) > 0)).ToBe(True);
   Expect<Boolean>(OutputExists).ToBe(False);
 end;
 
@@ -391,7 +487,8 @@ begin
   Request.Connectors[1] := Two;
   Res := CompileModuleBytes(AssembleWatText(EMPTY_WAT), Request);
   Expect<Integer>(Res.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('EWasmCompileError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>((Pos('EWasmCompileError', Res.Diagnostic) > 0) or
+    (Pos('EWasmPackagingError', Res.Diagnostic) > 0)).ToBe(True);
   Expect<Boolean>(Pos('EWasmConnectorError', Res.Diagnostic) > 0).ToBe(False);
   Expect<Boolean>(OutputExists).ToBe(False);
   DeleteFile(One);
@@ -440,8 +537,9 @@ var
   Request: TWasmCompileRequest;
   Connector: string;
 begin
-  { Parsing a selected connector does not resolve guest imports; that is
-    issue #42. Until then an import stays an EWasmLinkError. }
+  { Class `Env` is not guest module `env`, so resolve does not bind the
+    import. A matching connector would still fail closed: compiled
+    executables grant WASI only. }
   Connector := IncludeTrailingPathDelimiter(FTempDir) + 'env.wlc';
   WriteUtf8File(Connector,
     'static class Env {' + sLineBreak +
@@ -516,38 +614,60 @@ begin
   Expect<Boolean>(OutputExists).ToBe(False);
 end;
 
-procedure TCompileTests.TestWasiImportWithoutConnectorIsLinkError;
+procedure TCompileTests.TestWasiImportIsBuiltIn;
 var
   Res: TWasmCompileResult;
 begin
-  { Compile-time WASI is issue #40. Until then a WASI import is unsatisfied
-    and must not fall through to the interpreter or `wasmlight run`. }
+  { WASI preview1 is a runtime-shell built-in. Without a catalog the
+    pipeline still fails closed at compile or packaging, never at link. }
   Res := CompileWat(WASI_WAT);
   Expect<Integer>(Res.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
-  Expect<Boolean>(Pos('wasi_snapshot_preview1', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(False);
+  Expect<Boolean>((Pos('EWasmCompileError', Res.Diagnostic) > 0) or
+    (Pos('EWasmPackagingError', Res.Diagnostic) > 0)).ToBe(True);
   Expect<Boolean>(OutputExists).ToBe(False);
 end;
 
-procedure TCompileTests.TestEmptyModuleFailsAtStrictCompile;
+procedure TCompileTests.TestUnknownWasiImportIsLinkError;
+var
+  Res: TWasmCompileResult;
+begin
+  Res := CompileWat(StringReplace(WASI_WAT, 'proc_exit', 'missing',
+    [rfReplaceAll]));
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(OutputExists).ToBe(False);
+end;
+
+procedure TCompileTests.TestWrongWasiSignatureIsLinkError;
+var
+  Res: TWasmCompileResult;
+begin
+  Res := CompileWat('(module (import "wasi_snapshot_preview1" "proc_exit"' +
+    ' (func)) (memory (export "memory") 1) (func (export "_start")))');
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(OutputExists).ToBe(False);
+end;
+
+procedure TCompileTests.TestEmptyModuleFailsClosedWithoutCatalog;
 var
   Res: TWasmCompileResult;
   Request: TWasmCompileRequest;
 begin
   Res := CompileWat(EMPTY_WAT);
   Expect<Integer>(Res.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('EWasmCompileError', Res.Diagnostic) > 0).ToBe(True);
-  Expect<Boolean>(Pos('strict compile is not available', Res.Diagnostic) > 0)
-    .ToBe(True);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(False);
+  Expect<Boolean>((Pos('EWasmCompileError', Res.Diagnostic) > 0) or
+    (Pos('EWasmPackagingError', Res.Diagnostic) > 0)).ToBe(True);
   Expect<Boolean>(OutputExists).ToBe(False);
 
-  { The host default is only a default: on a released host it reaches the
-    same stub; on Windows/i386 it is an unreleased packaging error. }
   Request := NewRequest('');
   Res := CompileModuleBytes(AssembleWatText(EMPTY_WAT), Request);
   Expect<Integer>(Res.ExitCode).ToBe(1);
   if IsReleasedCompileTarget(CompileHostTarget) then
-    Expect<Boolean>(Pos('EWasmCompileError', Res.Diagnostic) > 0).ToBe(True)
+    Expect<Boolean>((Pos('EWasmCompileError', Res.Diagnostic) > 0) or
+      (Pos('EWasmPackagingError', Res.Diagnostic) > 0)).ToBe(True)
   else
     Expect<Boolean>(Pos('EWasmPackagingError', Res.Diagnostic) > 0).ToBe(True);
 end;
@@ -556,8 +676,9 @@ procedure TCompileTests.TestFailedCompileLeavesNoOutput;
 var
   Res: TWasmCompileResult;
 begin
-  Res := CompileWatToFile(EMPTY_WAT);
+  Res := CompileWatToFile(IMPORT_WAT);
   Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(OutputExists).ToBe(False);
   Expect<Boolean>(FileExists(FOutputPath + '.tmp')).ToBe(False);
 end;
@@ -567,7 +688,7 @@ var
   Res: TWasmCompileResult;
 begin
   WriteUtf8File(FOutputPath, 'keep-me');
-  Res := CompileWat(EMPTY_WAT);
+  Res := CompileWat(IMPORT_WAT);
   Expect<Integer>(Res.ExitCode).ToBe(1);
   Expect<string>(ReadUtf8File(FOutputPath)).ToBe('keep-me');
 end;
@@ -581,9 +702,9 @@ begin
     fall back to it, or treat it as success. }
   WaotPath := ChangeFileExt(FModulePath, '.waot');
   WriteUtf8File(WaotPath, 'not an artifact');
-  Res := CompileWatToFile(EMPTY_WAT);
+  Res := CompileWatToFile(IMPORT_WAT);
   Expect<Integer>(Res.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('EWasmCompileError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(Pos('waot', LowerCase(Res.Diagnostic)) > 0).ToBe(False);
   Expect<Boolean>(OutputExists).ToBe(False);
   DeleteFile(WaotPath);
@@ -619,20 +740,32 @@ begin
   Payload[2] := Byte('S');
   Payload[3] := Byte('M');
   WriteUtf8File(FOutputPath, 'old');
+  WriteUtf8File(FOutputPath + '.tmp', 'unrelated temp');
+  WriteUtf8File(FOutputPath + '.bak', 'unrelated backup');
   WriteCompileOutput(FOutputPath, Payload);
   Expect<string>(ReadUtf8File(FOutputPath)).ToBe('WASM');
-  Expect<Boolean>(FileExists(FOutputPath + '.tmp')).ToBe(False);
+  Expect<string>(ReadUtf8File(FOutputPath + '.tmp')).ToBe('unrelated temp');
+  Expect<string>(ReadUtf8File(FOutputPath + '.bak')).ToBe('unrelated backup');
+  DeleteFile(FOutputPath + '.tmp');
+  DeleteFile(FOutputPath + '.bak');
 end;
 
-procedure TCompileTests.TestPackageStubIsPackagingError;
+procedure TCompileTests.TestPackageWithoutCatalogIsPackagingError;
 var
   Raised: Boolean;
   Msg: string;
+  Payload: TWasmBytes;
 begin
   Raised := False;
   Msg := '';
+  SetLength(Payload, 4);
+  Payload[0] := Byte('W');
+  Payload[1] := Byte('N');
+  Payload[2] := Byte('E');
+  Payload[3] := Byte('P');
   try
-    PackageCompilePayload(WASM_COMPILE_TARGET_AARCH64_DARWIN);
+    PackageCompilePayload(WASM_COMPILE_TARGET_AARCH64_DARWIN, Payload,
+      IncludeTrailingPathDelimiter(FTempDir) + 'no-catalog', FOutputPath);
   except
     on E: EWasmPackagingError do
     begin
@@ -641,12 +774,84 @@ begin
     end;
   end;
   Expect<Boolean>(Raised).ToBe(True);
-  Expect<Boolean>(Pos('runtime shell packaging is not available', Msg) > 0)
+  Expect<Boolean>(Msg <> '').ToBe(True);
+end;
+
+procedure TCompileTests.TestHostTargetEmitsNativeExecutable;
+var
+  Res: TWasmCompileResult;
+  Request: TWasmCompileRequest;
+  Extracted: TWasmBytes;
+  Parsed: TWasmNativePayload;
+begin
+  Request := NewRequest(CompileHostTarget);
+  Request.CatalogRoot := FCatalogRoot;
+  Res := CompileModuleBytes(AssembleWatText(WASI_WAT), Request);
+  if not IsReleasedCompileTarget(CompileHostTarget) then
+  begin
+    Expect<Integer>(Res.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('EWasmPackagingError', Res.Diagnostic) > 0).ToBe(True);
+    Expect<Boolean>(OutputExists).ToBe(False);
+    Exit;
+  end;
+  Expect<string>(Res.Diagnostic).ToBe('');
+  Expect<Integer>(Res.ExitCode).ToBe(0);
+  Expect<Boolean>(OutputExists).ToBe(True);
+  Expect<Boolean>(ExtractPackagedPayloadFromFile(FOutputPath, Extracted))
     .ToBe(True);
+  Expect<Integer>(Ord(ParseNativePayload(Extracted, Parsed))).ToBe(Ord(nprOk));
+  Expect<Boolean>(Length(Parsed.Funcs) > 0).ToBe(True);
+end;
+
+procedure TCompileTests.TestWrongMachOTemplateFails;
+var
+  Raised: Boolean;
+begin
+  WritePackagingCatalog(FCatalogRoot, True);
+  Raised := False;
+  try
+    PackageCompilePayload(WASM_COMPILE_TARGET_AARCH64_DARWIN, nil,
+      FCatalogRoot, FOutputPath);
+  except
+    on E: EWasmPackagingError do
+      Raised := Pos('target mismatch', E.Message) > 0;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TCompileTests.TestStartParameter;
+var
+  Res: TWasmCompileResult;
+begin
+  WriteUtf8File(FOutputPath, 'existing executable');
+  Res := CompileWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (param i32)))');
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+  Expect<string>(ReadUtf8File(FOutputPath)).ToBe('existing executable');
+end;
+
+procedure TCompileTests.TestStartResult;
+var
+  Res: TWasmCompileResult;
+begin
+  WriteUtf8File(FOutputPath, 'existing executable');
+  Res := CompileWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (result i32) i32.const 7))');
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+  Expect<string>(ReadUtf8File(FOutputPath)).ToBe('existing executable');
 end;
 
 procedure TCompileTests.SetupTests;
 begin
+  Test('Mach-O templates must match the selected architecture', TestWrongMachOTemplateFails);
+  Test('unknown WASI imports fail before native emission', TestUnknownWasiImportIsLinkError);
+  Test('WASI signature mismatches fail before native emission', TestWrongWasiSignatureIsLinkError);
+  Test('_start parameters fail the command contract', TestStartParameter);
+  Test('_start results fail the command contract', TestStartResult);
   Test('compile error classes are siblings under EWasmError',
     TestErrorClassesAreSiblings);
   Test('help documents every owned compile option',
@@ -678,10 +883,9 @@ begin
   Test('an ill-typed module is a validation error', TestValidationFailure);
   Test('an import without a connector is a link error',
     TestImportWithoutConnectorIsLinkError);
-  Test('a WASI import without compile-time WASI is a link error',
-    TestWasiImportWithoutConnectorIsLinkError);
-  Test('a valid module fails at the strict-compile stub',
-    TestEmptyModuleFailsAtStrictCompile);
+  Test('a WASI import is a compile built-in', TestWasiImportIsBuiltIn);
+  Test('a valid module without a catalog fails closed',
+    TestEmptyModuleFailsClosedWithoutCatalog);
   Test('a failed compile writes no executable',
     TestFailedCompileLeavesNoOutput);
   Test('a failed compile leaves an existing output untouched',
@@ -691,7 +895,10 @@ begin
     TestWriteOutputRejectsDirectory);
   Test('a successful write replaces the output atomically',
     TestWriteOutputIsAtomic);
-  Test('packaging is a distinct stub error', TestPackageStubIsPackagingError);
+  Test('a missing catalog is a packaging error',
+    TestPackageWithoutCatalogIsPackagingError);
+  Test('the host target emits a packaged native executable',
+    TestHostTargetEmitsNativeExecutable);
 end;
 
 begin

@@ -31,6 +31,7 @@ uses
   Wasm.Core,
   Wasm.Engine,
   Wasm.Jit.CodeBuffer,
+  Wasm.Package.Elf,
   Wasm.Runtime.Store,
   Wasm.Shell,
   Wasm.Shell.Payload,
@@ -110,6 +111,7 @@ type
     procedure SetupTests; override;
     procedure TestEmptyPayload;
     procedure TestMalformedPayload;
+    procedure TestCorruptEmbeddedTrailer;
     procedure TestGarbageModuleIsDecodeError;
     procedure TestInvalidModuleIsValidationError;
     procedure TestIncompleteNativeRejected;
@@ -117,6 +119,8 @@ type
     procedure TestConnectorStubRejected;
     procedure TestCapabilityStubRejected;
     procedure TestNoStart;
+    procedure TestStartParameter;
+    procedure TestStartResult;
     procedure TestReactor;
     procedure TestBadImport;
     procedure TestHelloNativeOrClosed;
@@ -495,8 +499,58 @@ begin
   end;
 end;
 
+procedure TShellTests.TestCorruptEmbeddedTrailer;
+var
+  Payload, Packaged: TWasmBytes;
+  Path: string;
+  Res: TWasmShellResult;
+begin
+  SetLength(Payload, 4);
+  Payload[0] := Byte('W');
+  Payload[1] := Byte('N');
+  Payload[2] := Byte('E');
+  Payload[3] := Byte('P');
+  Expect<Integer>(Ord(PackageAppendedPayload(nil, Payload, Packaged))).ToBe(Ord(eprOk));
+  Packaged[Length(Packaged) - WLSHELF_TRAILER_SIZE + 16] :=
+    Packaged[Length(Packaged) - WLSHELF_TRAILER_SIZE + 16] xor 1;
+  Path := WriteTempPayload(Packaged);
+  FConfig := TWasmWasiConfig.Create;
+  try
+    Res := RunShellFile(Path, FConfig);
+    Expect<Integer>(Res.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('malformed embedded payload trailer', Res.Diagnostic) > 0).ToBe(True);
+  finally
+    DeleteFile(Path);
+  end;
+end;
+
+procedure TShellTests.TestStartParameter;
+var
+  Res: TWasmShellResult;
+begin
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellBytes(PayloadForWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (param i32)))'), FConfig);
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+end;
+
+procedure TShellTests.TestStartResult;
+var
+  Res: TWasmShellResult;
+begin
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellBytes(PayloadForWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (result i32) i32.const 7))'), FConfig);
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+end;
+
 procedure TShellTests.SetupTests;
 begin
+  Test('corrupt embedded trailers fail before the attach seam', TestCorruptEmbeddedTrailer);
   Test('an empty payload is the unfilled template', TestEmptyPayload);
   Test('a malformed envelope is rejected before decode', TestMalformedPayload);
   Test('garbage module bytes are EWasmDecodeError', TestGarbageModuleIsDecodeError);
@@ -511,6 +565,8 @@ begin
   Test('a non-empty capability set is rejected (stub until #40)',
     TestCapabilityStubRejected);
   Test('a module with no _start is rejected', TestNoStart);
+  Test('_start parameters fail the command contract', TestStartParameter);
+  Test('_start results fail the command contract', TestStartResult);
   Test('a reactor is rejected', TestReactor);
   Test('an import outside WASI fails to link', TestBadImport);
   Test('hello writes through native entries, or fails closed off-backend',

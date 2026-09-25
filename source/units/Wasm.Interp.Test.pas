@@ -208,6 +208,7 @@ type
     procedure TestArrayOutOfBounds;
     procedure TestArrayCopyOverlap;
     procedure TestArrayNewData;
+    procedure TestArrayNewDataRangeBeforeAllocation;
     procedure TestArrayNewElem;
     procedure TestRefTestCast;
     procedure TestBrOnCastRefinement;
@@ -1330,6 +1331,32 @@ begin
   DoInstantiate;
   Expect<Int32>(Call1('fd', [MakeValueI32(0)]).I32).ToBe(1);
   Expect<Int32>(Call1('fd', [MakeValueI32(3)]).I32).ToBe(4);
+end;
+
+procedure TInterpTests.TestArrayNewDataRangeBeforeAllocation;
+begin
+  { exec-array.new_data: check source bytes before array.new_fixed allocation.
+    A count of 2^32-1 cannot allocate even on a 64-bit host, so this checks
+    trap precedence without making a multi-gigabyte allocation. }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5E, $78, $01]),
+      BLit([$60, $02, $7F, $7F, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(7, VecOf([BLit([$02, $66, $64, $00, $00])])),
+    Sect(12, BLit([$01])),
+    Sect(10, VecOf([CodeEntry([$00,
+      $20, $00, $20, $01, $FB, $09, $00, $00, $1A, $41, $00, $0B])])),
+    Sect(11, VecOf([BLit([$01, $04, $01, $02, $03, $04])]))
+  ]));
+  DoInstantiate;
+  ExpectTrap('fd', [MakeValueI32(0), MakeValueI32(-1)],
+    'out of bounds memory access');
+  ExpectTrap('fd', [MakeValueI32(-1), MakeValueI32(0)],
+    'out of bounds memory access');
+  Expect<Int32>(Call1('fd', [MakeValueI32(0), MakeValueI32(4)]).I32).ToBe(0);
+  Expect<Int32>(Call1('fd', [MakeValueI32(4), MakeValueI32(0)]).I32).ToBe(0);
 end;
 
 procedure TInterpTests.TestArrayNewElem;
@@ -2529,6 +2556,7 @@ begin
   Test('array.get out of bounds traps', TestArrayOutOfBounds);
   Test('array.copy handles overlap (memmove)', TestArrayCopyOverlap);
   Test('array.new_data initialises from a data segment', TestArrayNewData);
+  Test('array.new_data checks source range before allocation', TestArrayNewDataRangeBeforeAllocation);
   Test('array.new_elem initialises from an element segment', TestArrayNewElem);
   Test('ref.test and ref.cast, hit / miss / null / cast failure',
     TestRefTestCast);

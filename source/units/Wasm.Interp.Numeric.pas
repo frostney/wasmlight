@@ -1048,12 +1048,118 @@ begin
   Result := CanonicalizeF64(F64ToBits(R));
 end;
 
+{ x87's 53-bit precision still has an extended exponent range. A tiny
+  multiply/divide can therefore round once in a normal x87 register and again
+  when stored as a subnormal Double. Compute only these boundary results in
+  integer units of 2^-1074, rounding once to nearest/even (op-fmul/op-fdiv).
+  Normal results keep the native arithmetic path; no SSE2 requirement is added. }
+procedure F64Significand(const ABits: UInt64; out AMantissa: UInt64;
+  out AExponent: Integer);
+begin
+  AMantissa := ABits and UInt64($000FFFFFFFFFFFFF);
+  AExponent := Integer((ABits shr 52) and $7FF);
+  if AExponent = 0 then
+  begin
+    AExponent := -1074;
+    if AMantissa = 0 then
+      Exit;
+    while AMantissa < (UInt64(1) shl 52) do
+    begin
+      AMantissa := AMantissa shl 1;
+      Dec(AExponent);
+    end;
+  end
+  else
+  begin
+    AMantissa := AMantissa or (UInt64(1) shl 52);
+    Dec(AExponent, 1075);
+  end;
+end;
+
+function F64TinyProduct(const A, B: UInt64): UInt64;
+var
+  Ma, Mb, LowPart, HighPart, Cross, Carry, Half, Tail: UInt64;
+  Ea, Eb, Shift: Integer;
+begin
+  F64Significand(A, Ma, Ea);
+  F64Significand(B, Mb, Eb);
+  if (Ma = 0) or (Mb = 0) then
+    Exit(0);
+  { Exact 53 x 53 bit product, using 32-bit limbs without overflowing u64. }
+  LowPart := UInt64(UInt32(Ma)) * UInt64(UInt32(Mb));
+  Cross := (Ma shr 32) * UInt64(UInt32(Mb)) +
+    (Mb shr 32) * UInt64(UInt32(Ma));
+  Carry := (LowPart shr 32) + UInt64(UInt32(Cross));
+  HighPart := (Ma shr 32) * (Mb shr 32) + (Cross shr 32) + (Carry shr 32);
+  LowPart := (UInt64(UInt32(Carry)) shl 32) or UInt64(UInt32(LowPart));
+  Shift := -(Ea + Eb + 1074);
+  { A product has at most 106 bits; above this shift it is below half a unit. }
+  if Shift > 106 then
+    Exit(0);
+  if Shift < 64 then
+  begin
+    Result := (HighPart shl (64 - Shift)) or (LowPart shr Shift);
+    Half := (LowPart shr (Shift - 1)) and 1;
+    Tail := LowPart and ((UInt64(1) shl (Shift - 1)) - 1);
+  end
+  else if Shift = 64 then
+  begin
+    Result := HighPart;
+    Half := LowPart shr 63;
+    Tail := LowPart and UInt64($7FFFFFFFFFFFFFFF);
+  end
+  else
+  begin
+    Result := HighPart shr (Shift - 64);
+    Half := (HighPart shr (Shift - 65)) and 1;
+    Tail := LowPart or (HighPart and ((UInt64(1) shl (Shift - 65)) - 1));
+  end;
+  if (Half <> 0) and ((Tail <> 0) or ((Result and 1) <> 0)) then
+    Inc(Result);
+end;
+
+function F64TinyQuotient(const A, B: UInt64): UInt64;
+var
+  Ma, Mb, Remainder: UInt64;
+  Ea, Eb, Shift, I: Integer;
+begin
+  F64Significand(A, Ma, Ea);
+  F64Significand(B, Mb, Eb);
+  if Ma = 0 then
+    Exit(0);
+  Shift := Ea - Eb + 1074;
+  if Shift < -1 then
+    Exit(0);
+  if Shift = -1 then
+    Exit(Ord(Ma > Mb)); { equality is exactly halfway to the even zero }
+  Result := Ma div Mb;
+  Remainder := Ma mod Mb;
+  for I := 1 to Shift do
+  begin
+    Result := Result shl 1;
+    Remainder := Remainder shl 1;
+    if Remainder >= Mb then
+    begin
+      Remainder := Remainder - Mb;
+      Inc(Result);
+    end;
+  end;
+  Remainder := Remainder shl 1;
+  if (Remainder > Mb) or
+    ((Remainder = Mb) and ((Result and 1) <> 0)) then
+    Inc(Result);
+end;
+
 function F64Mul(const A, B: UInt64): UInt64;
 var
   R: Double;
 begin
   R := BitsToF64(A) * BitsToF64(B);
   Result := CanonicalizeF64(F64ToBits(R));
+  if ((Result and UInt64($7FFFFFFFFFFFFFFF)) <= UInt64($0010000000000000)) and
+    ((A and UInt64($7FF0000000000000)) <> UInt64($7FF0000000000000)) and
+    ((B and UInt64($7FF0000000000000)) <> UInt64($7FF0000000000000)) then
+    Result := ((A xor B) and UInt64($8000000000000000)) or F64TinyProduct(A, B);
 end;
 
 function F64Div(const A, B: UInt64): UInt64;
@@ -1062,6 +1168,10 @@ var
 begin
   R := BitsToF64(A) / BitsToF64(B);
   Result := CanonicalizeF64(F64ToBits(R));
+  if ((Result and UInt64($7FFFFFFFFFFFFFFF)) <= UInt64($0010000000000000)) and
+    ((A and UInt64($7FF0000000000000)) <> UInt64($7FF0000000000000)) and
+    ((B and UInt64($7FF0000000000000)) <> UInt64($7FF0000000000000)) then
+    Result := ((A xor B) and UInt64($8000000000000000)) or F64TinyQuotient(A, B);
 end;
 
 function F64Min(const A, B: UInt64): UInt64;

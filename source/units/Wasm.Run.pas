@@ -300,8 +300,11 @@ begin
 
     { Link + instantiate. A module importing anything outside the granted
       wasi_snapshot_preview1 wave-1 surface fails here (embedding-spec.md §6.2:
-      link failure -> exit 1). }
+      link failure -> exit 1). A `_start` that is not () -> () is rejected the
+      same way compile and the runtime shell reject it, before any start
+      function runs. }
     try
+      WasiCheckCommandEntry(ALoaded);
       Instance := Instantiate(Store, Linker, ALoaded);
     except
       on E: EWasmError do

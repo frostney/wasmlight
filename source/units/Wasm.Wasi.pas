@@ -71,6 +71,7 @@ uses
   {$ENDIF}
   Wasm.Core,
   Wasm.Engine,
+  Wasm.Ir,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values,
   Wasm.Wasi.Memory,
@@ -320,7 +321,30 @@ type
 procedure WasiDefineAll(const ALinker: TWasmLinker;
   const AContext: TWasmWasiContext);
 
+{ Native command entry uses no argument or result slots. Check this host
+  contract on the validated export type before compilation or invocation.
+  Missing exports retain the caller's existing command/catalog diagnostics. }
+procedure WasiCheckCommandEntry(const ALoaded: TWasmLoadedModule);
+
 implementation
+
+procedure WasiCheckCommandEntry(const ALoaded: TWasmLoadedModule);
+var
+  Exported: TWasmIrExport;
+  Signature: TWasmFuncType;
+begin
+  for Exported in ALoaded.Ir.ExportList do
+    if (Exported.Name = '_start') and (Exported.Kind = wxkFunc) then
+    begin
+      Signature := ALoaded.Ir.CanonTypes[
+        ALoaded.Ir.FuncCanonTypes[Exported.Index]].Comp.Func;
+      if (Length(Signature.Params) <> 0) or
+        (Length(Signature.Results) <> 0) then
+        raise EWasmLinkError.Create(
+          'not a command module: "_start" must have type () -> ()');
+      Exit;
+    end;
+end;
 
 { --- platform seams for the default clock/CSPRNG and fs (F4) -------------- }
 

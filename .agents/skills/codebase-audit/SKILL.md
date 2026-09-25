@@ -1,11 +1,8 @@
 ---
 name: codebase-audit
 description: >-
-  Audits the current repository for systemic correctness, architecture,
-  churn, simplification, clarity, test value, and operational risks using
-  current source and reproducible probes. It can delegate evidence gathering
-  across bounded capability and perspective lanes. Use when the user runs
-  /codebase-audit or asks for an evidence-backed repository or subsystem audit.
+  Audit a repository or subsystem for systemic engineering risks and
+  actionable improvements. Assessment only unless follow-up fixes are selected.
 license: Unlicense OR MIT
 compatibility: >-
   Requires the project's declared build and test tools plus network access for
@@ -75,33 +72,8 @@ pushes, publication, issue creation, deployments, or shared-state mutation.
 
 ## Sub-agent lanes
 
-When the user supplies `subagents`, the coordinating agent still owns the audit
-scope, coverage map, capability map, active and skipped perspectives, validation,
-final findings, remediation batches, and report.
-
-1. Publish a bounded lane map before delegation. Form lanes from capability and
-   perspective intersections so no worker receives an unbounded whole-repository
-   perspective. Give each lane one worker; tightly coupled or individually small
-   perspectives may share a lane. Queue excess lanes when platform capacity is
-   temporarily full.
-2. Give each worker its lane ID, assigned capability and perspectives, bounded
-   scope, relevant project instructions, and known evidence. A worker may inspect
-   and run the safe probes allowed by this skill, but it must not edit, create
-   persistent or external side effects, delegate further, assign final finding
-   IDs or severities, propose final remediation batches, or issue an overall
-   conclusion.
-3. Require each worker to return its lane ID, assigned capability and
-   perspectives, bounded scope, inspected supporting context, exact probes and
-   observed results, candidate findings with evidence, impact, and smallest
-   remedy, verified claims, limitations, and `complete` or `incomplete` status.
-4. Validate every candidate against the current checkout, apply the
-   de-duplication model below, reconcile conflicts across lanes, then assign
-   final IDs, severities, categories, remediation batches, and conclusions. Do
-   not repeat a completed lane wholesale.
-5. If sub-agents are unsupported, unavailable after any applicable bounded
-   retry, or leave a lane incomplete, complete that lane directly. Report the
-   affected lane and reason as a single-agent fallback. Temporary capacity
-   exhaustion queues work rather than triggering immediate fallback.
+Read [references/subagent-lanes.md](references/subagent-lanes.md) only when
+`subagents` is requested. The coordinator retains coverage and final judgment.
 
 ## Establish current evidence
 
@@ -111,7 +83,9 @@ final findings, remediation batches, and report.
   entry point, job, migration, package, or deployment path. Cover success plus
   the most consequential failure or boundary case.
 - Record setup, action or command, input, expected result, and observed result.
-  Mark anything not executed `static only`.
+  Credit returned results or matching stored evidence; a request, acknowledgment,
+  or expected outcome is not an observed result. Mark missing results
+  `unverified` and source-only conclusions `static only`.
 - Verify test value: relevant wrong behavior should fail; assertions should
   cover outcomes and meaningful failure paths without excessive mocks,
   snapshots, or implementation coupling.
@@ -159,9 +133,9 @@ the external impact part of the repository finding.
 - Report dead code, duplication, speculative abstractions, needless wrappers,
   one-use indirection, stale compatibility paths, and dependencies that no
   longer earn their cost.
-- Require names, types, boundaries, and interfaces to communicate intent. Match
-  the surrounding comment density; comments should preserve rationale and
-  constraints, not narrate syntax.
+- Require names, types, boundaries, and interfaces to communicate intent.
+  Comments should preserve rationale and constraints, not narrate syntax;
+  surrounding comment density is not a requirement.
 - Treat repeated changes to the same symbol or file as an architectural-risk
   signal, not a defect by itself. Raise an `ARCHITECTURE_RISK` finding when the
   measured churn coincides with mixed responsibilities, recurring fixes or
