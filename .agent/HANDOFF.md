@@ -1,5 +1,69 @@
 # Handoff
 
+## x64 wave 1 — retained outcome, 2026-09-25
+
+- Delivery branch `codex/optimize-x64-wave1`, from exact main `1477917`
+  (push CI run 36160757442 green on all six targets). Evidence root (outside
+  the repo): `~/.local/share/wasmlight-evidence/x64-wave1-1477917` —
+  `PLAN.md`, retained binaries + `bin/SHA256SUMS`, `ab.py`, raw schedules,
+  gate logs, mutation logs, profiles.
+- Method: native AMD Ryzen AI MAX+ 395, Linux 7.0.0-34 x86_64, FPC 3.2.2,
+  lwpt 0.7.0, `lwpt build --mode release`. `ab.py` precompiles AOT artifacts
+  per binary (compilation excluded), pins CPU 7, holds
+  `/tmp/wasmlight-perf-gate.lock`, 1 warm-up + 7 alternating samples,
+  self-checking workloads (exit 0 required). Wasmtime 47.0.3 reference.
+  Baseline A/A noise: loop/call/fib/memory within 0.3%. `perf` is blocked
+  (`perf_event_paranoid=4`); profiles came from interrupting a 10x loop
+  under `gdb` and disassembling the JIT code.
+- Profile: x64 static-cache loops kept locals in r8/r9 but wrote every temp
+  through (9 `[rbx+off]` stores/iteration), reloaded one evicted temp,
+  reloaded `n`, rematerialized constants, and shuffled operands via rax/rcx.
+- Accepted (each measured against its immediate predecessor, both orders):
+  - Lane A `cc36fb7`: deferred write-back of x64 dynamic cache entries
+    (Dirty flag, write-back on eviction/flush, dead non-visible temps never
+    stored; `AnalyzeDynamicWriteBack` now also runs for x64) plus a
+    dead/clean-first eviction policy. loop **471.4 -> 412.7 ms** (0.876),
+    reverse 0.876. Only static-cache functions change; flushes precede every
+    branch, fused compare-branch, join fallthrough, epoch back-edge, return,
+    and unreachable, and every non-static-cache op flushes first. ARM64 code
+    is untouched (x64-only IFDEF blocks).
+  - Lane B `e2f8c6c`: x64 native cores return from `NativeResultSource`;
+    `AnalyzeNativeSelfReturnTail` and the leaf result-copy half now run on
+    x64. fib **47.06 -> 43.86 ms** (0.932), call **156.9 -> 152.3 ms**
+    (0.970); reverse 0.930 / 0.971. Only fib/call artifacts change; ARM64
+    driver preprocesses to the same code.
+  - Combined (merge A, then B; each merge re-measured): vs lane-A head,
+    fib 0.932, call 0.970 (reverse 1.074 / 1.035), loop 1.000; all ten guard
+    artifacts byte-identical to lane A's.
+- Final vs baseline (`final-overall`, ms, ratio comb/base; Wasmtime ms):
+  loop 471.76 -> 413.05 (0.876; Wasmtime 297.08), fib 46.53 -> 43.36
+  (0.932; 36.29), call 157.03 -> 151.89 (0.967; 72.68). Memory, memory-load,
+  memory-store, memory-grow, gc, simd, host-call flat. Startup artifact
+  changed; a 15-sample recheck in both orders was 0.983 / 0.982 (noise).
+  host-call-10repeat read ~1% slower in both orders (368.7 -> 372.7) with a
+  byte-identical artifact and overlapping ranges: binary-layout effect in
+  the Pascal host path, not generated code — recheck next wave.
+- Rejected (patches/binaries retained under the evidence root):
+  - Deferred stores alone (`laneA-746f8db6`): loop 472.32 -> 471.93, flat.
+  - Eviction policy alone (`laneA-ablate-d8ae93a1`): 471.87 -> 471.53, flat.
+    Only the combination removes all memory traffic from the loop body.
+- Correctness: new differential tests (joins, trap checks, loop-carried with
+  epoch interrupt, early exits; native return tails, terminal branches,
+  near-exhaustion recursion, leaf result sources) and an x64 byte-level
+  write-back test, each failing under deliberate mutations (logs in
+  `gates/`). Combined gates: frozen install, format, agents, dev + release
+  builds, `lwpt test` 62/63 (`Wasm.Native.Call.Test` needs clang, absent
+  here), markdownlint 50 files, ARM64 type-check, and pinned core
+  `files=257 errors=0 pass=65188 fail=0 skip=0 staged=0` in interp/jit/aot
+  (compiled 0/8763/8763) on dev and release builds; non-core identical.
+  macOS x86-64 and ARM64 execution come from CI.
+- Remaining x64 gap vs Wasmtime (this host): memory 8.9x, memory-load 8.5x,
+  memory-store 9.2x, 3-arg Wasm calls ~14x, call 2.1x, simd 3.4x, loop 1.39x,
+  fib 1.19x, gc 1.7x. Next profiled bottlenecks: x64 pinned-memory static
+  cache (memory ops never enter the static cache), more cache registers or
+  constant slots (n reload and constant rematerialization remain in `loop`),
+  operand shuffling through rax/rcx, then direct host dispatch and inlining.
+
 ## Stack #125 review and fix layers, 2026-09-25
 
 - The user waived an outside reviewer: four parallel subagent reviews count
