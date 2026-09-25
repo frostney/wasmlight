@@ -1035,7 +1035,7 @@ var
     end;
 
   begin
-    {$IFDEF WASM_JIT_ARM64}
+    {$IFDEF WASM_JIT_BACKEND}
     if not (UsePinnedMemoryBase and UseStaticCache) then
       Exit;
     for K := 0 to High(PlannedCode) do
@@ -1158,7 +1158,7 @@ var
     end;
 
   begin
-    {$IFDEF WASM_JIT_ARM64}
+    {$IFDEF WASM_JIT_BACKEND}
     { Validation lowers local.get to a move into a one-use expression slot.
       Forward that exact alias into an already-cached consumer without
       changing the canonical IR or labels — in the helper-free base-pinned
@@ -1167,9 +1167,15 @@ var
       bodies. The four-instruction window covers the bounded lowering
       shapes while a target, safepoint, or intervening write to the visible
       source ends the proof. }
+    {$IFDEF WASM_JIT_ARM64}
     if not ((UsePinnedMemoryBase and UseStaticCache) or
         UseNativeScalarCore or UsePreservedInlineCache) then
       Exit;
+    {$ELSE}
+    { x64 adopts the base-pinned loop shape only. }
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    {$ENDIF}
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op = iroMove) and not SkipPlanned[K] and
         (not Targets[K] or IsAllocatedSlot(PlannedCode[K].A)) and
@@ -1188,6 +1194,7 @@ var
             Break;
           if SkipPlanned[L] then
             Continue;
+          {$IFDEF WASM_JIT_ARM64}
           if UsePreservedInlineCache and (Length(InlineBodies[L]) <> 0) then
           begin
             { A proven call is the endpoint, never an instruction to cross.
@@ -1208,6 +1215,10 @@ var
             (PlannedCode[L].Op in [iroJump, iroBranchIf, iroBranchIfNot,
             iroReturn, iroUnreachable])) then
             Break;
+          {$ELSE}
+          if IrInstrIsSafepoint(PlannedCode[L]) then
+            Break;
+          {$ENDIF}
           if RewriteUse(PlannedCode[L], Alias_, Source) then
           begin
             SkipPlanned[K] := True;
@@ -1234,7 +1245,7 @@ var
     end;
 
   begin
-    {$IFDEF WASM_JIT_ARM64}
+    {$IFDEF WASM_JIT_BACKEND}
     { This is deliberately not general memory value numbering. In the
       helper-free, base-pinned shape, forward only across at most two pure
       lowering moves to an exact same-address i32 load.
@@ -1317,7 +1328,7 @@ var
       iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
       iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
         Result := True;
-      {$IFDEF WASM_JIT_ARM64}
+      {$IFDEF WASM_JIT_BACKEND}
       iroI32Load, iroI64Load, iroF32Load, iroF64Load,
       iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
       iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
@@ -1325,8 +1336,9 @@ var
       iroI32Store, iroI64Store, iroF32Store, iroF64Store,
       iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
       iroI64Store32:
-        { Only base-pinned memory functions are helper-free and keep x14/x15
-          available for the static cache's expression-value side. }
+        { Only base-pinned memory functions are helper-free: ARM64 keeps
+          x14/x15 available for the static cache's expression-value side, and
+          x64 keeps Base in rsi with no access touching r8-r11 as scratch. }
         Result := UsePinnedMemoryBase;
       {$ENDIF}
     else
@@ -2349,7 +2361,8 @@ begin
     if UseNativeScalarSelf then
       X64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
-      X64EmitPinMemory(Buf, PinnedMemoryIndex);
+      X64EmitPinMemory(Buf, PinnedMemoryIndex,
+        UsePinnedMemoryBase and UseStaticCache);
     X64InitRegCache(X64Cache);
     if UseNativeScalarCore then
       X64SeedNativeCoreCache(X64Cache, NativeParamCount, NativeParamReg,
@@ -2357,11 +2370,16 @@ begin
     else if UseStaticCache then
     begin
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
-      { StaticCacheOp admits only helper-free scalar operations on x64, so
-        the only exits from the straight line are branches, joins, the
-        epoch-polled back-edge, return, and unreachable; each writes back
-        the dynamic values a later read, local, result, or loop-carried
-        slot can observe (ARM64 9a3126a). }
+      if UsePinnedMemoryBase then
+        { StaticCacheOp admitted this function's scalar accesses only under
+          the base-pinned proof; the prologue loaded Base into rsi above. }
+        X64EnablePinnedMemoryBase(X64Cache);
+      { StaticCacheOp admits only helper-free scalar operations or
+        base-pinned memory on x64, so the only exits from the straight line
+        are branches, joins, the epoch-polled back-edge, return, and
+        unreachable; each writes back the dynamic values a later read, local,
+        result, or loop-carried slot can observe (ARM64 9a3126a). A guard-page
+        fault unwinds to the trampoline, which reads no slot. }
       X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
         @VisibleSlots[0], AFn^.RegisterCount);
     end;

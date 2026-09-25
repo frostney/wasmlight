@@ -69,6 +69,10 @@ type
     procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheDefersDynamicStores;
+    procedure TestStaticCachePinnedMemoryBytes;
+    procedure TestDirectOperandEncodings;
+    procedure TestDirectOperandCachedOps;
+    procedure TestDirectOperandBookkeeping;
     procedure TestGcFieldAccessBytes;
     procedure TestGcArrayAccessBytes;
 
@@ -752,6 +756,510 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestStaticCachePinnedMemoryBytes;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..5] of UInt32;
+  Visible: array[0..5] of Boolean;
+  Start: Integer;
+
+  function HasSeq(const AExpected: array of Byte;
+    const AFrom: Integer = 0): Boolean;
+  var
+    I, J: Integer;
+  begin
+    for I := AFrom to Buf.Size - Length(AExpected) do
+    begin
+      Result := True;
+      for J := 0 to High(AExpected) do
+        if Buf.ByteAt(I + J) <> AExpected[J] then
+        begin
+          Result := False;
+          Break;
+        end;
+      if Result then
+        Exit;
+    end;
+    Result := False;
+  end;
+
+  procedure CheckFrom(const AFrom: Integer; const AExpected: array of Byte);
+  var
+    J: Integer;
+  begin
+    Expect<Integer>(Buf.Size - AFrom).ToBe(Length(AExpected));
+    for J := 0 to High(AExpected) do
+      Expect<Byte>(Buf.ByteAt(AFrom + J)).ToBe(AExpected[J]);
+  end;
+
+begin
+  { The pin loads Base (TWasmMemoryInst's first field) into rsi only on
+    request: mov [rsp],rax (48 89 04 24); mov rsi,[rax] (48 8B 30). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPinMemory(Buf, 0);
+    Expect<Boolean>(HasSeq([$48, $89, $04, $24, $48, $8B, $30])).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitPinMemory(Buf, 0, True);
+    Expect<Boolean>(HasSeq([$48, $89, $04, $24, $48, $8B, $30])).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { Slots 0/1 are the static r8/r9 hosts. Each access zero-extends its i32
+    address into ecx (mov r32,r32 = 89 /r) and addresses [rsi + rcx*1]
+    (ModRM rm=100, SIB 0E) per SDM Vol. 2 Tables 2-2/2-3. }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Visible[0] := True;
+  Visible[1] := True;
+  UseCounts[2] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 6);
+    X64EnablePinnedMemoryBase(Cache);
+    Expect<Boolean>(Cache.PinnedMemoryBase).ToBe(True);
+
+    { i32.store8 [r8] := r9b: mov ecx,r8d; mov [rsi+rcx],r9b. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Store8, 1, 0, 0, 0), Aux, 0, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$44, $89, $C1, $44, $88, $0C, $0E]);
+
+    { i64.load8_s from [r9] into rax (REX.W 0F BE), then the dirty dynamic
+      host r10 for slot 2: mov r10,rax. No register-file store. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI64Load8S, 2, 1, 0, 0), Aux, 1, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$44, $89, $C9, $48, $0F, $BE, $04, $0E,
+      $49, $89, $C2]);
+    Expect<Boolean>(Cache.Entries[2].Valid and Cache.Entries[2].Dirty and
+      (Cache.Entries[2].Slot = 2)).ToBe(True);
+
+    { i32.store16 [r8] := r10w consumes the dirty value in place; the
+      guard-page access cannot observe slots, so nothing is flushed. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Store16, 2, 0, 0, 0), Aux, 2, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$44, $89, $C1, $66, $44, $89, $14, $0E]);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+    Expect<Boolean>(HasSeq([$4C, $89, $53, $10])).ToBe(False);
+
+    { Uncached operands come from their canonical slots: mov ecx,[rbx+0x28];
+      mov rax,[rbx+0x20]; mov [rsi+rcx],rax. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI64Store, 4, 5, 0, 0), Aux, 3, False, True,
+      Cache)).ToBe(True);
+    CheckFrom(Start, [$8B, $4B, $28, $48, $8B, $43, $20,
+      $48, $89, $04, $0E]);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- direct register operands (SDM Vol. 2: ADD 01, SUB 29, AND 21, OR 09,
+  XOR 31, CMP 39, TEST 85 /r; IMUL 0F AF /r; SETcc 0F 90+cc /0; MOVZX
+  0F B6 /r; REX W/R/B per §2.2.1 and Table 2-2) ----------------------------- }
+
+procedure TX64Tests.TestDirectOperandEncodings;
+const
+  Hosts: array[0 .. 5] of Byte = (X64_RAX, X64_RCX, X64_R8, X64_R9, X64_R10,
+    X64_R11);
+  Ops: array[0 .. 6] of Byte = ($01, $29, $21, $09, $31, $39, $85);
+var
+  Buf: TWasmCodeBuffer;
+  D, S, O, W: Integer;
+  Rex: Byte;
+begin
+  { Spot checks, each disassembled with objdump -mi386:x86-64. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitAluRegReg(Buf, $01, False, X64_R10, X64_R11);
+    X64EmitAluRegReg(Buf, $29, True, X64_R9, X64_R10);
+    X64EmitAluRegReg(Buf, $29, False, X64_RAX, X64_R9);
+    X64EmitAluRegReg(Buf, $21, True, X64_R8, X64_RAX);
+    X64EmitAluRegReg(Buf, $39, False, X64_R10, X64_R11);
+    X64EmitAluRegReg(Buf, $39, True, X64_R11, X64_R8);
+    X64EmitAluRegReg(Buf, $85, False, X64_R11, X64_R11);
+    X64EmitAluRegReg(Buf, $31, False, X64_R8, X64_R8);
+    X64EmitImul(Buf, False, X64_R10, X64_R11);
+    X64EmitImul(Buf, True, X64_R9, X64_R8);
+    X64EmitImul(Buf, True, X64_RAX, X64_R11);
+    X64EmitShiftCl(Buf, 4, False, X64_R11);
+    X64EmitShiftCl(Buf, 1, True, X64_R9);
+    X64EmitSetccReg(Buf, X64_CC_B, X64_R8);
+    X64EmitSetccReg(Buf, X64_CC_L, X64_R10);
+    X64EmitSetccReg(Buf, X64_CC_E, X64_RAX);
+    X64EmitSetccReg(Buf, X64_CC_NE, X64_RSI);
+    X64EmitMovzxReg8(Buf, X64_R10, X64_R10);
+    X64EmitMovzxReg8(Buf, X64_RAX, X64_RAX);
+    X64EmitMovzxReg8(Buf, X64_RAX, X64_RSI);
+    X64EmitMovzxReg8(Buf, X64_R9, X64_RAX);
+    X64EmitMovRegReg(Buf, X64_R10, X64_R9);
+    X64EmitMovRegImm32(Buf, X64_R11, $19660D);
+    CheckSeq(Buf, [
+      $45, $01, $DA,             { add r10d, r11d }
+      $4D, $29, $D1,             { sub r9, r10 }
+      $44, $29, $C8,             { sub eax, r9d }
+      $49, $21, $C0,             { and r8, rax }
+      $45, $39, $DA,             { cmp r10d, r11d }
+      $4D, $39, $C3,             { cmp r11, r8 }
+      $45, $85, $DB,             { test r11d, r11d }
+      $45, $31, $C0,             { xor r8d, r8d }
+      $45, $0F, $AF, $D3,        { imul r10d, r11d }
+      $4D, $0F, $AF, $C8,        { imul r9, r8 }
+      $49, $0F, $AF, $C3,        { imul rax, r11 }
+      $41, $D3, $E3,             { shl r11d, cl }
+      $49, $D3, $C9,             { ror r9, cl }
+      $41, $0F, $92, $C0,        { setb r8b }
+      $41, $0F, $9C, $C2,        { setl r10b }
+      $0F, $94, $C0,             { sete al }
+      $40, $0F, $95, $C6,        { setne sil (REX selects sil, not dh) }
+      $45, $0F, $B6, $D2,        { movzx r10d, r10b }
+      $0F, $B6, $C0,             { movzx eax, al }
+      $40, $0F, $B6, $C6,        { movzx eax, sil }
+      $44, $0F, $B6, $C8,        { movzx r9d, al }
+      $4D, $89, $CA,             { mov r10, r9 }
+      $41, $BB, $0D, $66, $19, $00]); { mov r11d, 0x19660d }
+  finally
+    Buf.Free;
+  end;
+
+  { Every scratch/cache register pair, both widths: <op> r/m=D, reg=S takes
+    REX.W for 64-bit, REX.R for S >= 8, REX.B for D >= 8, and ModRM
+    11 S D; imul swaps the fields (reg=D, rm=S). A 32-bit form with neither
+    extended register carries no REX. }
+  for D := 0 to High(Hosts) do
+    for S := 0 to High(Hosts) do
+      for W := 0 to 1 do
+      begin
+        for O := 0 to High(Ops) do
+        begin
+          Buf := TWasmCodeBuffer.Create;
+          try
+            X64EmitAluRegReg(Buf, Ops[O], W = 1, Hosts[D], Hosts[S]);
+            Rex := $40 or (W shl 3) or ((Hosts[S] shr 3) shl 2) or
+              (Hosts[D] shr 3);
+            if Rex = $40 then
+              CheckSeq(Buf, [Ops[O], $C0 or ((Hosts[S] and 7) shl 3) or
+                (Hosts[D] and 7)])
+            else
+              CheckSeq(Buf, [Rex, Ops[O], $C0 or ((Hosts[S] and 7) shl 3) or
+                (Hosts[D] and 7)]);
+          finally
+            Buf.Free;
+          end;
+        end;
+        Buf := TWasmCodeBuffer.Create;
+        try
+          X64EmitImul(Buf, W = 1, Hosts[D], Hosts[S]);
+          Rex := $40 or (W shl 3) or ((Hosts[D] shr 3) shl 2) or
+            (Hosts[S] shr 3);
+          if Rex = $40 then
+            CheckSeq(Buf, [$0F, $AF, $C0 or ((Hosts[D] and 7) shl 3) or
+              (Hosts[S] and 7)])
+          else
+            CheckSeq(Buf, [Rex, $0F, $AF, $C0 or ((Hosts[D] and 7) shl 3) or
+              (Hosts[S] and 7)]);
+        finally
+          Buf.Free;
+        end;
+      end;
+
+  { SETcc / MOVZX on each cache host: r8b..r11b need REX.B (and REX.R for
+    the movzx destination). }
+  for D := 2 to High(Hosts) do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      X64EmitSetccReg(Buf, X64_CC_A, Hosts[D]);
+      X64EmitMovzxReg8(Buf, Hosts[D], Hosts[D]);
+      CheckSeq(Buf, [$41, $0F, $97, $C0 or (Hosts[D] and 7),
+        $45, $0F, $B6, $C0 or ((Hosts[D] and 7) shl 3) or (Hosts[D] and 7)]);
+    finally
+      Buf.Free;
+    end;
+  end;
+end;
+
+{ Slots 0/1 are static (r8/r9); constants put slot 2 in r10 and slot 3 in
+  r11 with deferred stores. Each case then emits one cached op and asserts
+  the bytes it added. }
+procedure TX64Tests.TestDirectOperandCachedOps;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0 .. 7] of UInt32;
+  Visible: array[0 .. 7] of Boolean;
+  Start: Integer;
+
+  procedure Setup(const AUses2, AUses3: UInt32);
+  begin
+    FillChar(UseCounts, SizeOf(UseCounts), 0);
+    FillChar(Visible, SizeOf(Visible), 0);
+    UseCounts[2] := AUses2;
+    UseCounts[3] := AUses3;
+    Buf := TWasmCodeBuffer.Create;
+    Buf.NewLabel;
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 2, 0, 0, 7), Aux, 0,
+      False, False, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 3, 0, 0, 9), Aux, 1,
+      False, False, Cache);
+    Start := Buf.Size;
+  end;
+
+  procedure Emit(const AOp: TWasmIrOp; const ADest, AA, AB: UInt32);
+  begin
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(AOp, ADest, AA, AB, 0),
+      Aux, 2, False, False, Cache)).ToBe(True);
+  end;
+
+  procedure CheckAdded(const AExpected: array of Byte);
+  var
+    I: Integer;
+  begin
+    Expect<Integer>(Buf.Size - Start).ToBe(Length(AExpected));
+    for I := 0 to High(AExpected) do
+      if Start + I < Buf.Size then
+        Expect<Byte>(Buf.ByteAt(Start + I)).ToBe(AExpected[I]);
+    Buf.Free;
+  end;
+
+begin
+  { After the two static loads (7 bytes) the constants reach r10 and r11:
+    mov eax, 7 ; mov r10, rax ; mov eax, 9 ; mov r11, rax. }
+  Setup(1, 1);
+  Start := 7;
+  CheckAdded([$B8, $07, $00, $00, $00, $49, $89, $C2,
+    $B8, $09, $00, $00, $00, $49, $89, $C3]);
+
+  { Result slot is the left operand's: one in-place add r10d, r11d. }
+  Setup(1, 1);
+  Emit(iroI32Add, 2, 2, 3);
+  CheckAdded([$45, $01, $DA]);
+
+  { Static result host: mov r8, r10 ; sub r8d, r11d. }
+  Setup(1, 1);
+  Emit(iroI32Sub, 0, 2, 3);
+  CheckAdded([$4D, $89, $D0, $45, $29, $D8]);
+
+  { A subtraction whose result host holds its right operand goes through
+    rax: mov rax, r10 ; sub eax, r11d ; mov r11, rax. }
+  Setup(1, 1);
+  Emit(iroI32Sub, 3, 2, 3);
+  CheckAdded([$4C, $89, $D0, $44, $29, $D8, $49, $89, $C3]);
+
+  { A commutative op swaps instead: add r11, r10. }
+  Setup(1, 1);
+  Emit(iroI64Add, 3, 2, 3);
+  CheckAdded([$4D, $01, $D3]);
+
+  { Two-operand imul in place: imul r10, r11. }
+  Setup(1, 1);
+  Emit(iroI64Mul, 2, 2, 3);
+  CheckAdded([$4D, $0F, $AF, $D3]);
+
+  { x op x: mov r8, r10 ; xor r8d, r10d. }
+  Setup(2, 0);
+  Emit(iroI32Xor, 0, 2, 2);
+  CheckAdded([$4D, $89, $D0, $45, $31, $D0]);
+
+  { The count reaches CL before the result host (the count's own host) is
+    overwritten: mov rcx, r11 ; mov r11, r10 ; shl r11d, cl. }
+  Setup(1, 1);
+  Emit(iroI32Shl, 3, 2, 3);
+  CheckAdded([$4C, $89, $D9, $4D, $89, $D3, $41, $D3, $E3]);
+
+  { In place: mov rcx, r11 ; ror r10, cl. }
+  Setup(1, 1);
+  Emit(iroI64Rotr, 2, 2, 3);
+  CheckAdded([$4C, $89, $D9, $49, $D3, $CA]);
+
+  { A distinct result host is zeroed before the compare:
+    xor r8d, r8d ; cmp r10d, r11d ; setb r8b. }
+  Setup(1, 1);
+  Emit(iroI32LtU, 0, 2, 3);
+  CheckAdded([$45, $31, $C0, $45, $39, $DA, $41, $0F, $92, $C0]);
+
+  { An operand's host is widened after SETcc:
+    cmp r10, r11 ; setl r10b ; movzx r10d, r10b. }
+  Setup(1, 1);
+  Emit(iroI64LtS, 2, 2, 3);
+  CheckAdded([$4D, $39, $DA, $41, $0F, $9C, $C2, $45, $0F, $B6, $D2]);
+
+  { test r11d, r11d ; sete r11b ; movzx r11d, r11b. }
+  Setup(1, 1);
+  Emit(iroI32Eqz, 3, 3, 0);
+  CheckAdded([$45, $85, $DB, $41, $0F, $94, $C3, $45, $0F, $B6, $DB]);
+
+  { xor r9d, r9d ; test r10, r10 ; sete r9b. }
+  Setup(1, 1);
+  Emit(iroI64Eqz, 1, 2, 0);
+  CheckAdded([$45, $31, $C9, $4D, $85, $D2, $41, $0F, $94, $C1]);
+
+  { Fused compare-branch: cmp r10d, r11d ; (no live dirty value) ;
+    jge rel32. }
+  Setup(1, 1);
+  X64EmitCompareBranchCached(Buf, MakeIrInstr(iroI32GeS, 4, 2, 3, 0),
+    MakeIrInstr(iroBranchIf, 0, 4, 0, 0), Cache);
+  CheckAdded([$45, $39, $DA, $0F, $8D, $00, $00, $00, $00]);
+
+  { Branch on a resident condition: test r10d, r10d ; jne rel32. }
+  Setup(1, 0);
+  Emit(iroBranchIf, 0, 2, 0);
+  CheckAdded([$45, $85, $D2, $0F, $85, $00, $00, $00, $00]);
+end;
+
+procedure TX64Tests.TestDirectOperandBookkeeping;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0 .. 7] of UInt32;
+  Visible: array[0 .. 7] of Boolean;
+  Start: Integer;
+
+  procedure Emit(const AOp: TWasmIrOp; const ADest, AA, AB: UInt32;
+    const AImm: Int64 = 0);
+  begin
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(AOp, ADest, AA, AB, AImm), Aux, 0, False, False,
+      Cache)).ToBe(True);
+  end;
+
+  procedure CheckFrom(const AExpected: array of Byte);
+  var
+    I: Integer;
+  begin
+    Expect<Integer>(Buf.Size - Start).ToBe(Length(AExpected));
+    for I := 0 to High(AExpected) do
+      if Start + I < Buf.Size then
+        Expect<Byte>(Buf.ByteAt(Start + I)).ToBe(AExpected[I]);
+  end;
+
+begin
+  FillChar(Visible, SizeOf(Visible), 0);
+
+  { A dead left operand's host is the cheapest victim, so the result takes
+    it in place and the dead value is never stored: add r10d, r11d. }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  UseCounts[2] := 1;
+  UseCounts[3] := 2;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    Emit(iroI32Const, 2, 0, 0, 7);
+    Emit(iroI32Const, 3, 0, 0, 9);
+    Start := Buf.Size;
+    Emit(iroI32Add, 5, 2, 3);
+    CheckFrom([$45, $01, $DA]);
+    Expect<Boolean>(Cache.Entries[2].Valid and (Cache.Entries[2].Slot = 5) and
+      Cache.Entries[2].Dirty).ToBe(True);
+    Expect<Boolean>(Cache.Entries[3].Valid and
+      (Cache.Entries[3].Slot = 3)).ToBe(True);
+    Expect<UInt32>(UseCounts[2]).ToBe(0);
+    Expect<UInt32>(UseCounts[3]).ToBe(1);
+  finally
+    Buf.Free;
+  end;
+
+  { A still-live left operand displaced by the result is spilled before its
+    host is overwritten: mov [rbx+16], r10 ; add r10d, r11d. Its next read
+    reloads from the slot. }
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  UseCounts[2] := 2;
+  UseCounts[3] := 2;
+  UseCounts[5] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    Emit(iroI32Const, 2, 0, 0, 7);
+    Emit(iroI32Const, 3, 0, 0, 9);
+    Start := Buf.Size;
+    Emit(iroI32Add, 5, 2, 3);
+    CheckFrom([$4C, $89, $53, $10, $45, $01, $DA]);
+    Expect<Boolean>(Cache.Entries[2].Valid and (Cache.Entries[2].Slot = 5) and
+      Cache.Entries[2].Dirty).ToBe(True);
+    Expect<UInt32>(UseCounts[2]).ToBe(1);
+    { Both dynamic entries are live and dirty; round-robin picks r11, which
+      is spilled, then reloaded with slot 2: mov [rbx+24], r11 ;
+      mov r11, [rbx+16] ; mov r8, r11 ; add r8d, r10d. }
+    Start := Buf.Size;
+    Emit(iroI32Add, 0, 2, 5);
+    CheckFrom([$4C, $89, $5B, $18, $4C, $8B, $5B, $10, $4D, $89, $D8,
+      $45, $01, $D0]);
+  finally
+    Buf.Free;
+  end;
+
+  { Write-through pair: the right operand's miss takes the left operand's
+    host (r8), so the left value is copied to rax first; the result then
+    takes r9 and is stored: mov rax, r8 ; mov r8, [rbx+16] ; mov r9, rax ;
+    sub r9d, r8d ; mov [rbx+40], r9. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64InitRegCache(Cache);
+    Emit(iroI32Const, 1, 0, 0, 5);
+    Emit(iroI32Const, 3, 0, 0, 6);
+    Start := Buf.Size;
+    Emit(iroI32Sub, 5, 1, 2);
+    CheckFrom([$4C, $89, $C0, $4C, $8B, $43, $10, $49, $89, $C1,
+      $45, $29, $C1, $4C, $89, $4B, $28]);
+    Expect<Boolean>(Cache.Entries[0].Valid and
+      (Cache.Entries[0].Slot = 2)).ToBe(True);
+    Expect<Boolean>(Cache.Entries[1].Valid and
+      (Cache.Entries[1].Slot = 5)).ToBe(True);
+    Expect<Byte>(Cache.Next).ToBe(0);
+  finally
+    Buf.Free;
+  end;
+
+  { Static allocation without deferred stores writes a dynamic result through
+    from its host. Round robin gives slot 4 the left operand's r10:
+    add r10d, r11d ; mov [rbx+32], r10. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    Emit(iroI32Const, 2, 0, 0, 7);
+    Emit(iroI32Const, 3, 0, 0, 9);
+    Start := Buf.Size;
+    Emit(iroI32Add, 4, 2, 3);
+    CheckFrom([$45, $01, $DA, $4C, $89, $53, $20]);
+    Expect<Boolean>(Cache.Entries[2].Valid and (Cache.Entries[2].Slot = 4) and
+      not Cache.Entries[2].Dirty).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { A fixed write-through static entry (native leaf parameter) is stored
+    after an in-place op: add r8d, r8d ; mov [rbx], r8. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64SeedNativeCoreCache(Cache, 1, 0, 0, True);
+    Start := Buf.Size;
+    Emit(iroI32Add, 0, 0, 0);
+    CheckFrom([$45, $01, $C0, $4C, $89, $03]);
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestGcFieldAccessBytes;
 var
   Buf: TWasmCodeBuffer;
@@ -1015,6 +1523,14 @@ begin
     TestStaticCacheKeepsShiftResult);
   Test('static allocation defers dynamic stores and evicts dead values first',
     TestStaticCacheDefersDynamicStores);
+  Test('base-pinned scalar memory uses rsi plus cached operands',
+    TestStaticCachePinnedMemoryBytes);
+  Test('direct-operand ALU, compare, setcc, and movzx encodings',
+    TestDirectOperandEncodings);
+  Test('cached ALU and compares compute on the cache hosts',
+    TestDirectOperandCachedOps);
+  Test('direct operands keep victims, spills, and write-through stores',
+    TestDirectOperandBookkeeping);
   Test('numeric GC fields use baked native x64 loads and stores',
     TestGcFieldAccessBytes);
   Test('fixed scalar arrays use native x64 loads and stores',

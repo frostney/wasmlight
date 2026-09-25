@@ -1,5 +1,73 @@
 # Handoff
 
+## x64 wave 2 — retained outcome, 2026-09-25
+
+- Delivery branch `codex/optimize-x64-wave2` from exact main `fee6f3a` (push CI
+  run 36169261097 green on all six targets); main `bf6da54` (#133) merged in
+  later (tests/docs only; release hash unchanged). Evidence root:
+  `~/.local/share/wasmlight-evidence/x64-wave2-fee6f3a` (`PLAN.md`, binaries +
+  `SHA256SUMS`, `ab.py`, schedules, gates, patches, profiles). Method as in
+  wave 1 (native Ryzen AI MAX+ 395, release builds, AOT precompiled, CPU 7,
+  shared lock, 1 warm-up + 7 alternating samples); baseline sha
+  `167c4f2d…` equals wave 1's accepted binary. A/A noise ≤ 0.4%.
+- Profile: x64 memory functions never entered the static cache (memory ops
+  admitted only on ARM64), so memory loops ran write-through (~22 slot
+  stores/iteration) and each access reloaded the memory instance, base, size,
+  and the address slot; every cached ALU op shuffled operands via rax/rcx.
+- Accepted:
+  - Lane C `6006011`: x64 static cache admits scalar loads/stores under the
+    existing `UsePinnedMemoryBase` proof (single memory, no calls, no
+    `memory.grow`); memory base pinned in rsi after the prologue's one helper
+    call; `[rsi+rcx]` with a zero-extending 32-bit address copy; operands and
+    results through cache registers; `AnalyzeMemoryMoves`,
+    `AnalyzeStoreLoadForwarding` and pinned-shape `AnalyzeLocalAliases` now
+    run on x64. Only zero-offset i32 accesses take the new path (guard pages,
+    same fault→trampoline trap); memory64 and non-zero offsets keep the old
+    explicit checks. memory 0.29, memory-load 0.42, memory-store 0.37 (both
+    orders, two rounds).
+  - Lane D `e6e32ca`: cached integer ALU, shifts, compares, eqz, `br_if` and
+    fused compare-branch compute on r8–r11 directly (in place, or
+    `mov dst,a; op dst,b`; rax only when a sub's destination holds its right
+    operand or an operand register is evicted; CL for variable counts;
+    setcc/movzx for compare values). Identical ordered slot traffic in all 11
+    workload artifacts. loop 0.716, call 0.978 (both orders, two rounds).
+  - Combined (C, then D; each merge re-measured): vs lane-C head memory 0.943,
+    memory-load 0.805, memory-store 1.00, loop 0.717, fib 0.99, call 0.98;
+    guards flat.
+- Final vs wave-2 baseline (`final-overall`, ms; Wasmtime 47.0.3):
+  memory 149.22 -> 41.93 (0.281; 16.01), memory-load 237.21 -> 81.45 (0.343;
+  27.50), memory-store 217.35 -> 81.11 (0.373; 23.06), loop 412.40 -> 296.14
+  (0.718; 296.43 — parity), call 152.22 -> 148.41 (0.975; 72.67), fib 43.31
+  -> 43.02 (0.993; 36.12). startup, memory-grow, gc, simd, host-call(s),
+  host-dispatch flat within 1–2% with overlapping ranges.
+- Rejected (retained under the evidence root):
+  - Lane C rdi as a third cached local in pinned-memory frames: memory-load
+    100.64 -> 100.55, memory-store 81.02 -> 81.18, memory 44.47 -> 71.22
+    (layout, see below). No gain; reverted.
+  - Lane D direct moves/constants into their host registers: loop 1.000,
+    call 0.998 at 21 samples vs the ALU-only candidate. Reverted.
+- Caveat — layout sensitivity: padding the memory loops by 0–32 bytes moved
+  `memory` between 44 and 71 ms and `memory-store` between 81 and 101 ms
+  (memory-load stable). Every layout still beat baseline by >= 2x. Loop-head
+  alignment on x64 is the obvious next experiment.
+- Correctness: lane C tests (narrow/unaligned loads, every store width,
+  tee'd address, exact-end + one-past-end traps per width, OOB traps with a
+  dirty temp live, straddling stores, zero-page memory, store-then-load,
+  memory64 explicit-check path, byte-exact pin/access encodings) and lane D
+  tests (register-pair encodings, cached-op bytes, bookkeeping, differential
+  i32/i64 semantics vs an independent Python model), each failing under the
+  mutations in `gates/`. `tests/fixtures/wast/x64-writeback.wast` (#133)
+  passes 81/81 in all tiers (compiled 14) on the combined code. Gates:
+  frozen install, format, agents, dev + release builds, `lwpt test` 62/63
+  (`Wasm.Native.Call.Test` needs clang), markdownlint 50 files, ARM64
+  type-check, pinned core 65,188 in interp/jit/aot (compiled 0/8763/8763) on
+  dev and release, non-core identical. ARM64 code untouched.
+- Remaining x64 gap vs Wasmtime (this host): memory 2.6x, memory-load 3.0x,
+  memory-store 3.5x, 3-arg Wasm calls ~13x, call 2.0x, simd 3.5x, fib 1.19x,
+  gc 1.7x; loop at parity. Next: loop-head alignment (layout), non-zero
+  static offsets in the pinned path, the remaining accumulator slot store,
+  call/fib calling-convention overhead, then inlining and host dispatch.
+
 ## x64 wave 1 — retained outcome, 2026-09-25
 
 - Delivery branch `codex/optimize-x64-wave1`, from exact main `1477917`

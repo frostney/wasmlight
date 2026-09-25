@@ -23,6 +23,9 @@
     r12 = the store pointer   (the entry's 2nd arg, rsi)
     r13 = &Store.Epoch        (r12 + StoreEpoch offset)
     r14 = the epoch captured at entry (Store.EpochSnapshot, §6)
+  One conditional, caller-saved pin: in a base-pinned static-cache frame rsi
+  holds the pinned memory's Base (X64_REG_MEMBASE). That frame calls no helper
+  after loading it except the non-returning trap entries.
   Scratch is rax/rcx/rdx (caller-saved, dead at op boundaries); the SysV arg
   registers marshal helper arguments. The prologue pushes rbx/r12/r13/r14 and
   reserves one 8-byte alignment/memory slot; scalar-call-bearing functions use
@@ -123,6 +126,10 @@ type
     UseCounts: PUInt32;
     VisibleSlots: PBoolean;
     SlotCount: UInt32;
+    { Static allocation only: rsi (X64_REG_MEMBASE) holds the pinned memory's
+      Base for the whole activation, so zero-offset i32 scalar accesses read
+      and write the cache hosts directly. }
+    PinnedMemoryBase: Boolean;
   end;
 
   { Per-instruction native-shape words handed over by the driver's
@@ -165,6 +172,10 @@ const
   X64_REG_T0 = X64_RAX;         { rax/eax scratch }
   X64_REG_T1 = X64_RCX;         { rcx/ecx scratch (also CL for variable shifts) }
   X64_REG_T2 = X64_RDX;         { rdx/edx scratch }
+  { rsi = the pinned memory Base, only in a base-pinned static-cache frame
+    (TX64RegCache.PinnedMemoryBase). That frame calls no helper except the
+    non-returning trap entries, so this caller-saved register survives. }
+  X64_REG_MEMBASE = X64_RSI;
 
   { SysV integer argument registers, in order. }
   X64_ARG0 = X64_RDI;
@@ -276,6 +287,13 @@ procedure X64EmitShiftCl(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
   zero-extended into rax. }
 procedure X64EmitSetccAl(const ABuf: TWasmCodeBuffer; const ACc: Byte);
 procedure X64EmitMovzxEaxAl(const ABuf: TWasmCodeBuffer);
+{ setcc on AReg's low byte and movzx AReg32 <- ASrc's low byte. A byte
+  operand numbered 4..15 takes a REX prefix, so 4..7 name spl..dil rather
+  than ah..bh. }
+procedure X64EmitSetccReg(const ABuf: TWasmCodeBuffer; const ACc,
+  AReg: Byte);
+procedure X64EmitMovzxReg8(const ABuf: TWasmCodeBuffer; const ADst,
+  ASrc: Byte);
 { cmovcc ADst, ASrc (0F 40+cc /r). }
 procedure X64EmitCmovcc(const ABuf: TWasmCodeBuffer; const ACc: Byte;
   const AWide: Boolean; const ADst, ASrc: Byte);
@@ -343,9 +361,11 @@ procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;
   const AHelperTableOffset: NativeUInt);
 { Resolve a single function memory once and keep its stable instance pointer in
   the prologue's memory slot at [rsp]. Scalar accesses
-  still reload live Base/ByteSize fields, so memory.grow semantics are unchanged. }
+  still reload live Base/ByteSize fields, so memory.grow semantics are unchanged.
+  APinBase additionally loads Base into rsi (X64_REG_MEMBASE); the driver asks
+  for it only when the function can neither call nor grow memory. }
 procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
-  const AMemoryIndex: UInt32);
+  const AMemoryIndex: UInt32; const APinBase: Boolean = False);
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
   const AEpochOffset, ASnapshotOffset: NativeUInt);
 procedure X64EmitEpilogue(const ABuf: TWasmCodeBuffer;
@@ -392,6 +412,10 @@ procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
   const AStaticParams: Boolean = True);
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlots: array of UInt32);
+{ Mark a static allocation as base-pinned: rsi holds the memory Base (see
+  X64EmitPinMemory), and scalar memory ops take their address and value from
+  the cache hosts instead of making the register file canonical. }
+procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
 { Enable deferred dynamic write-back on a static allocation. AUseCounts holds
   each slot's remaining planned reads (consumed as the emitter reads them);
   AVisibleSlots marks locals, results, and loop-carried slots, which are
@@ -468,12 +492,30 @@ procedure X64EmitAluRegImm8(const ABuf: TWasmCodeBuffer;
   const ASubop: Byte; const AWide: Boolean; const AReg, AImm: Byte); forward;
 procedure X64EmitLeaIndexed(const ABuf: TWasmCodeBuffer;
   const ADest, ABase, AIndex, AScale: Byte; const ADisp: Int32); forward;
+const
+  { AIndex value for the scalar access core: plain [ABase] addressing. }
+  X64_NO_INDEX = $FF;
+
+procedure X64EmitLoadScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase, AIndex: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean); forward;
+procedure X64EmitStoreScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase, AIndex: Byte; const ASize: UInt32); forward;
 procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
   const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
   AResult64: Boolean); forward;
 procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
   const ASource, ABase: Byte; const ASize: UInt32); forward;
+procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean;
+  var ACache: TX64RegCache); forward;
 
+function X64CachedOperand(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlot: UInt32; const AProtect: Byte;
+  out AProtectMoved: Boolean): Byte; forward;
+procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
+  const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
+  AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache); forward;
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
@@ -724,6 +766,9 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
   const AGcShapes: PX64GcShapeArray): Boolean;
+var
+  Host: Byte;
+  Moved: Boolean;
 begin
   Result := True;
   { Deferred dynamic stores are an optimization of the helper-free static
@@ -731,6 +776,15 @@ begin
     straight line, so the register file is made canonical first. }
   if X64ScalarMemoryOp(AIns.Op) then
   begin
+    if ACache.PinnedMemoryBase then
+    begin
+      { Base-pinned static cache (the driver's UsePinnedMemoryBase proof): the
+        access touches only rsi, rcx, and rax, cannot call or return, and a
+        guard-page fault unwinds to the trampoline without reading any slot,
+        so deferred values stay in their hosts. }
+      X64EmitScalarMemoryPinned(ABuf, AIns, AAddr64, ACache);
+      Exit;
+    end;
     X64FlushDynamicRegCache(ABuf, ACache);
     X64InvalidateRegCache(ACache);
     X64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
@@ -765,8 +819,8 @@ begin
       end;
     iroBranchIf, iroBranchIfNot:
       begin
-        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
-        X64EmitAluRegReg(ABuf, $85, False, X64_RAX, X64_RAX);
+        Host := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
+        X64EmitAluRegReg(ABuf, $85, False, Host, Host);
         { After the condition's read, so a dead condition is not stored;
           MOV stores leave the flags for the jump. Both successors see the
           same canonical slots. }
@@ -833,11 +887,9 @@ begin
       end;
     iroI32Eqz, iroI64Eqz:
       begin
-        X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
-        X64EmitAluRegReg(ABuf, $85, AIns.Op = iroI64Eqz, X64_RAX, X64_RAX);
-        X64EmitSetccAl(ABuf, X64_CC_E);
-        X64EmitMovzxEaxAl(ABuf);
-        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+        Host := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
+        X64CachedFlagResult(ABuf, $85, AIns.Op = iroI64Eqz, X64_CC_E, Host,
+          Host, AIns.Dest, ACache);
       end;
     iroI32Eq: X64CachedRel(ABuf, AIns, X64_CC_E, False, ACache);
     iroI32Ne: X64CachedRel(ABuf, AIns, X64_CC_NE, False, ACache);
@@ -938,6 +990,12 @@ begin
       ACache.Entries[I].Slot := ASlots[I];
       X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ASlots[I]);
     end;
+end;
+
+procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
+begin
+  if ACache.StaticAllocation then
+    ACache.PinnedMemoryBase := True;
 end;
 
 procedure X64EnableDynamicWriteBack(var ACache: TX64RegCache;
@@ -1059,18 +1117,22 @@ begin
   ACache.Next := 0;
 end;
 
-procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
-  const ADest: Byte; const ASlot: UInt32);
+{ Make ASlot resident and return its cache host, consuming one planned read.
+  A miss takes the same victim, spill, and load as it always has. When that
+  victim's host is AProtect (an operand the caller has already resolved),
+  AProtect is first copied to rax and AProtectMoved is set, so the caller
+  reads the operand from rax; the bookkeeping is unchanged. }
+function X64CachedOperand(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlot: UInt32; const AProtect: Byte;
+  out AProtectMoved: Boolean): Byte;
 var
   I, Victim: Integer;
-  Host: Byte;
 begin
+  AProtectMoved := False;
   for I := 0 to High(ACache.Entries) do
     if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
     begin
-      Host := X64CacheHostReg(I);
-      if ADest <> Host then
-        X64EmitMovRegReg(ABuf, ADest, Host);
+      Result := X64CacheHostReg(I);
       X64ConsumeUse(ACache, ASlot);
       Exit;
     end;
@@ -1088,95 +1150,219 @@ begin
   end;
   if ACache.WriteBackDynamics then
     X64SpillCacheEntry(ABuf, ACache, Victim);
-  Host := X64CacheHostReg(Victim);
-  X64EmitLoadSlot64(ABuf, Host, ASlot);
+  Result := X64CacheHostReg(Victim);
+  if Result = AProtect then
+  begin
+    X64EmitMovRegReg(ABuf, X64_RAX, AProtect);
+    AProtectMoved := True;
+  end;
+  X64EmitLoadSlot64(ABuf, Result, ASlot);
   ACache.Entries[Victim].Valid := True;
   ACache.Entries[Victim].Slot := ASlot;
+  X64ConsumeUse(ACache, ASlot);
+end;
+
+{ Resolve a two-operand read in the order the scratch-pair path used, so use
+  counts, victims, and spills match it exactly. }
+procedure X64CachedOperands(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlotA, ASlotB: UInt32;
+  out AHostA, AHostB: Byte);
+var
+  Moved: Boolean;
+begin
+  AHostA := X64CachedOperand(ABuf, ACache, ASlotA, $FF, Moved);
+  AHostB := X64CachedOperand(ABuf, ACache, ASlotB, AHostA, Moved);
+  if Moved then
+    AHostA := X64_RAX;
+end;
+
+procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ADest: Byte; const ASlot: UInt32);
+var
+  Host: Byte;
+  Moved: Boolean;
+begin
+  Host := X64CachedOperand(ABuf, ACache, ASlot, $FF, Moved);
   if ADest <> Host then
     X64EmitMovRegReg(ABuf, ADest, Host);
-  X64ConsumeUse(ACache, ASlot);
+end;
+
+{ The two halves of a cached store, shared with X64CachedStore so the
+  entry-selection policy exists once. Begin picks (and spills) the entry; the
+  caller computes into that entry's host, which may be an operand's host,
+  since a spill only stores; Commit then emits the write-through store from
+  the host (unless the caller already emitted it) and records the entry.
+  Nothing may touch the cache in between. }
+function X64CachedDestBegin(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlot: UInt32): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Result := I;
+  if ACache.StaticAllocation then
+  begin
+    { A static entry keeps its fixed slot; a dynamic entry already holding
+      ASlot is superseded, as in X64CachedStore. }
+    if Result >= 0 then
+      Exit;
+    if ACache.WriteBackDynamics then
+    begin
+      Result := X64PickDynamicVictim(ACache);
+      X64SpillCacheEntry(ABuf, ACache, Result);
+    end
+    else
+    begin
+      Result := 2 + ACache.Next;
+      ACache.Next := Byte(1 - ACache.Next);
+    end;
+    Exit;
+  end;
+  if Result < 0 then
+  begin
+    Result := ACache.Next;
+    ACache.Next := Byte(1 - Result);
+  end;
+end;
+
+procedure X64CachedDestCommit(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const AIndex: Integer; const ASlot: UInt32;
+  const AStoreEmitted: Boolean = False);
+var
+  Host: Byte;
+begin
+  Host := X64CacheHostReg(AIndex);
+  if ACache.StaticAllocation then
+  begin
+    if AIndex <= 1 then
+    begin
+      if ACache.FixedWriteThrough then
+        X64EmitStoreSlot64(ABuf, Host, ASlot);
+      Exit;
+    end;
+    if not (ACache.WriteBackDynamics or AStoreEmitted) then
+      X64EmitStoreSlot64(ABuf, Host, ASlot);
+    ACache.Entries[AIndex].Valid := True;
+    ACache.Entries[AIndex].Dirty := ACache.WriteBackDynamics;
+    ACache.Entries[AIndex].Slot := ASlot;
+    Exit;
+  end;
+  if not AStoreEmitted then
+    X64EmitStoreSlot64(ABuf, Host, ASlot);
+  ACache.Entries[AIndex].Valid := True;
+  ACache.Entries[AIndex].Slot := ASlot;
 end;
 
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ASrc: Byte; const ASlot: UInt32);
 var
-  I, Victim: Integer;
+  Index: Integer;
   Host: Byte;
+  StoreFirst: Boolean;
 begin
-  Victim := -1;
-  for I := 0 to High(ACache.Entries) do
-    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
-      Victim := I;
-  if ACache.StaticAllocation then
-  begin
-    if (Victim >= 0) and (Victim <= 1) then
-    begin
-      Host := X64CacheHostReg(Victim);
-      if ASrc <> Host then
-        X64EmitMovRegReg(ABuf, Host, ASrc);
-      if ACache.FixedWriteThrough then
-        X64EmitStoreSlot64(ABuf, Host, ASlot);
-      Exit;
-    end;
-    if not ACache.WriteBackDynamics then
-      X64EmitStoreSlot64(ABuf, ASrc, ASlot);
-    if Victim < 2 then
-    begin
-      if ACache.WriteBackDynamics then
-      begin
-        Victim := X64PickDynamicVictim(ACache);
-        X64SpillCacheEntry(ABuf, ACache, Victim);
-      end
-      else
-      begin
-        Victim := 2 + ACache.Next;
-        ACache.Next := Byte(1 - ACache.Next);
-      end;
-    end;
-    { An entry already holding ASlot is simply superseded: every read of its
-      old value precedes this point on the straight line. }
-    Host := X64CacheHostReg(Victim);
-    if ASrc <> Host then
-      X64EmitMovRegReg(ABuf, Host, ASrc);
-    ACache.Entries[Victim].Valid := True;
-    ACache.Entries[Victim].Dirty := ACache.WriteBackDynamics;
-    ACache.Entries[Victim].Slot := ASlot;
-    Exit;
-  end;
-  X64EmitStoreSlot64(ABuf, ASrc, ASlot);
-  if Victim < 0 then
-  begin
-    Victim := ACache.Next;
-    ACache.Next := Byte(1 - Victim);
-  end;
-  Host := X64CacheHostReg(Victim);
+  { One entry-selection policy: X64CachedDestBegin picks (and spills) the
+    entry. A write-through store that has no fixed static host goes out from
+    the source before the move, as it always has; selecting an entry in those
+    modes emits no code, so the byte sequence is unchanged. }
+  Index := X64CachedDestBegin(ABuf, ACache, ASlot);
+  Host := X64CacheHostReg(Index);
+  StoreFirst := (not ACache.StaticAllocation) or
+    ((Index >= 2) and not ACache.WriteBackDynamics);
+  if StoreFirst then
+    X64EmitStoreSlot64(ABuf, ASrc, ASlot);
   if ASrc <> Host then
     X64EmitMovRegReg(ABuf, Host, ASrc);
-  ACache.Entries[Victim].Valid := True;
-  ACache.Entries[Victim].Slot := ASlot;
+  X64CachedDestCommit(ABuf, ACache, Index, ASlot, StoreFirst);
 end;
 
+{ The operands and the result stay in their cache hosts; rax serves only a
+  non-commutative op whose result host is its right operand's. A 32-bit form
+  zero-extends its destination, as the scratch path's did. }
 procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
   var ACache: TX64RegCache);
+
+  procedure EmitOp(const ADst, ASrc: Byte);
+  begin
+    if AMul then
+      X64EmitImul(ABuf, AWide, ADst, ASrc)
+    else
+      X64EmitAluRegReg(ABuf, AOpcode, AWide, ADst, ASrc);
+  end;
+
+var
+  HostA, HostB, HostD: Byte;
+  Index: Integer;
 begin
-  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
-  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
-  if AMul then
-    X64EmitImul(ABuf, AWide, X64_RAX, X64_RCX)
+  X64CachedOperands(ABuf, ACache, AIns.A, AIns.B, HostA, HostB);
+  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
+  HostD := X64CacheHostReg(Index);
+  if HostD = HostA then
+    EmitOp(HostD, HostB)
+  else if HostD <> HostB then
+  begin
+    X64EmitMovRegReg(ABuf, HostD, HostA);
+    EmitOp(HostD, HostB);
+  end
+  else if AMul or (AOpcode <> $29) then
+    { add, and, or, xor, and imul commute. }
+    EmitOp(HostD, HostA)
   else
-    X64EmitAluRegReg(ABuf, AOpcode, AWide, X64_RAX, X64_RCX);
-  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+  begin
+    if HostA <> X64_RAX then
+      X64EmitMovRegReg(ABuf, X64_RAX, HostA);
+    EmitOp(X64_RAX, HostB);
+    X64EmitMovRegReg(ABuf, HostD, X64_RAX);
+  end;
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest);
 end;
 
 procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
   var ACache: TX64RegCache);
+var
+  HostA, HostB, HostD: Byte;
+  Index: Integer;
 begin
-  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
-  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
-  X64EmitShiftCl(ABuf, ASubop, AWide, X64_RAX);
-  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+  X64CachedOperands(ABuf, ACache, AIns.A, AIns.B, HostA, HostB);
+  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
+  HostD := X64CacheHostReg(Index);
+  { The count is copied to CL first, so the result host may be its host. }
+  X64EmitMovRegReg(ABuf, X64_RCX, HostB);
+  if HostD <> HostA then
+    X64EmitMovRegReg(ABuf, HostD, HostA);
+  X64EmitShiftCl(ABuf, ASubop, AWide, HostD);
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest);
+end;
+
+{ Set the flags with AOpcode (cmp $39 or test $85) over the operand hosts and
+  write ACc as 0/1 into the result host. A result host distinct from both
+  operands is zeroed before the flags are set (a dependency-breaking idiom);
+  otherwise the flags come first and the byte is widened after SETcc. }
+procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
+  const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
+  AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache);
+var
+  HostD: Byte;
+  Index: Integer;
+begin
+  Index := X64CachedDestBegin(ABuf, ACache, ADest);
+  HostD := X64CacheHostReg(Index);
+  if (HostD <> AHostA) and (HostD <> AHostB) then
+  begin
+    X64EmitAluRegReg(ABuf, $31, False, HostD, HostD);
+    X64EmitAluRegReg(ABuf, AOpcode, AWide, AHostA, AHostB);
+    X64EmitSetccReg(ABuf, ACc, HostD);
+  end
+  else
+  begin
+    X64EmitAluRegReg(ABuf, AOpcode, AWide, AHostA, AHostB);
+    X64EmitSetccReg(ABuf, ACc, HostD);
+    X64EmitMovzxReg8(ABuf, HostD, HostD);
+  end;
+  X64CachedDestCommit(ABuf, ACache, Index, ADest);
 end;
 
 procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
@@ -1193,7 +1379,7 @@ end;
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
 var
-  Cond: Byte;
+  Cond, HostA, HostB: Byte;
   Wide: Boolean;
 begin
   Wide := False;
@@ -1222,9 +1408,8 @@ begin
   end;
   if ABranch.Op = iroBranchIfNot then
     Cond := Cond xor 1;
-  X64CachedLoad(ABuf, ACache, X64_RAX, ACompare.A);
-  X64CachedLoad(ABuf, ACache, X64_RCX, ACompare.B);
-  X64EmitAluRegReg(ABuf, $39, Wide, X64_RAX, X64_RCX);
+  X64CachedOperands(ABuf, ACache, ACompare.A, ACompare.B, HostA, HostB);
+  X64EmitAluRegReg(ABuf, $39, Wide, HostA, HostB);
   { MOV stores leave the compare's flags intact. }
   X64FlushDynamicRegCache(ABuf, ACache);
   X64EmitJccTo(ABuf, Cond, ABranch.B);
@@ -1234,13 +1419,12 @@ end;
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
   var ACache: TX64RegCache);
+var
+  HostA, HostB: Byte;
 begin
-  X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
-  X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
-  X64EmitAluRegReg(ABuf, $39, AWide, X64_RAX, X64_RCX);
-  X64EmitSetccAl(ABuf, ACc);
-  X64EmitMovzxEaxAl(ABuf);
-  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+  X64CachedOperands(ABuf, ACache, AIns.A, AIns.B, HostA, HostB);
+  X64CachedFlagResult(ABuf, $39, AWide, ACc, HostA, HostB, AIns.Dest,
+    ACache);
 end;
 
 function X64OpUnary(const AOp: PtrUInt; const A: UInt64): UInt64; cdecl;
@@ -1978,58 +2162,14 @@ procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
   const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
   AResult64: Boolean);
 begin
-  case ASize of
-    1, 2:
-      begin
-        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3, 0,
-          ABase shr 3);
-        ABuf.EmitByte($0F);
-        if ASigned then
-          ABuf.EmitByte($BE + Ord(ASize = 2))
-        else
-          ABuf.EmitByte($B6 + Ord(ASize = 2));
-        EmitMemOperand(ABuf, ADest, ABase, 0);
-      end;
-    4:
-      if ASigned and AResult64 then
-      begin
-        X64EmitRex(ABuf, 1, ADest shr 3, 0, ABase shr 3);
-        ABuf.EmitByte($63);                    { movsxd r64, r/m32 }
-        EmitMemOperand(ABuf, ADest, ABase, 0);
-      end
-      else
-        X64EmitLoadMem32(ABuf, ADest, ABase, 0);
-  else
-    X64EmitLoadMem64(ABuf, ADest, ABase, 0);
-  end;
+  X64EmitLoadScalarIndexed(ABuf, ADest, ABase, X64_NO_INDEX, ASize, ASigned,
+    AResult64);
 end;
 
 procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
   const ASource, ABase: Byte; const ASize: UInt32);
 begin
-  case ASize of
-    1:
-      begin
-        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
-        ABuf.EmitByte($88);
-        EmitMemOperand(ABuf, ASource, ABase, 0);
-      end;
-    2:
-      begin
-        ABuf.EmitByte($66);
-        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
-        ABuf.EmitByte($89);
-        EmitMemOperand(ABuf, ASource, ABase, 0);
-      end;
-    4:
-      begin
-        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
-        ABuf.EmitByte($89);
-        EmitMemOperand(ABuf, ASource, ABase, 0);
-      end;
-  else
-    X64EmitStoreMem64(ABuf, ASource, ABase, 0);
-  end;
+  X64EmitStoreScalarIndexed(ABuf, ASource, ABase, X64_NO_INDEX, ASize);
 end;
 
 procedure X64EmitTrapUnless(const ABuf: TWasmCodeBuffer;
@@ -2121,6 +2261,182 @@ begin
   X64EmitLoadScalar(ABuf, X64_RAX, X64_R8, AccessSize, SignedLoad,
     AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S]);
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
+end;
+
+{ The [base + index] memory operand (ModRM rm=100 + SIB, scale 1) per SDM
+  Vol. 2 Table 2-3. A base whose low bits are 101 (rbp/r13) has no mod=00
+  form, so it takes a zero disp8. AIndex must not be rsp (SIB index 100 means
+  "no index"). REX.X/REX.B are the caller's. }
+procedure EmitMemOperandIndexed(const ABuf: TWasmCodeBuffer;
+  const ARegField, ABase, AIndex: Byte);
+var
+  ModB: Byte;
+begin
+  if (ABase and 7) = 5 then
+    ModB := 1
+  else
+    ModB := 0;
+  ABuf.EmitByte((ModB shl 6) or ((ARegField and 7) shl 3) or 4);
+  ABuf.EmitByte(((AIndex and 7) shl 3) or (ABase and 7));
+  if ModB = 1 then
+    ABuf.EmitByte(0);
+end;
+
+{ The one scalar load/store encoder (movzx/movsx 0F B6/B7/BE/BF, movsxd 63,
+  mov 8B/89/88, 66-prefixed 16-bit store) over [ABase + AIndex], or over
+  [ABase] when AIndex is X64_NO_INDEX (X64EmitLoadScalar/X64EmitStoreScalar). }
+procedure X64EmitLoadScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase, AIndex: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean);
+var
+  X: Byte;
+begin
+  X := 0;
+  if AIndex <> X64_NO_INDEX then
+    X := AIndex shr 3;
+  case ASize of
+    1, 2:
+      begin
+        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3,
+          X, ABase shr 3);
+        ABuf.EmitByte($0F);
+        if ASigned then
+          ABuf.EmitByte($BE + Ord(ASize = 2))
+        else
+          ABuf.EmitByte($B6 + Ord(ASize = 2));
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, Ord(ASigned and AResult64), ADest shr 3,
+          X, ABase shr 3);
+        if ASigned and AResult64 then
+          ABuf.EmitByte($63)                   { movsxd r64, r/m32 }
+        else
+          ABuf.EmitByte($8B);
+      end;
+  else
+    begin
+      X64EmitRex(ABuf, 1, ADest shr 3, X, ABase shr 3);
+      ABuf.EmitByte($8B);
+    end;
+  end;
+  if AIndex = X64_NO_INDEX then
+    EmitMemOperand(ABuf, ADest, ABase, 0)
+  else
+    EmitMemOperandIndexed(ABuf, ADest, ABase, AIndex);
+end;
+
+procedure X64EmitStoreScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase, AIndex: Byte; const ASize: UInt32);
+var
+  X: Byte;
+begin
+  X := 0;
+  if AIndex <> X64_NO_INDEX then
+    X := AIndex shr 3;
+  case ASize of
+    1:
+      begin
+        { spl/bpl/sil/dil are byte-addressable only under a REX prefix. }
+        if ASource in [4 .. 7] then
+          ABuf.EmitByte($40 or (X shl 1) or (ABase shr 3))
+        else
+          X64EmitRex(ABuf, 0, ASource shr 3, X, ABase shr 3);
+        ABuf.EmitByte($88);
+      end;
+    2:
+      begin
+        ABuf.EmitByte($66);
+        X64EmitRex(ABuf, 0, ASource shr 3, X, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, X, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+  else
+    begin
+      X64EmitRex(ABuf, 1, ASource shr 3, X, ABase shr 3);
+      ABuf.EmitByte($89);
+    end;
+  end;
+  if AIndex = X64_NO_INDEX then
+    EmitMemOperand(ABuf, ASource, ABase, 0)
+  else
+    EmitMemOperandIndexed(ABuf, ASource, ABase, AIndex);
+end;
+
+function X64CachedHostForSlot(const ACache: TX64RegCache;
+  const ASlot: UInt32; out AHost: Byte): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+    begin
+      AHost := X64CacheHostReg(I);
+      Exit(True);
+    end;
+  AHost := 0;
+  Result := False;
+end;
+
+{ A scalar access in a base-pinned static-cache frame. The driver admits it
+  only under UsePinnedMemoryBase: one memory, no call, no memory.grow, and
+  every access a zero-offset i32 access. Base therefore cannot change during
+  the activation and lives in rsi. The i32 guard-page strategy needs neither
+  ByteSize nor an explicit check: the reservation plus guard covers every
+  zero-extended index plus the access width (ADR-0005), exactly as in
+  X64EmitScalarMemory's folded i32 branch. An out-of-bounds access faults
+  inside the reservation and WasmFaultHandler unwinds to the invocation
+  trampoline with the same trap kind (ADR-0009); that path reads no
+  register-file slot, so dirty cache hosts need no flush first.
+
+  The address is copied into ecx first: the 32-bit move discards stale high
+  bits of a 64-bit host or slot (an i32 is only its low half), and the copy
+  leaves the value side free to evict the address host. }
+procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean;
+  var ACache: TX64RegCache);
+var
+  Offset: UInt64;
+  Host, ValueReg: Byte;
+begin
+  Move(AIns.Imm, Offset, SizeOf(Offset));
+  if AAddr64 or (Offset <> 0) then
+    raise EWasmInternal.Create(
+      'internal: base-pinned x64 access is not a zero-offset i32 access');
+  if X64CachedHostForSlot(ACache, AIns.A, Host) then
+    X64EmitAluRegReg(ABuf, $89, False, X64_RCX, Host)
+  else
+    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.A);
+  X64ConsumeUse(ACache, AIns.A);
+
+  if AIns.Op in [iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32] then
+  begin
+    if X64CachedHostForSlot(ACache, AIns.Dest, Host) then
+      ValueReg := Host
+    else
+    begin
+      { Uncached, so its slot is canonical. }
+      X64EmitLoadSlot64(ABuf, X64_RAX, AIns.Dest);
+      ValueReg := X64_RAX;
+    end;
+    X64ConsumeUse(ACache, AIns.Dest);
+    X64EmitStoreScalarIndexed(ABuf, ValueReg, X64_REG_MEMBASE, X64_RCX,
+      X64MemoryAccessSize(AIns.Op));
+    Exit;
+  end;
+
+  X64EmitLoadScalarIndexed(ABuf, X64_RAX, X64_REG_MEMBASE, X64_RCX,
+    X64MemoryAccessSize(AIns.Op),
+    AIns.Op in [iroI32Load8S, iroI32Load16S, iroI64Load8S, iroI64Load16S,
+      iroI64Load32S],
+    AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S]);
+  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
 end;
 
 function X64SlotDispFits(const ASlot: UInt32): Boolean;
@@ -2484,6 +2800,31 @@ begin
   ABuf.EmitByte($C0);
 end;
 
+procedure X64EmitSetccReg(const ABuf: TWasmCodeBuffer; const ACc,
+  AReg: Byte);
+begin
+  { SETcc r/m8 = [REX] 0F (90+cc) /0. }
+  if AReg >= 4 then
+    ABuf.EmitByte($40 or (AReg shr 3));
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($90 or ACc);
+  EmitModRMReg(ABuf, 0, AReg);
+end;
+
+procedure X64EmitMovzxReg8(const ABuf: TWasmCodeBuffer; const ADst,
+  ASrc: Byte);
+var
+  Rex: Byte;
+begin
+  { MOVZX r32, r/m8 = [REX] 0F B6 /r; reg=ADst, rm=ASrc. }
+  Rex := $40 or ((ADst shr 3) shl 2) or (ASrc shr 3);
+  if (Rex <> $40) or (ASrc >= 4) then
+    ABuf.EmitByte(Rex);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($B6);
+  EmitModRMReg(ABuf, ADst, ASrc);
+end;
+
 procedure X64EmitCmovcc(const ABuf: TWasmCodeBuffer; const ACc: Byte;
   const AWide: Boolean; const ADst, ASrc: Byte);
 begin
@@ -2730,12 +3071,17 @@ begin
 end;
 
 procedure X64EmitPinMemory(const ABuf: TWasmCodeBuffer;
-  const AMemoryIndex: UInt32);
+  const AMemoryIndex: UInt32; const APinBase: Boolean);
+var
+  Layout: TWasmMemoryInst;
 begin
   X64EmitMovRegReg(ABuf, X64_ARG0, X64_REG_STORE);
   X64EmitMovRegImm32(ABuf, X64_ARG1, AMemoryIndex);
   X64EmitCallHelper(ABuf, aohResolveMemory);
   X64EmitStoreMem64(ABuf, X64_RAX, X64_RSP, 0);
+  if APinBase then
+    X64EmitLoadMem64(ABuf, X64_REG_MEMBASE, X64_RAX,
+      Int32(PtrUInt(@Layout.Base) - PtrUInt(@Layout)));
 end;
 
 procedure X64EmitEpochCapture(const ABuf: TWasmCodeBuffer;
