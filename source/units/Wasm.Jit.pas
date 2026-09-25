@@ -2199,8 +2199,9 @@ begin
 
     { A cache is valid only along one straight-line predecessor. Mark every IR
       branch destination up front so a join invalidates compile-time cache
-      metadata before its label is bound. Values are write-through, therefore
-      no generated flush is needed. }
+      metadata before its label is bound. Write-through values need no
+      generated flush; deferred dynamic values are written back on the
+      fallthrough edge, as every branch does before it jumps. }
     SetLength(Targets, Length(AFn^.Code));
     for I := 0 to High(AFn^.Code) do
     begin
@@ -2264,6 +2265,17 @@ begin
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeDynamicWriteBack;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    if UseStaticCache then
+    begin
+      { Masked-shift fusion is ARM64-only; the shared liveness walk reads its
+        plan, so give x64 the empty one. }
+      SetLength(MaskedShiftSource, Length(PlannedCode));
+      for I := 0 to High(MaskedShiftSource) do
+        MaskedShiftSource[I] := -1;
+      AnalyzeDynamicWriteBack;
+    end;
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -2345,7 +2357,16 @@ begin
       X64SeedNativeCoreCache(X64Cache, NativeParamCount, NativeParamReg,
         NativeParam1Reg, UseNativeScalarLeaf)
     else if UseStaticCache then
+    begin
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
+      { StaticCacheOp admits only helper-free scalar operations on x64, so
+        the only exits from the straight line are branches, joins, the
+        epoch-polled back-edge, return, and unreachable; each writes back
+        the dynamic values a later read, local, result, or loop-carried
+        slot can observe (ARM64 9a3126a). }
+      X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
+    end;
     if UseNativeScalarCore then
     begin
       X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
@@ -2371,6 +2392,7 @@ begin
         Arm64InvalidateRegCache(ArmCache);
         {$ENDIF}
         {$IFDEF WASM_JIT_X64}
+        X64FlushDynamicRegCache(Buf, X64Cache);
         X64InvalidateRegCache(X64Cache);
         {$ENDIF}
       end;

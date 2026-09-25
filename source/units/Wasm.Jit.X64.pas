@@ -103,6 +103,9 @@ type
 
   TX64RegCacheEntry = record
     Valid: Boolean;
+    { Only with WriteBackDynamics: the host register holds a value its
+      register-file slot does not have yet. }
+    Dirty: Boolean;
     Slot: UInt32;
   end;
 
@@ -111,6 +114,15 @@ type
     Next: Byte;
     StaticAllocation: Boolean;
     FixedWriteThrough: Boolean;
+    { Static allocation only: r10/r11 defer their register-file stores until
+      eviction or a canonical point (branch, join, exit), and skip them for a
+      temporary whose planned reads are exhausted and that no local, result,
+      or loop-carried use can observe. Off, the dynamic pair is the original
+      write-through cache. }
+    WriteBackDynamics: Boolean;
+    UseCounts: PUInt32;
+    VisibleSlots: PBoolean;
+    SlotCount: UInt32;
   end;
 
   { Per-instruction native-shape words handed over by the driver's
@@ -380,6 +392,19 @@ procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
   const AStaticParams: Boolean = True);
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlots: array of UInt32);
+{ Enable deferred dynamic write-back on a static allocation. AUseCounts holds
+  each slot's remaining planned reads (consumed as the emitter reads them);
+  AVisibleSlots marks locals, results, and loop-carried slots, which are
+  always written back. Both arrays have ASlotCount entries and must outlive
+  the emission. }
+procedure X64EnableDynamicWriteBack(var ACache: TX64RegCache;
+  const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
+  const ASlotCount: UInt32);
+{ Write back every dirty dynamic entry a later read or the canonical frame
+  still needs; entries stay valid and clean. Emits only MOV stores, so it
+  preserves the flags between a compare and its conditional jump. }
+procedure X64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
 procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache);
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
@@ -701,8 +726,12 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AGcShapes: PX64GcShapeArray): Boolean;
 begin
   Result := True;
+  { Deferred dynamic stores are an optimization of the helper-free static
+    allocation only. Every op outside it can call a helper, trap, or leave the
+    straight line, so the register file is made canonical first. }
   if X64ScalarMemoryOp(AIns.Op) then
   begin
+    X64FlushDynamicRegCache(ABuf, ACache);
     X64InvalidateRegCache(ACache);
     X64EmitScalarMemory(ABuf, AIns, AAddr64, AUsePinnedMemory);
     Exit;
@@ -710,6 +739,7 @@ begin
   if (AGcShapes <> nil) and
     ((AGcShapes[AInsIndex] and 1) <> 0) then
   begin
+    X64FlushDynamicRegCache(ABuf, ACache);
     if (AGcShapes[AInsIndex] and 4) <> 0 then
       X64EmitGcArrayAccess(ABuf, AIns, AInsIndex,
         AGcShapes[AInsIndex], ACache)
@@ -737,6 +767,10 @@ begin
       begin
         X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
         X64EmitAluRegReg(ABuf, $85, False, X64_RAX, X64_RAX);
+        { After the condition's read, so a dead condition is not stored;
+          MOV stores leave the flags for the jump. Both successors see the
+          same canonical slots. }
+        X64FlushDynamicRegCache(ABuf, ACache);
         if AIns.Op = iroBranchIf then
           X64EmitJccTo(ABuf, X64_CC_NE, AIns.B)
         else
@@ -748,13 +782,17 @@ begin
         { Static allocation is restricted to helper-free numeric functions.
           The epoch-only back-edge cannot collect on its fallthrough and the
           mismatch path traps without returning, so numeric slots need no
-          canonical writeback here. Observable exits still flush below. }
+          canonical writeback here. Observable exits still flush below.
+          Deferred dynamic values are not fixed to a host across the edge,
+          so the target reloads them: write back the live ones. }
+        X64FlushDynamicRegCache(ABuf, ACache);
         Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
           AUseNativeScalarCall);
       end;
     iroCall:
       if ANativeScalarSelf then
       begin
+        X64FlushDynamicRegCache(ABuf, ACache);
         X64CachedLoad(ABuf, ACache, X64_R8,
           IrAuxBlockItem(AAux, AIns.A, 0));
         X64InvalidateRegCache(ACache);
@@ -765,6 +803,7 @@ begin
       end
       else
       begin
+        X64FlushDynamicRegCache(ABuf, ACache);
         X64InvalidateRegCache(ACache);
         Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
           AUseNativeScalarCall);
@@ -840,6 +879,7 @@ begin
     iroI64Rotr: X64CachedShift(ABuf, AIns, 1, True, ACache);
     iroSelect: X64CachedSelect(ABuf, AIns, ACache);
   else
+    X64FlushDynamicRegCache(ABuf, ACache);
     X64InvalidateRegCache(ACache);
     Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
       AUseNativeScalarCall);
@@ -896,6 +936,95 @@ begin
     end;
 end;
 
+procedure X64EnableDynamicWriteBack(var ACache: TX64RegCache;
+  const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
+  const ASlotCount: UInt32);
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  ACache.WriteBackDynamics := True;
+  ACache.UseCounts := AUseCounts;
+  ACache.VisibleSlots := AVisibleSlots;
+  ACache.SlotCount := ASlotCount;
+end;
+
+{ A dirty entry must reach its slot when a later lexical read remains or the
+  slot is visible. A backward edge is the only way to reach a read already
+  emitted; the driver marks every slot read before its redefinition inside a
+  loop visible, so an exhausted count proves the value dead. }
+function X64EntryNeedsWriteBack(const ACache: TX64RegCache;
+  const AIndex: Integer): Boolean;
+var
+  Slot: UInt32;
+begin
+  Result := False;
+  if not ACache.Entries[AIndex].Valid or
+    not ACache.Entries[AIndex].Dirty then
+    Exit;
+  Slot := ACache.Entries[AIndex].Slot;
+  if Slot >= ACache.SlotCount then
+    Exit(True);
+  Result := ACache.VisibleSlots[Slot] or (ACache.UseCounts[Slot] > 0);
+end;
+
+procedure X64SpillCacheEntry(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const AIndex: Integer);
+begin
+  if X64EntryNeedsWriteBack(ACache, AIndex) then
+    X64EmitStoreSlot64(ABuf, X64CacheHostReg(AIndex),
+      ACache.Entries[AIndex].Slot);
+  ACache.Entries[AIndex].Dirty := False;
+end;
+
+procedure X64ConsumeUse(var ACache: TX64RegCache; const ASlot: UInt32);
+begin
+  if ACache.WriteBackDynamics and (ASlot < ACache.SlotCount) and
+    (ACache.UseCounts[ASlot] > 0) then
+    Dec(ACache.UseCounts[ASlot]);
+end;
+
+{ With deferred stores, prefer the dynamic entry whose eviction costs least:
+  empty or dead first, then one needing only a later reload, and only then a
+  dirty live value (a store plus a reload). Ties keep round-robin order. }
+function X64PickDynamicVictim(var ACache: TX64RegCache): Integer;
+var
+  Attempt, I, Cost, BestCost: Integer;
+  Slot: UInt32;
+begin
+  Result := 2 + ACache.Next;
+  BestCost := High(Integer);
+  for Attempt := 0 to 1 do
+  begin
+    I := 2 + ((ACache.Next + Attempt) and 1);
+    Cost := 0;
+    if ACache.Entries[I].Valid then
+    begin
+      Slot := ACache.Entries[I].Slot;
+      if X64EntryNeedsWriteBack(ACache, I) then
+        Inc(Cost);
+      if (Slot >= ACache.SlotCount) or (ACache.UseCounts[Slot] > 0) then
+        Inc(Cost);
+    end;
+    if Cost < BestCost then
+    begin
+      BestCost := Cost;
+      Result := I;
+    end;
+  end;
+  ACache.Next := Byte(1 - (Result - 2));
+end;
+
+procedure X64FlushDynamicRegCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
+var
+  I: Integer;
+begin
+  if not ACache.WriteBackDynamics then
+    Exit;
+  for I := 2 to 3 do
+    X64SpillCacheEntry(ABuf, ACache, I);
+end;
+
 procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache);
 var
@@ -906,14 +1035,18 @@ begin
   for I := 0 to 1 do
     if ACache.Entries[I].Valid then
       X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+  X64FlushDynamicRegCache(ABuf, ACache);
 end;
 
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
 begin
   if ACache.StaticAllocation then
   begin
+    { Callers flush first: a dirty entry dropped here would lose its value. }
     ACache.Entries[2].Valid := False;
+    ACache.Entries[2].Dirty := False;
     ACache.Entries[3].Valid := False;
+    ACache.Entries[3].Dirty := False;
     ACache.Next := 0;
     Exit;
   end;
@@ -934,9 +1067,12 @@ begin
       Host := X64CacheHostReg(I);
       if ADest <> Host then
         X64EmitMovRegReg(ABuf, ADest, Host);
+      X64ConsumeUse(ACache, ASlot);
       Exit;
     end;
-  if ACache.StaticAllocation then
+  if ACache.WriteBackDynamics then
+    Victim := X64PickDynamicVictim(ACache)
+  else if ACache.StaticAllocation then
   begin
     Victim := 2 + ACache.Next;
     ACache.Next := Byte(1 - ACache.Next);
@@ -946,12 +1082,15 @@ begin
     Victim := ACache.Next;
     ACache.Next := Byte(1 - ACache.Next);
   end;
+  if ACache.WriteBackDynamics then
+    X64SpillCacheEntry(ABuf, ACache, Victim);
   Host := X64CacheHostReg(Victim);
   X64EmitLoadSlot64(ABuf, Host, ASlot);
   ACache.Entries[Victim].Valid := True;
   ACache.Entries[Victim].Slot := ASlot;
   if ADest <> Host then
     X64EmitMovRegReg(ABuf, ADest, Host);
+  X64ConsumeUse(ACache, ASlot);
 end;
 
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
@@ -975,16 +1114,28 @@ begin
         X64EmitStoreSlot64(ABuf, Host, ASlot);
       Exit;
     end;
-    X64EmitStoreSlot64(ABuf, ASrc, ASlot);
+    if not ACache.WriteBackDynamics then
+      X64EmitStoreSlot64(ABuf, ASrc, ASlot);
     if Victim < 2 then
     begin
-      Victim := 2 + ACache.Next;
-      ACache.Next := Byte(1 - ACache.Next);
+      if ACache.WriteBackDynamics then
+      begin
+        Victim := X64PickDynamicVictim(ACache);
+        X64SpillCacheEntry(ABuf, ACache, Victim);
+      end
+      else
+      begin
+        Victim := 2 + ACache.Next;
+        ACache.Next := Byte(1 - ACache.Next);
+      end;
     end;
+    { An entry already holding ASlot is simply superseded: every read of its
+      old value precedes this point on the straight line. }
     Host := X64CacheHostReg(Victim);
     if ASrc <> Host then
       X64EmitMovRegReg(ABuf, Host, ASrc);
     ACache.Entries[Victim].Valid := True;
+    ACache.Entries[Victim].Dirty := ACache.WriteBackDynamics;
     ACache.Entries[Victim].Slot := ASlot;
     Exit;
   end;
@@ -1070,6 +1221,8 @@ begin
   X64CachedLoad(ABuf, ACache, X64_RAX, ACompare.A);
   X64CachedLoad(ABuf, ACache, X64_RCX, ACompare.B);
   X64EmitAluRegReg(ABuf, $39, Wide, X64_RAX, X64_RCX);
+  { MOV stores leave the compare's flags intact. }
+  X64FlushDynamicRegCache(ABuf, ACache);
   X64EmitJccTo(ABuf, Cond, ABranch.B);
   X64InvalidateRegCache(ACache);
 end;
