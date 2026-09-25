@@ -56,6 +56,9 @@ type
     procedure TestLea;
     procedure TestBranchPlaceholders;
     procedure TestResolvePatchRel32;
+    procedure TestNopForms;
+    procedure TestAlignCode;
+    procedure TestEpochBackEdgeBytes;
     procedure TestPrologueBytes;
     procedure TestEpilogueBytes;
     procedure TestEpochCaptureBytes;
@@ -434,6 +437,119 @@ begin
   end;
 end;
 
+procedure TX64Tests.TestNopForms;
+const
+  { SDM Vol. 2 "NOP": the recommended multi-byte sequences. }
+  Forms: array[1..9] of array[0..8] of Byte = (
+    ($90, 0, 0, 0, 0, 0, 0, 0, 0),
+    ($66, $90, 0, 0, 0, 0, 0, 0, 0),
+    ($0F, $1F, $00, 0, 0, 0, 0, 0, 0),
+    ($0F, $1F, $40, $00, 0, 0, 0, 0, 0),
+    ($0F, $1F, $44, $00, $00, 0, 0, 0, 0),
+    ($66, $0F, $1F, $44, $00, $00, 0, 0, 0),
+    ($0F, $1F, $80, $00, $00, $00, $00, 0, 0),
+    ($0F, $1F, $84, $00, $00, $00, $00, $00, 0),
+    ($66, $0F, $1F, $84, $00, $00, $00, $00, $00));
+var
+  Buf: TWasmCodeBuffer;
+  N, I: Integer;
+begin
+  for N := 1 to 9 do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      X64EmitNops(Buf, N);
+      Expect<Integer>(Buf.Size).ToBe(N);
+      for I := 0 to N - 1 do
+        Expect<Byte>(Buf.ByteAt(I)).ToBe(Forms[N][I]);
+    finally
+      Buf.Free;
+    end;
+  end;
+  { Longer runs are whole 9-byte forms, then one form for the remainder. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitNops(Buf, 20);
+    CheckSeq(Buf, [$66, $0F, $1F, $84, $00, $00, $00, $00, $00,
+      $66, $0F, $1F, $84, $00, $00, $00, $00, $00,
+      $66, $90]);
+    X64EmitNops(Buf, 0);
+    Expect<Integer>(Buf.Size).ToBe(20);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestAlignCode;
+var
+  Buf: TWasmCodeBuffer;
+  Start, Before, I: Integer;
+begin
+  { From every start offset in a 64-byte block the loop-head pad lands on
+    offset 32 of the next block position, emitting fewer than 64 bytes of
+    decodable NOPs (each form starts with 90, 66, or 0F). }
+  for Start := 0 to 64 do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      for I := 1 to Start do
+        Buf.EmitByte($CC);
+      X64EmitLoopHeadAlign(Buf);
+      Expect<Integer>(Buf.CurrentOffset mod X64_LOOP_HEAD_ALIGN)
+        .ToBe(X64_LOOP_HEAD_OFFSET);
+      Expect<Boolean>(Buf.CurrentOffset - Start < X64_LOOP_HEAD_ALIGN)
+        .ToBe(True);
+      Expect<Boolean>(Buf.CurrentOffset >= Start).ToBe(True);
+      if Buf.CurrentOffset > Start then
+        Expect<Boolean>(Buf.ByteAt(Start) in [$90, $66, $0F]).ToBe(True);
+      { Already placed: no further padding. }
+      Before := Buf.CurrentOffset;
+      X64EmitLoopHeadAlign(Buf);
+      Expect<Integer>(Buf.CurrentOffset).ToBe(Before);
+    finally
+      Buf.Free;
+    end;
+  end;
+  { The generic form honours any power-of-two boundary and offset. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.EmitByte($CC);
+    X64AlignCode(Buf, 16, 0);
+    Expect<Integer>(Buf.CurrentOffset).ToBe(16);
+    X64AlignCode(Buf, 32, 8);
+    Expect<Integer>(Buf.CurrentOffset).ToBe(40);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestEpochBackEdgeBytes;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { A loop head bound at 0, one body byte, then the back-edge: mov rax,[r13]
+    (49 8B 45 00); cmp rax,r14 (4C 39 F0); je head (0F 84 rel32, rel32 =
+    0 - (8 + 6) = -14); mov edi,wtkEpochInterrupt (BF imm32); call
+    [r15] (41 FF 17). The only taken branch is the je; the trap falls
+    through. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    Buf.BindLabel(0);
+    Buf.EmitByte($90);
+    X64EmitEpochBackEdge(Buf, 0);
+    X64ResolvePatches(Buf);
+    CheckSeq(Buf, [$90,
+      $49, $8B, $45, $00,
+      $4C, $39, $F0,
+      $0F, $84, $F2, $FF, $FF, $FF,
+      $BF, Byte(Ord(wtkEpochInterrupt)), $00, $00, $00,
+      $41, $FF, $17]);
+  finally
+    Buf.Free;
+  end;
+end;
+
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
 
 procedure TX64Tests.TestPrologueBytes;
@@ -579,16 +695,33 @@ begin
     Buf.Free;
   end;
 
-  { PinMemory: retain the stable instance pointer in the first frame slot. }
+  { PinMemory: resolve Store.FMemories[Acts[Depth-1].Instance.MemAddrs[7]]
+    inline and retain it in the first frame slot. Offsets are the published
+    LP64 layout (Wasm.Target): TierContext 168, Depth 56, ActStride 128, Acts
+    40, ActInstance 8, MemAddrs 48, MemInstStride 80, FMemories 64. The
+    emitter reads the host's live record offsets, which equal that layout on
+    every 64-bit host the x64 backend runs on; a 32-bit host's records are
+    smaller (the encoder tests still run there), so the literal bytes are
+    asserted on 64-bit hosts only. }
+  {$IFDEF CPU64}
   Buf := TWasmCodeBuffer.Create;
   try
     X64EmitPinMemory(Buf, 7);
-    CheckSeq(Buf, [$4C, $89, $E7, $BE, $07, $00, $00, $00,
-      $41, $FF, $57, Byte(Ord(aohResolveMemory) * 8),
-      $48, $89, $04, $24]);
+    CheckSeq(Buf, [
+      $49, $8B, $84, $24, $A8, $00, $00, $00,   { mov rax,[r12+168] }
+      $48, $8B, $48, $38,                       { mov rcx,[rax+56] }
+      $48, $69, $C9, $80, $00, $00, $00,        { imul rcx,rcx,128 }
+      $48, $03, $48, $28,                       { add rcx,[rax+40] }
+      $48, $8B, $41, $88,                       { mov rax,[rcx-120] }
+      $48, $8B, $40, $30,                       { mov rax,[rax+48] }
+      $8B, $40, $1C,                            { mov eax,[rax+28] }
+      $48, $69, $C0, $50, $00, $00, $00,        { imul rax,rax,80 }
+      $49, $03, $44, $24, $40,                  { add rax,[r12+64] }
+      $48, $89, $04, $24]);                     { mov [rsp],rax }
   finally
     Buf.Free;
   end;
+  {$ENDIF}
 
   { CallHelper: call qword [r15 + k*8] — the code holds only the slot index k.
     k = Ord(aohRtDispatch) = 3, disp = 24: 41 FF 57 18. }
@@ -1502,6 +1635,11 @@ begin
     TestBranchPlaceholders);
   Test('rel32 patch resolves to target - site - instrlen',
     TestResolvePatchRel32);
+  Test('multi-byte NOP padding uses the SDM forms', TestNopForms);
+  Test('loop-head alignment lands on the configured block offset',
+    TestAlignCode);
+  Test('the epoch back-edge branches to the head and traps on fall-through',
+    TestEpochBackEdgeBytes);
   Test('the prologue emits the asserted byte sequence', TestPrologueBytes);
   Test('the epilogue emits the asserted byte sequence', TestEpilogueBytes);
   Test('the epoch capture emits the asserted bytes', TestEpochCaptureBytes);

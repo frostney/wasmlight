@@ -252,6 +252,7 @@ begin
       Expect<Boolean>(Abi.Layout.DirectMetaResult0Reg = JO.DirectMetaResult0Reg)
         .ToBe(True);
       Expect<Boolean>(Abi.Layout.FuncCallCount = JO.FuncCallCount).ToBe(True);
+      Expect<Boolean>(Abi.Layout.FuncInstance = JO.FuncInstance).ToBe(True);
       Expect<Boolean>(Abi.Layout.MemInstStride = JO.MemInstStride).ToBe(True);
       Expect<Boolean>(Abi.Layout.MemBase = JO.MemBase).ToBe(True);
       Expect<Boolean>(Abi.Layout.MemByteSize = JO.MemByteSize).ToBe(True);
@@ -260,6 +261,8 @@ begin
         .ToBe(True);
       Expect<Boolean>(Abi.Layout.InstEngineTypeIds = JO.InstEngineTypeIds)
         .ToBe(True);
+      Expect<Boolean>(Abi.Layout.StoreMemories = JO.StoreMemories).ToBe(True);
+      Expect<Boolean>(Abi.Layout.InstMemAddrs = JO.InstMemAddrs).ToBe(True);
       Expect<Boolean>(Abi.Layout.HeapFFree0 = GO.HeapFFree0).ToBe(True);
       Expect<Boolean>(Abi.Layout.HeapMarkState = GO.HeapMarkState).ToBe(True);
       Expect<Boolean>(Abi.Layout.HeapBytesLive = GO.HeapBytesLive).ToBe(True);
@@ -290,6 +293,7 @@ begin
       Expect<Boolean>(Abi.Layout.ActRetBase = FO.ActRetBase).ToBe(True);
       Expect<Boolean>(Abi.Layout.ActEntryResults = FO.ActEntryResults)
         .ToBe(True);
+      Expect<Boolean>(Abi.Layout.ActNative = FO.ActNative).ToBe(True);
       Expect<Boolean>(Abi.Layout.GcFramePrev = FO.GcFramePrev).ToBe(True);
       Expect<Boolean>(Abi.Layout.GcFrameSlots = FO.GcFrameSlots).ToBe(True);
       Expect<Boolean>(Abi.Layout.GcFrameRefRegBits = FO.GcFrameRefRegBits)

@@ -1,5 +1,72 @@
 # Handoff
 
+## x64 wave 3 — retained outcome, 2026-09-25
+
+- Delivery branch `codex/optimize-x64-wave3` from exact main `6e0cdde` (push CI
+  run 36180801833 green on all six targets, incl. macos-x64). Evidence root:
+  `~/.local/share/wasmlight-evidence/x64-wave3-6e0cdde` (`PLAN.md`, binaries +
+  `SHA256SUMS`, `ab.py`, `waitquiet.py`, schedules, gates, patches, profiles;
+  `bin/laneE-probes/` holds ~200 padding-probe binaries and can be deleted).
+  Method as before (native Ryzen AI MAX+ 395, release, AOT precompiled, CPU 7,
+  shared lock, 1 warm-up + 7 alternating); other projects built on CPU 7/23
+  intermittently, so final schedules ran after `waitquiet.py` (no process
+  above 30% CPU for 30 s) and contaminated runs were discarded and re-run.
+- Profiles: generic compiled->compiled calls ran Pascal helpers per call
+  (`JitPrepareDirectCall`, `JitEnterResolvedFrame`/`ScatterParamsFlat`,
+  `JitPublishIp`, `JitFinishDirectCall`, the callee prologue's
+  `X64ResolveMemory`); symbolized samples need a dev build (release is
+  stripped; dev adds range/stack checks). Loop placement: pinned-memory loops
+  had fast/medium/slow tiers by loop-head offset mod 64 (memory 30.5 / 41.9 /
+  52 ms).
+- Accepted:
+  - Lane E `2e92bb5`: every backward-branch target is padded (SDM multi-byte
+    NOPs) to start at byte 32 of a 64-byte block, and the epoch back-edge is
+    fused to `cmp; je head` with the non-returning trap on the fall-through
+    (was `je skip; trap; skip: jmp head`). Alignment alone and fusion alone
+    were each flat on medians (fusion alone removed the slow layouts);
+    together: memory 0.68–0.70, memory-load 0.76–0.77, memory-store 0.64,
+    loop flat. Code size +3.2%. Function bodies are page-aligned in JIT, AOT
+    load and `Wasm.Native`, so buffer offsets equal real alignment.
+  - Lane F `c81b6ba` + `46b0cbf`: x64 direct calls to same-module compiled
+    callees outside the scalar-leaf proof do IP publication, live-callee
+    lookup, both exhaustion checks, frame/GC-frame setup, local zeroing,
+    argument copy, the direct call, and result copy in generated code; the
+    callee prologue pins memory inline. Pascal path remains the fallback.
+    AOT ABI revision 16 -> 17 (`ActNative`, `StoreMemories`, `InstMemAddrs`
+    in the layout fingerprint; old `.waot` rejected). 3-arg calls 0.35–0.39.
+  - Correctness fix found by lane F: a wasm exception thrown beneath two
+    nested compiled direct calls was reported uncaught on x64 even with a
+    matching outer `try_table` (interpreter correct). The seam catch now
+    pops dead direct-call frames (`JitDropDeadDirectFrames`) before
+    `UnwindException`. The same shape existed in `Arm64InvokeCompiled`; fixed
+    there too (`36a2eaf`, Pascal only; ARM64 codegen unchanged).
+  - Combined (E, then F; re-measured): vs lane-E head 3-arg 0.354 / 2.850
+    reverse, all other targets and guards flat.
+- Final vs wave-3 baseline (`final-overall`, ms; Wasmtime 47.0.3):
+  host-dispatch-3arg-wasm-10repeat 242.09 -> 84.44 (0.349; 17.01), memory
+  41.78 -> 28.94 (0.693; 15.96), memory-load 80.84 -> 61.06 (0.755; 27.88),
+  memory-store 80.93 -> 51.51 (0.637; 23.36); loop, fib, call, gc, simd,
+  startup, host-call(s) flat; memory-grow 4.75 -> 4.83 (overlapping ranges).
+- Rejected: lane E alignment-only (16/32/64-byte) and fusion-only variants;
+  lane F reading the context from the entry's rcx in the memory pin
+  (84.30 -> 84.31).
+- Correctness: lane E tests (NOP forms, alignment from every start offset,
+  back-edge bytes, nested loops across 16 prelude lengths, AOT-loaded aligned
+  head, page-aligned mapping) and lane F tests (3/4/5-arg mixed signatures,
+  multi-value, zeroed locals, callee traps, exhaustion sweeps, epoch inside
+  the callee, exceptions through one/two direct frames and across
+  `call_indirect`, GC refs, fallback, non-zero memory index), each failing
+  under the mutations logged in `gates/`. Gates: frozen install, format,
+  agents, dev + release builds, `lwpt test` 62/63 (`Wasm.Native.Call.Test`
+  needs clang), markdownlint, ARM64 type-check, `x64-writeback.wast` 81/81
+  (compiled 14), pinned core 65,188 in interp/jit/aot (compiled
+  0/8763/8763) on dev and release, non-core identical.
+- Remaining x64 gap vs Wasmtime (this host): 3-arg calls ~5x, memory 1.8x,
+  memory-load 2.2x, memory-store 2.2x, call 2.0x, simd 3.3x, gc 1.7x,
+  fib 1.19x; loop at parity. Next: the callee's 6-register push/pop and ~20
+  frame-record stores per generic call, the memory-lookup load chain, SIMD
+  (x64 vector ops), `call`'s leaf-call overhead, GC allocation.
+
 ## x64 wave 2 — retained outcome, 2026-09-25
 
 - Delivery branch `codex/optimize-x64-wave2` from exact main `fee6f3a` (push CI

@@ -68,6 +68,7 @@ type
     procedure TestExecReturnsConstX64;
     procedure TestExecAddsArgsX64;
 
+    procedure TestExecMappingIsPageAligned;
     procedure TestUnsupportedRaises;
   end;
 
@@ -301,6 +302,26 @@ begin
   end;
 end;
 
+{ --- the placement invariant code alignment relies on ------------------- }
+
+procedure TCodeBufferTests.TestExecMappingIsPageAligned;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { Backends align loop heads by buffer offset; that is address alignment
+    only because every finalized buffer starts its own page-aligned mapping
+    (the smallest supported page is 4 KiB). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.EmitBytes([$00, $00, $00, $00]);
+    Buf.MakeExecutable;
+    Expect<Boolean>(Buf.EntryPoint <> nil).ToBe(True);
+    Expect<PtrUInt>(PtrUInt(Buf.EntryPoint) and 4095).ToBe(0);
+  finally
+    Buf.Free;
+  end;
+end;
+
 { --- unsupported target refuses cleanly --------------------------------- }
 
 procedure TCodeBufferTests.TestUnsupportedRaises;
@@ -350,6 +371,11 @@ begin
   Test('executes JIT mov eax,42; ret -> 42', TestExecReturnsConstX64);
   Test('executes JIT lea eax,[rdi+rsi] with (17,25) -> 42',
     TestExecAddsArgsX64);
+  {$ENDIF}
+
+  {$IFDEF WASM_JIT_EXEC}
+  Test('the executable mapping starts on a page boundary',
+    TestExecMappingIsPageAligned);
   {$ENDIF}
 
   {$IFNDEF WASM_JIT_EXEC}

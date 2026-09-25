@@ -173,6 +173,7 @@ type
     ActRetCount: NativeUInt;         { TWasmActivation.RetCount }
     ActRetBase: NativeUInt;          { TWasmActivation.RetBase }
     ActEntryResults: NativeUInt;     { TWasmActivation.EntryResults }
+    ActNative: NativeUInt;           { TWasmActivation.Native }
     GcFramePrev: NativeUInt;         { TWasmGcFrame.Prev }
     GcFrameSlots: NativeUInt;        { TWasmGcFrame.Slots }
     GcFrameRefRegBits: NativeUInt;   { TWasmGcFrame.RefRegBits }
@@ -302,6 +303,18 @@ procedure UnwindException(const ACtx: PWasmInterpContext; const AExn: TWasmRef;
   the frame; interpreted entry leaves Native False. }
 procedure JitMarkTopNative(const ACtx: PWasmInterpContext);
 
+{ For a compiled invocation's seam catch, AFTER the LongJmp landed on it and
+  BEFORE it re-enters UnwindException: pop every activation above the
+  invocation's own frame (AOwnDepth = Depth with that frame on top) that is a
+  direct compiled call (rtCaller + Native). Those frames ran on the native
+  stack the jump discarded, and a direct-callable body never has handlers
+  (JitCanDirectCall), so each pop is exactly UnwindException's no-match pop.
+  Without it the unwind would treat the first such frame as a live native
+  barrier and hop PAST this invocation's own handlers. Stops at the first
+  frame of any other kind. }
+procedure JitDropDeadDirectFrames(const ACtx: PWasmInterpContext;
+  const AOwnDepth: NativeUInt);
+
 { Publish the compiled caller's resume IP (call-site + 1) so UnwindException
   scans the call instruction (eh-spec §2.3). cdecl for the helper table. }
 procedure JitPublishIp(const AStore: TWasmStore; const AIp: PtrUInt); cdecl;
@@ -380,7 +393,13 @@ const
   { Revision 16: compiled try_table / throw / throw_ref. Appends aohPublishIp,
     aohEhThrow, and aohEhResumeIndex; compiled frames publish a Native bit
     the unwinder consults. Must stay equal to WASM_TARGET_ABI_REVISION. }
-  AOT_ABI_REVISION = 16;
+  { Revision 17: x64 generic direct calls publish the callee activation,
+    including its Native bit (ActNative), in generated code, and the x64
+    prologue resolves its pinned memory instance inline (StoreMemories,
+    InstMemAddrs). The call site also bakes TWasmFuncInst.Instance
+    (FuncInstance) and stores Ord(rtCaller) and a Boolean as single bytes, so
+    SizeOf(TWasmRetKind) = SizeOf(Boolean) = 1 is part of this revision. }
+  AOT_ABI_REVISION = 17;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -1771,6 +1790,23 @@ end;
 procedure JitMarkTopNative(const ACtx: PWasmInterpContext);
 begin
   ACtx^.Acts[ACtx^.Depth - 1].Native := True;
+end;
+
+procedure JitDropDeadDirectFrames(const ACtx: PWasmInterpContext;
+  const AOwnDepth: NativeUInt);
+var
+  Top: PWasmActivation;
+begin
+  while ACtx^.Depth > AOwnDepth do
+  begin
+    Top := @ACtx^.Acts[ACtx^.Depth - 1];
+    if (Top^.RetKind <> rtCaller) or not Top^.Native or
+      (Length(Top^.Fn^.Handlers) > 0) then
+      Exit;
+    ACtx^.Store.Heap.PopFrame;
+    ACtx^.ValueTop := Top^.Base;
+    Dec(ACtx^.Depth);
+  end;
 end;
 
 procedure JitPublishIp(const AStore: TWasmStore; const AIp: PtrUInt); cdecl;
@@ -3597,6 +3633,7 @@ begin
   Result.ActRetCount := PtrUInt(@A.RetCount) - PtrUInt(@A);
   Result.ActRetBase := PtrUInt(@A.RetBase) - PtrUInt(@A);
   Result.ActEntryResults := PtrUInt(@A.EntryResults) - PtrUInt(@A);
+  Result.ActNative := PtrUInt(@A.Native) - PtrUInt(@A);
   Result.GcFramePrev := PtrUInt(@G.Prev) - PtrUInt(@G);
   Result.GcFrameSlots := PtrUInt(@G.Slots) - PtrUInt(@G);
   Result.GcFrameRefRegBits := PtrUInt(@G.RefRegBits) - PtrUInt(@G);
@@ -3656,12 +3693,15 @@ begin
   Fold(JO.DirectMetaParam1Reg);
   Fold(JO.DirectMetaResult0Reg);
   Fold(JO.FuncCallCount);
+  Fold(JO.FuncInstance);
   Fold(JO.MemInstStride);
   Fold(JO.MemBase);
   Fold(JO.MemByteSize);
   Fold(JO.StoreFHeap);
   Fold(JO.StoreTierContext);
   Fold(JO.InstEngineTypeIds);
+  Fold(JO.StoreMemories);
+  Fold(JO.InstMemAddrs);
 
   { The inline-allocation fast path bakes heap/block offsets too (wave 11). }
   GO := WasmJitGcHeapOffsets;
@@ -3694,6 +3734,7 @@ begin
   Fold(FO.ActRetCount);
   Fold(FO.ActRetBase);
   Fold(FO.ActEntryResults);
+  Fold(FO.ActNative);
   Fold(FO.GcFramePrev);
   Fold(FO.GcFrameSlots);
   Fold(FO.GcFrameRefRegBits);
