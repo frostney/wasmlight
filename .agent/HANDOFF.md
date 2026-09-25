@@ -5,12 +5,13 @@
 - User authorized implementing all five audit findings and shipping a native
   GitHub stack, including the project-skill migration. Base remains fetched
   `aef1e9c21979b5e15063fa1a159986443853427e`.
-- Initial native `gh stack` publication: `codex/migrate-skills-codebase-audit`,
-  `codex/audit-core-conformance-gate`, `codex/audit-callback-lifetimes`,
-  `codex/audit-native-entry-contract`, `codex/audit-shared-runtime-helpers`,
-  `codex/audit-native-vision`. Published through the protected native helper
-  as stack #123, bottom-to-top PRs #117, #118, #119, #120, #121, #122.
-  All PRs are attached to the task and contain reconciled validation evidence.
+- Published native stack **#125**, bottom-to-top: #117 skills, #119 callback
+  lifetimes, #120 native entry, #121 shared helpers, #122 documentation,
+  #124 i386 conformance repairs, #118 strict core gate. All PRs are attached
+  to the task and contain reconciled validation evidence. This supersedes
+  initial stack #123. Official `gh stack modify` moved the strict gate after
+  the runtime repairs; protected `gh stack submit` recreated native topology.
+  The integrated tree was verified identical before/after restructuring.
   Read live GitHub heads/checks/review state before continuing.
 - Skills: KGR `bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c`, Matt Pocock
   `c55ee46073ed923f86ce59a5eb3b6d895095d1b7`; 24 locked payloads verified,
@@ -42,20 +43,23 @@
   and uses exact integer rounding only at the f64 underflow boundary.
   The independent Fraction oracle passes 5,000 cases; committed tests cover
   the eleven corpus vectors, ties, signed zero and the normal boundary.
-- The stricter gate must follow the Win32 fixes in native stack order so every
-  intermediate PR is independently green. No member has an external review;
-  record heads/topology and use official native restructuring before resubmit.
+- Final local repair validation: 63 suites, four builds and all three pinned
+  core tiers pass. Logs: `/tmp/wasmlight-winfix-alltests.log`,
+  `/tmp/wasmlight-winfix-build.log`, `/tmp/wasmlight-winfix-conformance.log`.
+  The 5,000-case oracle is retained outside the tree in
+  `/tmp/wasmlight-underflow-oracle.Test.pas` and its adjacent `.log`.
 - No new release is requested; #46 is not completed by this remediation.
   Narrated video remains absent: say/asciinema exist, ffmpeg/agg do not.
 - Hosted checks are awaited with `delivery_wait.py` at each PR's exact head.
-  Native snapshot: `/tmp/wasmlight-native-snapshot.json`; CI receipts:
-  `/tmp/wasmlight-ci-117.json` through `122.json`. Guard publication receipt:
-  Git worktree `kgr-push-guards/24a8984a-1a99-409b-83be-a7ec149c7321`.
+  Native snapshot: `/tmp/wasmlight-final-native-snapshot.json`; CI receipts:
+  `/tmp/wasmlight-ci-<PR>.json`. Reconcile each receipt's head with GitHub.
+  Restructured publication receipt: Git worktree
+  `kgr-push-guards/f1756672-b20d-433e-bb57-8c0e18ded6bd`.
 - No configured external review provider or requested reviewer was found.
   The user has been asked which reviewer/provider should review the stack,
   as DEFINITION_OF_DONE requires external review before merge.
 - Next: await every current-head CI, mark ready, obtain and triage external
-  review, then complete the authorized delivery endpoint. Native stack #123
+  review, then complete the authorized delivery endpoint. Native stack #125
   contains the whole remediation; never merge a prefix below a required fix.
   Never infer merge readiness from local tests or absent reviewer findings.
 

@@ -213,6 +213,13 @@ through the interpreter and compare. Everything not judged is `SKIP` with a
 reason, and the skip column is never folded into the totals, so a report
 cannot read as more conformance than was measured.
 
+CI runs only the 257 top-level scripts through `tools/conformance/check.py`.
+The shared gate preserves the runner exit status and requires the exact pinned
+pass count with zero errors, failures, skips, and staged cases for every tier.
+`python3 -m unittest discover -s tools/conformance` proves that a failing runner
+or a regressed tally cannot pass the gate. Recursive proposal/legacy runs remain
+separate diagnostics and do not weaken the core gate.
+
 The pinned core target (the 257 top-level scripts) is clean:
 
 ```text
