@@ -1464,8 +1464,10 @@ procedure TWastRunnerTests.TestX64WriteBackFixtureAllTiers;
 const
   FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
     + PathDelim + 'x64-writeback.wast';
-  { One module plus 76 assertions. }
-  COMMANDS = 77;
+  { One module plus 80 assertions. }
+  COMMANDS = 81;
+  { Every function in the fixture's module is compilable. }
+  COMPILED_FUNCTIONS = 14;
 var
   Mode: TWastTierMode;
   Run: TWastRunResult;
@@ -1479,8 +1481,10 @@ begin
       Expect<Integer>(Run.Tally.Skip).ToBe(0);
       Expect<Integer>(Run.Tally.Staged).ToBe(0);
       {$IFDEF WASM_JIT_BACKEND}
-      Expect<Boolean>((Mode = wtmInterp) =
-        (Run.CompiledFuncCount = 0)).ToBe(True);
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
       {$ENDIF}
     finally
       Run.Free;

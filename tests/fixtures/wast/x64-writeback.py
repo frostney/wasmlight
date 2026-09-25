@@ -63,7 +63,7 @@ def early(n, stop):
             return w32(acc - 1000)
         if i == 9:
             return w32(w32(acc * 3) + i)
-        if i == 6:
+        if i == 6 and n % 2 == 0:
             return w32((acc ^ i) + i)
         i = w32(i + 1)
         if not i < w32(n):
@@ -220,7 +220,9 @@ WAT = r'''
           (if (i32.eq (local.get $i) (i32.const 9))
             (then (br $done (i32.mul (local.get $acc) (i32.const 3)))))
           (drop (br_if $done (i32.xor (local.get $acc) (local.get $i))
-                             (i32.eq (local.get $i) (i32.const 6))))
+                             (i32.and (i32.eq (local.get $i) (i32.const 6))
+                                      (i32.eqz (i32.and (local.get $n)
+                                                        (i32.const 1))))))
           (local.set $i (i32.add (local.get $i) (i32.const 1)))
           (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
         (i32.const 77))
@@ -346,7 +348,8 @@ for n in (0, 1, 2, 3, 7, 16, 33):
 for args in ((3, 5, 7, 11), (0x7fffffff, 0xffffffff, 0x100000001, 0xdeadbeefcafebabe),
              (1, 0, 0, 0), (0xffffffffffffffff,) * 4):
     lines.append(ret('pressure', [('i64', v) for v in args], pressure(*args), 'i64'))
-for n, stop in ((10, 100), (10, 3), (4, 100), (10, 0), (12, 100), (8, 7), (20, 15)):
+for n, stop in ((10, 100), (10, 3), (4, 100), (10, 0), (12, 100), (8, 7), (20, 15),
+                (11, 100), (21, 100), (7, 100), (11, 8)):
     lines.append(ret('early', [('i32', n), ('i32', stop)], early(n, stop)))
 for n, bad in ((8, 100), (8, 6), (1, 0), (8, 0), (3, 2)):
     lines.append(ret('trapmid', [('i32', n), ('i32', bad)], trapmid(n, bad)))
@@ -377,5 +380,5 @@ for k in (1, 2, 7, 40):
 
 import os
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'x64-writeback.wast')
-open(OUT, 'w').write('\n'.join(lines) + '\n')
+open(OUT, 'w', newline='\n').write('\n'.join(lines) + '\n')
 print(len(lines) - 1, 'assertions')
