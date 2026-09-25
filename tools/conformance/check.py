@@ -92,8 +92,16 @@ def check_identity(runner: list[str], corpus: Path, tiers: list[str]) -> None:
         # The non-core scripts fail by design; echoing every expected FAIL line
         # would bury real output, so only a divergence is shown in full.
         result = run(runner, tier, scripts, echo=False)
-        total = total_line(tier, result.stdout)
-        check_tier_ran(tier, total)
+        try:
+            total = total_line(tier, result.stdout)
+            check_tier_ran(tier, total)
+        except ValueError:
+            # A crashed or killed tier: show where it stopped.
+            print(f"{tier}: exit status {result.returncode}; last output:",
+                  file=sys.stderr)
+            for line in result.stdout.splitlines()[-40:]:
+                print(line, file=sys.stderr)
+            raise
         observed = (result.returncode, TIER_FIELDS.sub("", result.stdout))
         if reference is None:
             reference = (tier, observed)
@@ -106,8 +114,11 @@ def check_identity(runner: list[str], corpus: Path, tiers: list[str]) -> None:
             diff = difflib.unified_diff(
                 base_out.splitlines(), out.splitlines(),
                 fromfile=base_tier, tofile=tier, lineterm="")
-            for line in list(diff)[:200]:
+            lines = list(diff)
+            for line in lines[:200]:
                 print(line, file=sys.stderr)
+            if len(lines) > 200:
+                print(f"... {len(lines) - 200} more diff lines", file=sys.stderr)
             raise ValueError(
                 f"{tier}: non-core output differs from {base_tier} "
                 f"(tiers must be observationally identical)")

@@ -135,7 +135,24 @@ class ConformanceGateTests(unittest.TestCase):
     def test_non_core_exit_status_divergence_fails(self):
         result = self.run_gate(tiers=("interp", "jit"), nested_status={"jit": 0})
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exit status: interp=1 jit=0", result.stderr)
         self.assertIn("jit: non-core output differs from interp", result.stderr)
+
+    def test_a_tier_that_crashes_before_its_tally_shows_where(self):
+        crashed = "FAIL proposals/outside.wast:9 crashed-here"
+        result = self.run_gate(tiers=("interp", "jit"), nested={"jit": crashed},
+                               nested_status={"jit": 139})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("jit: exit status 139; last output:", result.stderr)
+        self.assertIn(crashed, result.stderr)
+        self.assertIn("jit: expected exactly one TOTAL tally", result.stderr)
+
+    def test_a_long_divergence_is_truncated_visibly(self):
+        long = "\n".join(f"FAIL proposals/outside.wast:{n} x" for n in range(300))
+        result = self.run_gate(tiers=("interp", "jit"),
+                               nested={"jit": long + "\n" + NESTED.splitlines()[1]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r"\.\.\. \d+ more diff lines")
 
     def test_missing_non_core_scripts_fail_the_identity_check(self):
         (self.root / "proposals" / "outside.wast").unlink()
