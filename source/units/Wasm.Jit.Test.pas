@@ -3333,9 +3333,6 @@ begin
     [MakeValueI32(7)])).ToBe('');
 end;
 
-{ struct.new with distinct field values, read back through a weighted sum of
-  every field. Three fields stay within Arm64's batched initialization; ten
-  exceed it, so both backend paths and x64's per-field path are covered. }
 { array.new_data whose source range is out of bounds for a count too large to
   allocate: the range trap must win over allocation (exec-array.new_data). }
 function ArrayNewDataRangeModuleBytes: TWasmBytes;
@@ -3347,6 +3344,9 @@ begin
     ' (i32.const 0)))');
 end;
 
+{ struct.new with distinct field values, read back through a weighted sum of
+  every field. Three fields stay within Arm64's batched initialization; ten
+  exceed it, so both backend paths and x64's per-field path are covered. }
 function WideStructModuleBytes: TWasmBytes;
 
   function StructFunc(const AName: string; const AFields: Integer): string;

@@ -36,6 +36,12 @@
   wave 16/17 JIT optimizations), `codex/validate-wave16-core`,
   `codex/validate-wave17-core`. They need a decision: deliver or drop.
 - #46 (0.2.0 cross-target gates, archives, Homebrew) remains open.
+- A fifth subagent review approved the fix layers #127–#129 with nits; those
+  nits are fixed in #129 and a top gate-diagnostics layer.
+- Next: once every layer's current-head CI is green, merge all layers
+  atomically with `gh stack merge --squash` (never layer by layer, never a
+  prefix below a fix layer), then sync `main` and delete the merged
+  branches. Then decide the wave 16/17 branches.
 
 ## Skills migration and audit remediation, 2026-09-22
 
