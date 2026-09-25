@@ -522,6 +522,14 @@ var
   UseNativeScalarCall: Boolean;
   UseX64ExtendedFrame: Boolean;
   NativeScalarCall: Boolean;
+  {$IFDEF WASM_JIT_ARM64}
+  InlineBodies: array of TWasmBytes;
+  InlineRegisterCounts: array of UInt32;
+  InlineResultSlots: array of UInt32;
+  InlineArgSlots: array of array[0..1] of UInt32;
+  NativeResultSource: UInt32;
+  UsePreservedInlineCache: Boolean;
+  {$ENDIF}
   UseExtendedFrame: Boolean;
   NativeParamCount: UInt32;
   NativeParamReg: UInt32;
@@ -563,31 +571,11 @@ var
       iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr]) or IntegerCompare(AOp);
   end;
 
-  function SimpleUseCount(const AReg: UInt32): UInt32;
-  var
-    K: Integer;
-  begin
-    Result := 0;
-    for K := 0 to High(AFn^.Code) do
-      case AFn^.Code[K].Op of
-        iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
-          if AFn^.Code[K].A = AReg then Inc(Result);
-        iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
-        iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
-        iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
-        iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
-        iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-        iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
-        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
-        iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
-          begin
-            if AFn^.Code[K].A = AReg then Inc(Result);
-            if AFn^.Code[K].B = AReg then Inc(Result);
-          end;
-      end;
-  end;
-
-  function VectorUseCount(const AReg: UInt32): UInt32;
+  { Every read of AReg in the function: source-register operands, A-side aux
+    source lists (call arguments), store values in Dest, and register Imm
+    operands. The single use-count for fold and forwarding decisions; an
+    incomplete counter once let a local.tee'd call argument be folded away. }
+  function RegisterUseCount(const AReg: UInt32): UInt32;
   var
     Info: TWasmIrOpInfo;
     K, N: Integer;
@@ -637,6 +625,108 @@ var
     Result := JitCanNativeScalarLeaf(@AIr.Functions[DefinedIdx]);
   end;
 
+  {$IFDEF WASM_JIT_ARM64}
+  { True with ABody set to the leaf's native body minus its final RET when
+    the leaf can be inlined (shape, emitted form, and the inline fence). }
+  function InlinableLeafBody(const ALeaf: PWasmIrFunctionRec;
+    const ATarget: UInt32; out ABody: TWasmBytes): Boolean;
+  var
+    N, StartOffset: Integer;
+    LeafBuffer: TWasmCodeBuffer;
+    Body: TWasmBytes;
+  begin
+    Result := False;
+    ABody := nil;
+    if (Length(ALeaf^.Code) = 0) or (Length(ALeaf^.Code) > 24) or
+      (ALeaf^.Code[High(ALeaf^.Code)].Op <> iroReturn) then
+      Exit;
+    for N := 0 to High(ALeaf^.Code) - 1 do
+      if ALeaf^.Code[N].Op = iroReturn then
+        Exit;
+    { A defined funcidx denotes the immutable body in this module, unlike
+      an import. Use the existing numeric-leaf proof and emitter; neither a
+      live compiled entry nor a store address is part of these semantics
+      (pinned core exec-call / exec-invoke). No process pointer is copied. }
+    LeafBuffer := JitCompileToBuffer(AIr, ALeaf, ATarget, AEpochOffset,
+      ASnapshotOffset, AHelperTableOffset, False);
+    try
+      StartOffset := LeafBuffer.LabelOffset(0);
+      Body := LeafBuffer.SnapshotBytes;
+      { All core paths end in exactly one RET. Keep its result move but
+        replace the return itself with ordinary caller fallthrough. }
+      if (Length(Body) < StartOffset + 4) or
+        (Body[High(Body) - 3] <> $C0) or
+        (Body[High(Body) - 2] <> $03) or
+        (Body[High(Body) - 1] <> $5F) or
+        (Body[High(Body)] <> $D6) then
+        Exit;
+      Body := Copy(Body, StartOffset, Length(Body) - StartOffset - 4);
+      if (Length(Body) > 256) or not Arm64CanInlineScalarBody(Body) then
+        Exit;
+      ABody := Body;
+      Result := True;
+    finally
+      LeafBuffer.Free;
+    end;
+  end;
+
+  procedure PrepareInlineBodies;
+  var
+    K, N, M, UsedBytes, Memo: Integer;
+    Target: UInt32;
+    Leaf: PWasmIrFunctionRec;
+    Body: TWasmBytes;
+    { One compile per distinct target: a leaf's inlinable body (or its
+      rejection) does not depend on the call site, only the budget does. }
+    MemoTargets: array of UInt32;
+    MemoBodies: array of TWasmBytes;
+    MemoOk: array of Boolean;
+  begin
+    MemoTargets := nil;
+    MemoBodies := nil;
+    MemoOk := nil;
+    SetLength(InlineBodies, Length(AFn^.Code));
+    SetLength(InlineRegisterCounts, Length(AFn^.Code));
+    SetLength(InlineResultSlots, Length(AFn^.Code));
+    SetLength(InlineArgSlots, Length(AFn^.Code));
+    UsedBytes := 0;
+    for K := 0 to High(AFn^.Code) do
+    begin
+      if (AFn^.Code[K].Op <> iroCall) or (UsedBytes >= 256) then
+        Continue;
+      Target := UInt32(AFn^.Code[K].Imm);
+      if not NativeScalarLeafTarget(Target) then
+        Continue;
+      Leaf := @AIr.Functions[Target - AIr.FuncImportCount];
+      Memo := -1;
+      for M := 0 to High(MemoTargets) do
+        if MemoTargets[M] = Target then
+          Memo := M;
+      if Memo < 0 then
+      begin
+        Memo := Length(MemoTargets);
+        SetLength(MemoTargets, Memo + 1);
+        SetLength(MemoBodies, Memo + 1);
+        SetLength(MemoOk, Memo + 1);
+        MemoTargets[Memo] := Target;
+        MemoOk[Memo] := InlinableLeafBody(Leaf, Target, MemoBodies[Memo]);
+      end;
+      Body := MemoBodies[Memo];
+      if not MemoOk[Memo] or (UsedBytes + Length(Body) > 256) then
+        Continue;
+      InlineBodies[K] := Body;
+      InlineRegisterCounts[K] := Leaf^.RegisterCount;
+      InlineResultSlots[K] := IrAuxBlockItem(AFn^.AuxU32,
+        AFn^.Code[K].B, 0);
+      for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+        AFn^.Code[K].A)) - 1 do
+        InlineArgSlots[K][N] := IrAuxBlockItem(AFn^.AuxU32,
+          AFn^.Code[K].A, UInt32(N));
+      Inc(UsedBytes, Length(Body));
+    end;
+  end;
+  {$ENDIF}
+
   procedure AnalyzeAdjacentMoves;
   var
     K: Integer;
@@ -652,7 +742,7 @@ var
         (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
         (PlannedCode[K - 1].Dest < UInt32(Length(AFn^.RegTypes))) and
         (AFn^.RegTypes[PlannedCode[K - 1].Dest].Kind = wvkVec) and
-        (VectorUseCount(PlannedCode[K - 1].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K - 1].Dest) = 1) and
         not IsVisibleFrameReg(PlannedCode[K - 1].Dest) and
         IsVisibleFrameReg(PlannedCode[K].Dest) and
         not Targets[K - 1] and not Targets[K] then
@@ -671,18 +761,117 @@ var
       if (PlannedCode[K].Op = iroMove) and
         PlannedProducer(PlannedCode[K - 1].Op) and
         (PlannedCode[K - 1].Dest = PlannedCode[K].A) and
-        (SimpleUseCount(PlannedCode[K].A) = 1) and
+        (RegisterUseCount(PlannedCode[K].A) = 1) and
         IsVisibleFrameReg(PlannedCode[K].Dest) and
         not Targets[K - 1] and not Targets[K] then
       begin
         { Fold a single-use expression result directly into the local/result
-          slot that the following lowering move would populate. The original
+          slot that the following lowering move would populate. Call argument
+          aux lists count as uses too: local.tee can feed both. The original
           IR and its instruction labels remain intact; the skipped move binds
           an empty label at the producer's fallthrough address. }
         PlannedCode[K - 1].Dest := PlannedCode[K].Dest;
         SkipPlanned[K] := True;
       end;
   end;
+
+  {$IFDEF WASM_JIT_ARM64}
+  procedure AnalyzeNativeSelfReturnTail;
+  var
+    K, Last, Tail: Integer;
+    Source: UInt32;
+  begin
+    if not UseNativeScalarSelf then
+      Exit;
+    Last := High(PlannedCode);
+    Tail := Last - 1;
+    if (Tail < 0) or (PlannedCode[Last].Op <> iroReturn) or
+      (PlannedCode[Tail].Op <> iroMove) or
+      (PlannedCode[Tail].Dest <> NativeResultReg) or
+      SkipPlanned[Tail] or not Targets[Tail] or Targets[Last] or
+      IrInstrIsSafepoint(PlannedCode[Tail]) or
+      IrInstrIsSafepoint(PlannedCode[Last]) then
+      Exit;
+    Source := PlannedCode[Tail].A;
+    if (Source >= UInt32(Length(AFn^.RegTypes))) or
+      (AFn^.RegTypes[Source].Kind <> wvkNum) then
+      Exit;
+    for K := 0 to Tail - 1 do
+      case PlannedCode[K].Op of
+        iroReturn, iroBrTable: Exit;
+        iroBranchIf, iroBranchIfNot:
+          if PlannedCode[K].B = UInt32(Tail) then
+            Exit;
+        iroJump:
+          if (PlannedCode[K].A = UInt32(Tail)) and
+            ((K >= Tail) or (PlannedCode[K].Imm <> 0)) then
+            Exit;
+      end;
+    { Every incoming edge is now a forward, unflagged terminal jump. Return
+      its cached join value directly; the only remaining tail predecessor is
+      lexical fallthrough. No cache state is carried across a branch. The
+      wrapper still publishes x12 to the canonical result slot. }
+    NativeResultSource := Source;
+    for K := 0 to Tail - 1 do
+      if (PlannedCode[K].Op = iroJump) and
+        (PlannedCode[K].A = UInt32(Tail)) then
+        PlannedCode[K].Op := iroReturn;
+    Targets[Tail] := False;
+    SkipPlanned[Tail] := True;
+  end;
+
+  procedure AnalyzeResultCopies;
+  var
+    K, Last: Integer;
+    SingleReturn: Boolean;
+    ResultSlot: UInt32;
+  begin
+    NativeResultSource := NativeResultReg;
+    AnalyzeNativeSelfReturnTail;
+    Last := High(PlannedCode);
+    if UseNativeScalarLeaf and (Last >= 1) and (Last < 24) and
+      (PlannedCode[Last].Op = iroReturn) and
+      (PlannedCode[Last - 1].Op = iroMove) and
+      (PlannedCode[Last - 1].Dest = NativeResultReg) and
+      not SkipPlanned[Last - 1] and not Targets[Last - 1] and
+      not Targets[Last] then
+    begin
+      SingleReturn := True;
+      for K := 0 to Last - 1 do
+        if PlannedCode[K].Op = iroReturn then
+          SingleReturn := False;
+      if SingleReturn then
+      begin
+        { The final copy has no intervening instruction or other return path.
+          Read its already-planned source into x12 at return; the external
+          wrapper still publishes x12 to canonical NativeResultReg. }
+        NativeResultSource := PlannedCode[Last - 1].A;
+        SkipPlanned[Last - 1] := True;
+      end;
+    end;
+    if not UsePreservedInlineCache then
+      Exit;
+    for K := 0 to Last - 1 do
+      if (Length(InlineBodies[K]) <> 0) and
+        (PlannedCode[K + 1].Op = iroMove) and
+        not SkipPlanned[K + 1] and not Targets[K] and
+        not Targets[K + 1] then
+      begin
+        ResultSlot := InlineResultSlots[K];
+        if (PlannedCode[K + 1].A = ResultSlot) and
+          not IsVisibleFrameReg(ResultSlot) and
+          IsVisibleFrameReg(PlannedCode[K + 1].Dest) and
+          (RegisterUseCount(ResultSlot) = 1) then
+        begin
+          { The proven body produces one numeric result, used only by this
+            adjacent lowering move. Count aux-list uses too; preserve both
+            labels and the call's exact capacity checks before computation. }
+          InlineResultSlots[K] := PlannedCode[K + 1].Dest;
+          SkipPlanned[K + 1] := True;
+        end;
+      end;
+  end;
+  {$ENDIF}
 
   function IsVisibleFrameReg(const AReg: UInt32): Boolean;
   var
@@ -737,7 +926,7 @@ var
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op = iroI32Const) and
         (PlannedCode[K + 1].B = PlannedCode[K].Dest) and
-        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
         not IsVisibleFrameReg(PlannedCode[K].Dest) and
         not SkipPlanned[K] and not SkipPlanned[K + 1] and
         not Targets[K] and not Targets[K + 1] then
@@ -773,9 +962,9 @@ var
         not SkipPlanned[K + 2] and not SkipPlanned[K + 3] and
         not Targets[K] and not Targets[K + 1] and
         not Targets[K + 2] and not Targets[K + 3] and
-        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
-        (SimpleUseCount(PlannedCode[K + 1].Dest) = 1) and
-        (SimpleUseCount(PlannedCode[K + 2].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K + 1].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K + 2].Dest) = 1) and
         (PlannedCode[K + 1].Dest = PlannedCode[K + 3].A) and
         (PlannedCode[K + 2].Dest = PlannedCode[K + 3].B) and
         not IsVisibleFrameReg(PlannedCode[K].Dest) and
@@ -841,23 +1030,6 @@ var
         iroI64Store32];
     end;
 
-    function MemoryUseCount(const AReg: UInt32): UInt32;
-    var
-      J: Integer;
-    begin
-      Result := 0;
-      for J := 0 to High(AFn^.Code) do
-        if ScalarMemoryOp(AFn^.Code[J].Op) then
-        begin
-          if AFn^.Code[J].A = AReg then Inc(Result);
-          if (AFn^.Code[J].Op in [iroI32Store, iroI64Store, iroF32Store,
-            iroF64Store, iroI32Store8, iroI32Store16, iroI64Store8,
-            iroI64Store16, iroI64Store32]) and
-            (AFn^.Code[J].Dest = AReg) then
-            Inc(Result);
-        end;
-    end;
-
   begin
     {$IFDEF WASM_JIT_ARM64}
     if not (UsePinnedMemoryBase and UseStaticCache) then
@@ -874,7 +1046,7 @@ var
             Source := PlannedCode[P].A;
             Temp := PlannedCode[P].Dest;
             if IsAllocatedSlot(Source) and
-              (SimpleUseCount(Temp) + MemoryUseCount(Temp) = 1) then
+              (RegisterUseCount(Temp) = 1) then
             begin
               if PlannedCode[K].A = Temp then
               begin
@@ -897,7 +1069,7 @@ var
 
   procedure AnalyzeLocalAliases;
   var
-    K, L, Last: Integer;
+    K, L, Last, Arg: Integer;
     Source, Alias_: UInt32;
 
     function IsAllocatedSlot(const ASlot: UInt32): Boolean;
@@ -906,42 +1078,6 @@ var
         (ASlot = AllocatedSlots[1]) or
         ((AllocatedSlots[2] <> High(UInt32)) and
           (ASlot = AllocatedSlots[2]));
-    end;
-
-    function FullUseCount(const ASlot: UInt32): UInt32;
-    var
-      N: Integer;
-    begin
-      Result := 0;
-      for N := 0 to High(AFn^.Code) do
-        case AFn^.Code[N].Op of
-          iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
-            if AFn^.Code[N].A = ASlot then Inc(Result);
-          iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
-          iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
-          iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
-          iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
-          iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-          iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
-          iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
-          iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
-            begin
-              if AFn^.Code[N].A = ASlot then Inc(Result);
-              if AFn^.Code[N].B = ASlot then Inc(Result);
-            end;
-          iroI32Load, iroI64Load, iroF32Load, iroF64Load,
-          iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
-          iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
-          iroI64Load32S, iroI64Load32U:
-            if AFn^.Code[N].A = ASlot then Inc(Result);
-          iroI32Store, iroI64Store, iroF32Store, iroF64Store,
-          iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
-          iroI64Store32:
-            begin
-              if AFn^.Code[N].A = ASlot then Inc(Result);
-              if AFn^.Code[N].Dest = ASlot then Inc(Result);
-            end;
-        end;
     end;
 
     function RewriteUse(var AIns: TWasmIrInstr; const AOld,
@@ -1023,18 +1159,19 @@ var
       Forward that exact alias into an already-cached consumer without
       changing the canonical IR or labels — in the helper-free base-pinned
       loop shape, and in the closed native-scalar core whose parameters sit
-      in fixed hosts. The four-instruction window covers the bounded lowering
+      in fixed hosts, or a closed caller preserving statics across inline
+      bodies. The four-instruction window covers the bounded lowering
       shapes while a target, safepoint, or intervening write to the visible
       source ends the proof. }
     if not ((UsePinnedMemoryBase and UseStaticCache) or
-        UseNativeScalarCore) then
+        UseNativeScalarCore or UsePreservedInlineCache) then
       Exit;
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op = iroMove) and not SkipPlanned[K] and
         (not Targets[K] or IsAllocatedSlot(PlannedCode[K].A)) and
         IsVisibleFrameReg(PlannedCode[K].A) and
         not IsVisibleFrameReg(PlannedCode[K].Dest) and
-        (FullUseCount(PlannedCode[K].Dest) = 1) then
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) then
       begin
         Source := PlannedCode[K].A;
         Alias_ := PlannedCode[K].Dest;
@@ -1043,10 +1180,30 @@ var
           Last := High(PlannedCode);
         for L := K + 1 to Last do
         begin
-          if Targets[L] or IrInstrIsSafepoint(PlannedCode[L]) then
+          if Targets[L] then
             Break;
           if SkipPlanned[L] then
             Continue;
+          if UsePreservedInlineCache and (Length(InlineBodies[L]) <> 0) then
+          begin
+            { A proven call is the endpoint, never an instruction to cross.
+              Keep canonical AuxU32 immutable; only its local argument plan
+              adopts the single-use alias. Both arguments are still read
+              before the body clobbers dynamic hosts. }
+            for Arg := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+              PlannedCode[L].A)) - 1 do
+              if InlineArgSlots[L][Arg] = Alias_ then
+              begin
+                InlineArgSlots[L][Arg] := Source;
+                SkipPlanned[K] := True;
+              end;
+            Break;
+          end;
+          if IrInstrIsSafepoint(PlannedCode[L]) or
+            (UsePreservedInlineCache and
+            (PlannedCode[L].Op in [iroJump, iroBranchIf, iroBranchIfNot,
+            iroReturn, iroUnreachable])) then
+            Break;
           if RewriteUse(PlannedCode[L], Alias_, Source) then
           begin
             SkipPlanned[K] := True;
@@ -1106,7 +1263,7 @@ var
             (LoadIns.Dest <> StoreIns.A) and
             (LoadIns.Dest <> StoreIns.Dest) and
             not IsVisibleFrameReg(LoadIns.Dest) and
-            (SimpleUseCount(LoadIns.Dest) = 1) and
+            (RegisterUseCount(LoadIns.Dest) = 1) and
             (L < High(PlannedCode)) and not Targets[L + 1] and
             not SkipPlanned[L + 1] and
             (PlannedCode[L + 1].Op = iroI32Add) then
@@ -1261,12 +1418,19 @@ var
       iroCall:
         for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, AIns.A)) - 1 do
           CountSlotUse(IrAuxBlockItem(AFn^.AuxU32, AIns.A, UInt32(N)));
+      {$IFDEF WASM_JIT_ARM64}
+      iroReturn:
+        if UseNativeScalarCore then
+          { Result-copy planning may make the actual return source an
+            expression slot. Retain its final read across dynamic eviction. }
+          CountSlotUse(NativeResultSource);
+      {$ENDIF}
     end;
   end;
 
   procedure AnalyzeDynamicWriteBack;
   var
-    K: Integer;
+    K, Arg: Integer;
 
     procedure MarkLoopCarried(const AFirst, ALast: Integer);
     var
@@ -1323,9 +1487,19 @@ var
               MarkUse(Ins.B);
               MarkUse(UInt32(Ins.Imm));
             end;
+          {$IFDEF WASM_JIT_ARM64}
+          iroReturn:
+            if UseNativeScalarCore then
+              MarkUse(NativeResultSource);
+          {$ENDIF}
           iroCall:
             for J := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.A)) - 1 do
-              MarkUse(IrAuxBlockItem(AFn^.AuxU32, Ins.A, UInt32(J)));
+              {$IFDEF WASM_JIT_ARM64}
+              if Length(InlineBodies[N]) <> 0 then
+                MarkUse(InlineArgSlots[N][J])
+              else
+              {$ENDIF}
+                MarkUse(IrAuxBlockItem(AFn^.AuxU32, Ins.A, UInt32(J)));
           iroI32Load, iroI64Load, iroF32Load, iroF64Load,
           iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
           iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
@@ -1377,6 +1551,15 @@ var
     for K := 0 to High(PlannedCode) do
       if not SkipPlanned[K] then
       begin
+        {$IFDEF WASM_JIT_ARM64}
+        if Length(InlineBodies[K]) <> 0 then
+        begin
+          for Arg := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+            PlannedCode[K].A)) - 1 do
+            CountSlotUse(InlineArgSlots[K][Arg]);
+        end
+        else
+        {$ENDIF}
         if MaskedShiftSource[K] >= 0 then
           CountSlotUse(UInt32(MaskedShiftSource[K]))
         else if Fusion[K] >= 0 then
@@ -1401,22 +1584,47 @@ var
   var
     K, Best, Second, Third: Integer;
     HasBackEdge, Eligible: Boolean;
+    {$IFDEF WASM_JIT_ARM64}
+    HasInlineCall: Boolean;
+    {$ENDIF}
   begin
     UseStaticCache := False;
+    {$IFDEF WASM_JIT_ARM64}
+    UsePreservedInlineCache := False;
+    {$ENDIF}
     AllocatedSlots[2] := High(UInt32);
     if AFn^.RegisterCount = 0 then
       Exit;
     SetLength(SlotScores, AFn^.RegisterCount);
     HasBackEdge := False;
     Eligible := True;
+    {$IFDEF WASM_JIT_ARM64}
+    HasInlineCall := False;
+    {$ENDIF}
     for K := 0 to High(AFn^.Code) do
     begin
-      Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
+      {$IFDEF WASM_JIT_ARM64}
+      if (AFn^.Code[K].Op = iroCall) and
+        (Length(InlineBodies[K]) <> 0) then
+        HasInlineCall := True
+      else
+      {$ENDIF}
+        Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
       if (AFn^.Code[K].Op = iroJump) and
         (AFn^.Code[K].A <= UInt32(K)) then
         HasBackEdge := True;
       ScoreInstruction(AFn^.Code[K]);
     end;
+    {$IFDEF WASM_JIT_ARM64}
+    if HasInlineCall then
+    begin
+      Eligible := Eligible and not UsePinnedMemory and not HasHandlers;
+      for K := 0 to High(AFn^.RegTypes) do
+        Eligible := Eligible and (AFn^.RegTypes[K].Kind = wvkNum) and
+          ((AFn^.RegTypes[K].Num = wntI32) or
+          (AFn^.RegTypes[K].Num = wntI64));
+    end;
+    {$ENDIF}
     if not Eligible or not HasBackEdge then
       Exit;
 
@@ -1449,6 +1657,13 @@ var
       AllocatedSlots[2] := UInt32(Third)
     else
       AllocatedSlots[2] := High(UInt32);
+    {$IFDEF WASM_JIT_ARM64}
+    UsePreservedInlineCache := HasInlineCall;
+    if UsePreservedInlineCache then
+      { Reserve the third preserved host for the existing one-constant plan;
+        every dynamic host remains inside the body's x14-x17 clobber set. }
+      AllocatedSlots[2] := High(UInt32);
+    {$ENDIF}
     UseStaticCache := True;
   end;
 
@@ -1963,6 +2178,9 @@ begin
       EhEndLabel := 0;
     end;
     {$IFDEF WASM_JIT_ARM64}
+    { Recursive leaf emission must finish before installing the caller's EH
+      labels in the backend emission context. }
+    PrepareInlineBodies;
     Arm64BeginEhEmit(HasHandlers, EhTableLabel, EhEndLabel,
       UInt32(Length(AFn^.Code)));
     {$ENDIF}
@@ -2028,6 +2246,9 @@ begin
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
     AnalyzeLocalAliases;
+    {$IFDEF WASM_JIT_ARM64}
+    AnalyzeResultCopies;
+    {$ENDIF}
     AnalyzeStoreLoadForwarding;
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeMaskedShiftFusion;
@@ -2046,7 +2267,8 @@ begin
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
-    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf;
+    UseExtendedFrame := UseThirdStatic or UseNativeScalarSelf or
+      UsePreservedInlineCache;
     if UseNativeScalarLeaf then
     begin
       Arm64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeCoreLabel,
@@ -2054,7 +2276,7 @@ begin
       Buf.BindLabel(NativeExternalLabel);
     end;
     if UseExtendedFrame then
-      Arm64EmitPrologueExtended(Buf)
+      Arm64EmitPrologueExtended(Buf, UsePreservedInlineCache)
     else
       Arm64EmitPrologue(Buf);
     Arm64EmitPinHelperTable(Buf, AHelperTableOffset);
@@ -2070,7 +2292,7 @@ begin
       Arm64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
         NativeParam1Reg, NativeResultReg, NativeCoreLabel);
       if UseExtendedFrame then
-        Arm64EmitEpilogueExtended(Buf)
+        Arm64EmitEpilogueExtended(Buf, UsePreservedInlineCache)
       else
         Arm64EmitEpilogue(Buf);
       Buf.BindLabel(NativeCoreLabel);
@@ -2078,12 +2300,16 @@ begin
     Arm64InitRegCache(ArmCache);
     if UseStaticCache then
     begin
-      Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots);
+      Arm64EnableStaticRegCache(Buf, ArmCache, AllocatedSlots,
+        UsePreservedInlineCache);
       if ConstSlots[0] <> High(UInt32) then
         Arm64EnableConstSlots(Buf, ArmCache, ConstSlots, ConstSlotBits);
-      if UsePinnedMemoryBase then
-        Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
-          @VisibleSlots[0], AFn^.RegisterCount);
+      { StaticCacheOp admits only helper-free scalar operations or base-pinned
+        memory. Both retain the same dynamic registers and can defer temporary
+        stores: locals, results, and loop-carried values stay visible to the
+        existing branch/exit reconciliation plan. }
+      Arm64EnableDynamicWriteBack(ArmCache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
     end;
     if UseNativeScalarCore then
       { The closed helper-free native core may defer block-local numeric
@@ -2094,6 +2320,9 @@ begin
     if UseNativeScalarCore then
       Arm64SeedNativeCoreCache(ArmCache, NativeParamCount, NativeParamReg,
         NativeParam1Reg, UseNativeScalarLeaf and not UseNativeScalarSelf);
+    { After every cache set-up call: the return epilogue must release the
+      frame the prologue above reserved, whatever cache mode was chosen. }
+    ArmCache.PreservedFrame := UsePreservedInlineCache;
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     UseX64ExtendedFrame := UseNativeScalarCall or UseNativeScalarSelf;
@@ -2153,7 +2382,16 @@ begin
         base (x23/rbp), which the entry receives freshly per invocation — no
         heap IR pointer is ever baked. }
       {$IFDEF WASM_JIT_ARM64}
-      if MaskedShiftSource[I] >= 0 then
+      if not UsePinnedMemory and (Length(InlineBodies[I]) <> 0) then
+      begin
+        Arm64EmitScalarBodyCall(Buf, InlineBodies[I],
+          InlineRegisterCounts[I],
+          IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[I].A),
+          InlineArgSlots[I][0], InlineArgSlots[I][1], InlineResultSlots[I],
+          ArmCache);
+        Emitted := True;
+      end
+      else if MaskedShiftSource[I] >= 0 then
       begin
         Arm64EmitMaskedShiftCached(Buf, UInt32(MaskedShiftSource[I]),
           PlannedCode[I].Dest, Byte(MaskedShiftShape[I] and $FF),
@@ -2179,7 +2417,7 @@ begin
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
             UsePinnedMemory, UsePinnedMemoryBase, UseExtendedFrame,
             UseNativeScalarCore, AFn^.RegisterCount, NativeParamReg,
-            NativeResultReg, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
+            NativeResultSource, NativeCoreLabel, NativeExhaustedLabel, ArmCache,
             @GcShapes[0], @GcAllocShapes[0], GcAllocInfo);
       end;
       {$ENDIF}
@@ -2226,7 +2464,7 @@ begin
     begin
       Buf.BindLabel(EhEndLabel);
       if UseExtendedFrame then
-        Arm64EmitEpilogueExtended(Buf)
+        Arm64EmitEpilogueExtended(Buf, UsePreservedInlineCache)
       else
         Arm64EmitEpilogue(Buf);
     end;

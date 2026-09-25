@@ -95,6 +95,7 @@ type
     procedure TestWrongSignatureHostIsRejected;
     procedure TestUnreachableIsATrap;
     procedure TestExportedMemoryReadWriteAndOob;
+    procedure TestMemoryU64ByteOrderAndBoundaries;
     procedure TestInternModuleIsIdempotent;
     procedure TestHostRootSurvivesCollection;
     procedure TestCaughtExceptionRefSurvivesCollection;
@@ -332,6 +333,49 @@ begin
   Expect<Boolean>(MemRead(Mem, MemSize(Mem), 0, @Scratch[0])).ToBe(True);
 end;
 
+procedure TEngineTests.TestMemoryU64ByteOrderAndBoundaries;
+const
+  Expected: array[0..7] of Byte = ($EF, $CD, $AB, $89, $67, $45, $23, $01);
+var
+  Loaded: TWasmLoadedModule;
+  Linker: TWasmLinker;
+  Inst: TWasmInstance;
+  Mem: TWasmMemoryRef;
+  Bytes: array[0..15] of Byte;
+  I: Integer;
+  Last: UInt64;
+begin
+  Loaded := Load('(module (memory (export "memory") 1))');
+  Linker := NewLinker;
+  Inst := Track(Instantiate(FStore, Linker, Loaded));
+  Expect<Boolean>(Inst.FindExportMemory('memory', Mem)).ToBe(True);
+  { Judge raw guest bytes independently of MemReadU64 at an unaligned address. }
+  Expect<Boolean>(MemWriteU64(Mem, 3, UInt64($0123456789ABCDEF))).ToBe(True);
+  Expect<Boolean>(MemRead(Mem, 3, 8, @Bytes[0])).ToBe(True);
+  for I := 0 to 7 do
+    Expect<Byte>(Bytes[I]).ToBe(Expected[I]);
+  Expect<Boolean>(MemWriteU64(Mem, 3, High(UInt64))).ToBe(True);
+  Expect<Boolean>(MemRead(Mem, 3, 8, @Bytes[0])).ToBe(True);
+  for I := 0 to 7 do
+    Expect<Byte>(Bytes[I]).ToBe($FF);
+
+  Last := MemSize(Mem);
+  for I := 0 to 15 do
+    Bytes[I] := $A5;
+  Expect<Boolean>(MemWrite(Mem, Last - 16, 16, @Bytes[0])).ToBe(True);
+  Expect<Boolean>(MemWriteU64(Mem, Last - 8, UInt64($0123456789ABCDEF))).ToBe(True);
+  { Every rejected write must leave even its in-bounds prefix untouched. }
+  Expect<Boolean>(MemWriteU64(Mem, Last - 7, 0)).ToBe(False);
+  Expect<Boolean>(MemWriteU64(Mem, Last, 0)).ToBe(False);
+  Expect<Boolean>(MemWriteU64(Mem, High(UInt64), 0)).ToBe(False);
+  Expect<Boolean>(MemRead(Mem, Last - 16, 16, @Bytes[0])).ToBe(True);
+  for I := 0 to 7 do
+  begin
+    Expect<Byte>(Bytes[I]).ToBe($A5);
+    Expect<Byte>(Bytes[I + 8]).ToBe(Expected[I]);
+  end;
+end;
+
 procedure TEngineTests.TestInternModuleIsIdempotent;
 var
   Loaded: TWasmLoadedModule;
@@ -507,6 +551,8 @@ begin
     TestUnreachableIsATrap);
   Test('exported memory reads and writes round-trip, and OOB is a clean False',
     TestExportedMemoryReadWriteAndOob);
+  Test('u64 writes preserve byte order and reject partial boundary writes',
+    TestMemoryU64ByteOrderAndBoundaries);
   Test('InternModule is idempotent so the linker needs no EnsureInterned',
     TestInternModuleIsIdempotent);
   Test('a rooted host ref survives a forced collection',

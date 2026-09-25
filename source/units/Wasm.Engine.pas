@@ -916,6 +916,13 @@ end;
 
 function MemWriteU64(const AMem: TWasmMemoryRef; const AOffset: UInt64;
   const AValue: UInt64): Boolean;
+{$IFDEF ENDIAN_LITTLE}
+begin
+  { The scalar already has the guest byte order. MemWrite still owns bounds,
+    range resolution and the alignment-independent copy into guest memory. }
+  Result := MemWrite(AMem, AOffset, 8, @AValue);
+end;
+{$ELSE}
 var
   B: array[0..7] of Byte;
   Index: Integer;
@@ -924,6 +931,7 @@ begin
     B[Index] := Byte(AValue shr (Index * 8));
   Result := MemWrite(AMem, AOffset, 8, @B[0]);
 end;
+{$ENDIF}
 
 { --- host roots ---------------------------------------------------------- }
 

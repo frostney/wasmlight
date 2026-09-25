@@ -52,6 +52,9 @@ type
 
     procedure TestWordBuilderBits;
     procedure TestFrameWordBits;
+    procedure TestNativeLeafFrameBranches;
+    procedure TestInlineScalarBodyFence;
+    procedure TestPreservedInlineFrame;
     procedure TestBranchPlaceholderBits;
     procedure TestLocalCallPatch;
     procedure TestSlotOffset;
@@ -60,6 +63,8 @@ type
     procedure TestSpZeroAdjustCopiesSp;
     procedure TestLargeSlotEncoding;
     procedure TestCondBranchVeneer;
+    procedure TestMixedDirectionVeneers;
+    procedure TestPinnedMemoryEpochJump;
     procedure TestBranchOffsetRangeGuard;
     procedure TestPositionIndependentSequences;
     procedure TestStaticCacheKeepsFourTemporaries;
@@ -96,6 +101,70 @@ function EmittedWord(const ABuf: TWasmCodeBuffer;
   const AIndex: Integer): UInt32; forward;
 
 { --- portable bit assertions -------------------------------------------- }
+
+procedure TArm64Tests.TestPreservedInlineFrame;
+var
+  Buf: TWasmCodeBuffer;
+  Epilogue: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64EmitPrologueExtended(Buf, True);
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe($D10083FF); { sub sp,sp,#32 }
+    Expect<UInt32>(EmittedWord(Buf, 10)).ToBe(Arm64StrX(26, 31, 64));
+    Expect<UInt32>(EmittedWord(Buf, 11)).ToBe(Arm64StrX(27, 31, 72));
+    Expect<UInt32>(EmittedWord(Buf, 12)).ToBe(Arm64StrX(28, 31, 80));
+    Epilogue := Buf.Size div 4;
+    Arm64EmitEpilogueExtended(Buf, True);
+    Expect<UInt32>(EmittedWord(Buf, Epilogue)).ToBe(Arm64LdrX(27, 31, 72));
+    Expect<UInt32>(EmittedWord(Buf, Epilogue + 1)).ToBe(Arm64LdrX(28, 31, 80));
+    Expect<UInt32>(EmittedWord(Buf, Epilogue + 2)).ToBe(Arm64LdrX(26, 31, 64));
+    Expect<UInt32>(EmittedWord(Buf, Buf.Size div 4 - 2)).ToBe($910083FF);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TArm64Tests.TestInlineScalarBodyFence;
+var
+  Buf: TWasmCodeBuffer;
+  I: Integer;
+const
+  Rejected: array[0..10] of UInt32 = (
+    $F940026C, { ldr x12,[x19]: spill reload }
+    $F900026C, { str x12,[x19]: spill }
+    $5800000C, { literal load }
+    $14000001, { b }
+    $94000001, { bl }
+    $D63F0120, { blr x9 }
+    $D65F03C0, { ret }
+    $1000000C, { adr x12 }
+    $9000000C, { adrp x12 }
+    $AA0C03F3, { mov x19,x12: pinned register clobber }
+    $910043FF  { add sp,sp,#16 }
+  );
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.EmitU32(Arm64AddW(14, 12, 13));
+    Buf.EmitU32(Arm64MovReg(12, 14));
+    Expect<Boolean>(Arm64CanInlineScalarBody(Buf.SnapshotBytes)).ToBe(True);
+    Buf.EmitByte(0);
+    Expect<Boolean>(Arm64CanInlineScalarBody(Buf.SnapshotBytes)).ToBe(False);
+  finally
+    Buf.Free;
+  end;
+  for I := Low(Rejected) to High(Rejected) do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      Buf.EmitU32(Rejected[I]);
+      Expect<Boolean>(Arm64CanInlineScalarBody(Buf.SnapshotBytes)).ToBe(False);
+    finally
+      Buf.Free;
+    end;
+  end;
+end;
 
 procedure TArm64Tests.TestWordBuilderBits;
 begin
@@ -208,6 +277,34 @@ begin
   { str/ldr x30 at [sp,#48] reuse the scaled LDR/STR builders. }
   Expect<UInt32>(Arm64StrX(30, 31, 48)).ToBe($F9001BFE);
   Expect<UInt32>(Arm64LdrX(30, 31, 48)).ToBe($F9401BFE);
+end;
+
+procedure TArm64Tests.TestNativeLeafFrameBranches;
+var
+  Buf: TWasmCodeBuffer;
+  CoreLabel, ExternalLabel: TWasmJitLabel;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    CoreLabel := Buf.NewLabel;
+    ExternalLabel := Buf.NewLabel;
+    Arm64EmitNativeLeafEntry(Buf, 10, CoreLabel, ExternalLabel);
+    Buf.BindLabel(ExternalLabel);
+    Buf.EmitU32(Arm64Ret);
+    Buf.BindLabel(CoreLabel);
+    Buf.EmitU32(Arm64Ret);
+    Arm64ResolvePatches(Buf);
+    { Both entry paths must follow the expanded epilogue's labels. The
+      lightweight path restores the original register file and all 96 stack
+      bytes before returning; its paired reload has no SP writeback. }
+    Expect<UInt32>(EmittedWord(Buf, 0)).ToBe($350000E4);
+    Expect<UInt32>(EmittedWord(Buf, 3)).ToBe($94000005);
+    Expect<UInt32>(EmittedWord(Buf, 4)).ToBe($A9407BF3);
+    Expect<UInt32>(EmittedWord(Buf, 5)).ToBe($910183FF);
+    Expect<UInt32>(EmittedWord(Buf, 6)).ToBe($D65F03C0);
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TArm64Tests.TestStaticCacheKeepsFourTemporaries;
@@ -409,7 +506,7 @@ var
 begin
   Buf := TWasmCodeBuffer.Create;
   try
-    Arm64EmitPrologueExtended(Buf);
+    Arm64EmitPrologueExtended(Buf, False);
     Expect<Integer>(Buf.Size).ToBe(11 * SizeOf(UInt32));
     Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
       Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
@@ -421,7 +518,7 @@ begin
 
   Buf := TWasmCodeBuffer.Create;
   try
-    Arm64EmitEpilogueExtended(Buf);
+    Arm64EmitEpilogueExtended(Buf, False);
     Expect<Integer>(Buf.Size).ToBe(8 * SizeOf(UInt32));
     Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
       Arm64LdrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));
@@ -701,6 +798,129 @@ begin
       .ToBe(Arm64BPlaceholder or UInt32(262144));
   finally
     Buf.Free;
+  end;
+end;
+
+{ A backward veneer moves a forward target across the imm19 boundary. Both
+  the earlier B and the newly overflowing CBNZ must use the final layout. }
+procedure TArm64Tests.TestMixedDirectionVeneers;
+var
+  Buf: TWasmCodeBuffer;
+  BackTarget, EndTarget: TWasmJitLabel;
+  I, Site: Integer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    BackTarget := Buf.NewLabel;
+    EndTarget := Buf.NewLabel;
+    Buf.BindLabel(BackTarget);
+    Buf.AddPatch(0, EndTarget, Integer(Arm64BPlaceholder));
+    Buf.EmitU32(Arm64BPlaceholder);
+    Buf.EmitU32($D503201F);
+    Buf.EmitU32($D503201F);
+    Buf.AddPatch(12, EndTarget, Integer(Arm64CbnzWPlaceholder(0)));
+    Buf.EmitU32(Arm64CbnzWPlaceholder(0));
+    for I := 1 to 262141 do
+      Buf.EmitU32($D503201F);
+    Site := Buf.CurrentOffset;
+    Buf.AddPatch(Site, BackTarget,
+      Integer(Arm64BCondPlaceholder(ARM64_COND_EQ)));
+    Buf.EmitU32(Arm64BCondPlaceholder(ARM64_COND_EQ));
+    Buf.BindLabel(EndTarget);
+    Buf.EmitU32(Arm64Ret);
+    Expect<Integer>(Site).ToBe(1048580);
+    Expect<Integer>(Buf.PatchDelta(1) div 4).ToBe(262143);
+    Expect<Integer>(Buf.PatchDelta(2) div 4).ToBe(-262145);
+
+    Arm64ResolvePatches(Buf);
+    Expect<Integer>(Buf.LabelOffset(EndTarget)).ToBe(1048592);
+    Expect<Integer>(Buf.Size).ToBe(1048596);
+    Expect<UInt32>(Arm64WordAt(Buf, 0))
+      .ToBe(Arm64BPlaceholder or UInt32(262148));
+    Expect<UInt32>(Arm64WordAt(Buf, 12))
+      .ToBe(Arm64CbzWPlaceholder(0) or (UInt32(2) shl 5));
+    Expect<UInt32>(Arm64WordAt(Buf, 16))
+      .ToBe(Arm64BPlaceholder or UInt32(262144));
+    Expect<UInt32>(Arm64WordAt(Buf, 1048584))
+      .ToBe(Arm64BCondPlaceholder(ARM64_COND_NE) or (UInt32(2) shl 5));
+    Expect<UInt32>(Arm64WordAt(Buf, 1048588))
+      .ToBe(Arm64BPlaceholder or (UInt32(Int32(-262147)) and $03FFFFFF));
+    Expect<UInt32>(Arm64WordAt(Buf, 1048592)).ToBe(Arm64Ret);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ Only the pinned-base static-cache path may carry the back-edge on the
+  success branch. Raw, instance-pinned, dynamic and unmarked paths retain
+  their old templates. The final case crosses the conditional branch range. }
+procedure TArm64Tests.TestPinnedMemoryEpochJump;
+var
+  Buf: TWasmCodeBuffer;
+  Cache: TArm64RegCache;
+  Target: TWasmJitLabel;
+  Jump: TWasmIrInstr;
+  CaseIndex, I, NopCount, Site, TrapSite: Integer;
+begin
+  for CaseIndex := 0 to 5 do
+  begin
+    Buf := TWasmCodeBuffer.Create;
+    try
+      Target := Buf.NewLabel;
+      Buf.BindLabel(Target);
+      if CaseIndex = 5 then
+        NopCount := 262143
+      else
+        NopCount := 1;
+      for I := 1 to NopCount do
+        Buf.EmitU32($D503201F);
+      Site := Buf.CurrentOffset;
+      Jump := Ins(iroJump, 0, UInt32(Target), 0);
+      if CaseIndex <> 4 then
+        Jump.Imm := IR_JUMP_SAFEPOINT;
+      Arm64InitRegCache(Cache);
+      if CaseIndex <> 2 then
+        Arm64EnableStaticRegCache(Buf, Cache, []);
+      if CaseIndex = 0 then
+        Expect<Boolean>(Arm64EmitOp(Buf, Jump, nil, 0, True)).ToBe(True)
+      else
+        Expect<Boolean>(Arm64EmitOpCached(Buf, Jump, nil, 0, False,
+          True, CaseIndex <> 1, False, Cache)).ToBe(True);
+      Arm64ResolvePatches(Buf);
+      if CaseIndex = 4 then
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site)).ToBe($17FFFFFF);
+        Expect<Integer>(Buf.Size).ToBe(8);
+        Continue;
+      end;
+      Expect<UInt32>(Arm64WordAt(Buf, Site)).ToBe(Arm64LdrX(9, 21, 0));
+      Expect<UInt32>(Arm64WordAt(Buf, Site + 4)).ToBe(Arm64CmpX(9, 22));
+      TrapSite := Site + 12;
+      if CaseIndex < 3 then
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 8)).ToBe($54000080);
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 24)).ToBe($17FFFFF9);
+        Expect<Integer>(Buf.Size).ToBe(32);
+      end
+      else if CaseIndex = 3 then
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 8)).ToBe($54FFFFA0);
+        Expect<Integer>(Buf.Size).ToBe(28);
+      end
+      else
+      begin
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 8)).ToBe($54000041);
+        Expect<UInt32>(Arm64WordAt(Buf, Site + 12))
+          .ToBe(Arm64BPlaceholder or (UInt32(Int32(-262146)) and $03FFFFFF));
+        TrapSite := Site + 16;
+        Expect<Integer>(Buf.Size).ToBe(TrapSite + 12);
+      end;
+      Expect<UInt32>(Arm64WordAt(Buf, TrapSite)).ToBe($52800240);
+      Expect<UInt32>(Arm64WordAt(Buf, TrapSite + 4)).ToBe(Arm64LdrX(9, 24, 0));
+      Expect<UInt32>(Arm64WordAt(Buf, TrapSite + 8)).ToBe(Arm64Blr(9));
+    finally
+      Buf.Free;
+    end;
   end;
 end;
 
@@ -1059,7 +1279,13 @@ end;
 procedure TArm64Tests.SetupTests;
 begin
   Test('word builders emit the asserted A64 bits', TestWordBuilderBits);
+  Test('scalar body fence excludes spills, control flow and pinned writes',
+    TestInlineScalarBodyFence);
+  Test('inline-call cache preserves x26-x28 in an aligned frame',
+    TestPreservedInlineFrame);
   Test('frame save/restore words emit the asserted bits', TestFrameWordBits);
+  Test('native leaf entry branches follow the restored stack frame',
+    TestNativeLeafFrameBranches);
   Test('branch placeholders emit the asserted bits', TestBranchPlaceholderBits);
   Test('local BL patches stay position-independent', TestLocalCallPatch);
   Test('slot byte offset is register*8', TestSlotOffset);
@@ -1073,6 +1299,10 @@ begin
     TestLargeSlotEncoding);
   Test('an out-of-range CBNZ is rewritten to invert+B',
     TestCondBranchVeneer);
+  Test('mixed-direction veneers settle earlier branch displacements',
+    TestMixedDirectionVeneers);
+  Test('only pinned-base static memory loops use the direct epoch branch',
+    TestPinnedMemoryEpochJump);
   Test('branch-offset range guard fits imm19/imm26 at the boundaries',
     TestBranchOffsetRangeGuard);
   Test('helper calls and the IR pointer are position-independent',
