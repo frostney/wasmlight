@@ -391,7 +391,7 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
   ANativeScalarCore, ANativeScalarSelf: Boolean;
-  const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
+  const ANativeRegisterCount, ANativeParamReg, ANativeResultSource: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
@@ -694,7 +694,7 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; const AAddr64, AUsePinnedMemory,
   ANativeScalarCore, ANativeScalarSelf: Boolean;
-  const ANativeRegisterCount, ANativeParamReg, ANativeResultReg: UInt32;
+  const ANativeRegisterCount, ANativeParamReg, ANativeResultSource: UInt32;
   const ANativeCoreLabel, ANativeExhaustedLabel: TWasmJitLabel;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
@@ -773,7 +773,11 @@ begin
       begin
         if ANativeScalarCore then
         begin
-          X64CachedLoad(ABuf, ACache, X64_R8, ANativeResultReg);
+          { The driver's result-copy plan may name the skipped final move's
+            source (or a recursive join's source) rather than the canonical
+            result slot. Native callers consume r8 only; the external wrapper
+            still publishes r8 to the canonical result slot. }
+          X64CachedLoad(ABuf, ACache, X64_R8, ANativeResultSource);
           X64EmitRet(ABuf);
         end
         else

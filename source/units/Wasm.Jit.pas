@@ -527,9 +527,9 @@ var
   InlineRegisterCounts: array of UInt32;
   InlineResultSlots: array of UInt32;
   InlineArgSlots: array of array[0..1] of UInt32;
-  NativeResultSource: UInt32;
   UsePreservedInlineCache: Boolean;
   {$ENDIF}
+  NativeResultSource: UInt32;
   UseExtendedFrame: Boolean;
   NativeParamCount: UInt32;
   NativeParamReg: UInt32;
@@ -775,7 +775,6 @@ var
       end;
   end;
 
-  {$IFDEF WASM_JIT_ARM64}
   procedure AnalyzeNativeSelfReturnTail;
   var
     K, Last, Tail: Integer;
@@ -810,7 +809,8 @@ var
     { Every incoming edge is now a forward, unflagged terminal jump. Return
       its cached join value directly; the only remaining tail predecessor is
       lexical fallthrough. No cache state is carried across a branch. The
-      wrapper still publishes x12 to the canonical result slot. }
+      wrapper still publishes the native result register (x12 / r8) to the
+      canonical result slot. }
     NativeResultSource := Source;
     for K := 0 to Tail - 1 do
       if (PlannedCode[K].Op = iroJump) and
@@ -824,7 +824,9 @@ var
   var
     K, Last: Integer;
     SingleReturn: Boolean;
+    {$IFDEF WASM_JIT_ARM64}
     ResultSlot: UInt32;
+    {$ENDIF}
   begin
     NativeResultSource := NativeResultReg;
     AnalyzeNativeSelfReturnTail;
@@ -843,12 +845,14 @@ var
       if SingleReturn then
       begin
         { The final copy has no intervening instruction or other return path.
-          Read its already-planned source into x12 at return; the external
-          wrapper still publishes x12 to canonical NativeResultReg. }
+          Read its already-planned source into the native result register
+          (x12 / r8) at return; the external wrapper still publishes it to
+          canonical NativeResultReg. }
         NativeResultSource := PlannedCode[Last - 1].A;
         SkipPlanned[Last - 1] := True;
       end;
     end;
+    {$IFDEF WASM_JIT_ARM64}
     if not UsePreservedInlineCache then
       Exit;
     for K := 0 to Last - 1 do
@@ -870,8 +874,8 @@ var
           SkipPlanned[K + 1] := True;
         end;
       end;
+    {$ENDIF}
   end;
-  {$ENDIF}
 
   function IsVisibleFrameReg(const AReg: UInt32): Boolean;
   var
@@ -1418,13 +1422,11 @@ var
       iroCall:
         for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, AIns.A)) - 1 do
           CountSlotUse(IrAuxBlockItem(AFn^.AuxU32, AIns.A, UInt32(N)));
-      {$IFDEF WASM_JIT_ARM64}
       iroReturn:
         if UseNativeScalarCore then
           { Result-copy planning may make the actual return source an
             expression slot. Retain its final read across dynamic eviction. }
           CountSlotUse(NativeResultSource);
-      {$ENDIF}
     end;
   end;
 
@@ -1487,11 +1489,9 @@ var
               MarkUse(Ins.B);
               MarkUse(UInt32(Ins.Imm));
             end;
-          {$IFDEF WASM_JIT_ARM64}
           iroReturn:
             if UseNativeScalarCore then
               MarkUse(NativeResultSource);
-          {$ENDIF}
           iroCall:
             for J := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32, Ins.A)) - 1 do
               {$IFDEF WASM_JIT_ARM64}
@@ -2246,9 +2246,7 @@ begin
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
     AnalyzeLocalAliases;
-    {$IFDEF WASM_JIT_ARM64}
     AnalyzeResultCopies;
-    {$ENDIF}
     AnalyzeStoreLoadForwarding;
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeMaskedShiftFusion;
@@ -2437,7 +2435,7 @@ begin
             (AFn^.RegTypes[AFn^.Code[I].A].Kind = wvkNum) and
             (AFn^.RegTypes[AFn^.Code[I].A].Num = wntI64),
           UsePinnedMemory, UseNativeScalarCore, UseNativeScalarSelf,
-          AFn^.RegisterCount, NativeParamReg, NativeResultReg,
+          AFn^.RegisterCount, NativeParamReg, NativeResultSource,
           NativeCoreLabel, NativeExhaustedLabel, UseX64ExtendedFrame,
           NativeScalarCall,
           X64Cache, @GcShapes[0]);
