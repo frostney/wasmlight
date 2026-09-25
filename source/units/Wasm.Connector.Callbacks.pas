@@ -298,17 +298,8 @@ begin
     Sleep(1);
   end;
   try
-    Index := 0;
-    while Index < GNoteCount do
-      if (GNotes[Index].Slot >= 0) and
-        (GNotes[Index].Slot < WASM_CALLBACK_SLOT_COUNT) and
-        (GSlots[GNotes[Index].Slot].Hub = Self) then
-      begin
-        GNotes[Index] := GNotes[GNoteCount - 1];
-        Dec(GNoteCount);
-      end
-      else
-        Inc(Index);
+    { ReleaseSlot drops each slot's pending notes and keeps the rest of the
+      queue, including other hubs' notes, in order. }
     for Index := 0 to WASM_CALLBACK_SLOT_COUNT - 1 do
       if GSlots[Index].Used and (GSlots[Index].Hub = Self) then
         ReleaseSlot(Index);

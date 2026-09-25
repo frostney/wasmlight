@@ -8,7 +8,8 @@
   Coverage:
     - direct store-thread re-entry and nested trampoline
     - retained default, scoped one-call lifetime, safe slot reuse after callers release their pointers
-    - queued void notifications copied from a foreign thread
+    - queued void notifications copied from a foreign thread, drained in
+      queue order even after another hub is freed
     - rejection of queued results / pointer borrows
     - rejection of foreign-thread synchronous results
     - bind/off-thread rejects are EWasmCallbackError, distinct from
@@ -64,6 +65,7 @@ type
     function ExportFunc(const AInst: TWasmInstance;
       const AName: string): TWasmFunc;
     function InstantiatePlain(const AWat: string): TWasmInstance;
+    function InstantiateDistinctIncs: TWasmInstance;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -78,6 +80,7 @@ type
     procedure TestTeardownReleasesBindings;
     procedure TestQueuedBindingReuse;
     procedure TestQueuedDuringDrainRebind;
+    procedure TestHubTeardownKeepsQueueOrder;
     procedure TestQueuedFromForeignThread;
     procedure TestQueuedRejectsResultsAndBorrows;
     procedure TestForeignDirectIsRejected;
@@ -286,6 +289,20 @@ begin
   Expect<Int32>(Thunk(8)).ToBe(9);
 end;
 
+function TCallbackTests.InstantiateDistinctIncs: TWasmInstance;
+var
+  Wat: string;
+  Index: Integer;
+begin
+  { One more function than there are slots: incN(x) = x + N + 1. }
+  Wat := '(module';
+  for Index := 0 to WASM_CALLBACK_SLOT_COUNT do
+    Wat := Wat + ' (func (export "inc' + IntToStr(Index) +
+      '") (param i32) (result i32) (i32.add (local.get 0) (i32.const ' +
+      IntToStr(Index + 1) + ')))';
+  Result := InstantiatePlain(Wat + ')');
+end;
+
 procedure TCallbackTests.TestScopedDiesWithScope;
 var
   Inst: TWasmInstance;
@@ -293,15 +310,15 @@ var
   Thunk: TWasmCallbackFnI32I32;
   Mark, Index: Integer;
 begin
-  Inst := InstantiatePlain(
-    '(module (func (export "inc") (param i32) (result i32)' +
-    ' (i32.add (local.get 0) (i32.const 1))))');
-  Fn := ExportFunc(Inst, 'inc');
+  { A distinct function per scope defeats thunk deduplication, so the pool
+    is exhausted unless EndScope actually releases each slot. }
+  Inst := InstantiateDistinctIncs;
   for Index := 0 to WASM_CALLBACK_SLOT_COUNT do
   begin
+    Fn := ExportFunc(Inst, 'inc' + IntToStr(Index));
     Mark := FHub.BeginScope;
     Thunk := TWasmCallbackFnI32I32(FHub.Bind(Fn, wcsI32I32, wckScoped));
-    Expect<Int32>(Thunk(1)).ToBe(2);
+    Expect<Int32>(Thunk(1)).ToBe(Index + 2);
     Thunk := nil;
     FHub.EndScope(Mark);
   end;
@@ -316,16 +333,16 @@ var
   Hub: TWasmCallbackHub;
   Index: Integer;
 begin
-  Inst := InstantiatePlain(
-    '(module (func (export "inc") (param i32) (result i32)' +
-    ' (i32.add (local.get 0) (i32.const 1))))');
-  Fn := ExportFunc(Inst, 'inc');
+  { A distinct function per hub keeps a reused hub address from matching a
+    leaked slot through deduplication. }
+  Inst := InstantiateDistinctIncs;
   for Index := 0 to WASM_CALLBACK_SLOT_COUNT do
   begin
+    Fn := ExportFunc(Inst, 'inc' + IntToStr(Index));
     Hub := TWasmCallbackHub.Create(FStore);
     try
       Thunk := TWasmCallbackFnI32I32(Hub.Bind(Fn, wcsI32I32, wckRetained));
-      Expect<Int32>(Thunk(Index)).ToBe(Index + 1);
+      Expect<Int32>(Thunk(1)).ToBe(Index + 2);
       Thunk := nil;
     finally
       Hub.Free;
@@ -385,6 +402,34 @@ begin
   QueueNote(GFireThunk, 7);
   FHub.DrainQueued;
   Expect<Int32>(GlobalGet(G).I32).ToBe(70);
+end;
+
+procedure TCallbackTests.TestHubTeardownKeepsQueueOrder;
+var
+  Inst: TWasmInstance;
+  G: TWasmGlobalRef;
+  Other: TWasmCallbackHub;
+  OtherThunk, Thunk: Pointer;
+begin
+  Inst := InstantiatePlain(
+    '(module (global $g (export "g") (mut i32) (i32.const 0))' +
+    ' (func (export "seq") (param i32)' +
+    ' global.get $g i32.const 10 i32.mul local.get 0 i32.add global.set $g)' +
+    ' (func (export "other") (param i32)))');
+  Expect<Boolean>(Inst.FindExportGlobal('g', G)).ToBe(True);
+  Other := TWasmCallbackHub.Create(FStore);
+  try
+    OtherThunk := Other.Bind(ExportFunc(Inst, 'other'), wcsVoidI32, wckQueued);
+    QueueNote(OtherThunk, 9);
+    Thunk := FHub.Bind(ExportFunc(Inst, 'seq'), wcsVoidI32, wckQueued);
+    QueueNote(Thunk, 1);
+    QueueNote(Thunk, 2);
+    QueueNote(Thunk, 3);
+  finally
+    Other.Free;
+  end;
+  FHub.DrainQueued;
+  Expect<Int32>(GlobalGet(G).I32).ToBe(123);
 end;
 
 procedure TCallbackTests.TestQueuedFromForeignThread;
@@ -681,6 +726,8 @@ begin
     TestTeardownReleasesBindings);
   Test('unbinding cancels queued work before slot reuse', TestQueuedBindingReuse);
   Test('a private drain batch rejects a replaced binding', TestQueuedDuringDrainRebind);
+  Test('freeing a hub keeps other hubs'' queued notes in order',
+    TestHubTeardownKeepsQueueOrder);
   Test('a queued notification is copied off-thread and drained later',
     TestQueuedFromForeignThread);
   Test('queued bind rejects results and pointer borrows',
