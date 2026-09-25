@@ -38,10 +38,27 @@
 - #46 (0.2.0 cross-target gates, archives, Homebrew) remains open.
 - A fifth subagent review approved the fix layers #127–#129 with nits; those
   nits are fixed in #129 and a top gate-diagnostics layer.
-- Next: once every layer's current-head CI is green, merge all layers
-  atomically with `gh stack merge --squash` (never layer by layer, never a
-  prefix below a fix layer), then sync `main` and delete the merged
-  branches. Then decide the wave 16/17 branches.
+- Done: stack #125 (12 layers) squash-merged atomically as `39a786e`; post-
+  merge CI green on all six targets, including linux-arm64 and macos-x64.
+- Wave 16/17 is PR #131 (`codex/optimize-runtime-wave16`, main merged in,
+  subagent-reviewed; ARM64 inline-leaf compile memoized and x64 tee-argument
+  coverage added from that review). macos-arm64 CI: 63/63 suites, pinned core
+  65,188 in all tiers, non-core identity OK. Not yet merged.
+- `codex/validate-wave16-core` / `codex/validate-wave17-core` are obsolete
+  one-off CI branches (they replace ci.yml); delete once #131 lands.
+- x86-64 review of #131: no x64 correctness bug (rel32 branches, no veneers;
+  the aux-use fix is shared and unreachable on x64 today); x64 codegen is
+  byte-identical. Measured gap vs Wasmtime on x64 (informational): memory
+  7–10x, 3-arg Wasm calls ~21x, call 2–4x, simd 2.6–3.5x, loop 1.6–1.9x,
+  fib ~1.2x; host calls and startup already faster. Suggested x64 port order
+  (optimize-runtime waves, benchmark-gated): deferred/write-back stores
+  (`9a3126a` analogue; x64 has none) -> x64 pinned-memory static cache ->
+  recursive terminal returns + leaf result-copy elimination (`7a869dc`,
+  `979e214`) -> direct host dispatch (`ce03cd7`) -> IR-level inlining, then
+  preserved registers and argument aliasing (`c9bb0ed`, `a2cd3c9`,
+  `038b357`). Veneer, leaf-reload split and epoch-backedge changes are N/A.
+- MCP: `~/.local/bin/{node,npm,npx}` wrap nvm's default Node so GUI-spawned
+  processes find it; the `wasm` server connects without restarting T3.
 
 ## Skills migration and audit remediation, 2026-09-22
 
