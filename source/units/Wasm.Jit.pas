@@ -571,30 +571,10 @@ var
       iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr]) or IntegerCompare(AOp);
   end;
 
-  function SimpleUseCount(const AReg: UInt32): UInt32;
-  var
-    K: Integer;
-  begin
-    Result := 0;
-    for K := 0 to High(AFn^.Code) do
-      case AFn^.Code[K].Op of
-        iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
-          if AFn^.Code[K].A = AReg then Inc(Result);
-        iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
-        iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
-        iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
-        iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU,
-        iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
-        iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotr,
-        iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
-        iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotr:
-          begin
-            if AFn^.Code[K].A = AReg then Inc(Result);
-            if AFn^.Code[K].B = AReg then Inc(Result);
-          end;
-      end;
-  end;
-
+  { Every read of AReg in the function: source-register operands, A-side aux
+    source lists (call arguments), store values in Dest, and register Imm
+    operands. The single use-count for fold and forwarding decisions; an
+    incomplete counter once let a local.tee'd call argument be folded away. }
   function RegisterUseCount(const AReg: UInt32): UInt32;
   var
     Info: TWasmIrOpInfo;
@@ -946,7 +926,7 @@ var
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op = iroI32Const) and
         (PlannedCode[K + 1].B = PlannedCode[K].Dest) and
-        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
         not IsVisibleFrameReg(PlannedCode[K].Dest) and
         not SkipPlanned[K] and not SkipPlanned[K + 1] and
         not Targets[K] and not Targets[K + 1] then
@@ -982,9 +962,9 @@ var
         not SkipPlanned[K + 2] and not SkipPlanned[K + 3] and
         not Targets[K] and not Targets[K + 1] and
         not Targets[K + 2] and not Targets[K + 3] and
-        (SimpleUseCount(PlannedCode[K].Dest) = 1) and
-        (SimpleUseCount(PlannedCode[K + 1].Dest) = 1) and
-        (SimpleUseCount(PlannedCode[K + 2].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K + 1].Dest) = 1) and
+        (RegisterUseCount(PlannedCode[K + 2].Dest) = 1) and
         (PlannedCode[K + 1].Dest = PlannedCode[K + 3].A) and
         (PlannedCode[K + 2].Dest = PlannedCode[K + 3].B) and
         not IsVisibleFrameReg(PlannedCode[K].Dest) and
@@ -1050,23 +1030,6 @@ var
         iroI64Store32];
     end;
 
-    function MemoryUseCount(const AReg: UInt32): UInt32;
-    var
-      J: Integer;
-    begin
-      Result := 0;
-      for J := 0 to High(AFn^.Code) do
-        if ScalarMemoryOp(AFn^.Code[J].Op) then
-        begin
-          if AFn^.Code[J].A = AReg then Inc(Result);
-          if (AFn^.Code[J].Op in [iroI32Store, iroI64Store, iroF32Store,
-            iroF64Store, iroI32Store8, iroI32Store16, iroI64Store8,
-            iroI64Store16, iroI64Store32]) and
-            (AFn^.Code[J].Dest = AReg) then
-            Inc(Result);
-        end;
-    end;
-
   begin
     {$IFDEF WASM_JIT_ARM64}
     if not (UsePinnedMemoryBase and UseStaticCache) then
@@ -1083,7 +1046,7 @@ var
             Source := PlannedCode[P].A;
             Temp := PlannedCode[P].Dest;
             if IsAllocatedSlot(Source) and
-              (SimpleUseCount(Temp) + MemoryUseCount(Temp) = 1) then
+              (RegisterUseCount(Temp) = 1) then
             begin
               if PlannedCode[K].A = Temp then
               begin
@@ -1300,7 +1263,7 @@ var
             (LoadIns.Dest <> StoreIns.A) and
             (LoadIns.Dest <> StoreIns.Dest) and
             not IsVisibleFrameReg(LoadIns.Dest) and
-            (SimpleUseCount(LoadIns.Dest) = 1) and
+            (RegisterUseCount(LoadIns.Dest) = 1) and
             (L < High(PlannedCode)) and not Targets[L + 1] and
             not SkipPlanned[L + 1] and
             (PlannedCode[L + 1].Op = iroI32Add) then
@@ -2329,7 +2292,7 @@ begin
       Arm64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
         NativeParam1Reg, NativeResultReg, NativeCoreLabel);
       if UseExtendedFrame then
-        Arm64EmitEpilogueExtended(Buf)
+        Arm64EmitEpilogueExtended(Buf, UsePreservedInlineCache)
       else
         Arm64EmitEpilogue(Buf);
       Buf.BindLabel(NativeCoreLabel);
@@ -2357,6 +2320,9 @@ begin
     if UseNativeScalarCore then
       Arm64SeedNativeCoreCache(ArmCache, NativeParamCount, NativeParamReg,
         NativeParam1Reg, UseNativeScalarLeaf and not UseNativeScalarSelf);
+    { After every cache set-up call: the return epilogue must release the
+      frame the prologue above reserved, whatever cache mode was chosen. }
+    ArmCache.PreservedFrame := UsePreservedInlineCache;
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     UseX64ExtendedFrame := UseNativeScalarCall or UseNativeScalarSelf;
@@ -2498,7 +2464,7 @@ begin
     begin
       Buf.BindLabel(EhEndLabel);
       if UseExtendedFrame then
-        Arm64EmitEpilogueExtended(Buf)
+        Arm64EmitEpilogueExtended(Buf, UsePreservedInlineCache)
       else
         Arm64EmitEpilogue(Buf);
     end;

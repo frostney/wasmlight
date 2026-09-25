@@ -506,7 +506,7 @@ var
 begin
   Buf := TWasmCodeBuffer.Create;
   try
-    Arm64EmitPrologueExtended(Buf);
+    Arm64EmitPrologueExtended(Buf, False);
     Expect<Integer>(Buf.Size).ToBe(11 * SizeOf(UInt32));
     Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
       Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, 16));
@@ -518,7 +518,7 @@ begin
 
   Buf := TWasmCodeBuffer.Create;
   try
-    Arm64EmitEpilogueExtended(Buf);
+    Arm64EmitEpilogueExtended(Buf, False);
     Expect<Integer>(Buf.Size).ToBe(8 * SizeOf(UInt32));
     Expect<UInt32>(EmittedWord(Buf, 0)).ToBe(
       Arm64LdrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_SP, 64));

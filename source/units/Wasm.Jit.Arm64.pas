@@ -162,6 +162,10 @@ type
     { Bounded scalar callers keep two locals and one constant in x26-x28;
       the inlined leaf body owns x9-x17. Other cache modes keep their ABI. }
     PreservedInlineStatics: Boolean;
+    { Frame layout, not cache policy: the driver sets it once from the same
+      flag that sized the prologue, so every epilogue releases exactly what
+      the prologue reserved even when no static cache is enabled. }
+    PreservedFrame: Boolean;
     WriteBackDynamics: Boolean;
     UseCounts: PUInt32;
     VisibleSlots: PBoolean;
@@ -484,7 +488,7 @@ procedure Arm64EmitLoadImm64(const ABuf: TWasmCodeBuffer; const ARd: Byte;
   the set and returns (iroReturn emits it). }
 procedure Arm64EmitPrologue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer;
-  const APreservedInlineStatics: Boolean = False);
+  const APreservedFrame: Boolean);
 { Pin the per-process helper-table base in x24 (aot-spec §1.2/§4.3): loads it
   from the store field (x20 + AHelperTableOffset) ONCE, so every subsequent
   helper call is `ldr xT,[x24,#k*8]; blr xT`. Emitted by the driver right after
@@ -515,7 +519,7 @@ procedure Arm64EmitScalarBodyCall(const ABuf: TWasmCodeBuffer;
   AArg0Slot, AArg1Slot, AResultSlot: UInt32; var ACache: TArm64RegCache);
 procedure Arm64EmitEpilogue(const ABuf: TWasmCodeBuffer);
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer;
-  const APreservedInlineStatics: Boolean = False);
+  const APreservedFrame: Boolean);
 
 { Emit an indirect call to helper slot AHelper through the pinned helper table:
   `ldr x9,[x24,#Ord(AHelper)*8]; blr x9` (aot-spec §1.2). Position-independent —
@@ -1509,7 +1513,7 @@ begin
           { Results and every observable exit are read from the logical frame. }
           Arm64FlushRegCache(ABuf, ACache);
           if AExtendedFrame then
-            Arm64EmitEpilogueExtended(ABuf, ACache.PreservedInlineStatics)
+            Arm64EmitEpilogueExtended(ABuf, ACache.PreservedFrame)
           else
             Arm64EmitEpilogue(ABuf);
         end;
@@ -3241,18 +3245,18 @@ begin
 end;
 
 procedure Arm64EmitPrologueExtended(const ABuf: TWasmCodeBuffer;
-  const APreservedInlineStatics: Boolean);
+  const APreservedFrame: Boolean);
 var
   Extra: UInt32;
 begin
   { Preserve the established frame offsets. Ordinary extended entries save
     x26; bounded inline-call caches save x26-x28 in two aligned extra slots. }
   Extra := 16;
-  if APreservedInlineStatics then Extra := 32;
+  if APreservedFrame then Extra := 32;
   ABuf.EmitU32(Arm64SubImmX(ARM64_REG_SP, ARM64_REG_SP, Extra));
   Arm64EmitPrologue(ABuf);
   ABuf.EmitU32(Arm64StrX(ARM64_REG_CACHE_STATIC2, ARM64_REG_ZR, 64));
-  if APreservedInlineStatics then
+  if APreservedFrame then
   begin
     ABuf.EmitU32(Arm64StrX(27, ARM64_REG_ZR, 72));
     ABuf.EmitU32(Arm64StrX(28, ARM64_REG_ZR, 80));
@@ -3388,12 +3392,12 @@ begin
 end;
 
 procedure Arm64EmitEpilogueExtended(const ABuf: TWasmCodeBuffer;
-  const APreservedInlineStatics: Boolean);
+  const APreservedFrame: Boolean);
 var
   Extra: UInt32;
 begin
   Extra := 16;
-  if APreservedInlineStatics then
+  if APreservedFrame then
   begin
     Extra := 32;
     ABuf.EmitU32(Arm64LdrX(27, ARM64_REG_ZR, 72));

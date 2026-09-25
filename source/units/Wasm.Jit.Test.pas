@@ -1720,6 +1720,7 @@ type
     procedure TestAdjacentMoveRetainsCallArgument;
     procedure TestTeeArgumentThroughCompiledLeaf;
     procedure TestTeeInStaticCacheLoop;
+    procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
     procedure TestThrowAcrossCompiledFrameCaught;
@@ -3578,6 +3579,29 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
+var
+  Bytes: TWasmBytes;
+begin
+  { A helper-free loop over constant addresses: on ARM64 it takes the
+    pinned-base static cache, where memory ops join the adjacent-move fold.
+    The tee'd sum is both the local's new value and a store's value operand
+    (the store's Dest field), so the move into the local must not be folded
+    into the add: the store would then read a register nothing wrote. }
+  Bytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param i32) (result i32) (local i32 i32) ' +
+    '(loop $l ' +
+    '(i32.store (i32.const 64) ' +
+    '(local.tee 1 (i32.add (local.get 1) (i32.const 3)))) ' +
+    '(local.set 2 (i32.add (local.get 2) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get 2) (local.get 0)))) ' +
+    '(i32.add (i32.load (i32.const 64)) (local.get 1))))');
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(3)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(7)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
 var
   Bytes: TWasmBytes;
@@ -4788,6 +4812,8 @@ begin
     TestTeeArgumentThroughCompiledLeaf);
   Test('a tee in a static-cache loop keeps both uses',
     TestTeeInStaticCacheLoop);
+  Test('a tee stored in a pinned-memory loop keeps the stored value',
+    TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
     TestNativeResultAcrossDroppedComputations);
   Test('inline results preserve external slots and aux-list uses',
