@@ -599,6 +599,12 @@ type
     procedure ArrayCopy(const ADest: TWasmRef; const ADestIdx: UInt32;
       const ASrc: TWasmRef; const ASrcIdx: UInt32; const ACount: UInt32);
 
+    { Check a data segment before array.new_data allocates, so a huge count
+      cannot replace the specified source-range trap with allocation failure. }
+    procedure CheckArrayDataRange(const ATypeId: TWasmGcTypeId;
+      const ADataSize: NativeUInt; const ADataByteOffset: UInt64;
+      const ACount: UInt32);
+
     { array.init_data (exec-array.init_data). Copy ACount elements from a
       passive/active data segment's bytes (ADataBytes, ADataSize, borrowed —
       Gc sits below Wasm.Runtime.Store so the caller passes the raw span, not
@@ -2107,6 +2113,27 @@ begin
   end;
 end;
 
+procedure RequireArrayDataRange(const ADataSize: NativeUInt;
+  const ADataByteOffset: UInt64; const ACount, AElemWidth: UInt32);
+begin
+  if (ADataByteOffset > UInt64(ADataSize)) or
+    (UInt64(ACount) * UInt64(AElemWidth) >
+      UInt64(ADataSize) - ADataByteOffset) then
+    TrapNow(wtkMemoryOutOfBounds);
+end;
+
+procedure TWasmGcHeap.CheckArrayDataRange(const ATypeId: TWasmGcTypeId;
+  const ADataSize: NativeUInt; const ADataByteOffset: UInt64;
+  const ACount: UInt32);
+var
+  Layout: PWasmGcLayout;
+begin
+  Layout := FTypes.Layout(ATypeId);
+  if (Layout^.Kind <> wckArray) or Layout^.Elem.IsRef then
+    raise EWasmInternal.Create('internal: array data requires a numeric array');
+  RequireArrayDataRange(ADataSize, ADataByteOffset, ACount, Layout^.Elem.Width);
+end;
+
 procedure TWasmGcHeap.ArrayInitFromData(const ADest: TWasmRef;
   const ADestIdx: UInt32; const ADataBytes: PByte; const ADataSize: NativeUInt;
   const ADataByteOffset: UInt64; const ACount: UInt32);
@@ -2116,7 +2143,6 @@ var
   DestLen: UInt32;
   ElemOffset: UInt32;
   ElemWidth: UInt32;
-  SrcEnd: UInt64;
   Cursor: UInt32;
   Src: PByte;
   Dst: PByte;
@@ -2150,9 +2176,7 @@ begin
   { Byte bound on the data side, in u64 so offset+count cannot wrap. The
     DATA side is a memory-style bound: 'out of bounds memory access'
     (corpus array_init_data.wast:72). }
-  SrcEnd := ADataByteOffset + UInt64(ACount) * UInt64(ElemWidth);
-  if SrcEnd > UInt64(ADataSize) then
-    TrapNow(wtkMemoryOutOfBounds);
+  RequireArrayDataRange(ADataSize, ADataByteOffset, ACount, ElemWidth);
 
   { A width-sized little-endian byte copy per element: the data segment
     image and packed/numeric element storage are both LE byte arrays, so

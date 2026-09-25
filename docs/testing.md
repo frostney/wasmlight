@@ -24,6 +24,11 @@
   judged: 65,188 pass with no failures or skips.
 - Two framework gotchas bite newcomers; both are listed below.
 
+The pinned core gate also covers i386: its regressions include `array.new_data`
+checking source bounds before allocation and binary64 multiplication/division
+rounding subnormal results once to nearest/even. The latter uses exact integer
+arithmetic at the underflow boundary, preserving support for x87-only hosts.
+
 ## Running
 
 ```bash

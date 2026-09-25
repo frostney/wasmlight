@@ -311,10 +311,12 @@ begin
     iroArrayNewData:
       begin
         IrUnpack(AIns^.Imm, TypeIdx, DataIdx);
+        DataAddr := Inst.DataAddrs[DataIdx];
+        AStore.Heap.CheckArrayDataRange(Inst.EngineTypeIds[TypeIdx],
+          AStore.Datas[DataAddr].Size, Reg[AIns^.A].U64, Reg[AIns^.B].U32);
         Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[TypeIdx],
           Reg[AIns^.B].U32);
         Reg[AIns^.Dest].Bits := UInt64(Obj);
-        DataAddr := Inst.DataAddrs[DataIdx];
         AStore.Heap.ArrayInitFromData(Obj, 0, AStore.Datas[DataAddr].Data,
           AStore.Datas[DataAddr].Size, Reg[AIns^.A].U64, Reg[AIns^.B].U32);
       end;

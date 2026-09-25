@@ -66,6 +66,7 @@ type
     procedure TestF32Relops;
 
     procedure TestF64Arithmetic;
+    procedure TestF64SubnormalRounding;
     procedure TestF64MinMax;
     procedure TestF64RoundOps;
     procedure TestF64Sqrt;
@@ -457,6 +458,66 @@ begin
     .ToBe(UInt64($7FF8000000000000)); { NaN input -> canonical }
 end;
 
+procedure TInterpNumericTests.TestF64SubnormalRounding;
+begin
+  { Pinned float_misc.wast:336-340,442-447 exposed x87 double rounding.
+    Additional literal-bit cases cover ties-to-even and the normal boundary. }
+  Expect<UInt64>(F64Mul(UInt64($1A8DB3BD2A286944), UInt64($256CE910AF1D55CA)))
+    .ToBe(UInt64($000D6ACCDD538A39));
+  Expect<UInt64>(F64Mul(UInt64($BC6ACA2239160120), UInt64($8392B2B4958DD228)))
+    .ToBe(UInt64($000FA74ECCAE5615));
+  Expect<UInt64>(F64Mul(UInt64($A17BD062DEF16CFF), UInt64($9E77DDD91A0C4C0E)))
+    .ToBe(UInt64($000A5F4D7769D90D));
+  Expect<UInt64>(F64Mul(UInt64($8FBC6A56169E9CE0), UInt64($300517D55A474122)))
+    .ToBe(UInt64($80012BAF260AFB77));
+  Expect<UInt64>(F64Mul(UInt64($9FB08951B0B41705), UInt64($A04102DC27168D09)))
+    .ToBe(UInt64($0008CA6DBF3F592B));
+  Expect<UInt64>(F64Div(UInt64($3FFDCBF69F10006D), UInt64($7FEFFFFFFFFFFFFF)))
+    .ToBe(UInt64($000772FDA7C4001B));
+  Expect<UInt64>(F64Div(UInt64($00CE14169442FBCA), UInt64($40B505451D62FF7D)))
+    .ToBe(UInt64($000B727E85F38B39));
+  Expect<UInt64>(F64Div(UInt64($B6FD3EBE726EC964), UInt64($F6F4A7BFC0B83608)))
+    .ToBe(UInt64($0005A9D8C50CBF87));
+  Expect<UInt64>(F64Div(UInt64($A766C3DEF770AEE1), UInt64($E768B84724347598)))
+    .ToBe(UInt64($0003AF0707FCD0C7));
+  Expect<UInt64>(F64Div(UInt64($0A716ABDA1BB3CB3), UInt64($4A56C9C7198EB1E6)))
+    .ToBe(UInt64($000C3A8FD6741649));
+  Expect<UInt64>(F64Div(UInt64($0127057D6AB553CA), UInt64($C162ABF1E98660EB)))
+    .ToBe(UInt64($80004EE8D8EC01CD));
+  Expect<UInt64>(F64Mul(UInt64($0000000000000001), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($0000000000000000));
+  Expect<UInt64>(F64Mul(UInt64($0000000000000003), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($0000000000000002));
+  Expect<UInt64>(F64Mul(UInt64($0000000000000005), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($0000000000000002));
+  Expect<UInt64>(F64Mul(UInt64($8000000000000001), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($8000000000000000));
+  Expect<UInt64>(F64Mul(UInt64($000FFFFFFFFFFFFF), UInt64($3FF0000000000001)))
+    .ToBe(UInt64($0010000000000000));
+  Expect<UInt64>(F64Mul(UInt64($0010000000000000), UInt64($3FEFFFFFFFFFFFFF)))
+    .ToBe(UInt64($0010000000000000));
+  Expect<UInt64>(F64Mul(UInt64($0000000000000001), UInt64($0000000000000001)))
+    .ToBe(UInt64($0000000000000000));
+  Expect<UInt64>(F64Mul(UInt64($0000000000000000), UInt64($3FF0000000000000)))
+    .ToBe(UInt64($0000000000000000));
+  Expect<UInt64>(F64Div(UInt64($0000000000000001), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($0000000000000002));
+  Expect<UInt64>(F64Div(UInt64($0000000000000003), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($0000000000000006));
+  Expect<UInt64>(F64Div(UInt64($0000000000000005), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($000000000000000A));
+  Expect<UInt64>(F64Div(UInt64($8000000000000001), UInt64($3FE0000000000000)))
+    .ToBe(UInt64($8000000000000002));
+  Expect<UInt64>(F64Div(UInt64($000FFFFFFFFFFFFF), UInt64($3FF0000000000001)))
+    .ToBe(UInt64($000FFFFFFFFFFFFE));
+  Expect<UInt64>(F64Div(UInt64($0010000000000000), UInt64($3FEFFFFFFFFFFFFF)))
+    .ToBe(UInt64($0010000000000001));
+  Expect<UInt64>(F64Div(UInt64($0000000000000001), UInt64($0000000000000001)))
+    .ToBe(UInt64($3FF0000000000000));
+  Expect<UInt64>(F64Div(UInt64($0000000000000000), UInt64($3FF0000000000000)))
+    .ToBe(UInt64($0000000000000000));
+end;
+
 procedure TInterpNumericTests.TestF64MinMax;
 begin
   Expect<UInt64>(F64Min(F64ToBits(1.0), F64ToBits(2.0))).ToBe(F64ToBits(1.0));
@@ -687,6 +748,7 @@ begin
   Test('f32 relops with unordered NaN', TestF32Relops);
 
   Test('f64 add/mul/div and NaN canonicalization', TestF64Arithmetic);
+  Test('f64 subnormal arithmetic rounds once to nearest/even', TestF64SubnormalRounding);
   Test('f64 min/max sign-of-zero and NaN rules', TestF64MinMax);
   Test('f64 ceil/floor/trunc/nearest ties-to-even', TestF64RoundOps);
   Test('f64 sqrt edges', TestF64Sqrt);
