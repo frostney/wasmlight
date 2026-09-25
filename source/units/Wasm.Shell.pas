@@ -254,6 +254,7 @@ begin
     WasiDefineAll(Linker, Context);
 
     try
+      WasiCheckCommandEntry(ALoaded);
       Imports := Linker.ResolveImports(ALoaded);
       Inst := InstantiateModule(Store, ALoaded.Ir, ALoaded.BytesPtr,
         ALoaded.BytesLength, Imports);

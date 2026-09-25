@@ -97,6 +97,8 @@ type
     procedure TestWasiImportIsBuiltIn;
     procedure TestUnknownWasiImportIsLinkError;
     procedure TestWrongWasiSignatureIsLinkError;
+    procedure TestStartParameter;
+    procedure TestStartResult;
     procedure TestEmptyModuleFailsClosedWithoutCatalog;
     procedure TestFailedCompileLeavesNoOutput;
     procedure TestFailedCompileLeavesExistingOutput;
@@ -817,11 +819,39 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+procedure TCompileTests.TestStartParameter;
+var
+  Res: TWasmCompileResult;
+begin
+  WriteUtf8File(FOutputPath, 'existing executable');
+  Res := CompileWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (param i32)))');
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+  Expect<string>(ReadUtf8File(FOutputPath)).ToBe('existing executable');
+end;
+
+procedure TCompileTests.TestStartResult;
+var
+  Res: TWasmCompileResult;
+begin
+  WriteUtf8File(FOutputPath, 'existing executable');
+  Res := CompileWat('(module (memory (export "memory") 1)' +
+    ' (func (export "_start") (result i32) i32.const 7))');
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
+  Expect<string>(ReadUtf8File(FOutputPath)).ToBe('existing executable');
+end;
+
 procedure TCompileTests.SetupTests;
 begin
   Test('Mach-O templates must match the selected architecture', TestWrongMachOTemplateFails);
   Test('unknown WASI imports fail before native emission', TestUnknownWasiImportIsLinkError);
   Test('WASI signature mismatches fail before native emission', TestWrongWasiSignatureIsLinkError);
+  Test('_start parameters fail the command contract', TestStartParameter);
+  Test('_start results fail the command contract', TestStartResult);
   Test('compile error classes are siblings under EWasmError',
     TestErrorClassesAreSiblings);
   Test('help documents every owned compile option',
