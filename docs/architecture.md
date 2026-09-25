@@ -452,7 +452,11 @@ different.
   never leaves the guest and an uncaught throw surfaces as `EWasmException`
   through the invocation trampoline. Handler-bearing and throwing functions
   decline only the direct-call fast path so each keeps an `InvokeCompiled`
-  seam. Large register files, wide non-tail calls, and out-of-range
+  seam. On x64, a direct call to a defined, direct-callable callee
+  publishes the callee's activation and GC frame in generated code — the
+  same fields, order, and exhaustion predicates as `JitPrepareDirectCall`
+  and `JitFinishDirectCall` — and falls back to those helpers whenever the
+  callee has no live direct entry. Large register files, wide non-tail calls, and out-of-range
   conditional branches are encoded, not declined. The remaining compile
   declines are an unsupported target (no backend) and a `return_call*`
   whose argument block exceeds the shared cross-tier tail channel.

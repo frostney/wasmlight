@@ -695,13 +695,24 @@ begin
     Buf.Free;
   end;
 
-  { PinMemory: retain the stable instance pointer in the first frame slot. }
+  { PinMemory: resolve Store.FMemories[Acts[Depth-1].Instance.MemAddrs[7]]
+    inline and retain it in the first frame slot. Offsets are the published
+    LP64 layout (Wasm.Target): TierContext 168, Depth 56, ActStride 128, Acts
+    40, ActInstance 8, MemAddrs 48, MemInstStride 80, FMemories 64. }
   Buf := TWasmCodeBuffer.Create;
   try
     X64EmitPinMemory(Buf, 7);
-    CheckSeq(Buf, [$4C, $89, $E7, $BE, $07, $00, $00, $00,
-      $41, $FF, $57, Byte(Ord(aohResolveMemory) * 8),
-      $48, $89, $04, $24]);
+    CheckSeq(Buf, [
+      $49, $8B, $84, $24, $A8, $00, $00, $00,   { mov rax,[r12+168] }
+      $48, $8B, $48, $38,                       { mov rcx,[rax+56] }
+      $48, $69, $C9, $80, $00, $00, $00,        { imul rcx,rcx,128 }
+      $48, $03, $48, $28,                       { add rcx,[rax+40] }
+      $48, $8B, $41, $88,                       { mov rax,[rcx-120] }
+      $48, $8B, $40, $30,                       { mov rax,[rax+48] }
+      $8B, $40, $1C,                            { mov eax,[rax+28] }
+      $48, $69, $C0, $50, $00, $00, $00,        { imul rax,rax,80 }
+      $49, $03, $44, $24, $40,                  { add rax,[r12+64] }
+      $48, $89, $04, $24]);                     { mov [rsp],rax }
   finally
     Buf.Free;
   end;

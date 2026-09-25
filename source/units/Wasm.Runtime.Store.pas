@@ -984,6 +984,12 @@ type
     StoreFHeap: NativeUInt;          { TWasmStore.FHeap }
     StoreTierContext: NativeUInt;    { TWasmStore.TierContext }
     InstEngineTypeIds: NativeUInt;   { TWasmModuleInstance.EngineTypeIds }
+    { x64 prologue memory pin: the instance's memory address map and the
+      store's memory-instance array. Generated code resolves only the
+      PWasmMemoryInst (what JitMemoryAt returns); every byte access still
+      goes through the checked scalar templates over its Base/ByteSize. }
+    StoreMemories: NativeUInt;       { TWasmStore.FMemories }
+    InstMemAddrs: NativeUInt;        { TWasmModuleInstance.MemAddrs }
   end;
 
 function WasmJitOffsets(const AStore: TWasmStore): TWasmJitOffsets;
@@ -999,6 +1005,8 @@ type
     FHeapOffset: NativeUInt;
     TierContextOffset: NativeUInt;
     EngineTypeIdsOffset: NativeUInt;
+    MemoriesOffset: NativeUInt;
+    MemAddrsOffset: NativeUInt;
   end;
 
 function WasmJitStoreAllocOffsets: TWasmJitStoreAllocOffsets;
@@ -1029,10 +1037,14 @@ begin
           PtrUInt(@Store.FHeap) - PtrUInt(Pointer(Store));
         GJitStoreAllocOffsets.TierContextOffset :=
           PtrUInt(@Store.TierContext) - PtrUInt(Pointer(Store));
+        GJitStoreAllocOffsets.MemoriesOffset :=
+          PtrUInt(@Store.FMemories) - PtrUInt(Pointer(Store));
         Inst := TWasmModuleInstance.Create;
         try
           GJitStoreAllocOffsets.EngineTypeIdsOffset :=
             PtrUInt(@Inst.EngineTypeIds) - PtrUInt(Pointer(Inst));
+          GJitStoreAllocOffsets.MemAddrsOffset :=
+            PtrUInt(@Inst.MemAddrs) - PtrUInt(Pointer(Inst));
         finally
           Inst.Free;
         end;
@@ -2392,6 +2404,8 @@ begin
   Result.StoreTierContext :=
     PtrUInt(@AStore.TierContext) - PtrUInt(Pointer(AStore));
   Result.InstEngineTypeIds := ProbeEngineTypeIds;
+  Result.StoreMemories := PtrUInt(@AStore.FMemories) - PtrUInt(Pointer(AStore));
+  Result.InstMemAddrs := WasmJitStoreAllocOffsets.MemAddrsOffset;
   Result.FuncInstStride := SizeOf(TWasmFuncInst);
   Result.FuncKind := PtrUInt(@F.Kind) - PtrUInt(@F);
   Result.FuncCompiledEntry := PtrUInt(@F.CompiledEntry) - PtrUInt(@F);
