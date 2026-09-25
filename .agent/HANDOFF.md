@@ -1,5 +1,31 @@
 # Handoff
 
+## Stack #125 status and skill refresh, 2026-09-25
+
+- Native stack #125 is now 8 layers: #117 ← #119 ← #120 ← #121 ← #122 ←
+  #124 ← #118 ← **#126**. None is behind `main` (`aef1e9c`); every layer is
+  non-draft, `CLEAN`, and green on its current head. Merge with
+  `gh stack merge --squash`, never layer by layer.
+- #126 refreshes `code-review` (KGR #66) and
+  `software-engineering-excellence` (KGR #65) to KGR
+  `946dc1ecc7cacd62caecfe67ab1a55d109a9154d` via pinned `skills@1.5.23`;
+  payloads byte-match upstream and a second update is a no-op. Lower layers
+  were not rewritten. KGR skills not installed are stack-specific
+  (convex/react/typescript) or optional (agent-behavior-audit, bleeding-edge).
+- **Blocker, still open:** DEFINITION_OF_DONE requires completed, triaged
+  external review before merge. No layer has any review, no reviewer is
+  requested, and no review provider is configured. The 2026-09-22 question
+  of which reviewer/provider to use is unanswered. Do not merge until it is.
+- Tooling now installed on this machine: nvm v0.40.8 + Node v24.21.0 LTS
+  (default; loaded from `~/.bashrc`), `gh stack` extension, `lwpt` 0.7.0
+  (`frostney/tap`), `lefthook` 2.1.14 (hooks installed). The `wasm` MCP
+  server starts via `npx`; T3 Code must be restarted to pick up the PATH.
+- Remote branches with no PR: `codex/optimize-runtime-wave16` (28 ahead),
+  `codex/validate-wave16-core` (20), `codex/validate-wave17-core` (1); last
+  commits 2026-09-05. Intent unconfirmed. Five other `codex/*` branches belong
+  to merged PRs and can be deleted.
+- #46 (0.2.0 cross-target gates, archives, Homebrew) remains open.
+
 ## Skills migration and audit remediation, 2026-09-22
 
 - User authorized implementing all five audit findings and shipping a native
