@@ -1921,6 +1921,7 @@ var
   Seam: TWasmSeamCatch;
   IrFn: PWasmIrFunction;
   IrBase: PWasmIrInstr;
+  OwnDepth: NativeUInt;
 begin
   Ctx := InterpContextFor(AStore);
   { Fix A: this whole invocation's frames share ONE return/unwind kind — rtEntry
@@ -1965,6 +1966,8 @@ begin
       pending buffer it may point into. }
     Base := JitEnterFrame(Ctx, AStore, CurAddr, CurArgs, AResults, RetKind);
     JitMarkTopNative(Ctx);
+    { Depth with this invocation's own frame on top; fixed before SetJmp. }
+    OwnDepth := Ctx^.Depth;
     Pend^.Pending := False;
     Entry := TArm64CompiledEntry(AStore.Funcs[CurAddr].CompiledEntry);
     { The IR-code base @Fn^.Code[0] the compiled body pins in x23 to compute
@@ -1991,7 +1994,13 @@ begin
       if Ctx^.Depth = 0 then
         JitRaiseUncaught(AStore, TWasmRef(Seam.ExnRef));
       if not Seam.Resume then
+      begin
+        { Direct calls this body made ran on the native stack the jump just
+          discarded; pop them so the unwind resumes at this invocation's own
+          frame instead of hopping past its handlers (as on x64). }
+        JitDropDeadDirectFrames(Ctx, OwnDepth);
         UnwindException(Ctx, TWasmRef(Seam.ExnRef), False);
+      end;
       if (Ctx^.Depth > 0) and (Ctx^.Acts[Ctx^.Depth - 1].Fn = IrFn) then
       begin
         JitEhRequestResume;
