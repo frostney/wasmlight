@@ -8103,7 +8103,7 @@ begin
     TestX64InlineStructNewCodeShape);
   Test('inline struct.new fills numeric, packed, reference, and empty structs',
     TestX64InlineStructNewFieldKinds);
-  Test('inline struct.new overwrites every byte of a recycled cell',
+  Test('x64 inline struct.new overwrites every byte of a recycled cell',
     TestX64InlineStructNewRecycledCellBytes);
   Test('inline struct.new overwrites every byte of a recycled cell',
     TestGcInlineStructNewRecycledCellBytes);

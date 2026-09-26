@@ -1122,7 +1122,7 @@ const
   { Wave 11 -- the inline struct.new fast path pinned word for word on
     64-bit hosts, for the canonical shape of one i32 field at cell offset 8,
     class-16 cell, engine id loaded through the context chain. Offsets are
-    the dev-build probe values; emitter drift, encoder typos, or offset
+    the published heap layout, shared by dev and release builds; emitter drift, encoder typos, or offset
     changes fail here first. The words were assembled independently by
     llvm-mc from the intended instruction text (commented alongside). 32-bit
     hosts expand unaligned LDR Xt offsets and cannot share this pin. }
@@ -1132,7 +1132,7 @@ const
     $F9400E8A,                                             { store -> heap }
     $F940194B,                                             { FFree[0] head }
     $340004CB,                                             { cbz head -> slow }
-    $F940894C, $F940A14D,              { ldr x12,[x10,#280]; x13,[x10,#328] }
+    $F940894C, $F940A14D,              { ldr x12,[x10,#272]; x13,[x10,#320] }
     $9100418C, $EB0D019F,              { add x12,x12,#16; cmp x12,x13 }
     $54000428,                         { b.hi slow: Allocate's trigger }
     $F940016C, $F900194C,                                  { pop link FIRST }
