@@ -202,6 +202,7 @@ type
     procedure TestRefEqAsNonNull;
     { GC / host calls. }
     procedure TestStructRoundTrip;
+    procedure TestStructNewEmpty;
     procedure TestStructNullTraps;
     procedure TestArrayRoundTrip;
     procedure TestVec128StructAndArrayRoundTrip;
@@ -1172,6 +1173,25 @@ begin
   Expect<Int32>(Call1('gs', [MakeValueI32(0), MakeValueI32(200)]).I32).ToBe(-56);
   Expect<Int32>(Call1('gu', [MakeValueI32(0), MakeValueI32(200)]).I32).ToBe(200);
   Expect<Int32>(Call1('sg', [MakeValueI32(99)]).I32).ToBe(99);
+end;
+
+procedure TInterpTests.TestStructNewEmpty;
+begin
+  { type0 = (struct), type1 = () -> i32.
+    $e: struct.new 0; drop; i32.const 7 — a field-less struct.new copies
+    nothing (its field count used to wrap an unsigned loop bound). }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $00]),
+      BLit([$60, $00, $01, $7F])])),
+    Sect(3, VecOf([BLit([$01])])),
+    Sect(7, VecOf([BLit([$01, $65, $00, $00])])),
+    Sect(10, VecOf([
+      CodeEntry([$00, $FB, $00, $00, $1A, $41, $07, $0B])]))
+  ]));
+  DoInstantiate;
+  Expect<Int32>(Call1('e', []).I32).ToBe(7);
 end;
 
 procedure TInterpTests.TestStructNullTraps;
@@ -2548,6 +2568,7 @@ begin
   Test('table.init and table.copy move references', TestTableInitCopy);
   Test('ref.eq and ref.as_non_null', TestRefEqAsNonNull);
   Test('a struct round-trips incl. packed get_s/get_u', TestStructRoundTrip);
+  Test('struct.new of a field-less struct', TestStructNewEmpty);
   Test('struct.get on a null traps null structure reference',
     TestStructNullTraps);
   Test('an array round-trips through new/get/len', TestArrayRoundTrip);
