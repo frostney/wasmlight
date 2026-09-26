@@ -2057,8 +2057,9 @@ var
     Allocate sequence except collection is compile-time: layout size, size
     class, cell size, field offsets. When the class size is a power of two
     and every field is a numeric <=64-bit member, the backend emits the
-    free-list-hit fast path with these shapes; the helper path stays as the
-    miss branch and remains the only collect trigger. Ref fields stay off
+    free-list-hit fast path with these shapes under Allocate's own collection
+    trigger (FBytesLive + CellSize > FThreshold); the helper path takes the
+    miss and the trigger and remains the only collect point. Ref fields stay off
     (the barrier shape belongs to the helper), v128 fields, struct.new_default,
     non-pow2 classes, and large objects all decline. Baked runtime offsets are
     range-checked here so emission can use scaled-imm12 addressing directly. }
@@ -2129,6 +2130,7 @@ var
       if (HeapFFree0 + WASM_GC_CLASS_COUNT * 8 >= $8000) or
         (HeapMarkState >= $8000) or (HeapBytesLive >= $8000) or
         (HeapBytesAllocated >= $8000) or (HeapObjectCount >= $8000) or
+        (HeapThreshold >= $8000) or
         (BlockBase >= $8000) or (BlockAllocated >= $8000) then
         Exit;
 
@@ -2181,8 +2183,8 @@ var
       { Size-class math mirrors TWasmGcHeap.Allocate exactly: Layout.Size is
         the align-up-8 of the field span, sizes below the first class bump to
         it, ClassOf takes the first class >= the size. A power-of-two class
-        means CellSize == Size exactly, so the cell tail past the aligned
-        layout is zero bytes and nothing needs an inline zero fill. }
+        means CellSize == Size exactly, so the cell index is one shift; the
+        emitter zeroes the qwords no field fills (alignment padding). }
       Size := (Offset + 7) and not UInt32(7);
       if Size < WASM_GC_SIZE_CLASSES[0] then
         Size := WASM_GC_SIZE_CLASSES[0];

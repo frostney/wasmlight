@@ -1,5 +1,43 @@
 # Handoff
 
+## ARM64 inline struct.new correctness fix, 2026-09-26
+
+- Branch `fix/arm64-inline-struct-new` from exact main `36c9394`. Found by the
+  x64 wave-4 differential test (`r0` of the size-class module returned
+  8754047715 / 561040656673507 on linux/macos-arm64 instead of 12247).
+- Root causes, all in `Arm64EmitInlineStructNew` (wave 11), confirmed by
+  llvm-mc disassembly of the pinned words and by an ARM64 CI dump of both
+  tiers' heap statistics and returned cells:
+  1. The allocation-bitmap word was read/written with `[x9, x12]` (unscaled)
+     instead of `[x9, x12, lsl #2]` — `Arm64MemRegOffset(..., True)` means a
+     64-bit index register, not a scaled one. Every recycled cell at index
+     >= 32 had its own bit left clear, so the next sweep relinked the live
+     object as free (field 0 became the free-list block pointer). The old
+     pin encoded the bug; the corpus never fires the fast path on big heaps.
+  2. An i8 field store OR-ed its byte offset into Rt instead of imm12, so
+     the field was written over the header's low byte (mark and kind bits).
+  3. No collection-trigger check, so compiled collection points (and heap
+     statistics, mark epoch) differed from the interpreter's.
+  4. Alignment padding in recycled cells was not zeroed (Allocate zeroes the
+     whole cell).
+- Fix: scaled bitmap access, shifted byte-store imm12, Allocate's trigger
+  (`FBytesLive + CellSize > FThreshold` -> helper), zero stores for every
+  qword the fields do not fill, bit-number mask `#31`. `HeapThreshold` joins
+  `TWasmJitGcOffsets`, the published layout (328, dev offsets as before),
+  both fingerprint folds and `Wasm.Target.Test`; AOT ABI 17 -> 18. These
+  layout hunks are textually identical to x64 wave 4's `d7ca357` (except the
+  `AOT_ABI_REVISION` comment) so the two branches reconcile trivially; wave
+  4's later heap-layout move (`1987080`, published 320) still applies on top.
+- Tests: `GcRun`/`GcDiff` (ported from wave 4, but asserting collections,
+  counters and returned cell bytes on EVERY backend), a 64-slot keep-alive
+  ring, the size-class keep-alive module, a padded 32-byte cell byte check,
+  and a second ARM64 pin for a packed (i8/i16/i64) shape's tail. When wave 4
+  merges, drop its `{$IFNDEF WASM_JIT_ARM64}` guard in `GcDiff` and keep one
+  copy of the shared helpers.
+- Unchanged but noted: the fast path's `cbz` tests the free-list head as a W
+  register; a head whose low 32 bits are zero only takes the (correct)
+  helper path.
+
 ## x64 wave 3 — retained outcome, 2026-09-25
 
 - Delivery branch `codex/optimize-x64-wave3` from exact main `6e0cdde` (push CI
