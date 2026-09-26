@@ -270,6 +270,7 @@ type
     { AOT corpus mode (Track J, aot-spec §5.1) }
     procedure TestAotModeLoadsAndPasses;
     procedure TestX64WriteBackFixtureAllTiers;
+    procedure TestGcV128FixtureAllTiers;
     procedure TestAotModeMixedTiersCoexist;
     procedure TestAotTallyIdenticalToInterp;
     procedure TestAotLoadedCountMatchesJit;
@@ -1492,6 +1493,46 @@ begin
   end;
 end;
 
+{ The committed net for v128 struct fields and array elements
+  (tests/fixtures/wast/gc-v128.wast, expected lanes spelled out by hand):
+  every allocation form (struct.new at each field position, the ten-field
+  unbatched struct, array.new, array.new_fixed, the constant-expression
+  forms), the access forms, array.copy with both overlap directions,
+  array.new_data / init_data, and values read back after forced
+  collections. Each tier must pass every command, and on a backend host
+  the compiled tiers must actually compile every function. }
+procedure TWastRunnerTests.TestGcV128FixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'gc-v128.wast';
+  { One module, 41 assertions, and three bare invokes. }
+  COMMANDS = 45;
+  { Every function in the fixture's module is compilable. }
+  COMPILED_FUNCTIONS = 32;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
 procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
   { Handler tables and wide non-tail calls compile, so the declined fixture
     is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
@@ -1743,6 +1784,8 @@ begin
     TestAotModeLoadsAndPasses);
   Test('the x64 write-back fixture passes in every tier',
     TestX64WriteBackFixtureAllTiers);
+  Test('the GC v128 field fixture passes in every tier',
+    TestGcV128FixtureAllTiers);
   Test('--tier=aot lets AOT-loaded and interpreted functions coexist',
     TestAotModeMixedTiersCoexist);
   Test('the --tier=aot tally is identical to the interpreter tally',

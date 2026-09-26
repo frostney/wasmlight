@@ -1495,7 +1495,7 @@ var
   Fn: PWasmIrFunction;
   Obj: TWasmRef;
   N, I: UInt32;
-  TmpFields: array[0..7] of TWasmValue;
+  TmpFields: array[0..7] of PWasmValue;
 begin
   Store := ACtx^.Store;
   Reg := Frame(ACtx^.Values, AAct^.Base);
@@ -1503,10 +1503,13 @@ begin
   Obj := Store.Heap.AllocStruct(AAct^.Instance.EngineTypeIds[UInt32(AIns^.Imm)]);
   Reg[AIns^.Dest].Bits := UInt64(Obj);            { publish before filling }
   N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
+  { Fields are passed as register POINTERS, not copies: a v128 field's
+    operand is a 16-byte register pair (VecAt), and an 8-byte copy would
+    drop it. }
   if N <= UInt32(Length(TmpFields)) then
   begin
     for I := 0 to Integer(N) - 1 do
-      TmpFields[I] := Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
+      TmpFields[I] := @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
     Store.Heap.StructSetSeq(Obj, @TmpFields[0], N);
   end
   else
@@ -1514,8 +1517,8 @@ begin
     I := 0;
     while I < N do
     begin
-      Store.Heap.StructSet(Obj, I,
-        Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+      Store.Heap.StructSetSlot(Obj, I,
+        @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
       Inc(I);
     end;
   end;
@@ -1548,7 +1551,7 @@ begin
   Obj := Store.Heap.AllocArray(AAct^.Instance.EngineTypeIds[UInt32(AIns^.Imm)],
     Reg[AIns^.B].U32);
   Reg[AIns^.Dest].Bits := UInt64(Obj);
-  Store.Heap.ArrayFill(Obj, Reg[AIns^.A]);
+  Store.Heap.ArrayFillSlot(Obj, @Reg[AIns^.A]);
 end;
 
 procedure ExecArrayNewDefault(const ACtx: PWasmInterpContext;
@@ -1584,7 +1587,8 @@ begin
   I := 0;
   while I < N do
   begin
-    Store.Heap.ArraySet(Obj, I, Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+    Store.Heap.ArraySetSlot(Obj, I,
+      @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
     Inc(I);
   end;
 end;

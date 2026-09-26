@@ -152,12 +152,17 @@ Text scripts the conformance runner executes, rather than binaries.
 | Fixture | What it covers |
 | --- | --- |
 | `x64-writeback.wast` | One module and 80 assertions aimed at the x64 deferred write-back and native return-tail plans: dirty temporaries across `if` joins, eleven-temporary register pressure, early `br_if` / `br` / `return` exits (all four loop exits reached), `unreachable` and integer divide-by-zero traps mid-loop, nested loops with two back-edges, native self-recursion with three arms, and leaves ending in `select` / parameter / constant / `eqz`. |
+| `gc-v128.wast` | One module, 41 assertions, and three bare invokes on v128 struct fields and array elements. `struct.new` puts a v128 as the only field, the first field, a middle field, after packed fields, and in adjacent pairs. A ten-field struct holds four v128 fields. The fixture also covers `struct.set`, `struct.new_default`, `array.new`, `array.new_fixed`, `array.new_default`, `array.get`, `array.set`, `array.fill`, `array.copy` (both overlap directions), `array.new_data`, `array.init_data`, and the constant-expression `struct.new` / `array.new` / `array.new_fixed`. Linked-list nodes and arrays are read back after about 8.6 MB of garbage forces collections. |
 
 `x64-writeback.py` generates the `.wast` beside it. Every expected value
 comes from that script's Python model, never from a wasmlight tier, so the
 fixture is an independent oracle. Regenerate with
 `python3 tests/fixtures/wast/x64-writeback.py`; the output is deterministic.
-`Wasm.Wast.Runner.Test` runs the fixture in the interpreter, JIT, and AOT
+
+`gc-v128.wast` is written by hand, with no generator. Each expected lane is
+spelled out and follows from the operands in the file.
+
+`Wasm.Wast.Runner.Test` runs both fixtures in the interpreter, JIT, and AOT
 tiers and requires every command to pass in each.
 
 ## Feature support notes

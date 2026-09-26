@@ -671,8 +671,9 @@ type
       Emitted by the validator so the interpreter never asks "is this
       register 8 or 16 bytes wide?" at run time (SIMD design §2.4): where a
       width is knowable statically, a *Vec variant is emitted; where the GC
-      layout record is in hand (struct.new, array.new_fixed, array.copy) the
-      existing op branches on TWasmGcField.IsVec and no new op is added. }
+      layout record is in hand (struct.new, array.new, array.new_fixed,
+      array.copy) the existing op branches on TWasmGcField.IsVec and no new
+      op is added. }
     iroMoveVec,                 { Dest <- A, 16 bytes }
     iroSelectVec,               { Dest <- A, B ? cond(Imm), 16 bytes }
     iroGlobalGetVec,            { a v128 global }

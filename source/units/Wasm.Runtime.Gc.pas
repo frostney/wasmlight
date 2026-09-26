@@ -197,6 +197,8 @@ type
   TWasmGcFields = array of TWasmGcField;
   TWasmGcOffsets = array of UInt32;
   PWasmGcField = ^TWasmGcField;
+  { An array of pointers at operand registers (StructSetSeq). }
+  PPWasmValue = ^PWasmValue;
 
   PWasmGcLayout = ^TWasmGcLayout;
 
@@ -535,15 +537,25 @@ type
       const AField: UInt32): Int32;
     function StructGetUnsigned(const ARef: TWasmRef;
       const AField: UInt32): UInt32;
-    { Writes fields 0..Count-1 from Values[0..Count-1] with a single layout
-      resolution — struct.new's shape, where per-field StructSet calls would
-      re-resolve the same layout N times. WriteField semantics per field are
-      unchanged; the v1 write barrier is empty (see its declaration), so a
+    { Writes fields 0..Count-1 from the registers Slots[0..Count-1] point at,
+      with a single layout resolution — struct.new's shape, where per-field
+      calls would re-resolve the same layout N times. Each entry points at
+      the field's operand register IN THE FRAME, not at a copy: a v128
+      field reads the 16-byte register pair there (`aux-packfield` leaves a
+      vector unchanged), every other field the 8-byte slot, with WriteField
+      semantics. The v1 write barrier is empty (see its declaration), so a
       sequential fill is observably identical to the per-field path. }
     procedure StructSetSeq(const ARef: TWasmRef;
-      const AValues: PWasmValue; const ACount: UInt32);
+      const ASlots: PPWasmValue; const ACount: UInt32);
     procedure StructSet(const ARef: TWasmRef; const AField: UInt32;
       const AValue: TWasmValue);
+    { StructSet from an operand register in the frame, for a field of any
+      storage type: a v128 field takes the 16-byte pair at ASlot, every other
+      field is exactly StructSet(ARef, AField, ASlot^). The allocation ops
+      (struct.new) use it because they name fields by position, not by a
+      statically typed *Vec op. }
+    procedure StructSetSlot(const ARef: TWasmRef; const AField: UInt32;
+      const ASlot: PWasmValue);
     { struct.get / struct.set on a v128 field (simd-spec §7). The field is
       never packed and never a reference, so there is no get_s/get_u split
       and no write barrier; the value is a 16-byte copy through
@@ -562,6 +574,13 @@ type
       const AIndex: UInt32): UInt32;
     procedure ArraySet(const ARef: TWasmRef; const AIndex: UInt32;
       const AValue: TWasmValue);
+    { ArraySet / whole-array ArrayFill from an operand register in the frame,
+      for any element type: a v128 element takes the 16-byte pair at ASlot,
+      every other element is exactly ArraySet / ArrayFill with ASlot^.
+      array.new_fixed and array.new use them (see StructSetSlot). }
+    procedure ArraySetSlot(const ARef: TWasmRef; const AIndex: UInt32;
+      const ASlot: PWasmValue);
+    procedure ArrayFillSlot(const ARef: TWasmRef; const ASlot: PWasmValue);
     { array.get / array.set on a v128 element, and array.fill's RANGE form
       with a v128 value (simd-spec §7). 16-byte copies, no barrier. }
     procedure ArrayGetVec(const ARef: TWasmRef; const AIndex: UInt32;
@@ -1627,9 +1646,10 @@ begin
     8: Result.Bits := PWasmU64(ABase + AField^.Offset)^;
     { Width 16 (v128) does not have an 8-byte scalar view: a v128 field is
       read only through ReadFieldV128, driven by the iroStructGetVec /
-      iroArrayGetVec ops. The scalar path never asks for a v128 value —
-      struct.new_default / array.new_default zero the whole cell before any
-      field write, and that zero IS the vector default (simd-spec §7). }
+      iroArrayGetVec ops and array.copy's IsVec branch. The scalar path
+      never asks for a v128 value — struct.new_default / array.new_default
+      zero the whole cell before any field write, and that zero IS the
+      vector default (simd-spec §7). }
   end;
 end;
 
@@ -1662,10 +1682,14 @@ begin
     2: PWasmU16(ABase + AField^.Offset)^ := Word(AValue.Bits);
     4: PWasmU32(ABase + AField^.Offset)^ := UInt32(AValue.Bits);
     8: PWasmU64(ABase + AField^.Offset)^ := AValue.Bits;
-    { Width 16 (v128) is written only through WriteFieldV128 (the *Vec IR
-      ops). The one scalar caller that names a v128 field is the
-      new_default zeroing loop, and a v128's default is the zero the cell
-      already holds — so the fall-through no-op is correct (simd-spec §7). }
+    { Width 16 (v128) is written only through WriteFieldV128: the *Vec IR
+      ops, the *Slot / StructSetSeq entry points the allocation ops use, and
+      array.copy's IsVec branch. The one scalar caller that names a v128
+      field is the new_default zeroing loop, and a v128's default is the
+      zero the cell already holds — so the fall-through no-op is correct
+      there (simd-spec §7). Any other scalar write to a v128 field would
+      silently drop the value, which is the defect the Slot forms exist to
+      prevent. }
   end;
 end;
 
@@ -1751,10 +1775,11 @@ begin
 end;
 
 procedure TWasmGcHeap.StructSetSeq(const ARef: TWasmRef;
-  const AValues: PWasmValue; const ACount: UInt32);
+  const ASlots: PPWasmValue; const ACount: UInt32);
 var
   Layout: PWasmGcLayout;
   I: Integer;
+  Slot: PWasmValue;
 begin
   if RefIsNull(ARef) then
     TrapNow(wtkNullStructReference);
@@ -1764,8 +1789,14 @@ begin
   if UInt32(Length(Layout^.Fields)) < ACount then
     raise EWasmInternal.Create('internal: struct field sequence overrun');
   for I := 0 to Integer(ACount) - 1 do
-    WriteField(PByte(RefToPointer(ARef)), @Layout^.Fields[I],
-      PWasmValue(PByte(AValues) + NativeUInt(I) * SizeOf(TWasmValue))^);
+  begin
+    Slot := PPWasmValue(PByte(ASlots) + NativeUInt(I) * SizeOf(PWasmValue))^;
+    if Layout^.Fields[I].IsVec then
+      WriteFieldV128(PByte(RefToPointer(ARef)), @Layout^.Fields[I],
+        PWasmV128(Slot))
+    else
+      WriteField(PByte(RefToPointer(ARef)), @Layout^.Fields[I], Slot^);
+  end;
 end;
 
 procedure TWasmGcHeap.StructSet(const ARef: TWasmRef; const AField: UInt32;
@@ -1777,6 +1808,22 @@ begin
   WriteField(PByte(RefToPointer(ARef)), Field, AValue);
   if Field^.IsRef then
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
+end;
+
+procedure TWasmGcHeap.StructSetSlot(const ARef: TWasmRef;
+  const AField: UInt32; const ASlot: PWasmValue);
+var
+  Field: PWasmGcField;
+begin
+  Field := StructFieldPtr(ARef, AField);
+  if Field^.IsVec then
+  begin
+    WriteFieldV128(PByte(RefToPointer(ARef)), Field, PWasmV128(ASlot));
+    Exit;
+  end;
+  WriteField(PByte(RefToPointer(ARef)), Field, ASlot^);
+  if Field^.IsRef then
+    WriteBarrier(ARef, TWasmRef(ASlot^.Bits));
 end;
 
 procedure TWasmGcHeap.StructGetVec(const ARef: TWasmRef; const AField: UInt32;
@@ -1912,6 +1959,23 @@ begin
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
 end;
 
+procedure TWasmGcHeap.ArraySetSlot(const ARef: TWasmRef;
+  const AIndex: UInt32; const ASlot: PWasmValue);
+var
+  Base: PByte;
+  Field: TWasmGcField;
+begin
+  ResolveElement(ARef, AIndex, Base, Field);
+  if Field.IsVec then
+  begin
+    WriteFieldV128(Base, @Field, PWasmV128(ASlot));
+    Exit;
+  end;
+  WriteField(Base, @Field, ASlot^);
+  if Field.IsRef then
+    WriteBarrier(ARef, TWasmRef(ASlot^.Bits));
+end;
+
 procedure TWasmGcHeap.ArrayGetVec(const ARef: TWasmRef; const AIndex: UInt32;
   const ADest: PWasmV128);
 var
@@ -2020,6 +2084,19 @@ begin
   FillRange(ARef, AOffset, ACount, AValue);
 end;
 
+procedure TWasmGcHeap.ArrayFillSlot(const ARef: TWasmRef;
+  const ASlot: PWasmValue);
+var
+  Len: UInt32;
+begin
+  { ArrayLength traps on a null reference before the layout is read. }
+  Len := ArrayLength(ARef);
+  if LayoutOf(ARef)^.Elem.IsVec then
+    ArrayFillVec(ARef, 0, Len, PWasmV128(ASlot))
+  else
+    FillRange(ARef, 0, Len, ASlot^);
+end;
+
 procedure TWasmGcHeap.ArraySetDefaults(const ARef: TWasmRef);
 var
   Layout: PWasmGcLayout;
@@ -2052,6 +2129,7 @@ var
   DestField: TWasmGcField;
   SrcField: TWasmGcField;
   Value: TWasmValue;
+  Vec: TWasmV128;
   Cursor: UInt32;
   Slot: UInt32;
   Backward: Boolean;
@@ -2104,11 +2182,21 @@ begin
       (ASrcIdx + Slot) * SrcLayout^.Elem.Width;
     DestField.Offset := DestLayout^.Elem.Offset +
       (ADestIdx + Slot) * DestLayout^.Elem.Width;
-    Value := ReadField(SrcBase, @SrcField);
-    WriteField(DestBase, @DestField, Value);
-    { Barriered per reference element (empty in v1; the site is the point). }
-    if DestField.IsRef then
-      WriteBarrier(ADest, TWasmRef(Value.Bits));
+    if DestField.IsVec then
+    begin
+      { A v128 element has no 8-byte scalar view; element types match by
+        validation, so the source is a v128 too. }
+      ReadFieldV128(SrcBase, @SrcField, @Vec);
+      WriteFieldV128(DestBase, @DestField, @Vec);
+    end
+    else
+    begin
+      Value := ReadField(SrcBase, @SrcField);
+      WriteField(DestBase, @DestField, Value);
+      { Barriered per reference element (empty in v1; the site is the point). }
+      if DestField.IsRef then
+        WriteBarrier(ADest, TWasmRef(Value.Bits));
+    end;
     Inc(Cursor);
   end;
 end;

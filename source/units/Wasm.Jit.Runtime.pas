@@ -23,7 +23,9 @@ procedure JitDoMem(const AStore: TWasmStore; const AReg: PWasmValue;
 { Preserve the backends' existing struct initialization choices: Arm64 batches
   up to eight fields, X64 writes each field. The batched path writes fields
   without a write barrier, which is sound only because the object is freshly
-  allocated; the per-field path goes through the barriered StructSet. }
+  allocated; the per-field path goes through the barriered StructSetSlot.
+  Both pass operand registers by address so a v128 field reads its 16-byte
+  register pair. }
 procedure JitDoGc(const AStore: TWasmStore; const AReg: PWasmValue;
   const AAct: PWasmActivation; const AIns: PWasmIrInstr;
   const ABatchStructFields: Boolean);
@@ -223,7 +225,7 @@ var
   Fn: PWasmIrFunction;
   Obj: TWasmRef;
   N, I, U1, U2, TypeIdx, DataIdx, ElemIdx, Aux: UInt32;
-  TmpFields: array[0..7] of TWasmValue;
+  TmpFields: array[0..7] of PWasmValue;
   ElemOffset, Count, SrcLen: UInt32;
   DataAddr: TWasmDataAddr;
   ElemAddr: TWasmElemAddr;
@@ -240,7 +242,7 @@ begin
         if ABatchStructFields and (N <= UInt32(Length(TmpFields))) then
         begin
           for I := 0 to Integer(N) - 1 do
-            TmpFields[I] := Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
+            TmpFields[I] := @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
           AStore.Heap.StructSetSeq(Obj, @TmpFields[0], N);
         end
         else
@@ -248,8 +250,8 @@ begin
           I := 0;
           while I < N do
           begin
-            AStore.Heap.StructSet(Obj, I,
-              Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+            AStore.Heap.StructSetSlot(Obj, I,
+              @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
             Inc(I);
           end;
         end;
@@ -288,7 +290,7 @@ begin
         Obj := AStore.Heap.AllocArray(Inst.EngineTypeIds[UInt32(AIns^.Imm)],
           Reg[AIns^.B].U32);
         Reg[AIns^.Dest].Bits := UInt64(Obj);
-        AStore.Heap.ArrayFill(Obj, Reg[AIns^.A]);
+        AStore.Heap.ArrayFillSlot(Obj, @Reg[AIns^.A]);
       end;
     iroArrayNewDefault:
       begin
@@ -305,8 +307,8 @@ begin
         I := 0;
         while I < N do
         begin
-          AStore.Heap.ArraySet(Obj, I,
-            Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+          AStore.Heap.ArraySetSlot(Obj, I,
+            @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
           Inc(I);
         end;
       end;
