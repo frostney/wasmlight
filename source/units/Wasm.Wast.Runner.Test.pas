@@ -270,6 +270,7 @@ type
     { AOT corpus mode (Track J, aot-spec §5.1) }
     procedure TestAotModeLoadsAndPasses;
     procedure TestX64WriteBackFixtureAllTiers;
+    procedure TestX64V128CacheFixtureAllTiers;
     procedure TestAotModeMixedTiersCoexist;
     procedure TestAotTallyIdenticalToInterp;
     procedure TestAotLoadedCountMatchesJit;
@@ -1492,6 +1493,46 @@ begin
   end;
 end;
 
+{ The committed adversarial net for the x64 v128 xmm cache
+  (tests/fixtures/wast/x64-v128-cache.py computes every expected lane with an
+  independent model): dirty vector temporaries across joins and traps, a
+  loop-carried v128 block parameter, more live vectors than xmm hosts, the
+  fixed-host cap for locals and hoisted constants, lane extracts and splats
+  of every shape, v128 parameters and results across calls, early exits,
+  nested loops, and local.get / local.tee values that must not alias a
+  local redefined before their use. Each tier must pass every command, and on a backend host the
+  compiled tiers must compile every function. }
+procedure TWastRunnerTests.TestX64V128CacheFixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'x64-v128-cache.wast';
+  { One module plus 60 assertions. }
+  COMMANDS = 61;
+  COMPILED_FUNCTIONS = 14;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
 procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
   { Handler tables and wide non-tail calls compile, so the declined fixture
     is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
@@ -1743,6 +1784,8 @@ begin
     TestAotModeLoadsAndPasses);
   Test('the x64 write-back fixture passes in every tier',
     TestX64WriteBackFixtureAllTiers);
+  Test('the x64 v128 cache fixture passes in every tier',
+    TestX64V128CacheFixtureAllTiers);
   Test('--tier=aot lets AOT-loaded and interpreted functions coexist',
     TestAotModeMixedTiersCoexist);
   Test('the --tier=aot tally is identical to the interpreter tally',
