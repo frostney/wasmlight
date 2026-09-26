@@ -1392,8 +1392,12 @@ begin
   begin
     Arm64EmitLdrX(ABuf, R3, ARM64_REG_REGFILE,
       Arm64SlotByteOffset(AShape.Fields[F].Slot));
+    { Unsigned-offset STRB/STRH/STR: imm12 sits at bits 10..21, scaled by
+      the access size — for the byte form too. An unshifted byte offset
+      lands in Rt (x12 or 8 = x12) and stores the field over the header's
+      low byte, the mark bit and kind bits included. }
     case AShape.Fields[F].Width of
-      1: ABuf.EmitU32($39000000 or AShape.Fields[F].Offset or
+      1: ABuf.EmitU32($39000000 or (UInt32(AShape.Fields[F].Offset) shl 10) or
            (UInt32(ARM64_REG_T2) shl 5) or R3);
       2: ABuf.EmitU32($79000000 or ((UInt32(AShape.Fields[F].Offset)
            div 2) shl 10) or (UInt32(ARM64_REG_T2) shl 5) or R3);
