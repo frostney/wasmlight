@@ -788,6 +788,7 @@ type
     HeapBytesLive: NativeUInt;     { TWasmGcHeap.FBytesLive }
     HeapBytesAllocated: NativeUInt;
     HeapObjectCount: NativeUInt;   { TWasmGcHeap.FObjectCount }
+    HeapThreshold: NativeUInt;     { TWasmGcHeap.FThreshold (live trigger) }
     BlockBase: NativeUInt;         { TWasmGcBlock.Base }
     BlockAllocated: NativeUInt;    { TWasmGcBlock.Allocated (dyn-array ptr) }
   end;
@@ -840,6 +841,8 @@ begin
           PtrUInt(@Heap.FBytesAllocated) - PtrUInt(Pointer(Heap));
         GJitGcOffsets.HeapObjectCount :=
           PtrUInt(@Heap.FObjectCount) - PtrUInt(Pointer(Heap));
+        GJitGcOffsets.HeapThreshold :=
+          PtrUInt(@Heap.FThreshold) - PtrUInt(Pointer(Heap));
         GJitGcOffsets.BlockBase :=
           PtrUInt(@Block.Base) - PtrUInt(@Block);
         GJitGcOffsets.BlockAllocated :=

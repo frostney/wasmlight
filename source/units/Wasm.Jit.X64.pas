@@ -137,6 +137,37 @@ type
   TX64GcShapeArray = array[0..$FFFFFF] of UInt64;
   PX64GcShapeArray = ^TX64GcShapeArray;
 
+  { One field fill of the inline struct.new fast path: the byte offset in
+    the object and the storage width (1, 2, 4, or 8 — a reference is 8). }
+  TX64GcAllocField = record
+    Offset: UInt16;
+    Width: Byte;
+  end;
+
+  { Per-instruction shape for the x64 inline struct.new fast path, handed
+    over by the driver's x64 allocation analysis; indexed by IR instruction
+    index. Everything here is a pure function of the module's struct type
+    and the heap's size classes, never of a store: the engine type id is
+    per-store state that the emitted code reads through the context chain,
+    so AOT artifacts stay store-agnostic. CellShift/CellTimes3 describe the
+    class size as 2^CellShift or 3*2^CellShift, the only two forms the size
+    classes take, so the cell index needs a shift and at most one multiply.
+    Covered marks, per qword of the cell after the header, whether the field
+    fills write all eight bytes (bit k = qword k); every other qword is
+    zeroed first, so a recycled cell is overwritten in full. }
+  TX64GcAllocShape = record
+    Enabled: Boolean;
+    FieldCount: Byte;
+    ClassIndex: Byte;
+    CellShift: Byte;
+    CellTimes3: Boolean;
+    CellSize: UInt16;
+    Covered: UInt64;
+    Fields: array[0..31] of TX64GcAllocField;
+  end;
+  TX64GcAllocArray = array[0..$FFFFF] of TX64GcAllocShape;
+  PX64GcAllocArray = ^TX64GcAllocArray;
+
   { The validated layout of a direct call's target when that target is a
     DEFINED function of the module being compiled: its body is fixed by the
     module the code (and any AOT artifact, bound by module hash) is built
@@ -491,7 +522,14 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
   const AGcShapes: PX64GcShapeArray;
-  const ADirectCallee: PX64DirectCallee = nil): Boolean; overload;
+  const ADirectCallee: PX64DirectCallee = nil;
+  const AGcAlloc: PX64GcAllocArray = nil): Boolean; overload;
+{ The inline struct.new free-list fast path. ASlowLabel is where the caller
+  binds the unchanged helper emission (the miss, over-threshold, and
+  collection route); the fast path jumps to ADoneLabel after publishing. }
+procedure X64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AShape: TX64GcAllocShape; const ASlowLabel, ADoneLabel: TWasmJitLabel);
 { Numeric struct field access with a validated baked byte offset. Null refs
   trap before the load; reference and vector fields never receive a shape. }
 procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
@@ -813,10 +851,12 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
   const AGcShapes: PX64GcShapeArray;
-  const ADirectCallee: PX64DirectCallee): Boolean;
+  const ADirectCallee: PX64DirectCallee;
+  const AGcAlloc: PX64GcAllocArray): Boolean;
 var
   Host: Byte;
   Moved: Boolean;
+  SlowLabel, DoneLabel: TWasmJitLabel;
 begin
   Result := True;
   { Deferred dynamic stores are an optimization of the helper-free static
@@ -847,6 +887,26 @@ begin
         AGcShapes[AInsIndex], ACache)
     else
       X64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+    Exit;
+  end;
+  if (AGcAlloc <> nil) and (AIns.Op = iroStructNew) and
+    AGcAlloc[AInsIndex].Enabled and not ACache.StaticAllocation then
+  begin
+    { Inline allocation: the free-list hit under the collection trigger is
+      emitted here; every other case lands on the unchanged helper emission,
+      which stays the only place an allocation can collect (ADR-0011). The
+      canonical register file is the fast path's only operand source. }
+    X64FlushDynamicRegCache(ABuf, ACache);
+    X64InvalidateRegCache(ACache);
+    SlowLabel := ABuf.NewLabel;
+    DoneLabel := ABuf.NewLabel;
+    X64EmitInlineStructNew(ABuf, AIns, AAux, AGcAlloc[AInsIndex], SlowLabel,
+      DoneLabel);
+    ABuf.BindLabel(SlowLabel);
+    Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+      AUseNativeScalarCall);
+    ABuf.BindLabel(DoneLabel);
+    X64InvalidateRegCache(ACache);
     Exit;
   end;
   case AIns.Op of
@@ -3746,6 +3806,217 @@ begin
   X64EmitMovToXmm(ABuf, 0, X64_RAX, ADemote);
   X64EmitFloatWidthConvert(ABuf, ADemote, 0, 0);
   EmitCanonicalFloatResult(ABuf, not ADemote, AIns.Dest);
+end;
+
+{ ===================================================================== }
+{  inline struct.new allocation                                          }
+{ ===================================================================== }
+
+{ <shift> r, imm8 = C1 /subop ib (SHL /4, SHR /5). }
+procedure X64EmitShiftImm(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg, AImm: Byte);
+begin
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  ABuf.EmitByte($C1);
+  EmitModRMReg(ABuf, ASubop, AReg);
+  ABuf.EmitByte(AImm);
+end;
+
+{ Group-1 ALU with a sign-extended imm32 = 81 /subop id, register form or
+  memory form [ABase + ADisp] (ADD /0, OR /1). }
+procedure X64EmitAluRegImm32(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg: Byte; const AImm: UInt32);
+begin
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  ABuf.EmitByte($81);
+  EmitModRMReg(ABuf, ASubop, AReg);
+  ABuf.EmitU32(AImm);
+end;
+
+procedure X64EmitAluMemImm32(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const ABase: Byte; const ADisp: Int32; const AImm: UInt32);
+begin
+  X64EmitRex(ABuf, 1, 0, 0, ABase shr 3);
+  ABuf.EmitByte($81);
+  EmitMemOperand(ABuf, ASubop, ABase, ADisp);
+  ABuf.EmitU32(AImm);
+end;
+
+{ BTS r32, r32 = 0F AB /r (rm = ADst, reg = ABit). The register form takes
+  the bit number modulo 32, which is exactly the in-word bit of a cell. }
+procedure X64EmitBtsReg32(const ABuf: TWasmCodeBuffer; const ADst,
+  ABit: Byte);
+begin
+  X64EmitRex(ABuf, 0, ABit shr 3, 0, ADst shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($AB);
+  EmitModRMReg(ABuf, ABit, ADst);
+end;
+
+{ A width-sized store of ASource to [ABase + ADisp]: 88 (byte), 66 89
+  (word), 89 (dword), REX.W 89 (qword). The template stores from r11, whose
+  REX prefix already makes the byte form address r11b. }
+procedure X64EmitStoreScalarDisp(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase: Byte; const ADisp: Int32; const AWidth: UInt32);
+begin
+  case AWidth of
+    1:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($88);
+      end;
+    2:
+      begin
+        ABuf.EmitByte($66);
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+  else
+    begin
+      X64EmitRex(ABuf, 1, ASource shr 3, 0, ABase shr 3);
+      ABuf.EmitByte($89);
+    end;
+  end;
+  EmitMemOperand(ABuf, ASource, ABase, ADisp);
+end;
+
+procedure X64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AShape: TX64GcAllocShape; const ASlowLabel, ADoneLabel: TWasmJitLabel);
+const
+  { The caller flushed and invalidated the value cache, and a function with
+    an allocation is never static-cache eligible, so every caller-saved
+    register is dead here: no rsi memory-base pin, no cached slot. }
+  R_TYPE = X64_RAX;   { engine type id, then the header word, then zero }
+  R_CELL = X64_RCX;   { the popped free-list head: the new object }
+  R_HEAP = X64_RDX;   { Store.FHeap }
+  R_LIVE = X64_RSI;   { FBytesLive + CellSize }
+  R_PTR = X64_RDI;    { link, then block, then bitmap base }
+  R_INDEX = X64_R8;   { cell index within its block }
+  R_WORD = X64_R9;    { address of the bitmap word }
+  R_BITS = X64_R10;   { the bitmap word }
+  R_FIELD = X64_R11;  { one field value }
+var
+  GO: TWasmJitGcOffsets;
+  FO: TWasmJitFrameOffsets;
+  AO: TWasmJitStoreAllocOffsets;
+  FreeOff: Int32;
+  F, Q: Integer;
+  Header: UInt32;
+begin
+  GO := WasmJitGcHeapOffsets;
+  FO := WasmJitFrameOffsets;
+  AO := WasmJitStoreAllocOffsets;
+  FreeOff := Int32(GO.HeapFFree0) + Int32(AShape.ClassIndex) * 8;
+
+  { Engine type id: Acts[Depth-1].Instance.EngineTypeIds[Imm] — the same
+    top activation X64RtDispatch hands JitDoGc, and the same walk the
+    prologue's inline memory pin uses. It is per-store state, never baked. }
+  X64EmitLoadMem64(ABuf, R_TYPE, X64_REG_STORE, Int32(AO.TierContextOffset));
+  X64EmitLoadMem64(ABuf, R_CELL, R_TYPE, Int32(FO.CtxDepth));
+  X64EmitImulImm32(ABuf, R_CELL, R_CELL, UInt32(FO.ActStride));
+  X64EmitAluRegMem(ABuf, $03, R_CELL, R_TYPE, Int32(FO.CtxActs));
+  X64EmitLoadMem64(ABuf, R_TYPE, R_CELL,
+    Int32(FO.ActInstance) - Int32(FO.ActStride));
+  X64EmitLoadMem64(ABuf, R_TYPE, R_TYPE, Int32(AO.EngineTypeIdsOffset));
+  X64EmitLoadMem32(ABuf, R_TYPE, R_TYPE, Int32(UInt32(AIns.Imm) * 4));
+  X64EmitShiftImm(ABuf, 4, True, R_TYPE, WASM_OBJ_TYPE_SHIFT);
+
+  { Free-list head for the class; an empty list goes to the helper, which
+    carves from the bump block or grows the heap. }
+  X64EmitLoadMem64(ABuf, R_HEAP, X64_REG_STORE, Int32(AO.FHeapOffset));
+  X64EmitLoadMem64(ABuf, R_CELL, R_HEAP, FreeOff);
+  X64EmitAluRegReg(ABuf, $85, True, R_CELL, R_CELL);
+  X64EmitJccTo(ABuf, X64_CC_E, UInt32(ASlowLabel));
+
+  { THE collection trigger, verbatim from Allocate:
+    FBytesLive + CellSize > FThreshold collects, so that allocation takes
+    the helper, which re-evaluates the same comparison and collects at
+    exactly this allocation. Nothing has been written on either exit. }
+  X64EmitLoadMem64(ABuf, R_LIVE, R_HEAP, Int32(GO.HeapBytesLive));
+  X64EmitAluRegImm32(ABuf, 0, True, R_LIVE, AShape.CellSize);
+  X64EmitAluRegMem(ABuf, $3B, R_LIVE, R_HEAP, Int32(GO.HeapThreshold));
+  X64EmitJccTo(ABuf, X64_CC_A, UInt32(ASlowLabel));
+
+  { Pop FIRST. The link and the block pointer are the cell's first two
+    qwords — the header and the first field qword this template is about to
+    write — so both are read before anything is stored into the cell. }
+  X64EmitLoadMem64(ABuf, R_PTR, R_CELL, WASM_GC_FREE_LINK_OFFSET);
+  X64EmitStoreMem64(ABuf, R_PTR, R_HEAP, FreeOff);
+  X64EmitLoadMem64(ABuf, R_PTR, R_CELL, WASM_GC_FREE_BLOCK_OFFSET);
+
+  { SetCellAllocated: cell = (head - Block.Base) div CellSize, then
+    Allocated[cell div 32] |= 1 shl (cell mod 32). A block spans at most
+    WASM_GC_BLOCK_BYTES, so the byte offset is below 2^16, where
+    (x * $AAAB) shr 17 = x div 3 exactly. }
+  X64EmitMovRegReg(ABuf, R_INDEX, R_CELL);
+  X64EmitAluRegMem(ABuf, $2B, R_INDEX, R_PTR, Int32(GO.BlockBase));
+  if AShape.CellShift <> 0 then
+    X64EmitShiftImm(ABuf, 5, False, R_INDEX, AShape.CellShift);
+  if AShape.CellTimes3 then
+  begin
+    X64EmitRex(ABuf, 0, R_INDEX shr 3, 0, R_INDEX shr 3);
+    ABuf.EmitByte($69);                         { imul r32, r/m32, imm32 }
+    EmitModRMReg(ABuf, R_INDEX, R_INDEX);
+    ABuf.EmitU32($AAAB);
+    X64EmitShiftImm(ABuf, 5, False, R_INDEX, 17);
+  end;
+  X64EmitLoadMem64(ABuf, R_PTR, R_PTR, Int32(GO.BlockAllocated));
+  X64EmitMovRegReg(ABuf, R_WORD, R_INDEX);
+  X64EmitShiftImm(ABuf, 5, False, R_WORD, 5);
+  X64EmitLeaIndexed(ABuf, R_WORD, R_PTR, R_WORD, 2, 0);
+  X64EmitLoadMem32(ABuf, R_BITS, R_WORD, 0);
+  X64EmitBtsReg32(ABuf, R_BITS, R_INDEX);
+  X64EmitRex(ABuf, 0, R_BITS shr 3, 0, R_WORD shr 3);
+  ABuf.EmitByte($89);                           { mov [r9], r10d }
+  EmitMemOperand(ABuf, R_BITS, R_WORD, 0);
+
+  { Host-visible counters, as Allocate leaves them. }
+  X64EmitStoreMem64(ABuf, R_LIVE, R_HEAP, Int32(GO.HeapBytesLive));
+  X64EmitAluMemImm32(ABuf, 0, R_HEAP, Int32(GO.HeapBytesAllocated),
+    AShape.CellSize);
+  X64EmitAluMemImm32(ABuf, 0, R_HEAP, Int32(GO.HeapObjectCount), 1);
+
+  { Header = MakeHeader(wokStruct, typeId) or FMarkState, so the next
+    cycle's polarity flip unmarks it like any Allocate-written header. }
+  X64EmitAluRegMem(ABuf, $0B, R_TYPE, R_HEAP, Int32(GO.HeapMarkState));
+  Header := UInt32(Ord(wokStruct)) shl WASM_OBJ_KIND_SHIFT;
+  if Header <> 0 then
+    X64EmitAluRegImm32(ABuf, 1, True, R_TYPE, Header);
+  X64EmitStoreMem64(ABuf, R_TYPE, R_CELL, 0);
+
+  { ZeroCell, restricted to the qwords the fills below do not write whole:
+    every byte of a recycled (and, outside PRODUCTION, poisoned) cell is
+    overwritten before the reference is published. }
+  if (AShape.Covered or 1) <> (UInt64(1) shl (AShape.CellSize div 8)) - 1 then
+    X64EmitAluRegReg(ABuf, $31, False, R_TYPE, R_TYPE);
+  for Q := 1 to Integer(AShape.CellSize div 8) - 1 do
+    if (AShape.Covered and (UInt64(1) shl Q)) = 0 then
+      X64EmitStoreMem64(ABuf, R_TYPE, R_CELL, Int32(Q * 8));
+
+  { Field fills from the canonical register file. A packed store truncates
+    like WriteField; a reference is its 8 bits. These are initializing
+    stores into an object nothing else can reach yet, which is why
+    StructSetSeq writes them without the (v1-empty) write barrier too. }
+  for F := 0 to Integer(AShape.FieldCount) - 1 do
+  begin
+    X64EmitLoadSlot64(ABuf, R_FIELD,
+      IrAuxBlockItem(AAux, AIns.A, UInt32(F)));
+    X64EmitStoreScalarDisp(ABuf, R_FIELD, R_CELL,
+      Int32(AShape.Fields[F].Offset), AShape.Fields[F].Width);
+  end;
+
+  { Publish last. The template has no call and no safepoint, so nothing can
+    collect between the pop and this store; from here the object is rooted
+    by Dest's register-file slot like any helper-allocated one. A field
+    source equal to Dest was read above, before this overwrite. }
+  X64EmitStoreSlot64(ABuf, R_CELL, AIns.Dest);
+  X64EmitJmpTo(ABuf, UInt32(ADoneLabel));
 end;
 
 { The uniform three-argument runtime/vector helper call: store (r12), regbase
