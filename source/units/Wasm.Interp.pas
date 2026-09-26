@@ -399,7 +399,9 @@ const
     InstMemAddrs). The call site also bakes TWasmFuncInst.Instance
     (FuncInstance) and stores Ord(rtCaller) and a Boolean as single bytes, so
     SizeOf(TWasmRetKind) = SizeOf(Boolean) = 1 is part of this revision. }
-  AOT_ABI_REVISION = 17;
+  { Revision 18: the x64 inline struct.new fast path bakes the GC heap's live
+    collection trigger (HeapThreshold) beside the wave-11 heap offsets. }
+  AOT_ABI_REVISION = 18;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on
@@ -3716,6 +3718,7 @@ begin
   Fold(GO.HeapBytesLive);
   Fold(GO.HeapBytesAllocated);
   Fold(GO.HeapObjectCount);
+  Fold(GO.HeapThreshold);
   Fold(GO.BlockBase);
   Fold(GO.BlockAllocated);
 
