@@ -152,13 +152,19 @@ Text scripts the conformance runner executes, rather than binaries.
 | Fixture | What it covers |
 | --- | --- |
 | `x64-writeback.wast` | One module and 80 assertions aimed at the x64 deferred write-back and native return-tail plans: dirty temporaries across `if` joins, eleven-temporary register pressure, early `br_if` / `br` / `return` exits (all four loop exits reached), `unreachable` and integer divide-by-zero traps mid-loop, nested loops with two back-edges, native self-recursion with three arms, and leaves ending in `select` / parameter / constant / `eqz`. |
+| `gc-v128.wast` | One module, 41 assertions, and three bare invokes on v128 struct fields and array elements. `struct.new` puts a v128 as the only field, the first field, a middle field, after packed fields, and in adjacent pairs. A ten-field struct holds four v128 fields. The fixture also covers `struct.set`, `struct.new_default`, `array.new`, `array.new_fixed`, `array.new_default`, `array.get`, `array.set`, `array.fill`, `array.copy` (both overlap directions), `array.new_data`, `array.init_data`, and the constant-expression `struct.new` / `array.new` / `array.new_fixed`. Linked-list nodes and arrays are read back after about 8.6 MB of garbage forces collections. |
+| `exn-v128.wast` | One module, ten assertions, one `assert_exception`, and two bare invokes on exception payloads that carry v128 values. It covers a v128-only tag, a mixed i32 / v128 / ref / i64 tag, and a tag with three v128 params. Payloads are delivered through `catch`, `catch_ref`, and `catch_all_ref`, and rethrown with `throw_ref`. A nested `try_table` skips a non-matching clause. One throw comes from a callee two direct calls deep. An exnref whose reference argument sits between two vectors is held in a global across forced collections. An uncaught throw ends the script. |
 
 `x64-writeback.py` generates the `.wast` beside it. Every expected value
 comes from that script's Python model, never from a wasmlight tier, so the
 fixture is an independent oracle. Regenerate with
 `python3 tests/fixtures/wast/x64-writeback.py`; the output is deterministic.
-`Wasm.Wast.Runner.Test` runs the fixture in the interpreter, JIT, and AOT
-tiers and requires every command to pass in each.
+
+`gc-v128.wast` and `exn-v128.wast` are written by hand, with no generator.
+Each expected lane is spelled out and follows from the operands in the file.
+
+`Wasm.Wast.Runner.Test` runs all three fixtures in the interpreter, JIT, and
+AOT tiers and requires every command to pass in each.
 
 ## Feature support notes
 

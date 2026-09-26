@@ -99,6 +99,7 @@ type
     procedure TestInternModuleIsIdempotent;
     procedure TestHostRootSurvivesCollection;
     procedure TestCaughtExceptionRefSurvivesCollection;
+    procedure TestUncaughtV128PayloadIsReadable;
     procedure TestV128CrossesTheCallBoundary;
   end;
 
@@ -513,6 +514,95 @@ begin
   RootRelease(FStore, Handle);
 end;
 
+{ The host-visible side of a v128 exception payload: an uncaught throw of
+  (param i32 v128 i64) reaches the host with all three arguments intact,
+  across a forced collection. The vector is read whole through ExnArgVec;
+  the 8-byte ExnArg refuses it rather than return half. }
+procedure TEngineTests.TestUncaughtV128PayloadIsReadable;
+var
+  Loaded: TWasmLoadedModule;
+  Linker: TWasmLinker;
+  Inst: TWasmInstance;
+  Boom, Alloc: TWasmFunc;
+  NoArgs, NoResults, One: array of TWasmValue;
+  Handle: TWasmRootHandle;
+  Threw, Refused: Boolean;
+  ExnRef: TWasmRef;
+  Vec: TWasmV128;
+begin
+  Loaded := Load(
+    '(module' + sLineBreak +
+    '  (type $t (struct (field i32)))' + sLineBreak +
+    '  (tag $e (param i32 v128 i64))' + sLineBreak +
+    '  (func (export "boom")' + sLineBreak +
+    '    (throw $e (i32.const -3)' + sLineBreak +
+    '      (v128.const i64x2 0x1122334455667788 0x99aabbccddeeff00)' + sLineBreak +
+    '      (i64.const 0x0102030405060708)))' + sLineBreak +
+    '  (func (export "alloc") (result (ref $t)) (struct.new_default $t)))');
+  Linker := NewLinker;
+  Inst := Track(Instantiate(FStore, Linker, Loaded));
+  Expect<Boolean>(Inst.FindExportFunc('boom', Boom)).ToBe(True);
+  Expect<Boolean>(Inst.FindExportFunc('alloc', Alloc)).ToBe(True);
+
+  NoArgs := nil;
+  NoResults := nil;
+  Threw := False;
+  Handle := WASM_NO_ROOT;
+  try
+    Call(Boom, NoArgs, NoResults);
+  except
+    on E: EWasmException do
+    begin
+      Threw := True;
+      Handle := RootExceptionRef(FStore, E);
+    end;
+  end;
+  Expect<Boolean>(Threw).ToBe(True);
+
+  FStore.Heap.Threshold := 0;
+  SetLength(One, 1);
+  Call(Alloc, NoArgs, One);
+
+  ExnRef := RootGet(FStore, Handle);
+  Expect<Boolean>(FStore.Heap.ExnArgCount(ExnRef) = 3).ToBe(True);
+  Expect<Int32>(FStore.Heap.ExnArg(ExnRef, 0).I32).ToBe(-3);
+  Expect<Boolean>(FStore.Heap.ExnArgIsVec(ExnRef, 0)).ToBe(False);
+  Expect<Boolean>(FStore.Heap.ExnArgIsVec(ExnRef, 1)).ToBe(True);
+  FStore.Heap.ExnArgVec(ExnRef, 1, @Vec);
+  Expect<UInt64>(Vec.U64[0]).ToBe(UInt64($1122334455667788));
+  Expect<UInt64>(Vec.U64[1]).ToBe(UInt64($99AABBCCDDEEFF00));
+  Expect<UInt64>(FStore.Heap.ExnArg(ExnRef, 2).U64)
+    .ToBe(UInt64($0102030405060708));
+
+  { Host API misuse is an EWasmError, never an internal defect. }
+  Refused := False;
+  try
+    FStore.Heap.ExnArg(ExnRef, 1);
+  except
+    on E: EWasmError do
+      Refused := not (E is EWasmInternal);
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+  Refused := False;
+  try
+    FStore.Heap.ExnArg(ExnRef, 3);
+  except
+    on E: EWasmError do
+      Refused := not (E is EWasmInternal);
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+  Refused := False;
+  try
+    FStore.Heap.ExnArgVec(ExnRef, 0, @Vec);
+  except
+    on E: EWasmError do
+      Refused := not (E is EWasmInternal);
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+
+  RootRelease(FStore, Handle);
+end;
+
 procedure TEngineTests.TestV128CrossesTheCallBoundary;
 var
   Loaded: TWasmLoadedModule;
@@ -559,6 +649,8 @@ begin
     TestHostRootSurvivesCollection);
   Test('a rooted caught exception ref survives a forced collection',
     TestCaughtExceptionRefSurvivesCollection);
+  Test('an uncaught exception exposes a v128 payload to the host whole',
+    TestUncaughtV128PayloadIsReadable);
   Test('a v128 result crosses the call boundary as two slots',
     TestV128CrossesTheCallBoundary);
 end;
