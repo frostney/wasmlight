@@ -123,3 +123,10 @@ Repository-authored skills also live under `.agents/skills/`, but are committed
 directly and intentionally absent from `skills-lock.json`: the repository is
 their source of truth. A skills update leaves these local folders in place.
 Use `$optimize-runtime` for benchmark-gated runtime optimization waves.
+
+CodeRabbit skips the imported skills: `.coderabbit.config.ts` inherits the
+central `frostney/coderabbit` settings and the web-UI settings and excludes
+every skill listed in `skills-lock.json`, so findings on them belong
+upstream. Repository-authored skills are reviewed like any other file. The
+config reads the lock through `skills-lock.yaml`, a symlink, because
+CodeRabbit's config sandbox imports `.yaml` but not `.json`.
