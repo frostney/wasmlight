@@ -574,12 +574,21 @@ begin
   Expect<UInt64>(FStore.Heap.ExnArg(ExnRef, 2).U64)
     .ToBe(UInt64($0102030405060708));
 
+  { Host API misuse is an EWasmError, never an internal defect. }
   Refused := False;
   try
     FStore.Heap.ExnArg(ExnRef, 1);
   except
-    on EWasmInternal do
-      Refused := True;
+    on E: EWasmError do
+      Refused := not (E is EWasmInternal);
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+  Refused := False;
+  try
+    FStore.Heap.ExnArg(ExnRef, 3);
+  except
+    on E: EWasmError do
+      Refused := not (E is EWasmInternal);
   end;
   Expect<Boolean>(Refused).ToBe(True);
 

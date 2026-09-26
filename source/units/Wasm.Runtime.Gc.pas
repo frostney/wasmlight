@@ -665,7 +665,8 @@ type
     function ExnTagAddr(const ARef: TWasmRef): UInt32;
     function ExnArgCount(const ARef: TWasmRef): UInt32;
     { Scalar and reference arguments. A v128 argument has no 8-byte view,
-      so both raise EWasmInternal on one; use the forms below. }
+      so both raise EWasmError on one (host API misuse, not an internal
+      defect); use the forms below. An out-of-range index is EWasmError too. }
     function ExnArg(const ARef: TWasmRef; const AIndex: UInt32): TWasmValue;
     procedure ExnSetArg(const ARef: TWasmRef; const AIndex: UInt32;
       const AValue: TWasmValue);
@@ -1131,6 +1132,7 @@ var
   Index: Integer;
   Offset: UInt32;
   RefCount: Integer;
+  VecCount: Integer;
 begin
   Grow(Integer(AId) + 1);
   if Integer(AId) >= FCount then
@@ -1217,11 +1219,11 @@ begin
           instance holds the argument VALUES). Only a tag with a vector
           param gets a slot map, so every other exception's layout is
           unchanged. }
-        RefCount := 0;
+        VecCount := 0;
         for Index := 0 to High(AComp.Func.Params) do
           if AComp.Func.Params[Index].Kind = wvkVec then
-            Inc(RefCount);
-        if RefCount > 0 then
+            Inc(VecCount);
+        if VecCount > 0 then
         begin
           SetLength(Layout^.ArgSlots, Length(AComp.Func.Params) + 1);
           Offset := 0;
@@ -2432,8 +2434,10 @@ end;
 function TWasmGcHeap.ExnArgLayout(const ARef: TWasmRef;
   const AIndex: UInt32): PWasmGcLayout;
 begin
+  { A host inspecting a caught exception can pass any index: API misuse,
+    so EWasmError rather than EWasmInternal. }
   if AIndex >= ExnArgCount(ARef) then
-    raise EWasmInternal.CreateFmt('internal: exception argument %u of %u',
+    raise EWasmError.CreateFmt('exception argument %u of %u',
       [AIndex, ExnArgCount(ARef)]);
   Result := LayoutOf(ARef);
 end;
@@ -2447,9 +2451,8 @@ begin
   { A v128 argument has no 8-byte view; returning half of it would be the
     truncation this accessor must never perform. }
   if ExnArgIsVecAt(Layout, AIndex) then
-    raise EWasmInternal.CreateFmt(
-      'internal: exception argument %u is a v128; read it with ExnArgVec',
-      [AIndex]);
+    raise EWasmError.CreateFmt(
+      'exception argument %u is a v128; read it with ExnArgVec', [AIndex]);
   Result := PWasmValue(PByte(RefToPointer(ARef)) +
     ExnArgOffset(Layout, AIndex))^;
 end;
@@ -2508,9 +2511,9 @@ var
 begin
   Layout := ExnArgLayout(ARef, AIndex);
   if ExnArgIsVecAt(Layout, AIndex) then
-    raise EWasmInternal.CreateFmt(
-      'internal: exception argument %u is a v128; write it with '
-      + 'ExnSetArgSlot', [AIndex]);
+    raise EWasmError.CreateFmt(
+      'exception argument %u is a v128; write it with ExnSetArgSlot',
+      [AIndex]);
   PWasmValue(PByte(RefToPointer(ARef)) + ExnArgOffset(Layout, AIndex))^ :=
     AValue;
   { Guard the barrier on whether this argument slot is a reference (L9),
