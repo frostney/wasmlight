@@ -6472,54 +6472,77 @@ begin
       Expect<Integer>(Result.Cell[I]).ToBe(Interp.Cell[I]);
 end;
 
-{ One i64 struct per iteration; every odd one is kept in a reference array,
-  every even one is garbage. The garbage refills the class-16 free list at
-  each collection, so later kept structs land in recycled cells spread over
-  hundreds of cell indices — well past the 32 cells one allocation-bitmap
-  word covers. A kept object whose bitmap bit went astray is swept as free
-  and its field is overwritten by a later allocation. }
-function GcKeepOddModule: TWasmBytes;
+{ One i64 struct per iteration; every odd one is kept in a 64-slot
+  reference ring (slot (i shr 1) and 63), so each kept struct lives for 128
+  more allocations and every even one is garbage at once. The small live set
+  keeps the trigger low: the heap collects every few hundred allocations, and
+  each collection refills the class-16 free list with cells spread over a
+  couple of hundred indices — past the 32 cells one allocation-bitmap word
+  covers. A kept object whose own bitmap bit is not set is swept as free at
+  the next collection and its field is overwritten by the free-list block
+  pointer or a later allocation. }
+function GcKeepRingModule: TWasmBytes;
 begin
   Result := AssembleWatText('(module ' +
     '(type $t (struct (field (mut i64)))) ' +
     '(type $k (array (mut (ref null $t)))) ' +
-    '(func (export "keep") (param $n i32) (result i64) ' +
+    '(func (export "ring") (param $n i32) (result i64) ' +
     '(local $i i32) (local $acc i64) (local $s (ref null $t)) ' +
     '(local $keep (ref null $k)) ' +
-    '(local.set $keep (array.new_default $k (local.get $n))) ' +
+    '(local.set $keep (array.new_default $k (i32.const 64))) ' +
     '(loop $l ' +
     '(local.set $s (struct.new $t (i64.extend_i32_u (local.get $i)))) ' +
     '(if (i32.and (local.get $i) (i32.const 1)) (then ' +
-    '(array.set $k (local.get $keep) (local.get $i) (local.get $s)))) ' +
+    '(array.set $k (local.get $keep) (i32.and (i32.shr_u (local.get $i) ' +
+    '(i32.const 1)) (i32.const 63)) (local.get $s)))) ' +
     '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
     '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
-    '(local.set $i (i32.const 1)) ' +
+    '(local.set $i (i32.const 0)) ' +
     '(loop $m (local.set $acc (i64.add (local.get $acc) ' +
     '(struct.get $t 0 (array.get $k (local.get $keep) (local.get $i))))) ' +
-    '(local.set $i (i32.add (local.get $i) (i32.const 2))) ' +
-    '(br_if $m (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $m (i32.lt_u (local.get $i) (i32.const 64)))) ' +
     '(local.get $acc)))');
+end;
+
+{ The independent value of ring(n) for n >= 128: the last odd i written to
+  each of the 64 slots. }
+function GcKeepRingExpected(const AN: Integer): UInt64;
+var
+  I: Integer;
+  Last: array[0 .. 63] of Integer;
+begin
+  for I := 0 to 63 do
+    Last[I] := 0;
+  for I := 0 to AN - 1 do
+    if Odd(I) then
+      Last[(I shr 1) and 63] := I;
+  Result := 0;
+  for I := 0 to 63 do
+    Result := Result + UInt64(Last[I]);
 end;
 
 procedure TJitTests.TestGcInlineStructNewKeepsRecycledCellsLive;
 const
-  Counts: array[0 .. 2] of Integer = (200, 1000, 3000);
+  Counts: array[0 .. 2] of Integer = (150, 1000, 5000);
+  { Worked by hand from the slot rule above (e.g. ring(150): slots 0..10
+    hold 129..149, slots 11..63 hold 23..127). }
+  Sums: array[0 .. 2] of UInt64 = (5504, 59904, 315904);
 var
   Bytes: TWasmBytes;
   Run: TGcRun;
   I: Integer;
-  Half: UInt64;
 begin
-  Bytes := GcKeepOddModule;
+  Bytes := GcKeepRingModule;
   for I := 0 to High(Counts) do
   begin
-    Run := GcDiff(Bytes, 'keep', [MakeValueI32(Counts[I])], 512, 0);
-    { 1 + 3 + ... + (n - 1) = (n / 2)^2 }
-    Half := UInt64(Counts[I] div 2);
+    Expect<UInt64>(GcKeepRingExpected(Counts[I])).ToBe(Sums[I]);
+    Run := GcDiff(Bytes, 'ring', [MakeValueI32(Counts[I])], 512, 0);
     Expect<Boolean>(Run.Outcome.Trapped).ToBe(False);
-    Expect<UInt64>(Run.Outcome.Bits).ToBe(Half * Half);
-    Expect<Boolean>(Run.Collections > 2).ToBe(True);
+    Expect<UInt64>(Run.Outcome.Bits).ToBe(Sums[I]);
   end;
+  { The longest run must actually churn many collections. }
+  Expect<Boolean>(Run.Collections > 20).ToBe(True);
 end;
 
 { Structs of GC_CLASS_FIELD_COUNTS[j] i64 fields: 1, 2, 3, 5, 7, 11, 15, 23,
