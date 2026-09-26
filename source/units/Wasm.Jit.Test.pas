@@ -1968,6 +1968,20 @@ type
     Extra: array[0 .. 3] of UInt64;  { result slots 1..4 (multi-value, v128) }
   end;
 
+  { One tier's run of a GC export on a fresh store: the call outcome, the
+    heap's allocation statistics afterwards, and — when the result is a heap
+    reference — the raw bytes of its cell. }
+  TGcRun = record
+    Outcome: TCallOutcome;
+    Compiled: Boolean;
+    Collections: UInt64;
+    Objects: UInt64;
+    Live: UInt64;
+    Allocated: UInt64;
+    Reclaimed: UInt64;
+    Cell: array of Byte;
+  end;
+
   TJitTests = class(TTestSuite)
   private
     FBytes: TWasmBytes;
@@ -2042,6 +2056,17 @@ type
       are available). -1 off x64. }
     function X64GenericDirectCallSites(const ABytes: TWasmBytes;
       const AFuncIndex: Integer): Integer;
+    { Run AExport on a fresh store with the heap trigger floor at AThreshold,
+      force-compiling FDiffCompile (or the export) when ACompile, and copy
+      ACellBytes of the returned object's cell. }
+    function GcRun(const ABytes: TWasmBytes; const AExport: string;
+      const AParams: array of TWasmValue; const ACompile: Boolean;
+      const AThreshold: UInt64; const ACellBytes: Integer): TGcRun;
+    { GcRun under both tiers; asserts the outcome, every heap statistic, and
+      the returned cell's bytes are identical, and returns the compiled run. }
+    function GcDiff(const ABytes: TWasmBytes; const AExport: string;
+      const AParams: array of TWasmValue; const AThreshold: UInt64;
+      const ACellBytes: Integer): TGcRun;
     { AFirst then ASecond on one fresh store, force-compiling FDiffCompile
       when ACompile; returns '<first trap>|<second trap>'. }
     function TwoCallOutcome(const ABytes: TWasmBytes; const ACompile: Boolean;
@@ -2169,6 +2194,9 @@ type
     procedure TestI31;
     procedure TestGcMidBodyCollectionWalkable;
     procedure TestGcInlineAllocFreeListReuse;
+    procedure TestGcInlineStructNewKeepsRecycledCellsLive;
+    procedure TestGcInlineStructNewSizeClassesAndStats;
+    procedure TestGcInlineStructNewRecycledCellBytes;
 
     { --- Wave 6: v128 SIMD via the Wasm.Interp.Vector leaves --------- }
     procedure TestSimdCompute;
@@ -6312,6 +6340,396 @@ begin
     [MakeValueI32(41)])).ToBe({$IFDEF WASM_JIT_BACKEND}True{$ELSE}False{$ENDIF});
 end;
 
+{ --- inline struct.new allocation: equivalence with Allocate -----------------
+
+  Eligible struct.new sites pop the size class's free list in generated code
+  when the allocation stays under the live collection trigger; every other
+  allocation takes the unchanged helper. A fresh heap has empty free lists,
+  so each module churns garbage through collections (a small trigger floor)
+  to give the fast path recycled cells to pop. Expected values are constants
+  of the test, and the heap statistics and returned cells are compared byte
+  for byte against the interpreter on every backend. }
+
+function TJitTests.GcRun(const ABytes: TWasmBytes; const AExport: string;
+  const AParams: array of TWasmValue; const ACompile: Boolean;
+  const AThreshold: UInt64; const ACellBytes: Integer): TGcRun;
+var
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Imports: TWasmImports;
+  Instance: TWasmModuleInstance;
+  Jit: TWasmJitContext;
+  Kind, K: TWasmExternKind;
+  Addr, A: UInt32;
+  P: array of TWasmValue;
+  Res: array[0 .. 4] of TWasmValue;
+  I: Integer;
+begin
+  Result := Default(TGcRun);
+  Module := TWasmModule.Create;
+  Engine := TWasmEngine.Create;
+  Store := TWasmStore.Create(Engine);
+  Ir := nil;
+  Jit := nil;
+  Imports := Default(TWasmImports);
+  try
+    DecodeModule(ABytes, Module);
+    Ir := ValidateModule(Module, ABytes);
+    Instance := InstantiateModule(Store, Ir, @ABytes[0],
+      NativeUInt(Length(ABytes)), Imports);
+    RegisterInterpreter(Store);
+    Store.Heap.Threshold := AThreshold;
+    if not Instance.FindExport(AExport, Kind, Addr) then
+      raise EWasmError.CreateFmt('no export named %s', [AExport]);
+    if ACompile then
+    begin
+      Jit := RegisterJit(Store);
+      if Length(FDiffCompile) = 0 then
+        Result.Compiled := Jit.ForceCompile(Addr)
+      else
+      begin
+        Result.Compiled := True;
+        for I := 0 to High(FDiffCompile) do
+        begin
+          if not Instance.FindExport(FDiffCompile[I], K, A) then
+            raise EWasmError.CreateFmt('no export named %s',
+              [FDiffCompile[I]]);
+          if not Jit.ForceCompile(A) then
+            Result.Compiled := False;
+        end;
+      end;
+    end;
+    SetLength(P, Length(AParams));
+    for I := 0 to High(AParams) do
+      P[I] := AParams[I];
+    for I := 0 to High(Res) do
+      Res[I].Bits := High(UInt64);
+    try
+      if Length(P) = 0 then
+        InterpInvoke(Store, Addr, nil, @Res[0])
+      else
+        InterpInvoke(Store, Addr, @P[0], @Res[0]);
+      Result.Outcome.Bits := Res[0].Bits;
+    except
+      on E: Exception do
+        if E.ClassType = EWasmTrap then
+        begin
+          Result.Outcome.Trapped := True;
+          Result.Outcome.Msg := E.Message;
+        end
+        else
+          raise;
+    end;
+    Result.Collections := Store.Heap.CollectionCount;
+    Result.Objects := Store.Heap.ObjectCount;
+    Result.Live := Store.Heap.BytesLive;
+    Result.Allocated := Store.Heap.BytesAllocated;
+    Result.Reclaimed := Store.Heap.BytesReclaimed;
+    if (not Result.Outcome.Trapped) and (ACellBytes > 0) and
+      RefIsObject(TWasmRef(Result.Outcome.Bits)) then
+    begin
+      SetLength(Result.Cell, ACellBytes);
+      Move(RefToPointer(TWasmRef(Result.Outcome.Bits))^, Result.Cell[0],
+        ACellBytes);
+    end;
+  finally
+    FreeAndNil(Jit);
+    FreeAndNil(Store);
+    FreeAndNil(Engine);
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+end;
+
+function TJitTests.GcDiff(const ABytes: TWasmBytes; const AExport: string;
+  const AParams: array of TWasmValue; const AThreshold: UInt64;
+  const ACellBytes: Integer): TGcRun;
+var
+  Interp: TGcRun;
+  I: Integer;
+begin
+  Interp := GcRun(ABytes, AExport, AParams, False, AThreshold, ACellBytes);
+  Result := GcRun(ABytes, AExport, AParams, True, AThreshold, ACellBytes);
+  Expect<Boolean>(Result.Compiled).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(Result.Outcome.Trapped).ToBe(Interp.Outcome.Trapped);
+  Expect<string>(Result.Outcome.Msg).ToBe(Interp.Outcome.Msg);
+  { A returned reference is an address in its own store; compare the cell. }
+  if ACellBytes = 0 then
+    Expect<UInt64>(Result.Outcome.Bits).ToBe(Interp.Outcome.Bits);
+  { The fast path collects exactly when Allocate would and accounts exactly
+    as it does, so the collection count, every counter, and the returned
+    cell — header mark state included — match the interpreter. }
+  Expect<UInt64>(Result.Collections).ToBe(Interp.Collections);
+  Expect<UInt64>(Result.Objects).ToBe(Interp.Objects);
+  Expect<UInt64>(Result.Live).ToBe(Interp.Live);
+  Expect<UInt64>(Result.Allocated).ToBe(Interp.Allocated);
+  Expect<UInt64>(Result.Reclaimed).ToBe(Interp.Reclaimed);
+  Expect<Integer>(Length(Result.Cell)).ToBe(Length(Interp.Cell));
+  for I := 0 to High(Interp.Cell) do
+    if I < Length(Result.Cell) then
+      Expect<Integer>(Result.Cell[I]).ToBe(Interp.Cell[I]);
+end;
+
+{ One i64 struct per iteration; every odd one is kept in a 64-slot
+  reference ring (slot (i shr 1) and 63), so each kept struct lives for 128
+  more allocations and every even one is garbage at once. The small live set
+  keeps the trigger low: the heap collects every few hundred allocations, and
+  each collection refills the class-16 free list with cells spread over a
+  couple of hundred indices — past the 32 cells one allocation-bitmap word
+  covers. A kept object whose own bitmap bit is not set is swept as free at
+  the next collection and its field is overwritten by the free-list block
+  pointer or a later allocation. }
+function GcKeepRingModule: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(type $t (struct (field (mut i64)))) ' +
+    '(type $k (array (mut (ref null $t)))) ' +
+    '(func (export "ring") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $acc i64) (local $s (ref null $t)) ' +
+    '(local $keep (ref null $k)) ' +
+    '(local.set $keep (array.new_default $k (i32.const 64))) ' +
+    '(loop $l ' +
+    '(local.set $s (struct.new $t (i64.extend_i32_u (local.get $i)))) ' +
+    '(if (i32.and (local.get $i) (i32.const 1)) (then ' +
+    '(array.set $k (local.get $keep) (i32.and (i32.shr_u (local.get $i) ' +
+    '(i32.const 1)) (i32.const 63)) (local.get $s)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(loop $m (local.set $acc (i64.add (local.get $acc) ' +
+    '(struct.get $t 0 (array.get $k (local.get $keep) (local.get $i))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $m (i32.lt_u (local.get $i) (i32.const 64)))) ' +
+    '(local.get $acc)))');
+end;
+
+{ The independent value of ring(n) for n >= 128: the last odd i written to
+  each of the 64 slots. }
+function GcKeepRingExpected(const AN: Integer): UInt64;
+var
+  I: Integer;
+  Last: array[0 .. 63] of Integer;
+begin
+  for I := 0 to 63 do
+    Last[I] := 0;
+  for I := 0 to AN - 1 do
+    if Odd(I) then
+      Last[(I shr 1) and 63] := I;
+  Result := 0;
+  for I := 0 to 63 do
+    Result := Result + UInt64(Last[I]);
+end;
+
+procedure TJitTests.TestGcInlineStructNewKeepsRecycledCellsLive;
+const
+  Counts: array[0 .. 2] of Integer = (150, 1000, 5000);
+  { Worked by hand from the slot rule above (e.g. ring(150): slots 0..10
+    hold 129..149, slots 11..63 hold 23..127). }
+  Sums: array[0 .. 2] of UInt64 = (5504, 59904, 315904);
+var
+  Bytes: TWasmBytes;
+  Run: TGcRun;
+  I: Integer;
+begin
+  Bytes := GcKeepRingModule;
+  for I := 0 to High(Counts) do
+  begin
+    Expect<UInt64>(GcKeepRingExpected(Counts[I])).ToBe(Sums[I]);
+    Run := GcDiff(Bytes, 'ring', [MakeValueI32(Counts[I])], 512, 0);
+    Expect<Boolean>(Run.Outcome.Trapped).ToBe(False);
+    Expect<UInt64>(Run.Outcome.Bits).ToBe(Sums[I]);
+  end;
+  { The longest run must actually churn many collections. }
+  Expect<Boolean>(Run.Collections > 20).ToBe(True);
+end;
+
+{ Structs of GC_CLASS_FIELD_COUNTS[j] i64 fields: 1, 2, 3, 5, 7, 11, 15, 23,
+  31 fields fill the 16..256 classes; 32 fields is a 264-byte large object
+  (helper only). Each rJ allocates n structs whose field f holds i + f,
+  keeps every fourth in an 8-slot reference array, sums the last field of
+  every struct, then field 0 of every kept one. rbytes allocates a struct of
+  40 i8 fields (class 48). }
+const
+  GC_CLASS_FIELD_COUNTS: array[0 .. 9] of Integer =
+    (1, 2, 3, 5, 7, 11, 15, 23, 31, 32);
+
+function GcSizeClassModule: TWasmBytes;
+var
+  Text, Fields, Args, J0: string;
+  J, F: Integer;
+begin
+  Text := '(module ';
+  for J := 0 to High(GC_CLASS_FIELD_COUNTS) do
+  begin
+    J0 := IntToStr(J);
+    Fields := '';
+    Args := '';
+    for F := 0 to GC_CLASS_FIELD_COUNTS[J] - 1 do
+    begin
+      Fields := Fields + '(field (mut i64)) ';
+      Args := Args + '(i64.add (local.get $x) (i64.const ' + IntToStr(F) +
+        ')) ';
+    end;
+    Text := Text + '(type $t' + J0 + ' (struct ' + Fields + ')) ' +
+      '(type $k' + J0 + ' (array (mut (ref null $t' + J0 + ')))) ' +
+      '(func $r' + J0 + ' (export "r' + J0 + '") ' +
+      '(param $n i32) (result i64) (local $i i32) (local $acc i64) ' +
+      '(local $x i64) (local $s (ref null $t' + J0 + ')) ' +
+      '(local $keep (ref null $k' + J0 + ')) ' +
+      '(local.set $keep (array.new_default $k' + J0 + ' (i32.const 8))) ' +
+      '(loop $l (local.set $x (i64.extend_i32_u (local.get $i))) ' +
+      '(local.set $s (struct.new $t' + J0 + ' ' + Args + ')) ' +
+      '(local.set $acc (i64.add (local.get $acc) (struct.get $t' + J0 +
+      ' ' + IntToStr(GC_CLASS_FIELD_COUNTS[J] - 1) + ' (local.get $s)))) ' +
+      '(if (i32.eqz (i32.and (local.get $i) (i32.const 3))) (then ' +
+      '(array.set $k' + J0 + ' (local.get $keep) (i32.and ' +
+      '(i32.shr_u (local.get $i) (i32.const 2)) (i32.const 7)) ' +
+      '(local.get $s)))) ' +
+      '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+      '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+      '(local.set $i (i32.const 0)) ' +
+      '(loop $m (local.set $acc (i64.add (local.get $acc) (struct.get $t' +
+      J0 + ' 0 (array.get $k' + J0 +
+      ' (local.get $keep) (local.get $i))))) ' +
+      '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+      '(br_if $m (i32.lt_u (local.get $i) (i32.const 8)))) ' +
+      '(local.get $acc)) ';
+  end;
+  Fields := '';
+  Args := '';
+  for F := 0 to 39 do
+  begin
+    Fields := Fields + '(field (mut i8)) ';
+    Args := Args + '(i32.add (local.get $i) (i32.const ' + IntToStr(F) +
+      ')) ';
+  end;
+  Text := Text + '(type $b (struct ' + Fields + ')) ' +
+    '(func $rb (export "rbytes") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $acc i64) (local $s (ref null $b)) ' +
+    '(loop $l (local.set $s (struct.new $b ' + Args + ')) ' +
+    '(local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u ' +
+    '(struct.get_u $b 39 (local.get $s))))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "all") (param $n i32) (result i64) ' +
+    '(i64.add (call $rb (local.get $n)) ';
+  for J := 0 to High(GC_CLASS_FIELD_COUNTS) do
+    Text := Text + '(i64.add (call $r' + IntToStr(J) + ' (local.get $n)) ';
+  Text := Text + '(i64.const 0)';
+  for J := 0 to High(GC_CLASS_FIELD_COUNTS) do
+    Text := Text + ')';
+  Text := Text + ')))';
+  Result := AssembleWatText(Text);
+end;
+
+{ The independent value of rJ(n): the last fields plus field 0 of the last
+  struct written to each keep slot. }
+function GcSizeClassExpected(const AFieldCount, AN: Integer): UInt64;
+var
+  I, Slot: Integer;
+  Last: array[0 .. 7] of Integer;
+begin
+  Result := 0;
+  for Slot := 0 to 7 do
+    Last[Slot] := -1;
+  for I := 0 to AN - 1 do
+  begin
+    Result := Result + UInt64(I + AFieldCount - 1);
+    if (I and 3) = 0 then
+      Last[(I shr 2) and 7] := I;
+  end;
+  for Slot := 0 to 7 do
+    Result := Result + UInt64(Last[Slot]);
+end;
+
+procedure TJitTests.TestGcInlineStructNewSizeClassesAndStats;
+const
+  N = 150;
+var
+  Bytes: TWasmBytes;
+  Names: array of string;
+  Run: TGcRun;
+  Expected, BytesExpected: UInt64;
+  J, I: Integer;
+begin
+  Bytes := GcSizeClassModule;
+  SetLength(Names, Length(GC_CLASS_FIELD_COUNTS) + 2);
+  for J := 0 to High(GC_CLASS_FIELD_COUNTS) do
+    Names[J] := 'r' + IntToStr(J);
+  Names[High(Names) - 1] := 'rbytes';
+  Names[High(Names)] := 'all';
+  { r0(150) worked by hand: 0 + 1 + ... + 149 = 11175, plus the last struct
+    kept in each slot (128, 132, 136, 140, 144, 148, 120, 124) = 1072. }
+  Expect<UInt64>(GcSizeClassExpected(1, N)).ToBe(12247);
+  BytesExpected := 0;
+  for I := 0 to N - 1 do
+    BytesExpected := BytesExpected + UInt64((I + 39) and $FF);
+  Expected := BytesExpected;
+  for J := 0 to High(GC_CLASS_FIELD_COUNTS) do
+  begin
+    Expected := Expected + GcSizeClassExpected(GC_CLASS_FIELD_COUNTS[J], N);
+    { Each class alone, under a trigger that recycles every few objects. }
+    Run := GcDiff(Bytes, 'r' + IntToStr(J), [MakeValueI32(N)], 512, 0);
+    Expect<Boolean>(Run.Outcome.Trapped).ToBe(False);
+    Expect<UInt64>(Run.Outcome.Bits).ToBe(
+      GcSizeClassExpected(GC_CLASS_FIELD_COUNTS[J], N));
+    Expect<Boolean>(Run.Collections > 2).ToBe(True);
+  end;
+  { Every class interleaved on one heap, at two trigger floors. }
+  CompileExports(Names);
+  Run := GcDiff(Bytes, 'all', [MakeValueI32(N)], 2048, 0);
+  Expect<Boolean>(Run.Outcome.Trapped).ToBe(False);
+  Expect<UInt64>(Run.Outcome.Bits).ToBe(Expected);
+  Run := GcDiff(Bytes, 'all', [MakeValueI32(N)], 40000, 0);
+  Expect<UInt64>(Run.Outcome.Bits).ToBe(Expected);
+  Expect<Boolean>(Run.Collections > 0).ToBe(True);
+end;
+
+{ $q spans 28 bytes in a 32-byte (power-of-two) cell: i8 at 8, i64 at 16,
+  i32 at 24, so bytes 9..15 and 28..31 are padding no field store covers. A
+  recycled cell arrives with a free-list link and block pointer in its first
+  two words (and poison in a dev build); $churn cycles garbage so the
+  returned struct pops such a cell. }
+function GcPaddedStructModule: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(type $q (struct (field (mut i8)) (field (mut i64)) ' +
+    '(field (mut i32)))) ' +
+    '(func $churn (param $k i32) (loop $l ' +
+    '(drop (struct.new $q (i32.const -1) (i64.const -1) (i32.const -1))) ' +
+    '(local.set $k (i32.sub (local.get $k) (i32.const 1))) ' +
+    '(br_if $l (local.get $k)))) ' +
+    '(func (export "padded") (param $k i32) (result (ref null $q)) ' +
+    '(call $churn (local.get $k)) ' +
+    '(struct.new $q (i32.const 0x1AB) (i64.const 0x1122334455667788) ' +
+    '(i32.const 0x7EADBEEF))))');
+end;
+
+procedure TJitTests.TestGcInlineStructNewRecycledCellBytes;
+const
+  Expected: array[8 .. 31] of Byte = ($AB, 0, 0, 0, 0, 0, 0, 0,
+    $88, $77, $66, $55, $44, $33, $22, $11,
+    $EF, $BE, $AD, $7E, 0, 0, 0, 0);
+var
+  Bytes: TWasmBytes;
+  Run: TGcRun;
+  I, K: Integer;
+begin
+  Bytes := GcPaddedStructModule;
+  for K := 1 to 40 do
+  begin
+    Run := GcDiff(Bytes, 'padded', [MakeValueI32(K)], 512, 32);
+    Expect<Boolean>(Run.Outcome.Trapped).ToBe(False);
+    Expect<Integer>(Length(Run.Cell)).ToBe(32);
+    if Length(Run.Cell) = 32 then
+      for I := Low(Expected) to High(Expected) do
+        Expect<Integer>(Run.Cell[I]).ToBe(Expected[I]);
+  end;
+end;
+
 procedure TJitTests.TestGcMidBodyCollectionWalkable;
 begin
   { THE §9 PROOF. Threshold 0 forces a collection inside the body's struct.new,
@@ -7328,6 +7746,13 @@ begin
     TestGcMidBodyCollectionWalkable);
   Test('inline struct.new reuses a recycled cell across forced collects',
     TestGcInlineAllocFreeListReuse);
+  Test('inline struct.new keeps objects in recycled cells past the ' +
+    'first bitmap word alive', TestGcInlineStructNewKeepsRecycledCellsLive);
+  Test('inline struct.new matches the helper in every size class, ' +
+    'collection point, and heap statistic',
+    TestGcInlineStructNewSizeClassesAndStats);
+  Test('inline struct.new overwrites every byte of a recycled cell',
+    TestGcInlineStructNewRecycledCellBytes);
 
   Test('v128 const/splat/extract/replace/add/eq/shuffle/swizzle match',
     TestSimdCompute);

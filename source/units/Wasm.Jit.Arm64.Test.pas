@@ -1123,26 +1123,43 @@ const
     64-bit hosts, for the canonical shape of one i32 field at cell offset 8,
     class-16 cell, engine id loaded through the context chain. Offsets are
     the dev-build probe values; emitter drift, encoder typos, or offset
-    changes fail here first. 32-bit hosts expand unaligned LDR Xt offsets
-    and cannot share this pin. }
-  FastPathWords: array[0 .. 42] of UInt32 = (
+    changes fail here first. The words were assembled independently by
+    llvm-mc from the intended instruction text (commented alongside). 32-bit
+    hosts expand unaligned LDR Xt offsets and cannot share this pin. }
+  FastPathWords: array[0 .. 48] of UInt32 = (
     $F9405689, $F9401D2C, $D100058C, $F940152A,             { ctx walk }
     $52801009, $9B09298C, $F940058C, $F9402D8C, $B9400189,
     $F9400E8A,                                             { store -> heap }
     $F940194B,                                             { FFree[0] head }
-    $3400040B,                                             { cbz head -> slow }
+    $340004CB,                                             { cbz head -> slow }
+    $F9408D4C, $F940A54D,              { ldr x12,[x10,#280]; x13,[x10,#328] }
+    $9100418C, $EB0D019F,              { add x12,x12,#16; cmp x12,x13 }
+    $54000428,                         { b.hi slow: Allocate's trigger }
     $F940016C, $F900194C,                                  { pop link FIRST }
     $B9000569,                                             { hdr hi = typeId }
     $F9408549, $B9000169,                                  { hdr lo = mark }
     $F9400569, $F940052A, $CB0A016A,                       { block, base, diff }
     $53047D4A,                                             { lsr w10,#4 cell }
     $F9401129,                                             { alloc bitmap ptr }
-    $53057D4C, $1200794D, $5280002A, $1ACD214A,            { word idx, mask }
-    $B86C692D, $2A0A01AD, $B82C692D,                       { word |= mask }
+    $53057D4C, $1200114D, $5280002A, $1ACD214A,  { word idx, and w13,#31, mask }
+    $B86C792D, $2A0A01AD, $B82C792D,       { [x9,x12,lsl #2] word |= mask }
     $F9400E89, $F9408D2A, $9100414A, $F9008D2A,            { BytesLive += 16 }
     $F940912A, $9100414A, $F900912A,                       { BytesAllocated }
     $F9409D2A, $9100054A, $F9009D2A,                       { ObjectCount += 1 }
+    $F900057F,                         { str xzr,[x11,#8]: qword 1 partial }
     $F9400A6C, $B900096C,                                  { field i32 @8 }
+    $F9000E6B,                                             { publish Dest }
+    $14000001);                                            { b Done }
+
+  { The tail of the same template for a packed shape in a 32-byte cell: i8
+    at 8, i16 at 10, i64 at 16 (slots 2, 3, 4). Qwords 1 (3 of 8 bytes
+    filled) and 3 (padding) are zeroed before the fills; the byte store
+    carries its offset in imm12 like every other width. llvm-mc words. }
+  PackedTailWords: array[0 .. 9] of UInt32 = (
+    $F900057F, $F9000D7F,              { str xzr,[x11,#8]; str xzr,[x11,#24] }
+    $F9400A6C, $3900216C,              { ldr x12,[x19,#16]; strb w12,[x11,#8] }
+    $F9400E6C, $7900156C,              { ldr x12,[x19,#24]; strh w12,[x11,#10] }
+    $F940126C, $F900096C,              { ldr x12,[x19,#32]; str x12,[x11,#16] }
     $F9000E6B,                                             { publish Dest }
     $14000001);                                            { b Done }
 
@@ -1154,10 +1171,8 @@ var
   Shape: TWasmGcAllocShape;
   Info: TWasmGcAllocInfo;
   SlowLbl, DoneLbl: TWasmJitLabel;
-  {$IFNDEF CPU32}
   I: Integer;
   W: UInt32;
-  {$ENDIF}
   Words: TWasmBytes;
   WordCount: NativeUInt;
 begin
@@ -1182,7 +1197,7 @@ begin
     {$IFDEF CPU32}
     { 32-bit hosts pack pointer fields at 4-byte offsets. LDR Xt requires an
       8-byte scaled immediate, so Arm64EmitLdrX expands those loads to
-      ADD+LDR and the 64-bit 43-word pin cannot hold. The template must
+      ADD+LDR and the 64-bit 49-word pin cannot hold. The template must
       still emit, stay 32-bit aligned, and grow rather than shrink. }
     Expect<Boolean>((Length(Words) mod 4) = 0).ToBe(True);
     Expect<Boolean>(WordCount >= NativeUInt(Length(FastPathWords))).ToBe(True);
@@ -1194,6 +1209,41 @@ begin
       Expect<UInt32>(W).ToBe(FastPathWords[I]);
     end;
     {$ENDIF}
+  finally
+    Buf.Free;
+  end;
+
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Arm64InitRegCache(Cache);
+    FillChar(Shape, SizeOf(Shape), 0);
+    Shape.Word := 1 or (UInt64(3) shl 8) or (UInt64(5) shl 16) or
+      (UInt64(2) shl 24);
+    Shape.Fields[0].Slot := 2;
+    Shape.Fields[0].Offset := 8;
+    Shape.Fields[0].Width := 1;
+    Shape.Fields[1].Slot := 3;
+    Shape.Fields[1].Offset := 10;
+    Shape.Fields[1].Width := 2;
+    Shape.Fields[2].Slot := 4;
+    Shape.Fields[2].Offset := 16;
+    Shape.Fields[2].Width := 8;
+    Ins := MakeIrInstr(iroStructNew, 3, 0, 0, 0);
+    Arm64EmitInlineStructNew(Buf, Ins, Shape, Info, Cache, SlowLbl, DoneLbl);
+    Buf.BindLabel(SlowLbl);
+    Buf.BindLabel(DoneLbl);
+    Arm64ResolvePatches(Buf);
+    Words := Buf.SnapshotBytes;
+    WordCount := NativeUInt(Length(Words)) div 4;
+    Expect<Boolean>(WordCount > NativeUInt(Length(PackedTailWords)))
+      .ToBe(True);
+    if WordCount > NativeUInt(Length(PackedTailWords)) then
+      for I := 0 to High(PackedTailWords) do
+      begin
+        Move(Words[(Integer(WordCount) - Length(PackedTailWords) + I) * 4],
+          W, 4);
+        Expect<UInt32>(W).ToBe(PackedTailWords[I]);
+      end;
   finally
     Buf.Free;
   end;

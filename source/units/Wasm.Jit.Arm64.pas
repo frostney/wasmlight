@@ -1259,8 +1259,9 @@ const
 var
   GO: TWasmJitGcOffsets;
   FO: TWasmJitFrameOffsets;
-  Count, Log2Cell, F: Integer;
-  FreeOff: UInt32;
+  Count, Log2Cell, F, Q: Integer;
+  FreeOff, CellSize: UInt32;
+  Covered: array[0 .. 31] of UInt32;
 begin
   GO := WasmJitGcHeapOffsets;
   FO := WasmJitFrameOffsets;
@@ -1268,6 +1269,7 @@ begin
   Log2Cell := Integer((AShape.Word shr 16) and $FF);
   FreeOff := UInt32(GO.HeapFFree0) +
     UInt32((AShape.Word shr 24) and $FF) * 8;
+  CellSize := UInt32(1) shl Log2Cell;
   ASlowLabel := ABuf.NewLabel;
   ADoneLabel := ABuf.NewLabel;
 
@@ -1294,6 +1296,17 @@ begin
   Arm64EmitLdrX(ABuf, ARM64_REG_T2, ARM64_REG_T1, FreeOff);
   EmitCbzTo(ABuf, ARM64_REG_T2, UInt32(ASlowLabel));
 
+  { Allocate's collection trigger, verbatim: FBytesLive + CellSize >
+    FThreshold (unsigned) sends this allocation to the helper, which
+    collects there. Checking it here is what makes the compiled tier
+    collect at exactly the interpreter's allocation, so collection count,
+    mark epoch, and every heap counter stay identical across tiers. }
+  Arm64EmitLdrX(ABuf, R3, ARM64_REG_T1, UInt32(GO.HeapBytesLive));
+  Arm64EmitLdrX(ABuf, R4, ARM64_REG_T1, UInt32(GO.HeapThreshold));
+  ABuf.EmitU32(Arm64AddImmX(R3, R3, CellSize));
+  ABuf.EmitU32(Arm64CmpX(R3, R4));
+  EmitBCondTo(ABuf, ARM64_COND_HI, ASlowLabel);
+
   { Pop FIRST: FFree[class] := [head + LINK]. The link word shares its qword
     with the header low half this very sequence is about to write, so the
     header stores MUST NOT precede it — and the pop parks the new head in R3,
@@ -1313,7 +1326,11 @@ begin
 
   { Bitmap: word = Allocated[(head-Base)/CellSize div 32] |=
     1 shl (... mod 32). CellSize is a power-of-two class size, so the
-    division is one shift and the cell index needs no magic multiply. }
+    division is one shift and the cell index needs no magic multiply.
+    Allocated is an array of UInt32, so the word access scales the word
+    index by 4 (LSL #2); an unscaled index lands the bit in a byte-offset
+    word, the live cell's own bit stays clear, and the next sweep frees a
+    reachable object — the defect every cell past index 31 used to hit. }
   Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_T2,
     WASM_GC_FREE_BLOCK_OFFSET);
   Arm64EmitLdrX(ABuf, ARM64_REG_T1, ARM64_REG_T0, UInt32(GO.BlockBase));
@@ -1322,12 +1339,14 @@ begin
   Arm64EmitLdrX(ABuf, ARM64_REG_T0, ARM64_REG_T0,
     UInt32(GO.BlockAllocated));
   ABuf.EmitU32(Arm64LsrImmW(R3, ARM64_REG_T1, 5));            { word idx }
-  ABuf.EmitU32(Arm64AndLowMaskImmW(R4, ARM64_REG_T1, 31));    { bit no }
+  ABuf.EmitU32(Arm64AndLowMaskImmW(R4, ARM64_REG_T1, 5));     { bit no }
   ABuf.EmitU32(Arm64MovzW(ARM64_REG_T1, 1, 0));
   ABuf.EmitU32(Arm64LslvW(ARM64_REG_T1, ARM64_REG_T1, R4));   { mask }
-  ABuf.EmitU32(Arm64MemRegOffset($B9400000, R4, ARM64_REG_T0, R3, True));
+  ABuf.EmitU32(Arm64MemRegOffset($B9400000, R4, ARM64_REG_T0, R3,
+    True) or $1000);                                          { lsl #2 }
   ABuf.EmitU32(Arm64OrrW(R4, R4, ARM64_REG_T1));
-  ABuf.EmitU32(Arm64MemRegOffset($B9000000, R4, ARM64_REG_T0, R3, True));
+  ABuf.EmitU32(Arm64MemRegOffset($B9000000, R4, ARM64_REG_T0, R3,
+    True) or $1000);
 
   { Host-visible counters. Each reloads the heap base — the pop above
     consumed the only copy — because three live base pointers do not fit
@@ -1353,14 +1372,32 @@ begin
   Arm64EmitStrX(ABuf, ARM64_REG_T1, ARM64_REG_T0,
     UInt32(GO.HeapObjectCount));
 
+  { A recycled cell still holds its free-list link and block pointer in the
+    first two qwords (poison too, in a dev build). The header and the field
+    stores cover only what the layout names, so every qword past the header
+    that the fields do not fill completely is zeroed first — the cell ends
+    byte-identical to Allocate's ZeroCell-then-fill. Fields never overlap,
+    so eight covered bytes mean the whole qword. The block pointer was read
+    by the bitmap update above, so the zeroing may overwrite it. }
+  FillChar(Covered, SizeOf(Covered), 0);
+  for F := 0 to Count - 1 do
+    Inc(Covered[AShape.Fields[F].Offset div 8], AShape.Fields[F].Width);
+  for Q := 1 to Integer(CellSize div 8) - 1 do
+    if Covered[Q] <> 8 then
+      Arm64EmitStrX(ABuf, ARM64_REG_ZR, ARM64_REG_T2, UInt32(Q) * 8);
+
   { Numeric field fills at baked offsets, sources straight from the
     canonical register file (the cache was invalidated on entry). }
   for F := 0 to Count - 1 do
   begin
     Arm64EmitLdrX(ABuf, R3, ARM64_REG_REGFILE,
       Arm64SlotByteOffset(AShape.Fields[F].Slot));
+    { Unsigned-offset STRB/STRH/STR: imm12 sits at bits 10..21, scaled by
+      the access size — for the byte form too. An unshifted byte offset
+      lands in Rt (x12 or 8 = x12) and stores the field over the header's
+      low byte, the mark bit and kind bits included. }
     case AShape.Fields[F].Width of
-      1: ABuf.EmitU32($39000000 or AShape.Fields[F].Offset or
+      1: ABuf.EmitU32($39000000 or (UInt32(AShape.Fields[F].Offset) shl 10) or
            (UInt32(ARM64_REG_T2) shl 5) or R3);
       2: ABuf.EmitU32($79000000 or ((UInt32(AShape.Fields[F].Offset)
            div 2) shl 10) or (UInt32(ARM64_REG_T2) shl 5) or R3);

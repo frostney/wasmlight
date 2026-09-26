@@ -74,7 +74,7 @@ const
   { Must stay equal to AOT_ABI_REVISION in Wasm.Interp. Identity fields
     are folded in addition to this revision, so two OS descriptors of the
     same arch do not share a fingerprint. }
-  WASM_TARGET_ABI_REVISION = UInt32(17);
+  WASM_TARGET_ABI_REVISION = UInt32(18);
 
   WASM_TARGET_POINTER_SIZE = Byte(8);
   WASM_TARGET_PAGE_SIZE_4K = UInt32(4096);
@@ -151,6 +151,7 @@ type
     HeapBytesLive: UInt64;
     HeapBytesAllocated: UInt64;
     HeapObjectCount: UInt64;
+    HeapThreshold: UInt64;
     BlockBase: UInt64;
     BlockAllocated: UInt64;
     CtxValues: UInt64;
@@ -376,6 +377,7 @@ begin
   Result.HeapBytesLive := 280;
   Result.HeapBytesAllocated := 288;
   Result.HeapObjectCount := 312;
+  Result.HeapThreshold := 328;
   Result.BlockBase := 8;
   Result.BlockAllocated := 32;
   Result.CtxValues := 8;
@@ -518,6 +520,7 @@ begin
   Fold(AAbi.Layout.HeapBytesLive);
   Fold(AAbi.Layout.HeapBytesAllocated);
   Fold(AAbi.Layout.HeapObjectCount);
+  Fold(AAbi.Layout.HeapThreshold);
   Fold(AAbi.Layout.BlockBase);
   Fold(AAbi.Layout.BlockAllocated);
   Fold(AAbi.ValueSlotSize);

@@ -270,6 +270,7 @@ begin
         .ToBe(True);
       Expect<Boolean>(Abi.Layout.HeapObjectCount = GO.HeapObjectCount)
         .ToBe(True);
+      Expect<Boolean>(Abi.Layout.HeapThreshold = GO.HeapThreshold).ToBe(True);
       Expect<Boolean>(Abi.Layout.BlockBase = GO.BlockBase).ToBe(True);
       Expect<Boolean>(Abi.Layout.BlockAllocated = GO.BlockAllocated).ToBe(True);
       Expect<Boolean>(Abi.Layout.CtxValues = FO.CtxValues).ToBe(True);
