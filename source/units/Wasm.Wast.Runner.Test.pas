@@ -271,6 +271,8 @@ type
     procedure TestAotModeLoadsAndPasses;
     procedure TestX64WriteBackFixtureAllTiers;
     procedure TestX64V128CacheFixtureAllTiers;
+    procedure TestGcV128FixtureAllTiers;
+    procedure TestExnV128FixtureAllTiers;
     procedure TestAotModeMixedTiersCoexist;
     procedure TestAotTallyIdenticalToInterp;
     procedure TestAotLoadedCountMatchesJit;
@@ -1533,6 +1535,87 @@ begin
   end;
 end;
 
+{ The committed net for v128 struct fields and array elements
+  (tests/fixtures/wast/gc-v128.wast, expected lanes spelled out by hand):
+  every allocation form (struct.new at each field position, the ten-field
+  unbatched struct, array.new, array.new_fixed, the constant-expression
+  forms), the access forms, array.copy with both overlap directions,
+  array.new_data / init_data, and values read back after forced
+  collections. Each tier must pass every command, and on a backend host
+  the compiled tiers must actually compile every function. }
+procedure TWastRunnerTests.TestGcV128FixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'gc-v128.wast';
+  { One module, 41 assertions, and three bare invokes. }
+  COMMANDS = 45;
+  { Every function in the fixture's module is compilable. }
+  COMPILED_FUNCTIONS = 32;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
+{ The committed net for v128 exception payloads
+  (tests/fixtures/wast/exn-v128.wast, expected lanes spelled out by hand):
+  v128-only, mixed i32/v128/ref/i64 and multi-v128 tags; catch, catch_ref,
+  catch_all_ref and throw_ref rethrow; a nested try_table that skips a
+  non-matching clause; a throw from a callee two direct calls deep; an
+  exnref held in a global across forced collections, whose reference
+  argument sits between two vectors; and an uncaught throw. Each tier must
+  pass every command, and on a backend host the compiled tiers must compile
+  every function. }
+procedure TWastRunnerTests.TestExnV128FixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'exn-v128.wast';
+  { One module, ten assert_return, one assert_exception, two bare invokes. }
+  COMMANDS = 14;
+  { Every function in the fixture's module is compilable. }
+  COMPILED_FUNCTIONS = 15;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
 procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
   { Handler tables and wide non-tail calls compile, so the declined fixture
     is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
@@ -1786,6 +1869,10 @@ begin
     TestX64WriteBackFixtureAllTiers);
   Test('the x64 v128 cache fixture passes in every tier',
     TestX64V128CacheFixtureAllTiers);
+  Test('the GC v128 field fixture passes in every tier',
+    TestGcV128FixtureAllTiers);
+  Test('the v128 exception payload fixture passes in every tier',
+    TestExnV128FixtureAllTiers);
   Test('--tier=aot lets AOT-loaded and interpreted functions coexist',
     TestAotModeMixedTiersCoexist);
   Test('the --tier=aot tally is identical to the interpreter tally',

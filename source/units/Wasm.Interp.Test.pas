@@ -215,6 +215,7 @@ type
     procedure TestBrOnCastRefinement;
     procedure TestI31;
     procedure TestMidConstructionCollection;
+    procedure TestVec128AllocationSurvivesCollection;
     procedure TestHostCallRoundTrip;
     procedure TestHostCallTrapPropagates;
     procedure TestHostCallReentrancy;
@@ -1531,6 +1532,75 @@ begin
   Expect<Int32>(Call1('nest', [MakeValueI32(1234)]).I32).ToBe(1234);
 end;
 
+{ struct.new / array.new / array.new_fixed take a v128 OPERAND, not a
+  *Vec store, so they are where a 16-byte value can be cut to 8 bytes.
+  With the threshold floored to 0 every allocation collects, so the second
+  allocation in each function runs a cycle while the first object is live
+  only through a local: both halves must still read back afterwards. }
+procedure TInterpTests.TestVec128AllocationSurvivesCollection;
+const
+  V128_CONST: array[0 .. 17] of Byte = ($FD, $0C,
+    $AB, $AB, $AB, $AB, $AB, $AB, $AB, $AB,
+    $AB, $AB, $AB, $AB, $AB, $AB, $AB, $AB);
+var
+  Params, Results: array[0 .. 1] of TWasmValue;
+  Before: UInt64;
+begin
+  { type0 (struct (field v128) (field (ref null 0)))
+    type1 (func (param v128) (result v128))
+    type2 (array (mut v128))
+    "sn": inner = struct.new 0 (param, null); outer = struct.new 0
+          (v128.const 0xAB.., inner); struct.get 0 0 (struct.get 0 1 outer)
+    "an": a = array.new 2 (param, 3); drop (array.new_fixed 2 2 (param,
+          param)); array.get 2 a [2] }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([
+      BLit([$5F, $02, $7B, $00, $63, $00, $00]),
+      BLit([$60, $01, $7B, $01, $7B]),
+      BLit([$5E, $7B, $01])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$01])])),
+    Sect(7, VecOf([
+      BLit([$02, $73, $6E, $00, $00]),
+      BLit([$02, $61, $6E, $00, $01])])),
+    Sect(10, VecOf([
+      CodeEntry(Cat([
+        BLit([$01, $01, $63, $00,
+          $20, $00, $D0, $00, $FB, $00, $00,   { inner = struct.new 0 }
+          $21, $01]),                          { local.set 1 }
+        BLit(V128_CONST),
+        BLit([$20, $01, $FB, $00, $00,         { outer = struct.new 0 }
+          $FB, $02, $00, $01,                  { struct.get 0 1 -> inner }
+          $FB, $02, $00, $00, $0B])])),        { struct.get 0 0 }
+      CodeEntry([$01, $01, $63, $02,
+        $20, $00, $41, $03, $FB, $06, $02,     { array.new 2 (param, 3) }
+        $21, $01,                              { local.set 1 }
+        $20, $00, $20, $00, $FB, $08, $02, $02, $1A,  { new_fixed; drop }
+        $20, $01, $41, $02, $FB, $0B, $02, $0B])]))   { array.get 2 [2] }
+  ]));
+  DoInstantiate;
+  FStore.Heap.Threshold := 0;   { collect at every allocation }
+
+  Params[0].Bits := UInt64($1122334455667788);
+  Params[1].Bits := UInt64($99AABBCCDDEEFF00);
+
+  Before := FStore.Heap.CollectionCount;
+  Results[0].Bits := 0;
+  Results[1].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('sn'), @Params[0], @Results[0]);
+  Expect<UInt64>(Results[0].Bits).ToBe(UInt64($1122334455667788));
+  Expect<UInt64>(Results[1].Bits).ToBe(UInt64($99AABBCCDDEEFF00));
+  Expect<Boolean>(FStore.Heap.CollectionCount >= Before + 2).ToBe(True);
+
+  Before := FStore.Heap.CollectionCount;
+  Results[0].Bits := 0;
+  Results[1].Bits := 0;
+  InterpInvoke(FStore, FuncAddr('an'), @Params[0], @Results[0]);
+  Expect<UInt64>(Results[0].Bits).ToBe(UInt64($1122334455667788));
+  Expect<UInt64>(Results[1].Bits).ToBe(UInt64($99AABBCCDDEEFF00));
+  Expect<Boolean>(FStore.Heap.CollectionCount >= Before + 2).ToBe(True);
+end;
+
 { --- host calls ---------------------------------------------------------- }
 
 procedure TInterpTests.TestHostCallRoundTrip;
@@ -2585,6 +2655,8 @@ begin
   Test('ref.i31 and i31.get_s/get_u, and the null i31 trap', TestI31);
   Test('a collection mid-construction keeps the fresh aggregate rooted',
     TestMidConstructionCollection);
+  Test('struct.new and array.new store a v128 operand across collections',
+    TestVec128AllocationSurvivesCollection);
   Test('a host call round-trips params and results', TestHostCallRoundTrip);
   Test('a host callback trap propagates', TestHostCallTrapPropagates);
   Test('a host callback re-enters guest code', TestHostCallReentrancy);

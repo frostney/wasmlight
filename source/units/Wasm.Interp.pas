@@ -1498,7 +1498,7 @@ var
   Fn: PWasmIrFunction;
   Obj: TWasmRef;
   N, I: UInt32;
-  TmpFields: array[0..7] of TWasmValue;
+  TmpFields: array[0..7] of PWasmValue;
 begin
   Store := ACtx^.Store;
   Reg := Frame(ACtx^.Values, AAct^.Base);
@@ -1506,6 +1506,9 @@ begin
   Obj := Store.Heap.AllocStruct(AAct^.Instance.EngineTypeIds[UInt32(AIns^.Imm)]);
   Reg[AIns^.Dest].Bits := UInt64(Obj);            { publish before filling }
   N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
+  { Fields are passed as register POINTERS, not copies: a v128 field's
+    operand is a 16-byte register pair (VecAt), and an 8-byte copy would
+    drop it. }
   if N <= UInt32(Length(TmpFields)) then
   begin
     { An unsigned counter: a field-less struct (N = 0) must copy nothing,
@@ -1513,7 +1516,7 @@ begin
     I := 0;
     while I < N do
     begin
-      TmpFields[I] := Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
+      TmpFields[I] := @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
       Inc(I);
     end;
     Store.Heap.StructSetSeq(Obj, @TmpFields[0], N);
@@ -1523,8 +1526,8 @@ begin
     I := 0;
     while I < N do
     begin
-      Store.Heap.StructSet(Obj, I,
-        Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+      Store.Heap.StructSetSlot(Obj, I,
+        @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
       Inc(I);
     end;
   end;
@@ -1557,7 +1560,7 @@ begin
   Obj := Store.Heap.AllocArray(AAct^.Instance.EngineTypeIds[UInt32(AIns^.Imm)],
     Reg[AIns^.B].U32);
   Reg[AIns^.Dest].Bits := UInt64(Obj);
-  Store.Heap.ArrayFill(Obj, Reg[AIns^.A]);
+  Store.Heap.ArrayFillSlot(Obj, @Reg[AIns^.A]);
 end;
 
 procedure ExecArrayNewDefault(const ACtx: PWasmInterpContext;
@@ -1593,7 +1596,8 @@ begin
   I := 0;
   while I < N do
   begin
-    Store.Heap.ArraySet(Obj, I, Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+    Store.Heap.ArraySetSlot(Obj, I,
+      @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
     Inc(I);
   end;
 end;
@@ -1883,7 +1887,8 @@ begin
     I := 0;
     while I < ArgC do
     begin
-      Store.Heap.ExnSetArg(Exn, I, Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+      Store.Heap.ExnSetArgSlot(Exn, I,
+        @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
       Inc(I);
     end;
   end;
@@ -1908,7 +1913,8 @@ end;
   the ONLY additions are the rtCompiledSeam arm and the AThrowFrame parameter. }
 
 { Deliver a matched exception to a clause: write its payload into the target
-  label's merge registers and set the frame's IP to the clause target. The epoch
+  label's merge registers (a v128 argument into its 16-byte register pair)
+  and set the frame's IP to the clause target. The epoch
   poll reads ACtx^.Store.EpochSnapshot — the shared per-invocation snapshot Run
   also seeds its EpochCache from (equal by construction after Fix B), so the
   resume-time interrupt check is unchanged. }
@@ -1929,8 +1935,9 @@ begin
         I := 0;
         while I < ArgC do
         begin
-          ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
-            Store.Heap.ExnArg(AExn, I);
+          Store.Heap.ExnGetArgSlot(AExn, I,
+            @ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux,
+            I)]);
           Inc(I);
         end;
       end;
@@ -1939,8 +1946,9 @@ begin
         I := 0;
         while I < ArgC do
         begin
-          ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
-            Store.Heap.ExnArg(AExn, I);
+          Store.Heap.ExnGetArgSlot(AExn, I,
+            @ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux,
+            I)]);
           Inc(I);
         end;
         { The exnref follows the payload. Canonical whole-slot ref write
@@ -2606,8 +2614,9 @@ begin
           U2 := 0;
           while U2 < N do
           begin
-            Store.Heap.ExnSetArg(Exn, U2,
-              Reg[IrAuxBlockItem(Fn^.AuxU32, Ins^.A, U2)]);
+            { By register address: a v128 argument is a 16-byte pair. }
+            Store.Heap.ExnSetArgSlot(Exn, U2,
+              @Reg[IrAuxBlockItem(Fn^.AuxU32, Ins^.A, U2)]);
             Inc(U2);
           end;
           { AThrowFrame True: scan the top (throwing) frame at its own IP. }

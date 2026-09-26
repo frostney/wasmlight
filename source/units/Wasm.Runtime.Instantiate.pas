@@ -452,7 +452,8 @@ begin
           begin
             Reg := IrAuxBlockItem(AExpr.AuxU32, Instr.A, UInt32(Item));
             CheckReg(Reg, Count, 'struct.new field');
-            AStore.Heap.StructSet(Obj, UInt32(Item), Slot(Reg)^);
+            { By register address: a v128 field reads the 16-byte pair. }
+            AStore.Heap.StructSetSlot(Obj, UInt32(Item), Slot(Reg));
           end;
         end;
 
@@ -478,7 +479,7 @@ begin
           Obj := AStore.Heap.AllocArray(
             EngineIdOf(AInstance, UInt32(Instr.Imm)), Slot(Instr.B)^.U32);
           Slot(Instr.Dest)^.Bits := UInt64(Obj);
-          AStore.Heap.ArrayFill(Obj, Slot(Instr.A)^);
+          AStore.Heap.ArrayFillSlot(Obj, Slot(Instr.A));
         end;
 
       iroArrayNewDefault:
@@ -504,7 +505,7 @@ begin
           begin
             Reg := IrAuxBlockItem(AExpr.AuxU32, Instr.A, UInt32(Item));
             CheckReg(Reg, Count, 'array.new_fixed element');
-            AStore.Heap.ArraySet(Obj, UInt32(Item), Slot(Reg)^);
+            AStore.Heap.ArraySetSlot(Obj, UInt32(Item), Slot(Reg));
           end;
         end;
     else
