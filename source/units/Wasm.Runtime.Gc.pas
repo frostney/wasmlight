@@ -219,7 +219,16 @@ type
     so tracing a struct is a loop over a small array and needs no
     per-object map. RefArgSlots is the same idea for an exception's
     arguments, which are TWasmValue slots whose reference-ness is NOT
-    derivable from the object — it comes from the tag's functype params. }
+    derivable from the object — it comes from the tag's functype params.
+    It holds PARAMETER indices; ExnArgOffset maps one to its bytes.
+
+    ArgSlots places an exception's arguments when the tag has a v128
+    param: a v128 argument takes two consecutive 8-byte slots (its 16
+    bytes), every other argument one. ArgSlots[i] is param i's first slot
+    and ArgSlots[ParamCount] the total, so param i is a vector exactly when
+    ArgSlots[i + 1] - ArgSlots[i] = 2. It is nil for a tag with no v128
+    param, whose argument i is slot i — the layout every such exception
+    has always had. }
   TWasmGcLayout = record
     Defined: Boolean;
     Kind: TWasmCompKind;
@@ -231,6 +240,7 @@ type
     Elem: TWasmGcField;
     { wckFunc — the tag functype behind a wokExn }
     RefArgSlots: TWasmGcOffsets;
+    ArgSlots: TWasmGcOffsets;
   end;
 
   { The layout table. OWNED BY THE ENGINE, not by a heap: a layout is a
@@ -455,6 +465,8 @@ type
     procedure ReleaseObject(const ACell: PByte);
 
     function LayoutOf(const ARef: TWasmRef): PWasmGcLayout; inline;
+    function ExnArgLayout(const ARef: TWasmRef;
+      const AIndex: UInt32): PWasmGcLayout;
     { Pointer variant of StructField: the hot get/set paths index straight
       into the layout table instead of copying the field record out. }
     function StructFieldPtr(const ARef: TWasmRef;
@@ -652,9 +664,23 @@ type
 
     function ExnTagAddr(const ARef: TWasmRef): UInt32;
     function ExnArgCount(const ARef: TWasmRef): UInt32;
+    { Scalar and reference arguments. A v128 argument has no 8-byte view,
+      so both raise EWasmInternal on one; use the forms below. }
     function ExnArg(const ARef: TWasmRef; const AIndex: UInt32): TWasmValue;
     procedure ExnSetArg(const ARef: TWasmRef; const AIndex: UInt32;
       const AValue: TWasmValue);
+    { Whether argument AIndex is a v128, and the host-facing read of one. }
+    function ExnArgIsVec(const ARef: TWasmRef; const AIndex: UInt32): Boolean;
+    procedure ExnArgVec(const ARef: TWasmRef; const AIndex: UInt32;
+      const ADest: PWasmV128);
+    { throw / catch delivery from and to an operand register in the frame,
+      for an argument of any type: a v128 moves the 16-byte register pair at
+      the slot, every other argument the 8-byte slot (with ExnSetArg's
+      barrier). }
+    procedure ExnSetArgSlot(const ARef: TWasmRef; const AIndex: UInt32;
+      const ASlot: PWasmValue);
+    procedure ExnGetArgSlot(const ARef: TWasmRef; const AIndex: UInt32;
+      const ADest: PWasmValue);
 
     { --- collection --------------------------------------------------- }
 
@@ -1124,6 +1150,7 @@ begin
   Layout^.Fields := nil;
   Layout^.RefFieldOffsets := nil;
   Layout^.RefArgSlots := nil;
+  Layout^.ArgSlots := nil;
   Layout^.Size := WASM_OBJ_HEADER_SIZE;
   { Reset Elem for every kind so a non-array layout does not inherit a
     previous definition's element field — the idempotence Define claims
@@ -1185,6 +1212,29 @@ begin
             Layout^.RefArgSlots[RefCount] := UInt32(Index);
             Inc(RefCount);
           end;
+
+        { A v128 argument needs its full 16 bytes (`syntax-exninst`: the
+          instance holds the argument VALUES). Only a tag with a vector
+          param gets a slot map, so every other exception's layout is
+          unchanged. }
+        RefCount := 0;
+        for Index := 0 to High(AComp.Func.Params) do
+          if AComp.Func.Params[Index].Kind = wvkVec then
+            Inc(RefCount);
+        if RefCount > 0 then
+        begin
+          SetLength(Layout^.ArgSlots, Length(AComp.Func.Params) + 1);
+          Offset := 0;
+          for Index := 0 to High(AComp.Func.Params) do
+          begin
+            Layout^.ArgSlots[Index] := Offset;
+            if AComp.Func.Params[Index].Kind = wvkVec then
+              Offset := Offset + 2
+            else
+              Offset := Offset + 1;
+          end;
+          Layout^.ArgSlots[Length(AComp.Func.Params)] := Offset;
+        end;
       end;
   end;
 
@@ -1541,12 +1591,33 @@ begin
   Result := MakeObjectRef(Cell);
 end;
 
+{ Where exception argument AIndex lives: its byte offset in the object, and
+  whether it is a v128 (two slots). The caller has bounded AIndex by the
+  object's argument count, which never exceeds the tag's param count. }
+function ExnArgOffset(const ALayout: PWasmGcLayout;
+  const AIndex: UInt32): UInt32; inline;
+begin
+  if ALayout^.ArgSlots = nil then
+    Result := WASM_EXN_ARGS_OFFSET + AIndex * SizeOf(TWasmValue)
+  else
+    Result := WASM_EXN_ARGS_OFFSET +
+      ALayout^.ArgSlots[AIndex] * SizeOf(TWasmValue);
+end;
+
+function ExnArgIsVecAt(const ALayout: PWasmGcLayout;
+  const AIndex: UInt32): Boolean; inline;
+begin
+  Result := (ALayout^.ArgSlots <> nil) and
+    (ALayout^.ArgSlots[AIndex + 1] - ALayout^.ArgSlots[AIndex] = 2);
+end;
+
 function TWasmGcHeap.AllocExn(const ATagAddr: UInt32;
   const ATypeId: TWasmGcTypeId; const AArgCount: UInt32): TWasmRef;
 var
   Cell: PByte;
   Bytes: UInt64;
   Layout: PWasmGcLayout;
+  Slots: UInt32;
 begin
   { The header's type id holds the TAG's functype id, so GcAbsKindOf
     yields wahExn and casts behave. Track H adds the throw path; the
@@ -1562,8 +1633,19 @@ begin
     raise EWasmInternal.CreateFmt(
       'internal: engine type %u is not a tag (func) type', [ATypeId]);
 
+  { A v128 argument takes two slots (see TWasmGcLayout.ArgSlots). }
+  if Layout^.ArgSlots = nil then
+    Slots := AArgCount
+  else
+  begin
+    if AArgCount >= UInt32(Length(Layout^.ArgSlots)) then
+      raise EWasmInternal.CreateFmt(
+        'internal: %u exception arguments for a tag of %u params',
+        [AArgCount, UInt32(Length(Layout^.ArgSlots)) - 1]);
+    Slots := Layout^.ArgSlots[AArgCount];
+  end;
   Bytes := UInt64(WASM_EXN_ARGS_OFFSET) +
-    UInt64(AArgCount) * UInt64(SizeOf(TWasmValue));
+    UInt64(Slots) * UInt64(SizeOf(TWasmValue));
   if Bytes > UInt64(High(UInt32) - WASM_GC_ALIGNMENT) then
     TrapNow(wtkAllocationFailure);
   Cell := Allocate(UInt32(Bytes), wokExn, ATypeId);
@@ -2345,42 +2427,114 @@ begin
   Result := PWasmU32(PByte(RefToPointer(ARef)) + WASM_EXN_ARGC_OFFSET)^;
 end;
 
-function TWasmGcHeap.ExnArg(const ARef: TWasmRef;
-  const AIndex: UInt32): TWasmValue;
+{ The shared resolve behind every exception-argument accessor: the bound
+  check, then the argument's layout. }
+function TWasmGcHeap.ExnArgLayout(const ARef: TWasmRef;
+  const AIndex: UInt32): PWasmGcLayout;
 begin
   if AIndex >= ExnArgCount(ARef) then
     raise EWasmInternal.CreateFmt('internal: exception argument %u of %u',
       [AIndex, ExnArgCount(ARef)]);
-  Result := PWasmValue(PByte(RefToPointer(ARef)) + WASM_EXN_ARGS_OFFSET +
-    AIndex * SizeOf(TWasmValue))^;
+  Result := LayoutOf(ARef);
+end;
+
+function TWasmGcHeap.ExnArg(const ARef: TWasmRef;
+  const AIndex: UInt32): TWasmValue;
+var
+  Layout: PWasmGcLayout;
+begin
+  Layout := ExnArgLayout(ARef, AIndex);
+  { A v128 argument has no 8-byte view; returning half of it would be the
+    truncation this accessor must never perform. }
+  if ExnArgIsVecAt(Layout, AIndex) then
+    raise EWasmInternal.CreateFmt(
+      'internal: exception argument %u is a v128; read it with ExnArgVec',
+      [AIndex]);
+  Result := PWasmValue(PByte(RefToPointer(ARef)) +
+    ExnArgOffset(Layout, AIndex))^;
+end;
+
+function TWasmGcHeap.ExnArgIsVec(const ARef: TWasmRef;
+  const AIndex: UInt32): Boolean;
+begin
+  Result := ExnArgIsVecAt(ExnArgLayout(ARef, AIndex), AIndex);
+end;
+
+procedure TWasmGcHeap.ExnArgVec(const ARef: TWasmRef; const AIndex: UInt32;
+  const ADest: PWasmV128);
+var
+  Layout: PWasmGcLayout;
+begin
+  Layout := ExnArgLayout(ARef, AIndex);
+  if not ExnArgIsVecAt(Layout, AIndex) then
+    raise EWasmInternal.CreateFmt(
+      'internal: exception argument %u is not a v128', [AIndex]);
+  Move((PByte(RefToPointer(ARef)) + ExnArgOffset(Layout, AIndex))^,
+    ADest^, 16);
+end;
+
+procedure TWasmGcHeap.ExnGetArgSlot(const ARef: TWasmRef;
+  const AIndex: UInt32; const ADest: PWasmValue);
+var
+  Layout: PWasmGcLayout;
+  Src: PByte;
+begin
+  Layout := ExnArgLayout(ARef, AIndex);
+  Src := PByte(RefToPointer(ARef)) + ExnArgOffset(Layout, AIndex);
+  if ExnArgIsVecAt(Layout, AIndex) then
+    Move(Src^, ADest^, 16)
+  else
+    ADest^ := PWasmValue(Src)^;
+end;
+
+{ Whether argument AIndex is a reference: which of an exn's args are
+  references comes from the tag functype's params (RefArgSlots), not from
+  the value. }
+function IsRefArgAt(const ALayout: PWasmGcLayout;
+  const AIndex: UInt32): Boolean;
+var
+  Index: Integer;
+begin
+  Result := False;
+  for Index := 0 to High(ALayout^.RefArgSlots) do
+    if ALayout^.RefArgSlots[Index] = AIndex then
+      Exit(True);
 end;
 
 procedure TWasmGcHeap.ExnSetArg(const ARef: TWasmRef; const AIndex: UInt32;
   const AValue: TWasmValue);
 var
   Layout: PWasmGcLayout;
-  Index: Integer;
-  IsRefArg: Boolean;
 begin
-  if AIndex >= ExnArgCount(ARef) then
-    raise EWasmInternal.CreateFmt('internal: exception argument %u of %u',
-      [AIndex, ExnArgCount(ARef)]);
-  PWasmValue(PByte(RefToPointer(ARef)) + WASM_EXN_ARGS_OFFSET +
-    AIndex * SizeOf(TWasmValue))^ := AValue;
+  Layout := ExnArgLayout(ARef, AIndex);
+  if ExnArgIsVecAt(Layout, AIndex) then
+    raise EWasmInternal.CreateFmt(
+      'internal: exception argument %u is a v128; write it with '
+      + 'ExnSetArgSlot', [AIndex]);
+  PWasmValue(PByte(RefToPointer(ARef)) + ExnArgOffset(Layout, AIndex))^ :=
+    AValue;
   { Guard the barrier on whether this argument slot is a reference (L9),
-    for consistency with StructSet/ArraySet — which of an exn's args are
-    references comes from the tag functype's params (RefArgSlots), not from
-    the value. }
-  Layout := LayoutOf(ARef);
-  IsRefArg := False;
-  for Index := 0 to High(Layout^.RefArgSlots) do
-    if Layout^.RefArgSlots[Index] = AIndex then
-    begin
-      IsRefArg := True;
-      Break;
-    end;
-  if IsRefArg then
+    for consistency with StructSet/ArraySet. }
+  if IsRefArgAt(Layout, AIndex) then
     WriteBarrier(ARef, TWasmRef(AValue.Bits));
+end;
+
+procedure TWasmGcHeap.ExnSetArgSlot(const ARef: TWasmRef;
+  const AIndex: UInt32; const ASlot: PWasmValue);
+var
+  Layout: PWasmGcLayout;
+  Dst: PByte;
+begin
+  Layout := ExnArgLayout(ARef, AIndex);
+  Dst := PByte(RefToPointer(ARef)) + ExnArgOffset(Layout, AIndex);
+  if ExnArgIsVecAt(Layout, AIndex) then
+  begin
+    Move(ASlot^, Dst^, 16);
+    Exit;
+  end;
+  PWasmValue(Dst)^ := ASlot^;
+  if IsRefArgAt(Layout, AIndex) then
+    WriteBarrier(ARef, TWasmRef(ASlot^.Bits));
 end;
 
 { --- roots --------------------------------------------------------------- }
@@ -2635,8 +2789,10 @@ begin
         Count := PWasmU32(Base + WASM_EXN_ARGC_OFFSET)^;
         for Index := 0 to High(Layout^.RefArgSlots) do
           if Layout^.RefArgSlots[Index] < Count then
-            MarkRoot(PWasmValue(Base + WASM_EXN_ARGS_OFFSET +
-              Layout^.RefArgSlots[Index] * SizeOf(TWasmValue))^.Ref);
+            { Placed through the slot map: a v128 param before a reference
+              shifts it, and a vector's bytes are never read as a ref. }
+            MarkRoot(PWasmValue(Base +
+              ExnArgOffset(Layout, Layout^.RefArgSlots[Index]))^.Ref);
       end;
 
     wokExternalized, wokInternalized:

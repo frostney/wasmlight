@@ -1878,7 +1878,8 @@ begin
     I := 0;
     while I < ArgC do
     begin
-      Store.Heap.ExnSetArg(Exn, I, Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
+      Store.Heap.ExnSetArgSlot(Exn, I,
+        @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)]);
       Inc(I);
     end;
   end;
@@ -1903,7 +1904,8 @@ end;
   the ONLY additions are the rtCompiledSeam arm and the AThrowFrame parameter. }
 
 { Deliver a matched exception to a clause: write its payload into the target
-  label's merge registers and set the frame's IP to the clause target. The epoch
+  label's merge registers (a v128 argument into its 16-byte register pair)
+  and set the frame's IP to the clause target. The epoch
   poll reads ACtx^.Store.EpochSnapshot — the shared per-invocation snapshot Run
   also seeds its EpochCache from (equal by construction after Fix B), so the
   resume-time interrupt check is unchanged. }
@@ -1924,8 +1926,9 @@ begin
         I := 0;
         while I < ArgC do
         begin
-          ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
-            Store.Heap.ExnArg(AExn, I);
+          Store.Heap.ExnGetArgSlot(AExn, I,
+            @ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux,
+            I)]);
           Inc(I);
         end;
       end;
@@ -1934,8 +1937,9 @@ begin
         I := 0;
         while I < ArgC do
         begin
-          ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux, I)] :=
-            Store.Heap.ExnArg(AExn, I);
+          Store.Heap.ExnGetArgSlot(AExn, I,
+            @ClauseRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AClause.PayloadAux,
+            I)]);
           Inc(I);
         end;
         { The exnref follows the payload. Canonical whole-slot ref write
@@ -2601,8 +2605,9 @@ begin
           U2 := 0;
           while U2 < N do
           begin
-            Store.Heap.ExnSetArg(Exn, U2,
-              Reg[IrAuxBlockItem(Fn^.AuxU32, Ins^.A, U2)]);
+            { By register address: a v128 argument is a 16-byte pair. }
+            Store.Heap.ExnSetArgSlot(Exn, U2,
+              @Reg[IrAuxBlockItem(Fn^.AuxU32, Ins^.A, U2)]);
             Inc(U2);
           end;
           { AThrowFrame True: scan the top (throwing) frame at its own IP. }
