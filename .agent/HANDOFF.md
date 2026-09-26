@@ -45,14 +45,24 @@
 - Rejected: lane G folding single-use v128 results into the `local.set`
   destination (with the alias pass: simd-long +18% vs G1; fold alone flat);
   lane G without the alias pass (superseded, ~12% slower than G3).
-- Found, not yet fixed (next follow-up PR): (1) the heap's dev-only
-  `FInjectBlockFailures` field shifts later heap offsets by 8 between dev and
-  release builds, while the published layout/fingerprint use the dev offsets
-  — a dev-built `.waot` can pass the fingerprint in a release runtime with
-  wrong heap offsets (already true for ARM64's wave-11 inline path); fix by
-  making the heap layout build-mode independent. (2) ARM64's inline
-  `struct.new` never checks the collection trigger, so its collection points
-  differ from the interpreter's (heap statistics only, not wasm-observable).
+- Follow-ups found during wave 4, now resolved:
+  - The heap's dev-only `FInjectBlockFailures` field shifted later heap
+    offsets by 8 between dev and release builds. The published layout used
+    the dev offsets, so a dev-built `.waot` with wrong heap offsets could
+    pass the fingerprint in a release runtime. Fable CR-2 on #136 flagged it.
+    The fix moves the field after every baked field (`1987080`), so dev and
+    release share one layout. A probe confirmed live 272, alloc 280, objs
+    304 and threshold 320 in both modes.
+  - ARM64's inline `struct.new` had use-after-free, header-clobber,
+    missing-trigger and padding bugs. The ARM64 heap-stat assertions exposed
+    them, and #138 (`19bf792`) fixed them. `GcDiff` now asserts heap
+    statistics on every backend.
+  - Main (#138, then #137's v128 GC fields `e4aff9e`) was merged into this
+    branch (`0570f72`, `0aac888`). The merged struct.new copy loops keep this
+    wave's unsigned while-loop and use #137's register pointers.
+  - The x64 inline path still falls back to the helper for v128 fields, and
+    `gc-v128.wast` / `exn-v128.wast` pass in every tier (dev and release,
+    compiled 32/15).
 - Correctness: lane J differential tests (field kinds incl. packed/ref/i31/
   empty, recycled-cell bytes over 12 churn lengths, all nine size classes and
   fallbacks at three trigger floors, code-shape) plus an interpreter test for
@@ -73,6 +83,7 @@
   accumulator store, address arithmetic, possibly unrolling/strength
   reduction), fib/call leaf-call overhead or inlining, the generic call
   frame, then loop (dependency chain).
+
 ## ARM64 inline struct.new correctness fix, 2026-09-26
 
 - Branch `fix/arm64-inline-struct-new` from exact main `36c9394`. Found by the
