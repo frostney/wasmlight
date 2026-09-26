@@ -2469,9 +2469,11 @@ var
   Layout: PWasmGcLayout;
 begin
   Layout := ExnArgLayout(ARef, AIndex);
+  { Host API misuse (a scalar or reference read through the v128 accessor):
+    EWasmError, like ExnArg's refusal of a v128. }
   if not ExnArgIsVecAt(Layout, AIndex) then
-    raise EWasmInternal.CreateFmt(
-      'internal: exception argument %u is not a v128', [AIndex]);
+    raise EWasmError.CreateFmt(
+      'exception argument %u is not a v128; read it with ExnArg', [AIndex]);
   Move((PByte(RefToPointer(ARef)) + ExnArgOffset(Layout, AIndex))^,
     ADest^, 16);
 end;

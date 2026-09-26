@@ -591,6 +591,14 @@ begin
       Refused := not (E is EWasmInternal);
   end;
   Expect<Boolean>(Refused).ToBe(True);
+  Refused := False;
+  try
+    FStore.Heap.ExnArgVec(ExnRef, 0, @Vec);
+  except
+    on E: EWasmError do
+      Refused := not (E is EWasmInternal);
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
 
   RootRelease(FStore, Handle);
 end;
