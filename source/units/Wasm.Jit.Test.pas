@@ -2180,6 +2180,8 @@ type
     procedure TestSimdMoveSelect;
     procedure TestSimdGlobal;
     procedure TestSimdStructArray;
+    procedure TestVecCacheLoopEpoch;
+    procedure TestVecCacheLoopCodeShape;
   end;
 
 procedure TJitTests.BeforeEach;
@@ -7133,6 +7135,129 @@ begin
     [MakeValueI32(4242)])).ToBe(VEC_COMPILED);
 end;
 
+{ The simd workload's loop shape — a v128 local carried in a fixed xmm host,
+  a hoisted loop-invariant v128.const, dying vector temporaries — plus a v128
+  loop parameter, which crosses the epoch-polled back-edge in a dynamic xmm
+  host. The interpreted "run" checks the leaf's result against literals from
+  an independent lane model (per 32-bit lane: v = ((v + c) mod 2^32) xor i,
+  p = p - v). With the epoch bumped, the first taken back-edge interrupts in
+  both tiers; without it every carried value must survive the poll. }
+procedure TJitTests.TestVecCacheLoopEpoch;
+const
+  LEAF = '(func $leaf (export "leaf") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $v v128) ' +
+    '(local.set $v (v128.const i32x4 1 2 3 4)) ' +
+    'v128.const i32x4 9 9 9 9 ' +
+    'loop $l (param v128) (result v128) ' +
+    'local.get $v v128.const i32x4 1 3 5 7 i32x4.add ' +
+    'local.get $i i32x4.splat v128.xor local.set $v ' +
+    'local.get $v i32x4.sub ' +
+    'local.get $i i32.const 1 i32.add local.tee $i ' +
+    'local.get $n i32.lt_u br_if $l ' +
+    'end ' +
+    'i32x4.extract_lane 2 ' +
+    '(i32x4.extract_lane 3 (local.get $v)) i32.add ' +
+    '(i32x4.extract_lane 1 (local.get $v)) i32.add) ';
+  Inputs: array[0 .. 2] of Integer = (1, 10, 1000);
+  Expected: array[0 .. 2] of Integer = (17, -259, -2015837);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  { Values on fresh stores per tier: an interpreted run first on the same
+    store would leave its final register-file values behind, and a missing
+    write-back could then read them back as if correct. }
+  Bytes := AssembleWatText('(module ' + LEAF +
+    '(func (export "check") (param $n i32) (param $want i32) (result i32) ' +
+    '(local $r i32) (local.set $r (call $leaf (local.get $n))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  CompileExports(['leaf']);
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Expected[I])])).ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Expected[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+  Bytes := AssembleWatText('(module (import "e" "bump" (func $bump)) ' +
+    LEAF +
+    '(func (export "run") (param $n i32) (param $bump i32) ' +
+    '(param $want i32) (result i32) (local $r i32) ' +
+    '(if (local.get $bump) (then (call $bump))) ' +
+    '(local.set $r (call $leaf (local.get $n))) ' +
+    '(if (i32.ne (local.get $r) (local.get $want)) (then unreachable)) ' +
+    '(local.get $r)))');
+  FDiffHost := @JitBumpEpochCallback;
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(1), MakeValueI32(1), MakeValueI32(17)])).ToBe('');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(1), MakeValueI32(1), MakeValueI32(17)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TrapMessageOf(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(1), MakeValueI32(17)]))
+    .ToBe('interrupt');
+  Expect<Boolean>(DiffModule(Bytes, 'run',
+    [MakeValueI32(2), MakeValueI32(1), MakeValueI32(17)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  FDiffHost := nil;
+end;
+
+{ The same loop staged on x64: the only vector memory access left is the
+  fixed local's load at entry. No MOVDQU store (F3 [REX] 0F 7F) remains —
+  the carried local, the hoisted constant, and the temporaries never touch
+  the register file — and the constant's two halves are materialized once. }
+procedure TJitTests.TestVecCacheLoopCodeShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  I, Loads, Stores, Consts: Integer;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_X64}
+  FBytes := AssembleWatText('(module ' +
+    '(func (export "leaf") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $v v128) ' +
+    '(local.set $v (v128.const i32x4 1 2 3 4)) ' +
+    '(loop $l ' +
+    '(local.set $v (v128.xor (i32x4.add (local.get $v) ' +
+    '(v128.const i32x4 1 3 5 7)) (i32x4.splat (local.get $i)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32x4.extract_lane 3 (local.get $v))))');
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Code := JitStageFunctionBytes(FStore, @FIr.Functions[0], EntryOffset,
+    RegisterCount);
+  Loads := 0;
+  Stores := 0;
+  Consts := 0;
+  for I := 0 to Length(Code) - 4 do
+  begin
+    if (Code[I] = $F3) and (Code[I + 1] = $0F) and (Code[I + 2] = $6F) then
+      Inc(Loads);
+    if (Code[I] = $F3) and (Code[I + 2] = $0F) and (Code[I + 3] = $6F) then
+      Inc(Loads);
+    if (Code[I] = $F3) and (Code[I + 1] = $0F) and (Code[I + 2] = $7F) then
+      Inc(Stores);
+    if (Code[I] = $F3) and (Code[I + 2] = $0F) and (Code[I + 3] = $7F) then
+      Inc(Stores);
+    { movabs rax, 0x0000000300000001: the constant's low half. }
+    if (Code[I] = $48) and (Code[I + 1] = $B8) and (Code[I + 2] = $01) and
+      (I + 9 < Length(Code)) and (Code[I + 6] = $03) then
+      Inc(Consts);
+  end;
+  Expect<Integer>(Loads).ToBe(1);
+  Expect<Integer>(Stores).ToBe(0);
+  Expect<Integer>(Consts).ToBe(1);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TJitTests.SetupTests;
 begin
   Test('adjacent result moves retain call argument snapshots',
@@ -7149,6 +7274,10 @@ begin
     TestDeferredStoreLoopCarriedEpoch);
   Test('deferred static-cache values reach early br and return exits',
     TestDeferredStoreEarlyExits);
+  Test('cached v128 loop values survive the epoch poll and interrupt it',
+    TestVecCacheLoopEpoch);
+  Test('a cached v128 loop keeps its vectors out of the register file',
+    TestVecCacheLoopCodeShape);
   Test('direct-operand i32 ALU and compares match in the static cache',
     TestDirectOperandStaticI32);
   Test('a direct operand survives eviction by its partner operand',

@@ -554,6 +554,11 @@ var
   X64Cache: TX64RegCache;
   X64Callee: TX64DirectCallee;
   X64CalleePtr: PX64DirectCallee;
+  UseX64VecCache: Boolean;
+  X64VecStatics: array of UInt32;
+  X64VecConsts: array of UInt32;
+  X64VecConstLo: array of UInt64;
+  X64VecConstHi: array of UInt64;
   {$ENDIF}
 
   procedure MarkTarget(const ATarget: UInt32);
@@ -896,6 +901,73 @@ var
         SkipPlanned[K] := True;
       end;
   end;
+
+  {$IFDEF WASM_JIT_X64}
+  { local.get lowers to a move into a one-use temporary. In a static-cache
+    function with v128 ops, that alias is forwarded into the cached vector
+    op reading it within four instructions: a v128 operand, or the scalar
+    operand of a splat. The op then reads the local's host directly. A
+    join, or any instruction naming the local as its destination, ends the
+    proof; the skipped move's label stays bound after any join write-back. }
+  procedure AnalyzeX64VecAliases;
+  var
+    K, L, Last: Integer;
+    Source, Alias_: UInt32;
+
+    function RewriteUse(var AIns: TWasmIrInstr): Boolean;
+    begin
+      Result := False;
+      if not X64VecCacheOp(AIns.Op) then
+        Exit;
+      if AIns.A = Alias_ then
+      begin
+        AIns.A := Source;
+        Result := True;
+      end;
+      case AIns.Op of
+        iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+        iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+        iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub:
+          if AIns.B = Alias_ then
+          begin
+            AIns.B := Source;
+            Result := True;
+          end;
+      end;
+    end;
+
+  begin
+    if not UseStaticCache then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if ((PlannedCode[K].Op = iroMove) or
+        (PlannedCode[K].Op = iroMoveVec)) and
+        not SkipPlanned[K] and IsVisibleFrameReg(PlannedCode[K].A) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) then
+      begin
+        Source := PlannedCode[K].A;
+        Alias_ := PlannedCode[K].Dest;
+        Last := K + 4;
+        if Last > High(PlannedCode) then
+          Last := High(PlannedCode);
+        for L := K + 1 to Last do
+        begin
+          if Targets[L] then
+            Break;
+          if SkipPlanned[L] then
+            Continue;
+          if RewriteUse(PlannedCode[L]) then
+          begin
+            SkipPlanned[K] := True;
+            Break;
+          end;
+          if PlannedCode[L].Dest = Source then
+            Break;
+        end;
+      end;
+  end;
+  {$ENDIF}
 
   procedure AnalyzeNativeSelfReturnTail;
   var
@@ -1277,6 +1349,17 @@ var
           iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
           iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
           iroI64Load32S, iroI64Load32U]);
+      {$IFDEF WASM_JIT_X64}
+      { A static-cache function may now hold v128 ops; a lane extract is
+        the one that can redefine a scalar local. }
+      if AIns.Dest = ASlot then
+        case AIns.Op of
+          iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+          iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+          iroI32x4ExtractLane, iroI64x2ExtractLane:
+            Result := True;
+        end;
+      {$ENDIF}
     end;
 
   begin
@@ -1463,6 +1546,21 @@ var
           x64 keeps Base in rsi with no access touching r8-r11 as scratch. }
         Result := UsePinnedMemoryBase;
       {$ENDIF}
+      {$IFDEF WASM_JIT_X64}
+      { The natively emitted v128 ops call no helper; X64EnableVecCache keeps
+        their values in xmm hosts. Every slot must be disp32-addressable so
+        no vector load, store, or write-back needs an address scratch. }
+      iroV128Not, iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+      iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+      iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub,
+      iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+      iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+      iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+      iroI32x4ExtractLane, iroI64x2ExtractLane,
+      iroMoveVec, iroV128Const:
+        Result := X64VecCacheOp(AOp) and
+          (UInt64(AFn^.RegisterCount) * 8 <= UInt64(High(Int32)));
+      {$ENDIF}
     else
       Result := False;
     end;
@@ -1561,6 +1659,23 @@ var
           { Result-copy planning may make the actual return source an
             expression slot. Retain its final read across dynamic eviction. }
           CountSlotUse(NativeResultSource);
+      {$IFDEF WASM_JIT_X64}
+      { v128 values are counted by their low slot, as the xmm cache keys
+        them; splat's operand is scalar. }
+      iroMoveVec, iroV128Not,
+      iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+      iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+      iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+      iroI32x4ExtractLane, iroI64x2ExtractLane:
+        CountSlotUse(AIns.A);
+      iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+      iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+      iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub:
+        begin
+          CountSlotUse(AIns.A);
+          CountSlotUse(AIns.B);
+        end;
+      {$ENDIF}
     end;
   end;
 
@@ -1646,7 +1761,26 @@ var
               MarkUse(Ins.A);
               MarkUse(Ins.Dest);
             end;
+          {$IFDEF WASM_JIT_X64}
+          iroMoveVec, iroV128Not,
+          iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat,
+          iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+          iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+          iroI32x4ExtractLane, iroI64x2ExtractLane:
+            MarkUse(Ins.A);
+          iroV128And, iroV128Andnot, iroV128Or, iroV128Xor,
+          iroI8x16Add, iroI8x16Sub, iroI16x8Add, iroI16x8Sub,
+          iroI32x4Add, iroI32x4Sub, iroI64x2Add, iroI64x2Sub:
+            begin
+              MarkUse(Ins.A);
+              MarkUse(Ins.B);
+            end;
+          {$ENDIF}
         end;
+        {$IFDEF WASM_JIT_X64}
+        if X64VecCacheOp(Ins.Op) then
+          MarkDefinition(Ins.Dest);
+        {$ENDIF}
         if Fusion[N] < 0 then
           case Ins.Op of
             iroMove, iroI32Const, iroI64Const, iroF32Const, iroF64Const,
@@ -1713,6 +1847,153 @@ var
         (PlannedCode[K].B <= UInt32(K)) then
         MarkLoopCarried(Integer(PlannedCode[K].B), K);
   end;
+
+  {$IFDEF WASM_JIT_X64}
+  { The xmm plan for a static-cache function holding natively emitted v128
+    ops. Fixed hosts go first to the most-used v128 locals and parameters —
+    never a result slot, because a fixed host is not written back at an
+    exit — then to loop-invariant v128.const results: a constant defined
+    inside a loop span re-materializes every iteration, so it is seeded once
+    at entry instead. A candidate constant must be the only writer of a slot
+    no local, result, or exit can observe; a validated temporary is written
+    before every read, and a unique writer always writes the same bits, so
+    the seeded host equals the slot's value at every read. A function
+    without v128 ops keeps its exact previous code. }
+  procedure AnalyzeX64VecCache;
+  const
+    MAX_FIXED = 8;
+    MAX_STATIC = 6;
+  var
+    K, M, Best: Integer;
+    Scores: array of UInt32;
+    Slot: UInt32;
+    Ins: TWasmIrInstr;
+    HasVec, InLoop, Unique: Boolean;
+    VTmp: TWasmV128;
+
+    procedure ScoreVec(const ASlot: UInt32; const AWeight: UInt32);
+    begin
+      if ASlot < UInt32(Length(Scores)) then
+        Inc(Scores[ASlot], AWeight);
+    end;
+
+    function Chosen(const ASlot: UInt32): Boolean;
+    var
+      N: Integer;
+    begin
+      Result := True;
+      for N := 0 to High(X64VecStatics) do
+        if X64VecStatics[N] = ASlot then
+          Exit;
+      for N := 0 to High(X64VecConsts) do
+        if X64VecConsts[N] = ASlot then
+          Exit;
+      Result := False;
+    end;
+
+  begin
+    UseX64VecCache := False;
+    SetLength(X64VecStatics, 0);
+    SetLength(X64VecConsts, 0);
+    SetLength(X64VecConstLo, 0);
+    SetLength(X64VecConstHi, 0);
+    if not UseStaticCache then
+      Exit;
+    HasVec := False;
+    SetLength(Scores, AFn^.RegisterCount);
+    for K := 0 to High(PlannedCode) do
+    begin
+      Ins := PlannedCode[K];
+      if SkipPlanned[K] or not X64VecCacheOp(Ins.Op) then
+        Continue;
+      HasVec := True;
+      case Ins.Op of
+        iroMoveVec:
+          begin
+            ScoreVec(Ins.A, 2);
+            ScoreVec(Ins.Dest, 2);
+          end;
+        iroV128Const,
+        iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat:
+          ScoreVec(Ins.Dest, 1);
+        iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
+        iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
+        iroI32x4ExtractLane, iroI64x2ExtractLane:
+          ScoreVec(Ins.A, 1);
+        iroV128Not:
+          begin
+            ScoreVec(Ins.A, 1);
+            ScoreVec(Ins.Dest, 1);
+          end;
+      else
+        ScoreVec(Ins.A, 1);
+        ScoreVec(Ins.B, 1);
+        ScoreVec(Ins.Dest, 1);
+      end;
+    end;
+    if not HasVec then
+      Exit;
+    UseX64VecCache := True;
+    repeat
+      Best := -1;
+      for K := 0 to High(AFn^.LocalRegs) do
+      begin
+        Slot := AFn^.LocalRegs[K];
+        if (Slot >= UInt32(Length(AFn^.RegTypes))) or
+          (AFn^.RegTypes[Slot].Kind <> wvkVec) or (Scores[Slot] < 2) or
+          Chosen(Slot) then
+          Continue;
+        if (Best < 0) or (Scores[Slot] > Scores[AFn^.LocalRegs[Best]]) then
+          Best := K;
+      end;
+      if Best >= 0 then
+      begin
+        SetLength(X64VecStatics, Length(X64VecStatics) + 1);
+        X64VecStatics[High(X64VecStatics)] := AFn^.LocalRegs[Best];
+      end;
+    until (Best < 0) or (Length(X64VecStatics) = MAX_STATIC);
+    for K := 0 to High(PlannedCode) do
+    begin
+      if Length(X64VecStatics) + Length(X64VecConsts) >= MAX_FIXED then
+        Break;
+      Ins := PlannedCode[K];
+      if SkipPlanned[K] or (Ins.Op <> iroV128Const) or
+        IsVisibleFrameReg(Ins.Dest) or Chosen(Ins.Dest) then
+        Continue;
+      InLoop := False;
+      for M := K to High(PlannedCode) do
+        if ((PlannedCode[M].Op = iroJump) and
+          (PlannedCode[M].A <= UInt32(K))) or
+          ((PlannedCode[M].Op in [iroBranchIf, iroBranchIfNot]) and
+          (PlannedCode[M].B <= UInt32(K))) then
+        begin
+          InLoop := True;
+          Break;
+        end;
+      if not InLoop then
+        Continue;
+      { Every Dest field counts, including a store's value operand: a
+        conservative superset of the slot's writers. }
+      Unique := True;
+      for M := 0 to High(AFn^.Code) do
+        if (M <> K) and ((AFn^.Code[M].Dest = Ins.Dest) or
+          (PlannedCode[M].Dest = Ins.Dest)) then
+        begin
+          Unique := False;
+          Break;
+        end;
+      if not Unique then
+        Continue;
+      IrAuxReadV128(AFn^.AuxU32, UInt32(Ins.Imm), VTmp);
+      SetLength(X64VecConsts, Length(X64VecConsts) + 1);
+      SetLength(X64VecConstLo, Length(X64VecConsts));
+      SetLength(X64VecConstHi, Length(X64VecConsts));
+      X64VecConsts[High(X64VecConsts)] := Ins.Dest;
+      X64VecConstLo[High(X64VecConsts)] := VTmp.U64[0];
+      X64VecConstHi[High(X64VecConsts)] := VTmp.U64[1];
+    end;
+  end;
+  {$ENDIF}
 
   procedure AnalyzeStaticCache;
   var
@@ -2384,6 +2665,9 @@ begin
     AnalyzeAdjacentMoves;
     AnalyzeMemoryMoves;
     AnalyzeLocalAliases;
+    {$IFDEF WASM_JIT_X64}
+    AnalyzeX64VecAliases;
+    {$ENDIF}
     AnalyzeResultCopies;
     AnalyzeStoreLoadForwarding;
     {$IFDEF WASM_JIT_ARM64}
@@ -2411,6 +2695,7 @@ begin
         MaskedShiftSource[I] := -1;
       AnalyzeDynamicWriteBack;
     end;
+    AnalyzeX64VecCache;
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -2507,6 +2792,11 @@ begin
         fault unwinds to the trampoline, which reads no slot. }
       X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
         @VisibleSlots[0], AFn^.RegisterCount);
+      { Admitted v128 ops are helper-free too, so their xmm hosts survive to
+        the same exits; a caller-saved xmm is never live across a call. }
+      if UseX64VecCache then
+        X64EnableVecCache(Buf, X64Cache, X64VecStatics, X64VecConsts,
+          X64VecConstLo, X64VecConstHi);
     end;
     if UseNativeScalarCore then
     begin

@@ -152,13 +152,15 @@ Text scripts the conformance runner executes, rather than binaries.
 | Fixture | What it covers |
 | --- | --- |
 | `x64-writeback.wast` | One module and 80 assertions aimed at the x64 deferred write-back and native return-tail plans: dirty temporaries across `if` joins, eleven-temporary register pressure, early `br_if` / `br` / `return` exits (all four loop exits reached), `unreachable` and integer divide-by-zero traps mid-loop, nested loops with two back-edges, native self-recursion with three arms, and leaves ending in `select` / parameter / constant / `eqz`. |
+| `x64-v128-cache.wast` | One module and 60 assertions aimed at the x64 v128 xmm cache: dirty vector temporaries across `if` joins and an `unreachable` check, a loop-carried v128 block parameter, eight v128 locals and nine simultaneously live vectors, the fixed-host cap for locals and hoisted `v128.const` values (including all-zero and all-ones), lane extracts and splats of every shape mixed with scalar locals, v128 parameters and results across calls, early `br_if` / `return` exits, nested loops, `local.get` / `local.tee` values read after their local is redefined, and a `replace_lane` loop that stays on the helper path. |
 
-`x64-writeback.py` generates the `.wast` beside it. Every expected value
-comes from that script's Python model, never from a wasmlight tier, so the
+Each `.py` beside a fixture generates its `.wast`. Every expected value
+comes from that script's Python model, never from a wasmlight tier, so each
 fixture is an independent oracle. Regenerate with
-`python3 tests/fixtures/wast/x64-writeback.py`; the output is deterministic.
-`Wasm.Wast.Runner.Test` runs the fixture in the interpreter, JIT, and AOT
-tiers and requires every command to pass in each.
+`python3 tests/fixtures/wast/x64-writeback.py` or
+`python3 tests/fixtures/wast/x64-v128-cache.py`; the output is
+deterministic. `Wasm.Wast.Runner.Test` runs both fixtures in the
+interpreter, JIT, and AOT tiers and requires every command to pass in each.
 
 ## Feature support notes
 
