@@ -1139,9 +1139,9 @@ const
     $F9401129,                                             { alloc bitmap ptr }
     $53057D4C, $1200794D, $5280002A, $1ACD214A,            { word idx, mask }
     $B86C692D, $2A0A01AD, $B82C692D,                       { word |= mask }
-    $F9400E89, $F9408D2A, $9100414A, $F9008D2A,            { BytesLive += 16 }
-    $F940912A, $9100414A, $F900912A,                       { BytesAllocated }
-    $F9409D2A, $9100054A, $F9009D2A,                       { ObjectCount += 1 }
+    $F9400E89, $F940892A, $9100414A, $F900892A,            { BytesLive += 16 }
+    $F9408D2A, $9100414A, $F9008D2A,                       { BytesAllocated }
+    $F940992A, $9100054A, $F900992A,                       { ObjectCount += 1 }
     $F9400A6C, $B900096C,                                  { field i32 @8 }
     $F9000E6B,                                             { publish Dest }
     $14000001);                                            { b Done }
