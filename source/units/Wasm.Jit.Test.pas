@@ -2920,6 +2920,8 @@ type
     procedure TestStaticHostsAddressAcrossJoin;
     procedure TestStaticHostsTrapMidLoop;
     procedure TestStaticHostsLoadAluOperands;
+    procedure TestScaledIndexLoopShape;
+    procedure TestScaledIndexWrapAndLiveness;
     procedure TestMemory64LoopExplicitChecks;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
@@ -4960,10 +4962,10 @@ var
   Saved, SavedJoin: TWasmIrInstr;
 
   {$IFDEF WASM_JIT_X64}
-  { `mov rax, [r13]; cmp rax, r14`: the epoch poll a flagged jump emits. }
+  { `cmp r14, [r13]; je`: the epoch poll a flagged jump emits. }
   function HasEpochPoll(const ACode: TWasmBytes): Boolean;
   const
-    POLL: array[0..6] of Byte = ($49, $8B, $45, $00, $4C, $39, $F0);
+    POLL: array[0..5] of Byte = ($4D, $3B, $75, $00, $0F, $84);
   var
     N, J: Integer;
   begin
@@ -6099,11 +6101,12 @@ begin
   end;
   Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
   Expect<Boolean>(Has([$41, $81, -1, $FF, $3F, $00, $00])).ToBe(True);
-  { shl by 2 (C1 /4 ib) writes a 32-bit result into $2's host (rdi), so
-    the fused load-add indexes [rsi + rdi] with no mov ecx, edi copy:
-    add r9d, [rsi + rdi] (44 03 0C 3E). }
-  Expect<Boolean>(Has([$C1, -1, $02])).ToBe(True);
-  Expect<Boolean>(Has([$03, $0C, $3E])).ToBe(True);
+  { The masked shift by 2 folds into the fused load-add's SIB scale (the
+    mask bounds the index below 2^30, and $2 is dead after the load), so
+    no shl (C1 /4 ib) is emitted and the and's 32-bit result in r10
+    indexes directly: add r9d, [rsi + r10*4] (46 03 0C 96). }
+  Expect<Boolean>(Has([$C1, -1, $02])).ToBe(False);
+  Expect<Boolean>(Has([$46, $03, $0C, $96])).ToBe(True);
   Expect<Boolean>(Has([$41, $83, -1, $01])).ToBe(True);
   Expect<Boolean>(Has([$41, $81, -1, $00, $E1, $F5, $05])).ToBe(True);
   Expect<Boolean>(Has([$B8, $FF, $3F, $00, $00])).ToBe(False);
@@ -6429,6 +6432,251 @@ begin
   end;
   Expect<Integer>(Bodies).ToBe(2);
   {$ENDIF}
+end;
+
+{ Models for TestScaledIndexLoopShape: the memory-store, memory-load, and
+  memory benchmark loops over n iterations. }
+{$PUSH}
+{$OVERFLOWCHECKS OFF}
+{$RANGECHECKS OFF}
+function OracleScaledStore(const AN: UInt32): UInt64;
+var
+  Mem: array[0 .. 16383] of UInt32;
+  I: UInt32;
+begin
+  FillChar(Mem, SizeOf(Mem), 0);
+  I := 0;
+  repeat
+    Mem[I and 16383] := I;
+    Inc(I);
+  until not (I < AN);
+  Result := UInt32(Mem[0] + Mem[16383]);
+end;
+
+function OracleScaledLoad(const AN: UInt32): UInt64;
+var
+  Mem: array[0 .. 16383] of UInt32;
+  I, Acc: UInt32;
+begin
+  for I := 0 to 16383 do
+    Mem[I] := (I * 17) xor $9E3779B9;
+  Acc := 0;
+  I := 0;
+  repeat
+    Acc := Acc + Mem[I and 16383];
+    Inc(I);
+  until not (I < AN);
+  Result := Acc;
+end;
+
+function OracleScaledForward(const AN: UInt32): UInt64;
+var
+  I, Acc: UInt32;
+begin
+  Acc := 0;
+  I := 0;
+  repeat
+    Acc := Acc + I;
+    Inc(I);
+  until not (I < AN);
+  Result := Acc;
+end;
+{$POP}
+
+{ The three benchmark memory loops. Each address is
+  `(i32.shl (i32.and $i 16383) 2)` into a local read only by the access, so
+  the x64 plan folds the shift into the access: the hot loop body has no
+  shift-by-immediate (C1 /4) and exactly one [rsi + index*4] access (SIB
+  scale bits 10, base rsi), none unscaled. Results against Pascal models
+  and the interpreter; the accesses fault and trap exactly as before
+  (TestScaledIndexWrapAndLiveness and x64-scaled-index.wast). }
+procedure TJitTests.TestScaledIndexLoopShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  F, I, J, Head, Scaled, Unscaled, Shifts: Integer;
+  Rel: Int32;
+{$ENDIF}
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "store") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $address i32) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 16383)) (i32.const 2))) ' +
+    '(i32.store (local.get $address) (local.get $i)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.load (i32.const 0)) (i32.load (i32.const 65532)))) ' +
+    '(func (export "load") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (local $address i32) ' +
+    '(loop $fill ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) ' +
+    '(i32.xor (i32.mul (local.get $i) (i32.const 17)) ' +
+    '(i32.const -1640531527))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (i32.const 16384)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 16383)) (i32.const 2))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (local.get $address)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "memory") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (local $address i32) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 16383)) (i32.const 2))) ' +
+    '(i32.store (local.get $address) (local.get $i)) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (local.get $address)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  Expect<Boolean>(DiffFresh(FBytes, 'store', [MakeValueI32(20000)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleScaledStore(20000));
+  Expect<Boolean>(DiffFresh(FBytes, 'store', [MakeValueI32(100)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleScaledStore(100));
+  Expect<Boolean>(DiffFresh(FBytes, 'load', [MakeValueI32(50000)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleScaledLoad(50000));
+  Expect<Boolean>(DiffFresh(FBytes, 'memory', [MakeValueI32(70000)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleScaledForward(70000));
+  {$IFDEF WASM_JIT_X64}
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  for F := 0 to 2 do
+  begin
+    Code := JitStageFunctionBytes(FStore, @FIr.Functions[F], EntryOffset,
+      RegisterCount);
+    { The last back-edge is the hot loop's epoch-fused je (0F 84 rel32)
+      to its head; the body runs from the head to that je. }
+    Head := -1;
+    J := -1;
+    for I := 0 to Length(Code) - 6 do
+      if (Code[I] = $0F) and (Code[I + 1] = $84) then
+      begin
+        Move(Code[I + 2], Rel, SizeOf(Rel));
+        if Rel < 0 then
+        begin
+          Head := I + 6 + Rel;
+          J := I;
+        end;
+      end;
+    Expect<Boolean>(Head >= 0).ToBe(True);
+    if Head < 0 then
+      Continue;
+    Scaled := 0;
+    Unscaled := 0;
+    Shifts := 0;
+    for I := Head to J - 3 do
+    begin
+      { mov r32, [rsi + index*s] (8B), add r32, [...] (03), and mov
+        [...], r32 (89): mod=00 rm=100, SIB base rsi. }
+      if (Code[I] in [$8B, $03, $89]) and ((Code[I + 1] and $C7) = $04) and
+        ((Code[I + 2] and 7) = 6) then
+      begin
+        if (Code[I + 2] shr 6) = 2 then
+          Inc(Scaled)
+        else
+          Inc(Unscaled);
+      end;
+      { shl r32, 2 (C1 /4 ib, mod=11). }
+      if (Code[I] = $C1) and ((Code[I + 1] and $F8) = $E0) and
+        (Code[I + 2] = 2) then
+        Inc(Shifts);
+    end;
+    Expect<Integer>(Scaled).ToBe(1);
+    Expect<Integer>(Unscaled).ToBe(0);
+    Expect<Integer>(Shifts).ToBe(0);
+    { The back-edge compares the epoch in memory: cmp r14, [r13] (4D 3B
+      75 00) right before the je. }
+    Expect<Boolean>((J >= 4) and (Code[J - 4] = $4D) and
+      (Code[J - 3] = $3B) and (Code[J - 2] = $75) and (Code[J - 1] = $00))
+      .ToBe(True);
+  end;
+  {$ENDIF}
+end;
+
+{ Around the fold's proof. `wrap` masks with 0x7fffffff, so 0x7fffffff * 4
+  does not fit 32 bits and the shift stays: the i32 shift of 0x40000001
+  wraps to 4, a valid store the fold would have sent 16 GiB away. `edge`
+  (mask 0xffff, fused) stores until 4 * 16384 = 65536, which traps with the
+  interpreter's kind after every earlier store. `after` reads its address
+  local after the loop and `carried` before its redefinition, so neither
+  folds. Expected values are worked out below, independent of both tiers. }
+procedure TJitTests.TestScaledIndexWrapAndLiveness;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "wrap") (param $x i32) (result i32) ' +
+    '(local $i i32) (local $a i32) ' +
+    '(loop $l ' +
+    '(local.set $a (i32.shl (i32.and (i32.add (local.get $x) (local.get $i)) ' +
+    '(i32.const 0x7fffffff)) (i32.const 2))) ' +
+    '(i32.store (local.get $a) (i32.add (local.get $i) (i32.const 100))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) ' +
+    '(i32.add (i32.load (i32.const 4)) (i32.load (i32.const 12)))) ' +
+    '(func (export "edge") (param $x i32) (result i32) ' +
+    '(local $i i32) (local $a i32) ' +
+    '(loop $l ' +
+    '(local.set $a (i32.shl (i32.and (i32.add (local.get $x) (local.get $i)) ' +
+    '(i32.const 0xffff)) (i32.const 2))) ' +
+    '(i32.store (local.get $a) (local.get $i)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 100)))) ' +
+    '(i32.const 7)) ' +
+    '(func (export "after") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) ' +
+    '(loop $l ' +
+    '(local.set $a (i32.shl (i32.and (local.get $i) (i32.const 0x3fff)) ' +
+    '(i32.const 2))) ' +
+    '(i32.store (local.get $a) (i32.const 9)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $a)) ' +
+    '(func (export "carried") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $acc i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (local.get $acc) (local.get $a))) ' +
+    '(local.set $a (i32.shl (i32.and (local.get $i) (i32.const 0x1fff)) ' +
+    '(i32.const 3))) ' +
+    '(i32.store (local.get $a) (local.get $acc)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  { x = 0x40000001: i = 0, 1, 2 store 100, 101, 102 at (x + i) * 4 mod 2^32
+    = 4, 8, 12. }
+  Expect<Boolean>(DiffFresh(FBytes, 'wrap', [MakeValueI32($40000001)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(100 + 102);
+  { x = 0x3ffe: addresses 0xfff8, 0xfffc, then 0x10000 traps. }
+  Expect<Boolean>(DiffFresh(FBytes, 'edge', [MakeValueI32($3FFE)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  { x = 0xc000: (x + i) and 0xffff = 0xc000 + i, far past the page. }
+  Expect<Boolean>(DiffFresh(FBytes, 'edge', [MakeValueI32($C000)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  Expect<Boolean>(DiffFresh(FBytes, 'edge', [MakeValueI32(5)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(7);
+  { The last address: 4 * (999 and 0x3fff). }
+  Expect<Boolean>(DiffFresh(FBytes, 'after', [MakeValueI32(1000)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(3996);
+  { acc sums the previous iteration's address, 8 * (0 + 1 + ... + 8). }
+  Expect<Boolean>(DiffFresh(FBytes, 'carried', [MakeValueI32(10)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(288);
 end;
 
 { Seven locals live in two nested loops with an if/else join per inner
@@ -8973,6 +9221,22 @@ begin
   Expect<Integer>(Loads).ToBe(1);
   Expect<Integer>(Stores).ToBe(0);
   Expect<Integer>(Consts).ToBe(1);
+  { The back-edge keeps the load form (mov rax,[r13]; cmp rax,r14; je),
+    never cmp r14,[r13] (4D 3B 75 00): see X64EmitEpochBackEdge. }
+  Loads := 0;
+  Stores := 0;
+  for I := 0 to Length(Code) - 9 do
+  begin
+    if (Code[I] = $49) and (Code[I + 1] = $8B) and (Code[I + 2] = $45) and
+      (Code[I + 3] = $00) and (Code[I + 4] = $4C) and (Code[I + 5] = $39) and
+      (Code[I + 6] = $F0) and (Code[I + 7] = $0F) and (Code[I + 8] = $84) then
+      Inc(Loads);
+    if (Code[I] = $4D) and (Code[I + 1] = $3B) and (Code[I + 2] = $75) and
+      (Code[I + 3] = $00) then
+      Inc(Stores);
+  end;
+  Expect<Integer>(Loads).ToBe(1);
+  Expect<Integer>(Stores).ToBe(0);
   {$ELSE}
   Expect<Boolean>(True).ToBe(True);
   {$ENDIF}
@@ -10285,6 +10549,10 @@ begin
     TestStaticHostsTrapMidLoop);
   Test('loads fused into add/sub/and/or/xor/mul match a model and trap alike',
     TestStaticHostsLoadAluOperands);
+  Test('the benchmark memory loops fold their address shift into the SIB',
+    TestScaledIndexLoopShape);
+  Test('an unfused shift wraps and a live address local keeps its shift',
+    TestScaledIndexWrapAndLiveness);
   Test('memory64 loops keep explicit checks',
     TestMemory64LoopExplicitChecks);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);

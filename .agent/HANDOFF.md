@@ -1,5 +1,29 @@
 # Handoff
 
+## x64 wave 6 — in progress, 2026-09-27
+
+- Delivery branch `codex/optimize-x64-wave6` from exact main `7d4b6ab` (push CI
+  run 36294080555 green on all six targets). Evidence root:
+  `~/.local/share/wasmlight-evidence/x64-wave6-7d4b6ab` (`PLAN.md`,
+  `LANE-BRIEF.md`, baseline binary, schedules, profiles). The baseline binary
+  is byte-identical to wave 5's final candidate.
+- wasmlight/Wasmtime at the start of the wave:
+  - out of range: host-dispatch-3arg 4.74, memory-store 1.82, memory-load
+    1.51, memory 1.38, loop 1.00, call 0.85;
+  - in range: fib 0.80, memory-grow 0.79, gc 0.66, simd 0.65, startup 0.60,
+    host-call 0.50.
+- Lanes:
+  - N (`lane/x64-w6-mem`, worktree `w6-laneN`): fold the address `shl` into
+    the SIB scale, with a range proof from the mask and the zero-extension
+    flag; compare the epoch against memory on the back-edge; drop the copy
+    into the dead-after-use `$address` local.
+  - Q (`lane/x64-w6-leaf`, worktree `w6-laneQ`): native leaves that use
+    memory and take up to 4 parameters, for 3-arg's `$fake`, which currently
+    takes the generic inline call at ~8 ns/call; also call's caller-side leaf
+    costs.
+- Next: integrate the accepted lanes one at a time, then a Fable 5.1 review,
+  the PR, and CI.
+
 ## x64 wave 5 — retained outcome, 2026-09-27
 
 - Delivery branch `codex/optimize-x64-wave5` from exact main `b9d8085` (push CI

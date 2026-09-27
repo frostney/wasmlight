@@ -84,6 +84,8 @@ type
     procedure TestStaticCacheFourFixedHosts;
     procedure TestStaticCacheAddressZeroExtension;
     procedure TestStaticCacheLoadAluFusion;
+    procedure TestScaledIndexEncodings;
+    procedure TestScaledIndexPinnedAccess;
     procedure TestDirectOperandEncodings;
     procedure TestDirectOperandCachedOps;
     procedure TestDirectOperandBookkeeping;
@@ -565,17 +567,34 @@ procedure TX64Tests.TestEpochBackEdgeBytes;
 var
   Buf: TWasmCodeBuffer;
 begin
-  { A loop head bound at 0, one body byte, then the back-edge: mov rax,[r13]
-    (49 8B 45 00); cmp rax,r14 (4C 39 F0); je head (0F 84 rel32, rel32 =
-    0 - (8 + 6) = -14); mov edi,wtkEpochInterrupt (BF imm32); call
-    [r15] (41 FF 17). The only taken branch is the je; the trap falls
-    through. }
+  { A loop head bound at 0, one body byte, then the back-edge: cmp r14,
+    [r13 + 0] (4D 3B 75 00, CMP r64, r/m64; GNU as agrees); je head (0F 84
+    rel32, rel32 = 0 - (5 + 6) = -11); mov edi,wtkEpochInterrupt (BF
+    imm32); call [r15] (41 FF 17). The only taken branch is the je; the
+    trap falls through. }
   Buf := TWasmCodeBuffer.Create;
   try
     Buf.NewLabel;
     Buf.BindLabel(0);
     Buf.EmitByte($90);
     X64EmitEpochBackEdge(Buf, 0);
+    X64ResolvePatches(Buf);
+    CheckSeq(Buf, [$90,
+      $4D, $3B, $75, $00,
+      $0F, $84, $F5, $FF, $FF, $FF,
+      $BF, Byte(Ord(wtkEpochInterrupt)), $00, $00, $00,
+      $41, $FF, $17]);
+  finally
+    Buf.Free;
+  end;
+  { The load form v128-cache loops keep: mov rax,[r13] (49 8B 45 00); cmp
+    rax,r14 (4C 39 F0); je head (rel32 = 0 - (8 + 6) = -14). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    Buf.BindLabel(0);
+    Buf.EmitByte($90);
+    X64EmitEpochBackEdge(Buf, 0, True);
     X64ResolvePatches(Buf);
     CheckSeq(Buf, [$90,
       $49, $8B, $45, $00,
@@ -1768,6 +1787,161 @@ begin
       $44, $0F, $AF, $14, $0E]);
     Expect<Boolean>(Cache.Entries[3].Valid and
       (Cache.Entries[3].Slot = 4)).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ --- scaled pinned index (SDM Vol. 2 Table 2-3: SIB = ss index base; a
+  base with low bits 101 takes mod=01 disp8 0; index 100 needs REX.X, so
+  r12 indexes and rsp cannot). Each expected sequence was assembled with
+  GNU as and disassembled with objdump -Mintel. -------------------------- }
+
+procedure TX64Tests.TestScaledIndexEncodings;
+var
+  Buf: TWasmCodeBuffer;
+
+  procedure Load(const ADest, ABase, AIndex: Byte; const ASize: UInt32;
+    const ASigned, AResult64: Boolean; const AScale: Byte;
+    const AExpected: array of Byte);
+  begin
+    Buf.Free;
+    Buf := TWasmCodeBuffer.Create;
+    X64EmitLoadScalarIndexed(Buf, ADest, ABase, AIndex, ASize, ASigned,
+      AResult64, AScale);
+    CheckSeq(Buf, AExpected);
+  end;
+
+  procedure Store(const ASource, ABase, AIndex: Byte; const ASize: UInt32;
+    const AScale: Byte; const AExpected: array of Byte);
+  begin
+    Buf.Free;
+    Buf := TWasmCodeBuffer.Create;
+    X64EmitStoreScalarIndexed(Buf, ASource, ABase, AIndex, ASize, AScale);
+    CheckSeq(Buf, AExpected);
+  end;
+
+var
+  Raised: Boolean;
+begin
+  Buf := nil;
+  try
+    { mov r8d, [rsi + r10*4] }
+    Load(X64_R8, X64_RSI, X64_R10, 4, False, False, 2, [$46, $8B, $04, $96]);
+    { mov eax, [rbp + rcx*2 + 0] }
+    Load(X64_RAX, X64_RBP, X64_RCX, 4, False, False, 1,
+      [$8B, $44, $4D, $00]);
+    { mov r15d, [r12 + r12*8] }
+    Load(X64_R15, X64_R12, X64_R12, 4, False, False, 3, [$47, $8B, $3C, $E4]);
+    { movzx r9d, byte [r13 + r15*2 + 0] }
+    Load(X64_R9, X64_R13, X64_R15, 1, False, False, 1,
+      [$47, $0F, $B6, $4C, $7D, $00]);
+    { movsx eax, word [rsi + rbx*8] }
+    Load(X64_RAX, X64_RSI, X64_RBX, 2, True, False, 3,
+      [$0F, $BF, $04, $DE]);
+    { movsxd r10, dword [rbx + r12*4] }
+    Load(X64_R10, X64_RBX, X64_R12, 4, True, True, 2, [$4E, $63, $14, $A3]);
+    { mov rax, [r12 + r8*8] }
+    Load(X64_RAX, X64_R12, X64_R8, 8, False, False, 3, [$4B, $8B, $04, $C4]);
+    { movzx edx, word [rsi + r11*2] }
+    Load(X64_RDX, X64_RSI, X64_R11, 2, False, False, 1,
+      [$42, $0F, $B7, $14, $5E]);
+    { mov [rsi + r10*4], r8d }
+    Store(X64_R8, X64_RSI, X64_R10, 4, 2, [$46, $89, $04, $96]);
+    { mov [rbp + r9*8 + 0], rax }
+    Store(X64_RAX, X64_RBP, X64_R9, 8, 3, [$4A, $89, $44, $CD, $00]);
+    { mov byte [r12 + rdi*2], sil: the REX that makes sil addressable }
+    Store(X64_RSI, X64_R12, X64_RDI, 1, 1, [$41, $88, $34, $7C]);
+    { mov word [r13 + r11*4 + 0], dx }
+    Store(X64_RDX, X64_R13, X64_R11, 2, 2, [$66, $43, $89, $54, $9D, $00]);
+    { mov byte [rsi + r14*8], r9b }
+    Store(X64_R9, X64_RSI, X64_R14, 1, 3, [$46, $88, $0C, $F6]);
+    { Scale 0 is the unscaled form: mov r8d, [rsi + r10] }
+    Store(X64_R8, X64_RSI, X64_R10, 4, 0, [$46, $89, $04, $16]);
+
+    { rsp is not an index, and there is no scale above 8. }
+    Raised := False;
+    try
+      Load(X64_RAX, X64_RSI, X64_RSP, 4, False, False, 1, []);
+    except
+      on EWasmInternal do
+        Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Raised := False;
+    try
+      Store(X64_RAX, X64_RSI, X64_RCX, 4, 4, []);
+    except
+      on EWasmInternal do
+        Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestScaledIndexPinnedAccess;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..7] of UInt32;
+  Visible: array[0..7] of Boolean;
+  Start: Integer;
+
+  procedure CheckFrom(const AFrom: Integer; const AExpected: array of Byte);
+  var
+    J: Integer;
+  begin
+    Expect<Integer>(Buf.Size - AFrom).ToBe(Length(AExpected));
+    for J := 0 to High(AExpected) do
+      Expect<Byte>(Buf.ByteAt(AFrom + J)).ToBe(AExpected[J]);
+  end;
+
+begin
+  Aux := nil;
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1, 2, 3]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    X64EnablePinnedMemoryBase(Cache);
+
+    { An i32.and leaves rdi zero-extended (mov rdi, r8; and edi, r9d), so
+      the scaled load indexes it directly: mov r10d, [rsi + rdi*4]. }
+    Start := Buf.Size;
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI32And, 2, 0, 1, 0),
+      Aux, 0, False, True, Cache)).ToBe(True);
+    X64EmitScalarMemoryPinned(Buf, MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+      False, Cache, 2);
+    CheckFrom(Start, [$4C, $89, $C7, $44, $21, $CF, $44, $8B, $14, $BE]);
+
+    { After an i64.add rdi's high half is live: mov ecx, edi, then
+      mov [rsi + rcx*8], r8d. A scaled 64-bit index would be wrong. }
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI64Add, 2, 0, 1, 0),
+      Aux, 0, False, True, Cache)).ToBe(True);
+    Start := Buf.Size;
+    X64EmitScalarMemoryPinned(Buf, MakeIrInstr(iroI32Store, 0, 2, 0, 0),
+      False, Cache, 3);
+    CheckFrom(Start, [$89, $F9, $44, $89, $04, $CE]);
+
+    { An uncached index loads its slot with a 32-bit load (mov ecx,
+      [rbx + 0x38]): mov word [rsi + rcx*2], r9w. }
+    Start := Buf.Size;
+    X64EmitScalarMemoryPinned(Buf, MakeIrInstr(iroI32Store16, 1, 7, 0, 0),
+      False, Cache, 1);
+    CheckFrom(Start, [$8B, $4B, $38, $66, $44, $89, $0C, $4E]);
+
+    { The load/ALU pair takes the same scale: add edx, [rsi + rdi*4] after
+      a fresh i32.and into rdi. }
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI32And, 2, 0, 1, 0),
+      Aux, 0, False, True, Cache)).ToBe(True);
+    Start := Buf.Size;
+    X64EmitLoadAluCached(Buf, MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+      MakeIrInstr(iroI32Add, 3, 3, 6, 0), Cache, 2);
+    CheckFrom(Start, [$03, $14, $BE]);
   finally
     Buf.Free;
   end;
@@ -3000,6 +3174,10 @@ begin
     TestStaticCacheAddressZeroExtension);
   Test('an i32.load feeding an ALU op becomes its memory operand',
     TestStaticCacheLoadAluFusion);
+  Test('scaled-index loads and stores emit the asserted SIB bytes',
+    TestScaledIndexEncodings);
+  Test('a scaled pinned access zero-extends a non-Zx32 index first',
+    TestScaledIndexPinnedAccess);
   Test('direct-operand ALU, compare, setcc, and movzx encodings',
     TestDirectOperandEncodings);
   Test('cached ALU and compares compute on the cache hosts',

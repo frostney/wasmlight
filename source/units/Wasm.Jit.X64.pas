@@ -529,11 +529,15 @@ procedure X64AlignCode(const ABuf: TWasmCodeBuffer;
   position for every measured loop, and a line start never was. The padding
   runs once per loop entry, on the fall-through path only. }
 procedure X64EmitLoopHeadAlign(const ABuf: TWasmCodeBuffer);
-{ The loop back-edge safepoint (§6): `mov rax,[r13]; cmp rax,r14; je
-  ATarget` then the epoch-interrupt trap call, which does not return. One
-  taken branch per iteration; the trap stays on the fall-through. }
+{ The loop back-edge safepoint (§6): `cmp r14,[r13]; je ATarget` then the
+  epoch-interrupt trap call, which does not return. One taken branch per
+  iteration; the trap stays on the fall-through. ALoadEpoch keeps the
+  earlier `mov rax,[r13]; cmp rax,r14` form, which v128-cache loops use:
+  on the measuring host (Zen 5) the three bytes shorter back-edge made the
+  xmm-bound simd loop ~18% slower, the effect X64CodeHasVecCacheOp
+  describes. }
 procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
-  const ATarget: UInt32);
+  const ATarget: UInt32; const ALoadEpoch: Boolean = False);
 
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
 procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer;
@@ -746,7 +750,24 @@ function X64CanFuseLoadAlu(const ALoad, AAlu: TWasmIrInstr): Boolean;
   access, its guard-page fault, and its trap are the load's own; nothing
   else runs between the two, so only the loaded value's register is saved. }
 procedure X64EmitLoadAluCached(const ABuf: TWasmCodeBuffer;
-  const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache);
+  const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache;
+  const AScale: Byte = 0);
+{ The scalar load/store encoders over [ABase + AIndex * 2^AScale] (SIB,
+  SDM Vol. 2 Table 2-3). AIndex must not be rsp; AScale is 0..3. }
+procedure X64EmitLoadScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ADest, ABase, AIndex: Byte; const ASize: UInt32; const ASigned,
+  AResult64: Boolean; const AScale: Byte = 0);
+procedure X64EmitStoreScalarIndexed(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase, AIndex: Byte; const ASize: UInt32;
+  const AScale: Byte = 0);
+{ A zero-offset i32 access in a base-pinned static-cache frame. A nonzero
+  AScale means the driver's scaled-index plan (X64PlanScaledIndex) rewrote
+  the access to read the unshifted operand of an elided `i32.shl` by
+  AScale, proven below 2^(32 - AScale): the index register then holds that
+  operand zero-extended and the hardware scales it. }
+procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAddr64: Boolean;
+  var ACache: TX64RegCache; const AScale: Byte = 0);
 { The plan half of x64 immediate fusion: AConst is an i32/i64 constant
   whose destination is AConsumer's right operand, and AConsumer has an
   immediate form for it (X64CanUseImmediate); AValue is the constant as an
@@ -800,19 +821,11 @@ const
   { AIndex value for the scalar access core: plain [ABase] addressing. }
   X64_NO_INDEX = $FF;
 
-procedure X64EmitLoadScalarIndexed(const ABuf: TWasmCodeBuffer;
-  const ADest, ABase, AIndex: Byte; const ASize: UInt32; const ASigned,
-  AResult64: Boolean); forward;
-procedure X64EmitStoreScalarIndexed(const ABuf: TWasmCodeBuffer;
-  const ASource, ABase, AIndex: Byte; const ASize: UInt32); forward;
 procedure X64EmitLoadScalar(const ABuf: TWasmCodeBuffer;
   const ADest, ABase: Byte; const ASize: UInt32; const ASigned,
   AResult64: Boolean); forward;
 procedure X64EmitStoreScalar(const ABuf: TWasmCodeBuffer;
   const ASource, ABase: Byte; const ASize: UInt32); forward;
-procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; const AAddr64: Boolean;
-  var ACache: TX64RegCache); forward;
 
 function X64CachedOperand(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlot: UInt32; const AProtect: Byte;
@@ -1198,8 +1211,11 @@ begin
           Deferred dynamic values are not fixed to a host across the edge,
           so the target reloads them: write back the live ones. }
         X64FlushDynamicRegCache(ABuf, ACache);
-        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
-          AUseNativeScalarCall);
+        if ACache.VecCache and ((AIns.Imm and IR_JUMP_SAFEPOINT) <> 0) then
+          X64EmitEpochBackEdge(ABuf, AIns.A, True)
+        else
+          Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+            AUseNativeScalarCall);
       end;
     iroCall:
       if ANativeScalarSelf then
@@ -3518,21 +3534,24 @@ begin
   X64EmitStoreSlot64(ABuf, X64_RAX, AIns.Dest);
 end;
 
-{ The [base + index] memory operand (ModRM rm=100 + SIB, scale 1) per SDM
+{ The [base + index * 2^scale] memory operand (ModRM rm=100 + SIB) per SDM
   Vol. 2 Table 2-3. A base whose low bits are 101 (rbp/r13) has no mod=00
   form, so it takes a zero disp8. AIndex must not be rsp (SIB index 100 means
-  "no index"). REX.X/REX.B are the caller's. }
+  "no index"); r12 is a valid index under REX.X. REX.X/REX.B are the
+  caller's. }
 procedure EmitMemOperandIndexed(const ABuf: TWasmCodeBuffer;
-  const ARegField, ABase, AIndex: Byte);
+  const ARegField, ABase, AIndex: Byte; const AScale: Byte = 0);
 var
   ModB: Byte;
 begin
+  if (AScale > 3) or (AIndex = X64_RSP) then
+    raise EWasmInternal.Create('internal: x64 SIB index or scale out of range');
   if (ABase and 7) = 5 then
     ModB := 1
   else
     ModB := 0;
   ABuf.EmitByte((ModB shl 6) or ((ARegField and 7) shl 3) or 4);
-  ABuf.EmitByte(((AIndex and 7) shl 3) or (ABase and 7));
+  ABuf.EmitByte((AScale shl 6) or ((AIndex and 7) shl 3) or (ABase and 7));
   if ModB = 1 then
     ABuf.EmitByte(0);
 end;
@@ -3542,7 +3561,7 @@ end;
   [ABase] when AIndex is X64_NO_INDEX (X64EmitLoadScalar/X64EmitStoreScalar). }
 procedure X64EmitLoadScalarIndexed(const ABuf: TWasmCodeBuffer;
   const ADest, ABase, AIndex: Byte; const ASize: UInt32; const ASigned,
-  AResult64: Boolean);
+  AResult64: Boolean; const AScale: Byte);
 var
   X: Byte;
 begin
@@ -3578,11 +3597,12 @@ begin
   if AIndex = X64_NO_INDEX then
     EmitMemOperand(ABuf, ADest, ABase, 0)
   else
-    EmitMemOperandIndexed(ABuf, ADest, ABase, AIndex);
+    EmitMemOperandIndexed(ABuf, ADest, ABase, AIndex, AScale);
 end;
 
 procedure X64EmitStoreScalarIndexed(const ABuf: TWasmCodeBuffer;
-  const ASource, ABase, AIndex: Byte; const ASize: UInt32);
+  const ASource, ABase, AIndex: Byte; const ASize: UInt32;
+  const AScale: Byte);
 var
   X: Byte;
 begin
@@ -3619,7 +3639,7 @@ begin
   if AIndex = X64_NO_INDEX then
     EmitMemOperand(ABuf, ASource, ABase, 0)
   else
-    EmitMemOperandIndexed(ABuf, ASource, ABase, AIndex);
+    EmitMemOperandIndexed(ABuf, ASource, ABase, AIndex, AScale);
 end;
 
 function X64CachedHostForSlot(const ACache: TX64RegCache;
@@ -3676,7 +3696,7 @@ end;
 
 procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAddr64: Boolean;
-  var ACache: TX64RegCache);
+  var ACache: TX64RegCache; const AScale: Byte);
 var
   Offset: UInt64;
   Host, ValueReg, IndexReg: Byte;
@@ -3704,7 +3724,7 @@ begin
     end;
     X64ConsumeUse(ACache, AIns.Dest);
     X64EmitStoreScalarIndexed(ABuf, ValueReg, X64_REG_MEMBASE, IndexReg,
-      X64MemoryAccessSize(AIns.Op));
+      X64MemoryAccessSize(AIns.Op), AScale);
     Exit;
   end;
 
@@ -3714,7 +3734,7 @@ begin
   Result64 := AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S];
   Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
   X64EmitLoadScalarIndexed(ABuf, X64CacheHostReg(Index), X64_REG_MEMBASE,
-    IndexReg, Size, Signed, Result64);
+    IndexReg, Size, Signed, Result64, AScale);
   { Every access narrower than 8 bytes except a sign extension to 64 bits
     has a 32-bit destination (mov/movzx/movsx r32), which zero-extends. }
   X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False,
@@ -3738,7 +3758,8 @@ end;
   overwrite the index, so the index moves to ecx first. The 32-bit op
   zero-extends its destination. }
 procedure X64EmitLoadAluCached(const ABuf: TWasmCodeBuffer;
-  const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache);
+  const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache;
+  const AScale: Byte);
 var
   Other: UInt32;
   HostA, HostD, IndexReg: Byte;
@@ -3779,7 +3800,7 @@ begin
       ABuf.EmitByte($AF);
     end;
   end;
-  EmitMemOperandIndexed(ABuf, HostD, X64_REG_MEMBASE, IndexReg);
+  EmitMemOperandIndexed(ABuf, HostD, X64_REG_MEMBASE, IndexReg, AScale);
   X64CachedDestCommit(ABuf, ACache, Index, AAlu.Dest, False, True);
 end;
 
@@ -4822,10 +4843,21 @@ begin
 end;
 
 procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
-  const ATarget: UInt32);
+  const ATarget: UInt32; const ALoadEpoch: Boolean);
 begin
-  X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_EPOCHADDR, 0);       { rax := *r13 }
-  X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_REG_EPOCH);   { cmp rax, r14 }
+  if ALoadEpoch then
+  begin
+    X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_EPOCHADDR, 0);     { rax := *r13 }
+    X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_REG_EPOCH); { cmp rax, r14 }
+  end
+  else
+  begin
+    { cmp r14, [r13] (CMP r64, r/m64 = REX.W 3B /r): the same equality
+      test with no scratch write. }
+    X64EmitRex(ABuf, 1, X64_REG_EPOCH shr 3, 0, X64_REG_EPOCHADDR shr 3);
+    ABuf.EmitByte($3B);
+    EmitMemOperand(ABuf, X64_REG_EPOCH, X64_REG_EPOCHADDR, 0);
+  end;
   X64EmitJccTo(ABuf, X64_CC_E, ATarget);                       { je target }
   EmitTrapCall(ABuf, wtkEpochInterrupt);                       { no return }
 end;
