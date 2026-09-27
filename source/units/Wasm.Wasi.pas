@@ -397,6 +397,35 @@ const
   follow-up. }
 function RtlGenRandom(ABuffer: Pointer; ALength: UInt32): ByteBool; stdcall;
   external 'advapi32.dll' name 'SystemFunction036';
+
+{ The Windows half of preopen containment (HostRealPath, LeafIsSymlink). The
+  Windows unit is deliberately not used — its ANSI DeleteFile / FindClose would
+  shadow the SysUtils routines the fs layer calls — so the four kernel32 entry
+  points are declared here, wide-char only. FPC 3.2.2's Windows unit does not
+  declare GetFinalPathNameByHandleW at all. }
+const
+  WIN_INVALID_HANDLE_VALUE = THandle(-1);
+  WIN_INVALID_FILE_ATTRIBUTES = UInt32($FFFFFFFF);
+  WIN_FILE_SHARE_ALL = UInt32($00000007);   { READ or WRITE or DELETE }
+  WIN_OPEN_EXISTING = UInt32(3);
+  { Needed to open a directory handle; without FILE_FLAG_OPEN_REPARSE_POINT
+    the open follows every symlink and junction on the path. }
+  WIN_FILE_FLAG_BACKUP_SEMANTICS = UInt32($02000000);
+  WIN_FILE_ATTRIBUTE_REPARSE_POINT = UInt32($00000400);
+  { FILE_NAME_NORMALIZED or VOLUME_NAME_DOS: a drive-letter or UNC path. }
+  WIN_FINAL_PATH_DOS_NORMALIZED = UInt32(0);
+
+function WinCreateFileW(AFileName: PWideChar; ADesiredAccess, AShareMode: UInt32;
+  ASecurityAttributes: Pointer; ACreationDisposition, AFlagsAndAttributes: UInt32;
+  ATemplateFile: THandle): THandle; stdcall;
+  external 'kernel32.dll' name 'CreateFileW';
+function WinGetFinalPathNameByHandleW(AFile: THandle; AFilePath: PWideChar;
+  AFilePathLen, AFlags: UInt32): UInt32; stdcall;
+  external 'kernel32.dll' name 'GetFinalPathNameByHandleW';
+function WinGetFileAttributesW(AFileName: PWideChar): UInt32; stdcall;
+  external 'kernel32.dll' name 'GetFileAttributesW';
+function WinCloseHandle(AObject: THandle): LongBool; stdcall;
+  external 'kernel32.dll' name 'CloseHandle';
 {$ENDIF}
 
 const
@@ -1676,8 +1705,17 @@ end;
 
 { Canonicalise a host path with ALL symlinks resolved. On POSIX this is
   realpath(3) — the primitive the symlink-escape check relies on; it fails if
-  the path does not exist. On non-UNIX it degrades to a lexical ExpandFileName
-  (symlink containment UNCONFIRMED off-POSIX). }
+  the path does not exist.
+
+  On Windows the equivalent is to open the path — following every symlink,
+  junction, and other reparse point — and ask the handle for its final path:
+  CreateFileW with FILE_FLAG_BACKUP_SEMANTICS (so directories open too) and
+  GetFinalPathNameByHandleW. The answer carries the \\?\ (or \\?\UNC\) prefix,
+  which is stripped so root and candidate compare in the same drive-letter or
+  UNC form. It also expands 8.3 short names. Any failure — a missing or
+  dangling target, an unopenable one, an unexpected result shape, or a name
+  the ANSI string cannot carry losslessly — is False: a path that cannot be
+  resolved is never treated as contained. }
 function HostRealPath(const APath: string; out AReal: string): Boolean;
 {$IFDEF UNIX}
 var
@@ -1692,9 +1730,57 @@ begin
   Result := True;
 end;
 {$ELSE}
+const
+  VERBATIM_PREFIX = '\\?\';
+  VERBATIM_UNC_PREFIX = '\\?\UNC\';
+var
+  Wide, Final: UnicodeString;
+  Handle: THandle;
+  Len: UInt32;
 begin
-  AReal := ExpandFileName(APath);
-  Result := FileExists(APath) or DirectoryExists(APath);
+  AReal := '';
+  Result := False;
+  if APath = '' then
+    Exit;
+  Wide := UnicodeString(APath);
+  Handle := WinCreateFileW(PWideChar(Wide), 0, WIN_FILE_SHARE_ALL, nil,
+    WIN_OPEN_EXISTING, WIN_FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if Handle = WIN_INVALID_HANDLE_VALUE then
+    Exit;
+  try
+    SetLength(Final, 512);
+    Len := WinGetFinalPathNameByHandleW(Handle, PWideChar(Final),
+      UInt32(Length(Final)), WIN_FINAL_PATH_DOS_NORMALIZED);
+    if Len >= UInt32(Length(Final)) then
+    begin
+      { Too small: Len is the required size, terminating NUL included. }
+      SetLength(Final, Len);
+      Len := WinGetFinalPathNameByHandleW(Handle, PWideChar(Final),
+        UInt32(Length(Final)), WIN_FINAL_PATH_DOS_NORMALIZED);
+      if Len >= UInt32(Length(Final)) then
+        Exit;
+    end;
+    if Len = 0 then
+      Exit;
+    SetLength(Final, Len);
+  finally
+    WinCloseHandle(Handle);
+  end;
+  if Copy(Final, 1, Length(VERBATIM_UNC_PREFIX)) = VERBATIM_UNC_PREFIX then
+    Final := '\\' + Copy(Final, Length(VERBATIM_UNC_PREFIX) + 1, MaxInt)
+  else if (Length(Final) >= 6) and
+    (Copy(Final, 1, Length(VERBATIM_PREFIX)) = VERBATIM_PREFIX) and
+    (Final[6] = ':') then
+    Final := Copy(Final, Length(VERBATIM_PREFIX) + 1, MaxInt)
+  else
+    Exit;
+  AReal := string(Final);
+  if UnicodeString(AReal) <> Final then
+  begin
+    AReal := '';
+    Exit;
+  end;
+  Result := True;
 end;
 {$ENDIF}
 
@@ -1706,7 +1792,12 @@ end;
   PARENT and handed back parent_real + '/' + leaf — so a plain FileCreate would
   follow the link and write OUTSIDE the sandbox. lstat sees the link, not its
   target, so we can refuse. A missing leaf (nothing to follow) or a non-link is
-  False and the create proceeds normally. }
+  False and the create proceeds normally.
+
+  On Windows the no-follow question is GetFileAttributesW, which reports the
+  final component's own attributes rather than its target's. Any reparse
+  point counts — a symlink, a junction, or another tag — since each can
+  redirect the create. }
 function LeafIsSymlink(const APath: string): Boolean;
 {$IFDEF UNIX}
 var
@@ -1717,10 +1808,12 @@ begin
   Result := fpS_ISLNK(St.st_mode);
 end;
 {$ELSE}
+var
+  Attr: UInt32;
 begin
-  { Off-POSIX there is no no-follow stat here; the final-component-symlink
-    guard on create is UNCONFIRMED off-UNIX (the fs layer is POSIX-first). }
-  Result := False;
+  Attr := WinGetFileAttributesW(PWideChar(UnicodeString(APath)));
+  Result := (Attr <> WIN_INVALID_FILE_ATTRIBUTES) and
+    ((Attr and WIN_FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
 end;
 {$ENDIF}
 
@@ -1878,6 +1971,15 @@ begin
   { Does not exist. }
   if ARequireExists then
     Exit(weNoEnt);
+  {$IFDEF WINDOWS}
+  { The leaf is present but did not resolve: a dangling, looping, or otherwise
+    unopenable symlink or junction. Its target is unknown, so it is denied
+    before any create can follow it. The SysUtils existence checks path_open
+    and path_create_directory run next follow links through the reparse data
+    on their own, so the leaf guard in path_open alone is too late here. }
+  if LeafIsSymlink(Candidate) then
+    Exit(weNotCapable);
+  {$ENDIF}
   Parent := ExtractFileDir(Candidate);
   if not HostRealPath(Parent, ParentReal) then
     Exit(weNoEnt);
