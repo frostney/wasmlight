@@ -499,9 +499,10 @@ payload and packages it onto a catalog or host-sibling runtime shell.
 The **runtime shell** (`Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native`,
 program `wasmlight-shell`) is the interpreter-free template
 `wasmlight compile` populates. Startup always re-decodes and
-re-validates the embedded module, then wires only a complete native
-image; an incomplete or incompatible image is `EWasmLinkError` and is
-never interpreted. `.waot` remains the fallback-capable cache for
+re-validates the embedded module, strictly decodes and applies the
+embedded capability set, then wires only a complete native image; an
+incomplete or incompatible image is `EWasmLinkError` and is never
+interpreted. `.waot` remains the fallback-capable cache for
 `run --aot`. Packaged ELF/Mach-O images carry the product payload;
 the attach-seam `.wshl` envelope remains for template tests.
 
@@ -609,7 +610,9 @@ boundary is drawn.
   executable payload, and package it onto a catalog or host-sibling
   runtime shell. WASI preview1 is a built-in; other imports fail at link
   unless a selected connector uniquely binds them, and connector host
-  functions are not yet embedded. There is no `.waot`, JIT, or interpreter
+  functions are not yet embedded. `--dir GUEST=HOST` and `--env KEY=VALUE`
+  build the compiled capability set, which the payload embeds; a malformed
+  spec is a usage error before decode. There is no `.waot`, JIT, or interpreter
   fallback. A missing catalog or unusable shell is `EWasmPackagingError`.
 - **`Wasm.Connector` / `Wasm.Connector.Resolve`** are compile-time linking,
   not a runtime host. `ParseConnector` turns `.wlc` into declaration
@@ -630,7 +633,13 @@ boundary is drawn.
   the guest. Embedded environment values are visible in the executable and
   are not a secret mechanism. The set cannot grow after it is frozen, and
   apply refuses a config that already has preopens or env. Containment
-  stays in `Wasm.Wasi`.
+  stays in `Wasm.Wasi`. The unit also owns the capability-set section
+  encoding: versioned, fixed-width little-endian, order-preserving, with
+  the empty set as no bytes so every set has one encoding, and a strict
+  decoder that rejects anything the compile path could not have written.
+  `CompiledGuestArgv` is the one argv builder: `wasmlight run` passes the
+  module path and a compiled executable passes its own path, so the guest
+  sees the same argc for the same arguments.
 
 ### Target-shell discovery
 
