@@ -3856,22 +3856,16 @@ begin
 end;
 
 function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
-var
-  Live: UInt64;
 begin
   if WasmTargetSupported(WasmTargetHost) then
-  begin
-    Result := WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost));
-    { Artifacts are stamped with the published descriptor, but a build
-      whose layout drifted from it (-O4 ORDERFIELDS once reordered class
-      fields in release only) does not have those offsets. Answer with the
-      live fingerprint then, so every published-layout artifact or payload
-      is rejected instead of wired onto the wrong offsets. Stamping from such
-      a build is refused in Wasm.Aot. }
-    Live := WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore));
-    if Live <> Result then
-      Result := Live;
-  end
+    { The host descriptor fingerprinted over this build's live offsets. On a
+      conforming build it equals the published descriptor's (Wasm.Target.Test
+      proves it at release's -O4). A build whose layout drifted from it (-O4
+      ORDERFIELDS once reordered class fields in release only) answers
+      differently, so every published-layout artifact or payload is rejected
+      instead of wired onto the wrong offsets; stamping from such a build is
+      refused in Wasm.Aot. }
+    Result := WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore))
   else
     Result := WasmAotAbiFingerprintFromLiveRuntime(AStore);
 end;
