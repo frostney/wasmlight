@@ -9361,13 +9361,14 @@ procedure TJitTests.TestGenericDirectCallFallback;
 var
   Bytes, Declined: TWasmBytes;
 begin
-  { $f is outside the scalar-leaf proof. First the caller alone is compiled,
-    so the inline site finds no direct entry and must take the helper path
-    to the interpreted callee; then the callee is compiled on the SAME store
-    and the same site switches to the inline call. f(1,2,3) = 1 + 20 + 300. }
+  { $f is outside the native-leaf proof (it declares a local). First the
+    caller alone is compiled, so the inline site finds no direct entry and
+    must take the helper path to the interpreted callee; then the callee is
+    compiled on the SAME store and the same site switches to the inline
+    call. f(1,2,3) = 1 + 20 + 300. }
   FBytes := AssembleWatText('(module ' +
     '(func $f (export "f") (param $a i32) (param $b i64) (param $c i32) ' +
-    '(result i32) ' +
+    '(result i32) (local $unused i32) ' +
     '(i32.add (i32.add (local.get $a) (i32.mul (i32.wrap_i64 (local.get $b)) ' +
     '(i32.const 10))) (i32.mul (local.get $c) (i32.const 100)))) ' +
     '(func (export "run") (result i32) ' +
