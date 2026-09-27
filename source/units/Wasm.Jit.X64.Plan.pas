@@ -84,7 +84,9 @@ procedure X64PlanGcInlineAlloc(const AIr: TWasmIrModule;
   no read — lexical or through a back-edge or join, since every block start
   is a label — can observe D's unwritten value. The defining set is an
   under-approximation (moves, constants, and integer ALU/shift/rotate ops),
-  and any op outside the static-cache read set counts as reading D. }
+  and any op outside the static-cache read set counts as reading D, except
+  a direct call, which reads its argument list (a static-cache function
+  calls only native leaves). }
 procedure X64PlanScaledIndex(const AFn: TWasmIrFunction;
   var APlanned: TWasmIrCode; var ASkip: array of Boolean;
   const ATargets, AImmediate: array of Boolean;
@@ -231,6 +233,21 @@ var
       IntAluOp(APlanned[Result].Op));
   end;
 
+  { A direct call reads exactly its argument list: a static-cache function
+    calls only native leaves, and neither a leaf nor the helper fallback
+    reads any other slot of this frame. }
+  function ReadsD(const AIns: TWasmIrInstr): Boolean;
+  var
+    N: Integer;
+  begin
+    if AIns.Op <> iroCall then
+      Exit(MayReadSlot(AIns, D));
+    for N := 0 to Integer(IrAuxBlockCount(AFn.AuxU32, AIns.A)) - 1 do
+      if IrAuxBlockItem(AFn.AuxU32, AIns.A, UInt32(N)) = D then
+        Exit(True);
+    Result := False;
+  end;
+
   function DeadAfterAccess: Boolean;
   var
     R, W: Integer;
@@ -238,7 +255,7 @@ var
     if IsResultSlot(AFn, D) then
       Exit(False);
     for R := 0 to High(APlanned) do
-      if (R <> M) and not ASkip[R] and MayReadSlot(APlanned[R], D) then
+      if (R <> M) and not ASkip[R] and ReadsD(APlanned[R]) then
       begin
         W := ReachingDef(R);
         if (W < 0) or (W = S) then

@@ -169,6 +169,38 @@ class Machine:
                 break
         return w32(s + x)
 
+    def sidx(self, i, v, k):
+        self.store(0, w32((i & 0x3FF) << 2), 4, w32(v + k))
+        return self.load(0, w32(((i ^ k) & 0x7FF) << 3), 4)
+
+    def sret(self, i):
+        i = w32((i & 0xFF) << 2)
+        self.load(0, i, 4)
+        return i
+
+    def sloop(self, n):
+        s, i = 0, 0
+        while True:
+            s = w32(s + self.load(0, w32((i & 0x7FF) << 2), 4))
+            s = s ^ self.sidx(i, s, 5)
+            self.store(0, w32((w32(i + 3) & 0x3FF) << 3), 4, s)
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return s
+
+    def sloop2(self, n):
+        s, i = 0, 0
+        while True:
+            s = w32(s + self.load(0, w32((i & 0x7FF) << 2), 4))
+            s = s ^ self.sidx(i, s, 5)
+            s = w32(s + self.sret(w32(s ^ i)))
+            self.store(0, w32((w32(i + 3) & 0x3FF) << 3), 4, s)
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return s
+
     def ident(self, a, b, c):
         return c
 
@@ -396,6 +428,21 @@ WAT = r'''
                         (local.tee $a (i32.add (local.get $b) (local.get $c))))
                (i32.const 7))
       (i32.xor (local.get $a) (local.get $c))))
+  ;; Masked-shift addressing inside memory leaves (the scaled-index fold
+  ;; is a static-cache plan and stays out of leaf bodies); $sret returns
+  ;; the shifted address it also loaded through.
+  (func $sidx (export "sidx") (param $i i32) (param $v i32) (param $k i32)
+    (result i32)
+    (i32.store (i32.shl (i32.and (local.get $i) (i32.const 0x3ff))
+                        (i32.const 2))
+      (i32.add (local.get $v) (local.get $k)))
+    (i32.load (i32.shl (i32.and (i32.xor (local.get $i) (local.get $k))
+                                (i32.const 0x7ff))
+                       (i32.const 3))))
+  (func $sret (export "sret") (param $i i32) (result i32)
+    (drop (i32.load (local.tee $i
+      (i32.shl (i32.and (local.get $i) (i32.const 0xff)) (i32.const 2)))))
+    (local.get $i))
   (func $ident (export "ident") (param i32 i32 i32) (result i32)
     (local.get 2))
   (func $mrw (export "mrw") (param $id i32) (param $d i64) (param $p i32)
@@ -683,6 +730,43 @@ WAT = r'''
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (i32.add (local.get $s) (local.get $x)))
 
+  ;; A base-pinned static loop with its own scaled accesses around a
+  ;; memory leaf's call (one target: the cached entry keeps rsi).
+  (func (export "sloop") (param $n i32) (result i32)
+    (local $s i32) (local $i i32)
+    (loop $l
+      (local.set $s (i32.add (local.get $s)
+        (i32.load (i32.shl (i32.and (local.get $i) (i32.const 0x7ff))
+                           (i32.const 2)))))
+      (local.set $s (i32.xor (local.get $s)
+        (call $sidx (local.get $i) (local.get $s) (i32.const 5))))
+      (i32.store (i32.shl (i32.and (i32.add (local.get $i) (i32.const 3))
+                                   (i32.const 0x3ff))
+                          (i32.const 3))
+        (local.get $s))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $s))
+  ;; The same with a second leaf: each call resolves inline and overwrites
+  ;; rsi before the scaled accesses that follow.
+  (func (export "sloop2") (param $n i32) (result i32)
+    (local $s i32) (local $i i32)
+    (loop $l
+      (local.set $s (i32.add (local.get $s)
+        (i32.load (i32.shl (i32.and (local.get $i) (i32.const 0x7ff))
+                           (i32.const 2)))))
+      (local.set $s (i32.xor (local.get $s)
+        (call $sidx (local.get $i) (local.get $s) (i32.const 5))))
+      (local.set $s (i32.add (local.get $s)
+        (call $sret (i32.xor (local.get $s) (local.get $i)))))
+      (i32.store (i32.shl (i32.and (i32.add (local.get $i) (i32.const 3))
+                                   (i32.const 0x3ff))
+                          (i32.const 3))
+        (local.get $s))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $s))
+
   ;; memory.grow between leaf calls: the leaf must see the new Base/size.
   (func (export "growloop") (param $n i32) (result i32)
     (local $s i32) (local $i i32) (local $top i32)
@@ -796,6 +880,12 @@ COMMANDS = [
     ('quadloop', 'ii', (9, 3)),
     ('quad', 'i', (65524,)),
     ('quad', 'i', (65525,)),
+    ('sidx', 'iii', (0x1234, 9, 0x77)),
+    ('sret', 'i', (0x1FF,)),
+    ('sloop', 'i', (1,)),
+    ('sloop', 'i', (3000,)),
+    ('sloop2', 'i', (1,)),
+    ('sloop2', 'i', (2500,)),
     ('ldall', 'i', (0,)),
     ('ldall', 'i', (3,)),
     ('ldall', 'i', (65,)),

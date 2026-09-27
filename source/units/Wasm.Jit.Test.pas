@@ -1021,6 +1021,69 @@ begin
     ' (i32.const 1))) ');
 end;
 
+{ Lane N's scaled pinned index next to x64 memory leaves: $sidx and $sret
+  address memory through masked shifts inside the leaf ($sret also returns
+  the shifted address), $sloop is a one-leaf base-pinned loop with its own
+  scaled load and store around the call, and $sloop2 adds a second leaf,
+  so each call resolves inline and overwrites rsi. `check` runs, on one
+  fresh memory, sloop(1), sloop(3000), sloop2(2500), sret(0x1ff),
+  sidx(0x1234, 9, 0x77) against the constants the Python model in
+  tests/fixtures/wast/x64-leaf.py (Machine) computes for that order. }
+function ScaledLeafModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory 1) ' +
+    '(func $sidx (export "sidx") (param $i i32) (param $v i32) (param $k i32) ' +
+    ' (result i32) ' +
+    ' (i32.store (i32.shl (i32.and (local.get $i) (i32.const 0x3ff)) ' +
+    '  (i32.const 2)) (i32.add (local.get $v) (local.get $k))) ' +
+    ' (i32.load (i32.shl (i32.and (i32.xor (local.get $i) (local.get $k)) ' +
+    '  (i32.const 0x7ff)) (i32.const 3)))) ' +
+    '(func $sret (export "sret") (param $i i32) (result i32) ' +
+    ' (drop (i32.load (local.tee $i ' +
+    '  (i32.shl (i32.and (local.get $i) (i32.const 0xff)) (i32.const 2))))) ' +
+    ' (local.get $i)) ' +
+    '(func $sloop (export "sloop") (param $n i32) (result i32) ' +
+    ' (local $s i32) (local $i i32) ' +
+    ' (loop $l ' +
+    '  (local.set $s (i32.add (local.get $s) ' +
+    '   (i32.load (i32.shl (i32.and (local.get $i) (i32.const 0x7ff)) ' +
+    '    (i32.const 2))))) ' +
+    '  (local.set $s (i32.xor (local.get $s) ' +
+    '   (call $sidx (local.get $i) (local.get $s) (i32.const 5)))) ' +
+    '  (i32.store (i32.shl (i32.and (i32.add (local.get $i) (i32.const 3)) ' +
+    '   (i32.const 0x3ff)) (i32.const 3)) (local.get $s)) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (local.get $s)) ' +
+    '(func $sloop2 (export "sloop2") (param $n i32) (result i32) ' +
+    ' (local $s i32) (local $i i32) ' +
+    ' (loop $l ' +
+    '  (local.set $s (i32.add (local.get $s) ' +
+    '   (i32.load (i32.shl (i32.and (local.get $i) (i32.const 0x7ff)) ' +
+    '    (i32.const 2))))) ' +
+    '  (local.set $s (i32.xor (local.get $s) ' +
+    '   (call $sidx (local.get $i) (local.get $s) (i32.const 5)))) ' +
+    '  (local.set $s (i32.add (local.get $s) ' +
+    '   (call $sret (i32.xor (local.get $s) (local.get $i))))) ' +
+    '  (i32.store (i32.shl (i32.and (i32.add (local.get $i) (i32.const 3)) ' +
+    '   (i32.const 0x3ff)) (i32.const 3)) (local.get $s)) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (local.get $s)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $sloop (i32.const 1)) (i32.const 0)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $sloop (i32.const 3000)) (i32.const -987990320)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $sloop2 (i32.const 2500)) (i32.const 1408406710)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $sret (i32.const 0x1ff)) (i32.const 1020)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $sidx (i32.const 0x1234) (i32.const 9) ' +
+    '  (i32.const 0x77)) (i32.const -1622610987)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
 { Recursion through callers of a three-parameter memory leaf. $rec calls
   $bump at every level before recursing (a write-through caller); $rec2
   recurses to a static-cache loop that calls $bump three times. On a fresh
@@ -2854,6 +2917,7 @@ type
     procedure TestNativeLeafStaticCallerHosts;
     procedure TestX64MemoryLeafShape;
     procedure TestMemoryLeafCallers;
+    procedure TestScaledIndexAroundLeafCalls;
     procedure TestMemoryLeafExhaustion;
     procedure TestMemoryLeafEpoch;
     procedure TestInlineScalarBodyRelocation;
@@ -7898,6 +7962,80 @@ begin
   Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1);
 end;
 
+procedure TJitTests.TestScaledIndexAroundLeafCalls;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_X64}
+  Code: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  EntryOffset: NativeUInt;
+  StagedCount: UInt32;
+
+  function Occurs(const ACode: TWasmBytes; const ASeq: array of Byte):
+    Integer;
+  var
+    N, J: Integer;
+  begin
+    Result := 0;
+    for N := 0 to Length(ACode) - Length(ASeq) do
+    begin
+      J := 0;
+      while (J <= High(ASeq)) and (ACode[N + J] = ASeq[J]) do
+        Inc(J);
+      if J > High(ASeq) then
+        Inc(Result);
+    end;
+  end;
+
+  function Stage(const AIndex: Integer): TWasmBytes;
+  begin
+    Result := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[AIndex],
+      Ir.FuncImportCount + UInt32(AIndex), EntryOffset, StagedCount);
+  end;
+  {$ENDIF}
+begin
+  Bytes := ScaledLeafModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    { The leaves keep their shifts (shl r10d, 2 / shl r10d, 3): the scaled
+      fold is a static-cache plan, and $sret's shifted address is also its
+      result. }
+    Code := Stage(0);
+    Expect<Integer>(Occurs(Code, [$41, $C1, $E2, $02])).ToBe(1);
+    Expect<Integer>(Occurs(Code, [$41, $C1, $E2, $03])).ToBe(1);
+    Code := Stage(1);
+    Expect<Integer>(Occurs(Code, [$41, $C1, $E2, $02])).ToBe(1);
+    { $sloop: both of its own accesses fold into the SIB scale although
+      the loop calls a leaf (a call reads only its arguments):
+      add edx, [rsi + r10*4] and mov [rsi + r11*8], edx; the call is the
+      cached entry's (call rax). }
+    Code := Stage(2);
+    Expect<Integer>(Occurs(Code, [$42, $03, $14, $96])).ToBe(1);
+    Expect<Integer>(Occurs(Code, [$42, $89, $14, $DE])).ToBe(1);
+    Expect<Integer>(Occurs(Code, [$31, $C9, $FF, $D0])).ToBe(1);
+    { $sloop2 resolves both leaves inline: Base is reloaded before each
+      call (mov rsi, [rsp] ; mov rsi, [rsi]) and after each fallback. }
+    Code := Stage(3);
+    Expect<Integer>(Occurs(Code, [$31, $C9, $FF, $D2])).ToBe(2);
+    Expect<Integer>(Occurs(Code, [$48, $8B, $34, $24])).ToBe(4);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  {$ENDIF}
+  CompileExports(['sidx', 'sret', 'sloop', 'sloop2', 'check']);
+  Expect<Boolean>(DiffFresh(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1);
+  CompileExports(['sloop', 'sloop2', 'check']);
+  Expect<Boolean>(DiffFresh(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1);
+end;
+
 procedure TJitTests.TestMemoryLeafExhaustion;
 var
   N: Integer;
@@ -10461,6 +10599,8 @@ begin
     TestX64MemoryLeafShape);
   Test('memory and four-parameter leaves match independent values in every mix',
     TestMemoryLeafCallers);
+  Test('scaled pinned accesses fold around memory-leaf calls, not in leaves',
+    TestScaledIndexAroundLeafCalls);
   Test('memory leaf calls exhaust at the interpreter''s depth',
     TestMemoryLeafExhaustion);
   Test('an epoch bump interrupts a memory-leaf loop after one call',
