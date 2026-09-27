@@ -143,7 +143,8 @@ this committed binary, so the two cannot drift apart unnoticed.
 
 `caps.wat` is the source of `caps.wasm`, assembled with
 `wasm-tools parse caps.wat -o caps.wasm` (wasm-tools 1.259.0). It is also the
-inline `CAPS_WAT` in `source/units/Wasm.Shell.Test.pas`.
+inline `CAPS_COMMAND_WAT` in `source/units/Wasm.Shell.Test.pas`, which runs
+both that text and this committed binary so the two cannot drift apart.
 
 `regenerate.sh` does not build these files: that script derives the decoder
 corpus (`valid/` from its `.wat`, `malformed/` by byte-patching), and these

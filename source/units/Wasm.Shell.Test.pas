@@ -103,7 +103,7 @@ const
 
   { tests/fixtures/wasi/caps.wat: exits with argc + 10 * envc, plus 100
     when fd 3 opens probe.txt. }
-  CAPS_WAT =
+  CAPS_COMMAND_WAT =
     '(module' + sLineBreak +
     '  (import "wasi_snapshot_preview1" "args_sizes_get"' + sLineBreak +
     '    (func $args_sizes_get (param i32 i32) (result i32)))' + sLineBreak +
@@ -165,6 +165,8 @@ type
     procedure TestCapabilitySetCannotBeExpanded;
     procedure TestCompiledCapabilitiesReachGuest;
     procedure TestArgcMatchesRun;
+    procedure TestCapsFixtureMatchesSource;
+    procedure TestExecutablePathIsAbsolute;
     procedure TestNoStart;
     procedure TestStartParameter;
     procedure TestStartResult;
@@ -379,7 +381,7 @@ var
   Err: string;
   I: Integer;
 begin
-  Module := AssembleWatText(CAPS_WAT);
+  Module := AssembleWatText(CAPS_COMMAND_WAT);
   Caps := TWasmCompiledCapabilities.Create;
   try
     for I := 0 to High(ADirs) do
@@ -407,6 +409,15 @@ begin
   Expect<string>(Res.Diagnostic)
     .ToBe('EWasmLinkError: cannot expand a compiled capability set');
   Expect<Integer>(Length(FConfig.Env)).ToBe(1);
+
+  FreeAndNil(FConfig);
+  FConfig := TWasmWasiConfig.Create;
+  FConfig.AddPreopenDir('/ambient', GetTempDir, WASM_COMPILED_DIR_RIGHTS);
+  Res := RunShellBytes(CapsPayload([], ['A=1']), FConfig,
+    ShellInvocation('/opt/app/tool', []));
+  Expect<string>(Res.Diagnostic)
+    .ToBe('EWasmLinkError: cannot expand a compiled capability set');
+  Expect<Integer>(Length(FConfig.Env)).ToBe(0);
 end;
 
 procedure TShellTests.TestCompiledCapabilitiesReachGuest;
@@ -465,7 +476,7 @@ begin
   RunConfig := TWasmWasiConfig.Create;
   try
     RunConfig.SetArgv(CompiledGuestArgv('caps.wasm', ARGS));
-    RunRes := RunModuleBytes(AssembleWatText(CAPS_WAT), RunConfig);
+    RunRes := RunModuleBytes(AssembleWatText(CAPS_COMMAND_WAT), RunConfig);
     Expect<Integer>(RunRes.ExitCode).ToBe(4);
   finally
     RunConfig.Free;
@@ -802,6 +813,54 @@ begin
   Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
 end;
 
+procedure TShellTests.TestCapsFixtureMatchesSource;
+const
+  CAPS_FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wasi' +
+    PathDelim + 'caps.wasm';
+var
+  Stream: TFileStream;
+  Fixture: TWasmBytes;
+  FromFile, FromText: TWasmRunResult;
+  Config: TWasmWasiConfig;
+begin
+  Stream := TFileStream.Create(CAPS_FIXTURE, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Fixture, Stream.Size);
+    Stream.ReadBuffer(Fixture[0], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+  Config := TWasmWasiConfig.Create;
+  try
+    Config.SetArgv(CompiledGuestArgv('caps.wasm', ['x']));
+    Config.AddEnv('A=1');
+    FromFile := RunModuleBytes(Fixture, Config);
+  finally
+    Config.Free;
+  end;
+  Config := TWasmWasiConfig.Create;
+  try
+    Config.SetArgv(CompiledGuestArgv('caps.wasm', ['x']));
+    Config.AddEnv('A=1');
+    FromText := RunModuleBytes(AssembleWatText(CAPS_COMMAND_WAT), Config);
+  finally
+    Config.Free;
+  end;
+  { argc 2 + 10 * envc 1, no preopen. }
+  Expect<Integer>(FromFile.ExitCode).ToBe(12);
+  Expect<Integer>(FromText.ExitCode).ToBe(FromFile.ExitCode);
+end;
+
+procedure TShellTests.TestExecutablePathIsAbsolute;
+var
+  Path: string;
+begin
+  Path := ShellExecutablePath;
+  Expect<string>(ExpandFileName(Path)).ToBe(Path);
+  Expect<Boolean>(FileExists(Path)).ToBe(True);
+  Expect<string>(ExtractFileName(Path)).ToBe(ExtractFileName(ParamStr(0)));
+end;
+
 procedure TShellTests.SetupTests;
 begin
   Test('corrupt embedded trailers fail before the attach seam', TestCorruptEmbeddedTrailer);
@@ -818,12 +877,16 @@ begin
     TestConnectorStubRejected);
   Test('a malformed capability set is rejected before instantiation',
     TestMalformedCapabilitySetRejected);
-  Test('a config that already grants env cannot expand the compiled set',
+  Test('a config that already grants env or a preopen cannot expand the set',
     TestCapabilitySetCannotBeExpanded);
   Test('compiled preopens, env, and argv reach the guest, or fail closed',
     TestCompiledCapabilitiesReachGuest);
   Test('a compiled executable gives the guest the argc run gives',
     TestArgcMatchesRun);
+  Test('the committed caps.wasm behaves as its wat source',
+    TestCapsFixtureMatchesSource);
+  Test('the shell asks the OS for an absolute executable path',
+    TestExecutablePathIsAbsolute);
   Test('a module with no _start is rejected', TestNoStart);
   Test('_start parameters fail the command contract', TestStartParameter);
   Test('_start results fail the command contract', TestStartResult);

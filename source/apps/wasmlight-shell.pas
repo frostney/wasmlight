@@ -55,10 +55,9 @@ var
   I, GuestStart: Integer;
   AttachPath, ExePath: string;
 begin
-  { On Darwin ParamStr(0) is argv[0], which may be relative to the startup
-    CWD; anchor it now so relative compiled preopens resolve from the
-    executable's real directory. }
-  ExePath := ExpandFileName(ParamStr(0));
+  { The OS's view of this executable, not argv[0]: the payload is read from
+    it and relative compiled preopens resolve from its directory. }
+  ExePath := ShellExecutablePath;
   Payload := EmbeddedPayload;
   GuestStart := 1;
   AttachPath := '';

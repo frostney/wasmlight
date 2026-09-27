@@ -1,3 +1,5 @@
+;; A WASI command that reports its capabilities through its exit code:
+;; argc + 10 * envc, plus 100 when path_open on fd 3 opens "probe.txt".
 (module
   (import "wasi_snapshot_preview1" "args_sizes_get"
     (func $args_sizes_get (param i32 i32) (result i32)))

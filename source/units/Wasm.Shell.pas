@@ -97,6 +97,13 @@ type
 function ShellInvocation(const AExecutablePath: string;
   const AArgs: array of string): TWasmShellInvocation;
 
+{ The absolute, symlink-resolved path of the running executable, asked of
+  the OS rather than taken from argv[0]: relative compiled preopens resolve
+  from its directory whether the program was started by path, through a
+  symlink, or by a PATH lookup. Linux reads /proc/self/exe; Darwin uses
+  _NSGetExecutablePath + realpath; elsewhere ExpandFileName(ParamStr(0)). }
+function ShellExecutablePath: string;
+
 { Run a parsed-or-raw shell image. The embedded compiled capability set and
   AInvocation's argv are applied to AConfig, which must carry no preopens or
   env of its own. AConfig is borrowed. Never raises a guest outcome: decode,
@@ -138,10 +145,58 @@ function ExtractPackagedPayloadFromFile(const APath: string;
 implementation
 
 uses
+  {$IFDEF LINUX}
+  BaseUnix,
+  {$ENDIF}
   Wasm.Compile.Capabilities;
 
 type
   PWasmNativePayload = ^TWasmNativePayload;
+
+{$IFDEF DARWIN}
+{ FPC 3.2.2 on Darwin returns raw argv[0] from ParamStr(0) (a bare name
+  after a PATH lookup), so ask dyld and libc instead. Both live in
+  libSystem, which every Darwin program already links. }
+function NSGetExecutablePath(ABuf: PAnsiChar; var ASize: UInt32): LongInt;
+  cdecl; external 'c' name '_NSGetExecutablePath';
+function CRealPath(APath, AResolved: PAnsiChar): PAnsiChar;
+  cdecl; external 'c' name 'realpath';
+{$ENDIF}
+
+function ShellExecutablePath: string;
+{$IFDEF DARWIN}
+var
+  Size: UInt32;
+  Raw: AnsiString;
+  Resolved: array[0..4095] of AnsiChar;
+{$ENDIF}
+begin
+  Result := '';
+  {$IFDEF LINUX}
+  { fpReadLink returns an unbounded AnsiString; ParamStr(0) is the same
+    link read into a 255-byte shortstring. }
+  Result := fpReadLink('/proc/self/exe');
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Size := 0;
+  SetLength(Raw, 1);
+  NSGetExecutablePath(PAnsiChar(Raw), Size);
+  if Size > 0 then
+  begin
+    SetLength(Raw, Size);
+    if NSGetExecutablePath(PAnsiChar(Raw), Size) = 0 then
+    begin
+      if CRealPath(PAnsiChar(Raw), @Resolved[0]) <> nil then
+        Result := StrPas(PAnsiChar(@Resolved[0]))
+      else
+        Result := StrPas(PAnsiChar(Raw));
+    end;
+  end;
+  {$ENDIF}
+  if Result = '' then
+    Result := ParamStr(0);
+  Result := ExpandFileName(Result);
+end;
 
 constructor TWasmShellOsOutStream.Create(const AHandle: THandle);
 begin
@@ -258,7 +313,7 @@ end;
 
 function SelfInvocation: TWasmShellInvocation;
 begin
-  Result := ShellInvocation(ParamStr(0), []);
+  Result := ShellInvocation(ShellExecutablePath, []);
 end;
 
 { Decode the embedded capability set and install exactly it, plus the

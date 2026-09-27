@@ -156,8 +156,9 @@ See [roadmap.md](roadmap.md) for what comes next and in what order.
 
 `wasmlight compile` turns the same command into a native executable. A
 generated executable has no Wasmlight flags, so its WASI grants are fixed at
-compile time with the same `--dir GUEST=HOST` and `--env KEY=VALUE` flags and
-embedded as an immutable capability set:
+compile time with `--dir GUEST=HOST` and `--env KEY=VALUE`, spelled as for
+`run`, and embedded as an immutable capability set. `compile` rejects an
+`--env` value without a `KEY=` part:
 
 ```bash
 ./build/wasmlight compile app.wasm --dir /data=data --env LANG=C -o app
@@ -165,7 +166,9 @@ embedded as an immutable capability set:
 ```
 
 A relative `HOST` such as `data` resolves from the executable's directory
-when it runs, so the executable can be moved together with its data; an
+when it runs (the real file, as the OS reports it, even when started through
+a symlink or a `PATH` lookup), so the executable can be moved together with
+its data; an
 absolute `HOST` stays literal. The executable never inherits the process
 environment and cannot widen its set at run time. Every invocation argument
 belongs to the guest, and argc matches `wasmlight run` for the same

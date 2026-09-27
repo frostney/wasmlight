@@ -113,7 +113,6 @@ type
     procedure TestCapabilityOptionsMapVerbatim;
     procedure TestMalformedCapabilityIsUsageError;
     procedure TestHostTargetEmbedsCapabilitySet;
-    procedure TestHostTargetWithoutGrantsEmbedsEmptySet;
   end;
 
 function TCompileTests.NewRequest(const ATarget: string): TWasmCompileRequest;
@@ -809,6 +808,8 @@ begin
     .ToBe(True);
   Expect<Integer>(Ord(ParseNativePayload(Extracted, Parsed))).ToBe(Ord(nprOk));
   Expect<Boolean>(Length(Parsed.Funcs) > 0).ToBe(True);
+  { No --dir/--env: the empty, deny-by-default set is no bytes. }
+  Expect<Integer>(Length(Parsed.CapabilitySet)).ToBe(0);
 end;
 
 procedure TCompileTests.TestWrongMachOTemplateFails;
@@ -980,28 +981,6 @@ begin
   end;
 end;
 
-procedure TCompileTests.TestHostTargetWithoutGrantsEmbedsEmptySet;
-var
-  Res: TWasmCompileResult;
-  Request: TWasmCompileRequest;
-  Extracted: TWasmBytes;
-  Parsed: TWasmNativePayload;
-begin
-  Request := NewRequest(CompileHostTarget);
-  Request.CatalogRoot := FCatalogRoot;
-  Res := CompileModuleBytes(AssembleWatText(WASI_WAT), Request);
-  if not IsReleasedCompileTarget(CompileHostTarget) then
-  begin
-    Expect<Boolean>(Pos('EWasmPackagingError', Res.Diagnostic) > 0).ToBe(True);
-    Exit;
-  end;
-  Expect<string>(Res.Diagnostic).ToBe('');
-  Expect<Boolean>(ExtractPackagedPayloadFromFile(FOutputPath, Extracted))
-    .ToBe(True);
-  Expect<Integer>(Ord(ParseNativePayload(Extracted, Parsed))).ToBe(Ord(nprOk));
-  Expect<Integer>(Length(Parsed.CapabilitySet)).ToBe(0);
-end;
-
 procedure TCompileTests.SetupTests;
 begin
   Test('Mach-O templates must match the selected architecture', TestWrongMachOTemplateFails);
@@ -1064,8 +1043,6 @@ begin
     TestMalformedCapabilityIsUsageError);
   Test('the host target embeds the compiled capability set',
     TestHostTargetEmbedsCapabilitySet);
-  Test('no grants embed the empty, deny-by-default set',
-    TestHostTargetWithoutGrantsEmbedsEmptySet);
 end;
 
 begin

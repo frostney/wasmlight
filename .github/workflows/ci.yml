@@ -205,6 +205,11 @@ jobs:
           expect_exit 123 ./build/wasmlight run --dir "/d=$APP/data" \
             --env A=1 --env B=2 "$CAPS" a --b
           (cd / && expect_exit 123 "$APP/caps" a --b)
+          # Started by a PATH lookup or through a symlink, the grant still
+          # resolves from the real executable's directory.
+          (cd / && export PATH="$APP:$PATH" && expect_exit 123 caps a --b)
+          ln -s "$APP/caps" "$MOVED/link"
+          (cd / && expect_exit 123 "$MOVED/link" a --b)
           # Relocated without a data directory: the grant does not follow CWD.
           cp "$APP/caps" "$MOVED/caps"
           (cd "$APP" && expect_exit 21 "$MOVED/caps")
