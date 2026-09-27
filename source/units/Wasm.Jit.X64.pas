@@ -640,7 +640,7 @@ procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   the cache hosts instead of making the register file canonical. }
 procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
 { Mark each static fixed host whose slot AWritten says no instruction of the
-  function writes (AA parameter only read, ASuch as a loop bound) as Stable. }
+  function writes, a parameter only read such as a loop bound, as Stable. }
 procedure X64MarkStableFixedHosts(var ACache: TX64RegCache;
   const AWritten: array of Boolean);
 { A static-allocation caller whose native-leaf calls all target AFuncIdx
