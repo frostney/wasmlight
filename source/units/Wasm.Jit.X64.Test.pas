@@ -1654,6 +1654,12 @@ begin
   Emit(iroI64Shl, 2, 2, 64);
   CheckAdded([$45, $89, $D2]);
 
+  { ... and into a distinct host (the operand stays live) it is a copy:
+    mov r11, r10. }
+  Setup(2);
+  Emit(iroI64Shl, 4, 2, 64);
+  CheckAdded([$4D, $89, $D3]);
+
   { cmp against the constant: xor r8d,r8d ; cmp r10d,1000000000 ;
     setb r8b. }
   Setup(1);

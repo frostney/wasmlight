@@ -5317,14 +5317,14 @@ end;
   bounced through eax or shifted by CL. Wildcards (-1) leave the host
   registers free. }
 procedure TJitTests.TestImmediateOperandCodeShape;
-{$IFDEF WASM_JIT_X64}
 var
+  Bytes: TWasmBytes;
+{$IFDEF WASM_JIT_X64}
   Module: TWasmModule;
   Ir: TWasmIrModule;
   Code: TWasmBytes;
   EntryOffset: NativeUInt;
   RegisterCount: UInt32;
-  Bytes: TWasmBytes;
 
   function Has(const APattern: array of Integer): Boolean;
   var
@@ -5374,15 +5374,33 @@ begin
   Expect<Boolean>(Has([$B8, $00, $E1, $F5, $05])).ToBe(False);
   Expect<Boolean>(Has([$41, $D3])).ToBe(False);
   {$ENDIF}
-  Expect<Boolean>(DiffFresh(AssembleWatText('(module (memory 1 1) ' +
-    '(func (export "run") (param $n i32) (result i32) (local i32 i32 i32) ' +
-    '(loop $l (local.set 3 (i32.shl (i32.and (local.get 1) ' +
-    '(i32.const 16383)) (i32.const 2))) (local.set 2 (i32.add (local.get 2) ' +
-    '(i32.load (local.get 3)))) (local.set 1 (i32.add (local.get 1) ' +
-    '(i32.const 1))) (br_if $l (i32.lt_u (local.get 1) (local.get $n)))) ' +
-    '(local.get 2)))'), 'run', [MakeValueI32(20000)]))
+  { A dynamic local ($p: the static hosts go to $a and $b), dirty after
+    its update at the loop head, is read through its alias by two
+    immediate ops: an op may take a dead operand's host in place, never a
+    live one's. The expected sums come from the lane K model. }
+  Bytes := AssembleWatText('(module (memory 1 1) (data (i32.const 0) ' +
+    '"\05\00\00\00\09\00\00\00\11\00\00\00\21\00\00\00") ' +
+    '(func (export "run") (param $n i32) (result i32) (local $i i32) ' +
+    '(local $a i32) (local $b i32) (local $p i32) (loop $l ' +
+    '(local.set $p (i32.add (local.get $p) (i32.const 4))) ' +
+    '(local.set $a (i32.add (local.get $a) (i32.load (i32.and ' +
+    '(local.get $p) (i32.const 12))))) ' +
+    '(local.set $b (i32.xor (local.get $b) (i32.shl (local.get $p) ' +
+    '(i32.const 3)))) ' +
+    '(local.set $a (i32.add (local.get $a) (local.get $b))) ' +
+    '(local.set $b (i32.add (local.get $b) (local.get $a))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (local.get $a) (local.get $b))))');
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(10)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
-  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(0);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(247786);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(37)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(82010498);
 end;
 
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
