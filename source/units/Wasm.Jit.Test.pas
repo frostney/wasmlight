@@ -2629,6 +2629,7 @@ type
     procedure TestImmediateOperandForms;
     procedure TestImmediateOperandTrapMidLoop;
     procedure TestImmediateOperandCodeShape;
+    procedure TestImmediateOperandNativeCores;
     procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
@@ -5864,6 +5865,29 @@ begin
   Expect<Boolean>(Has([$B8, $01, $00, $00, $00])).ToBe(False);
   Expect<Boolean>(Has([$B8, $00, $E1, $F5, $05])).ToBe(False);
   Expect<Boolean>(Has([$41, $D3])).ToBe(False);
+  { A constant store address goes straight into a host as a zero-extended
+    32-bit value (lane L's Zx32 fact), so the pinned store indexes that host
+    with no mov ecx copy: mov r32, 0x100 ; mov [rsi + r], r32 (REX.X). }
+  Bytes := AssembleWatText('(module (memory 1 1) ' +
+    '(func (export "run") (param $n i32) (result i32) (local $i i32) ' +
+    '(local $acc i32) (loop $l (local.set $acc (i32.add (local.get $acc) ' +
+    '(local.get $i))) (i32.store (i32.const 0x100) (local.get $acc)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+      RegisterCount);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  Expect<Boolean>(Has([$00, $01, $00, $00, $46, $89, -1, -1])).ToBe(True);
   { A v128-cache loop (the simd workload's) keeps the previous scalar
     emission: mov eax, 1 and mov eax, 1000000 feed register compares. }
   Bytes := AssembleWatText('(module (func (export "run") (result i32) ' +
@@ -5914,6 +5938,74 @@ begin
   Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(37)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(82010498);
+end;
+
+{ Immediates inside lane M's deferred-write-back native self cores (a
+  compare-branch against 2, subs of 1 and 2 feeding the self-call argument,
+  imul by 0x9E3779B1 / -2^31, rotr and shr_u by masked counts, an add of 2^32
+  that has no imm32 form) and in a static caller that keeps its four fixed
+  hosts (r8, r9, rdi, rdx) across native leaf calls. Expected values come
+  from the lane K model (patches/laneK-imm-model.py). }
+procedure TJitTests.TestImmediateOperandNativeCores;
+const
+  N32: array[0 .. 4] of Int32 = (0, 1, 2, 7, 15);
+  R32: array[0 .. 4] of Int32 = (-129, -130, -1479265315, 1869713821,
+    33384351);
+  R64: array[0 .. 4] of Int64 = (4294967296, 4294967297,
+    9223372032559808512, 2305843009750564864, 144115188109410304);
+  NC: array[0 .. 2] of Int32 = (1, 5, 100);
+  RC: array[0 .. 2] of Int32 = (536868476, 1624373064, 347210642);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  Bytes := AssembleWatText('(module ' +
+    '(func $rec32 (export "rec32") (param $n i32) (result i32) ' +
+    '(if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '(then (i32.xor (local.get $n) (i32.const -129))) ' +
+    '(else (i32.add (i32.mul (call $rec32 (i32.sub (local.get $n) ' +
+    '(i32.const 1))) (i32.const 0x9E3779B1)) (i32.rotr (call $rec32 ' +
+    '(i32.sub (local.get $n) (i32.const 2))) (i32.const 33)))))) ' +
+    '(func $rec64 (export "rec64") (param $n i64) (result i64) ' +
+    '(if (result i64) (i64.lt_s (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 0x100000000))) ' +
+    '(else (i64.xor (i64.mul (call $rec64 (i64.sub (local.get $n) ' +
+    '(i64.const 1))) (i64.const -0x80000000)) (i64.shr_u (call $rec64 ' +
+    '(i64.sub (local.get $n) (i64.const 2))) (i64.const 65)))))) ' +
+    '(func $leafk (export "leafk") (param $x i32) (param $y i32) ' +
+    '(result i32) (i32.xor (i32.mul (local.get $x) (i32.const 17)) ' +
+    '(i32.add (local.get $y) (i32.const -128)))) ' +
+    '(func $caller (export "caller") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $b i32) (local $c i32) (loop $l ' +
+    '(local.set $a (i32.add (local.get $a) (i32.const 127))) ' +
+    '(local.set $b (i32.xor (local.get $b) (i32.shl (local.get $i) ' +
+    '(i32.const 3)))) ' +
+    '(local.set $c (call $leafk (local.get $a) (local.get $b))) ' +
+    '(local.set $a (i32.sub (local.get $a) (i32.and (local.get $c) ' +
+    '(i32.const 0xff)))) ' +
+    '(local.set $b (i32.add (local.get $b) (i32.shr_u (local.get $c) ' +
+    '(i32.const 35)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $a) (local.get $b)) (local.get $c))))');
+  CompileExports(['rec32', 'rec64', 'leafk', 'caller']);
+  for I := 0 to High(N32) do
+  begin
+    Expect<Boolean>(DiffFresh(Bytes, 'rec32', [MakeValueI32(N32[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+      .ToBe(UInt64(UInt32(R32[I])));
+    Expect<Boolean>(DiffFresh(Bytes, 'rec64', [MakeValueI64(N32[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64(R64[I]));
+  end;
+  for I := 0 to High(NC) do
+  begin
+    Expect<Boolean>(DiffFresh(Bytes, 'caller', [MakeValueI32(NC[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+      .ToBe(UInt64(UInt32(RC[I])));
+  end;
 end;
 
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
@@ -9521,6 +9613,8 @@ begin
     TestImmediateOperandTrapMidLoop);
   Test('a memory-load loop uses x64 immediate forms',
     TestImmediateOperandCodeShape);
+  Test('fused immediates match in native self cores and leaf-calling loops',
+    TestImmediateOperandNativeCores);
   Test('a tee stored in a pinned-memory loop keeps the stored value',
     TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
