@@ -1,28 +1,81 @@
 # Handoff
 
-## x64 wave 6 — in progress, 2026-09-27
+## x64 wave 6 — retained outcome, 2026-09-27
 
 - Delivery branch `codex/optimize-x64-wave6` from exact main `7d4b6ab` (push CI
   run 36294080555 green on all six targets). Evidence root:
   `~/.local/share/wasmlight-evidence/x64-wave6-7d4b6ab` (`PLAN.md`,
-  `LANE-BRIEF.md`, baseline binary, schedules, profiles). The baseline binary
-  is byte-identical to wave 5's final candidate.
-- wasmlight/Wasmtime at the start of the wave:
-  - out of range: host-dispatch-3arg 4.74, memory-store 1.82, memory-load
-    1.51, memory 1.38, loop 1.00, call 0.85;
-  - in range: fib 0.80, memory-grow 0.79, gc 0.66, simd 0.65, startup 0.60,
-    host-call 0.50.
-- Lanes:
-  - N (`lane/x64-w6-mem`, worktree `w6-laneN`): fold the address `shl` into
-    the SIB scale, with a range proof from the mask and the zero-extension
-    flag; compare the epoch against memory on the back-edge; drop the copy
-    into the dead-after-use `$address` local.
-  - Q (`lane/x64-w6-leaf`, worktree `w6-laneQ`): native leaves that use
-    memory and take up to 4 parameters, for 3-arg's `$fake`, which currently
-    takes the generic inline call at ~8 ns/call; also call's caller-side leaf
-    costs.
-- Next: integrate the accepted lanes one at a time, then a Fable 5.1 review,
-  the PR, and CI.
+  `LANE-BRIEF.md`, binaries + `SHA256SUMS`, schedules, gates, patches,
+  profiles). Method as wave 5.
+- Profiles:
+  - memory loops: the address `shl` and a copy into the dead `$address`
+    local, and the epoch poll loaded into rax;
+  - 3-arg: the memory-using `$fake` was not a native leaf, so it paid the
+    generic inline direct call, about 150 instructions (~8 ns/call);
+  - call: caller arguments went through rax, and hosts were saved around
+    every leaf call.
+- Accepted, integrated N then Q:
+  - **Lane N** (`lane/x64-w6-mem`):
+    - `X := i32.and(Y, m); D := i32.shl(X, k)` feeding a pinned access
+      becomes `[rsi + X*2^k]` when m·2^k < 2^32, with k in 1..3. D must be
+      dead (label-bounded scan). `X64PlanScaledIndex` is in
+      `Wasm.Jit.X64.Plan`. X is copied through ecx unless it is known
+      zero-extended.
+    - Back-edge epoch poll `cmp (%r13),%r14; je`. v128-cache loops keep the
+      old form; unfenced, simd was 1.184x slower (the Zen 5 xmm-loop-length
+      effect again).
+    - New fixture `x64-scaled-index.wast` (113 commands) and
+      `Wasm.Jit.X64.Plan.Test`.
+    Alone: memory-store 0.545, memory-load 0.557, memory 0.843.
+  - **Lane Q** (`lane/x64-w6-leaf`):
+    - x64 native leaves (new `Wasm.Jit.X64.Leaf`; the shared admission is
+      unchanged, so ARM64 is untouched) take 1–4 i32/i64 params in
+      r8/r9/rdi/rdx, the width conversions, and zero-offset guard-page i32
+      memory accesses on one memory with Base in rsi. A 4-param leaf may not
+      use `select`.
+    - Callers pin the leaf's memory and keep the static cache. Arguments move
+      as one parallel move through rcx, with constants and `local.get`
+      forwarded. Only clobbered, dirty, live hosts are saved.
+    - `Wasm.Native` wires x64 leaf entries.
+    - AOT ABI revision 18 → 19.
+    - New fixture `x64-leaf.wast` (108 commands).
+    - In the integration, N's dead-result proof counts a direct call as
+      reading only its arguments, so the scaled fold also fires in
+      leaf-calling loops.
+    3-arg: `$fake` is now an 11-instruction frameless leaf.
+- Final, release `e797bf9` vs main `7d4b6ab` (`schedules/final-{fwd,rev}.txt`,
+  ms; wave6/base forward, base/wave6 reverse):
+  - host-dispatch-3arg 93.28 → 12.06 (0.129; 6.926x)
+  - memory-store 41.72 → 22.64 (0.543; 1.841x)
+  - memory-load 41.71 → 23.54 (0.564; 1.800x)
+  - memory 21.87 → 15.28 (0.699; 1.452x)
+  - call 61.57 → 52.28 (0.849; 1.197x)
+  - guards flat in both orders
+- vs Wasmtime 47.0.3, wasmlight/wasmtime:
+  - in or below the 0.6–0.8 range: host-dispatch-3arg 0.71, call 0.72, fib
+    0.80, memory-grow 0.80, startup 0.63, gc 0.63, simd 0.60, host-call 0.51;
+  - not yet: memory-load 0.86, memory 0.97, memory-store 0.99, loop 1.00.
+- Correctness:
+  - lane N: 18 mutants killed;
+  - lane Q: 25 mutants killed plus 3 killed on the combined code;
+  - the survivors are equivalent under current lowering and are documented
+    in `gates/laneQ-mutations.txt`.
+  Gates at `e797bf9`:
+  - frozen install, format, agents, dev and release builds;
+  - `lwpt test` (all, at `-O4`), health (`Wasm.Jit.pas` cognitive 981),
+    duplication, markdownlint and the ARM64 type-check;
+  - the six fixtures in every tier;
+  - pinned core 65,188 in interp/jit/aot (compiled 0/8763/8763) on dev and
+    release, non-core identical.
+- Next levers:
+  - memory loops: `mov %r8,%r10` before `and`;
+  - loop-bound proofs to fold unmasked shifts (memory-load's fill loop);
+  - `i64.extend`/`wrap` as static-cache ops;
+  - wiring ARM64 native-image leaf entries (they always take the helper
+    fallback);
+  - loop is bound by its dependency chain;
+  - the memory loops may be at Wasmtime's own floor: its code is about the
+    same length.
 
 ## x64 wave 5 — retained outcome, 2026-09-27
 
