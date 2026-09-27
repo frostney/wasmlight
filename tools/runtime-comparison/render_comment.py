@@ -11,6 +11,9 @@ from pathlib import Path
 
 MARKER = "<!-- wasmlight-runtime-comparison -->"
 PEERS = ("Wasmtime", "Wasmer", "WasmEdge", "WAMR", "wazero", "wasm3")
+# Peers measured with their interruption checks compiled in (bench.py's
+# interruptible profile); the others have no CLI-reachable mechanism.
+INTERRUPTIBLE_PEERS = ("Wasmtime", "WasmEdge", "wazero")
 
 
 def read_report(path: Path | None) -> dict | None:
@@ -25,10 +28,10 @@ def read_report(path: Path | None) -> dict | None:
     return report
 
 
-def result_map(report: dict) -> dict[tuple[str, str], dict]:
+def result_map(report: dict, profile: str = "best") -> dict[tuple[str, str], dict]:
     mapped = {}
     for row in report["results"]:
-        if not isinstance(row, dict) or row.get("profile") != "best":
+        if not isinstance(row, dict) or row.get("profile") != profile:
             continue
         median = row.get("median_ms")
         if not isinstance(median, (int, float)) or not math.isfinite(median) or median <= 0:
@@ -126,6 +129,8 @@ def build_comment(
         )
         lines.append("| " + " | ".join(cells) + " |")
 
+    lines.extend(interruptible_table(current, workloads))
+
     method = current.get("method", {})
     sample_count = method.get("samples", "?")
     warmups = method.get("warmups", "?")
@@ -150,6 +155,36 @@ def build_comment(
     if run_url:
         lines.extend(("", f"[Workflow run]({run_url})"))
     return "\n".join(lines) + "\n"
+
+
+def interruptible_table(current: dict, workloads: list[str]) -> list[str]:
+    rows = result_map(current, "interruptible")
+    if not rows:
+        return []
+    lines = [
+        "",
+        "### Like-for-like: interruption checks on",
+        "",
+        "wasmlight always polls its epoch. Here each peer also runs with its own "
+        "interruption checks compiled in: Wasmtime epoch interruption, WasmEdge "
+        "`--interruptible` AOT, and wazero `-timeout`. Wasmer, WAMR AOT, and wasm3 "
+        "expose no CLI-reachable interruption, so they are not shown.",
+        "",
+    ]
+    header = ["Workload", "PR", *INTERRUPTIBLE_PEERS]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(["---", *(["---:"] * (len(header) - 1))]) + " |")
+    for workload in workloads:
+        candidate = rows.get((workload, "wasmlight"))
+        if candidate is None:
+            continue
+        cells = [workload, format_ms(candidate)]
+        cells.extend(
+            format_peer(candidate, rows.get((workload, peer)))
+            for peer in INTERRUPTIBLE_PEERS
+        )
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
 
 
 def parse_args() -> argparse.Namespace:

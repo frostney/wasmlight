@@ -26,6 +26,12 @@ BUILD_DIR = ROOT / "build" / "runtime-comparison"
 MODULE_DIR = BUILD_DIR / "modules"
 ARTIFACT_DIR = BUILD_DIR / "artifacts"
 WAZERO_CACHE = BUILD_DIR / "wazero-cache"
+# wazero keys its compiled code on the termination mode, so the interruptible
+# profile needs its own cache.
+WAZERO_INTERRUPTIBLE_CACHE = BUILD_DIR / "wazero-interruptible-cache"
+# A deadline no workload reaches. It arms each runtime's interruption checks
+# without ever firing (run_checked kills a command long before it).
+INTERRUPT_DEADLINE_SECONDS = 600
 LOCK_PATH = Path("/tmp/wasmlight-perf-gate.lock")
 ALL_RUNTIME_KEYS = frozenset(
     ("wasmlight", "wasmtime", "wasmer", "wasmedge", "wamr", "wazero", "wasm3")
@@ -48,6 +54,23 @@ PROFILE_RUNTIME_ORDER = {
         "wasm3",
     ),
     "interpreter": ("wasmlight", "WasmEdge", "WAMR", "wazero", "wasm3"),
+    "interruptible": ("wasmlight", "Wasmtime", "WasmEdge", "wazero"),
+}
+PROFILES = tuple(PROFILE_RUNTIME_ORDER)
+# How each runtime runs guest code that the embedder can interrupt, or why its
+# CLI cannot. wasmlight always polls its epoch (ADR-0006), so the like-for-like
+# peers are the ones whose compiled code also carries interruption checks.
+INTERRUPTION_MECHANISMS = {
+    "wasmlight": "epoch polling at loop back-edges and function entries, always on",
+    "Wasmtime": "epoch interruption compiled in and armed "
+    f"(`-W epoch-interruption=y,timeout={INTERRUPT_DEADLINE_SECONDS}s`)",
+    "WasmEdge": "AOT compiled with `--interruptible`, run with `--time-limit`",
+    "wazero": "`-timeout`, which compiles termination checks into the code",
+}
+INTERRUPTION_UNAVAILABLE = {
+    "Wasmer": "the CLI exposes no interruption; metering is an embedding-API middleware",
+    "WAMR": "`iwasm --timeout` does not stop `wamrc` AOT code",
+    "wasm3": "the CLI exposes no interruption",
 }
 
 
@@ -153,11 +176,16 @@ def assemble(workload: str) -> Path:
 
 
 def prepare(
-    workloads: tuple[str, ...], wasmlight: Path
+    workloads: tuple[str, ...],
+    wasmlight: Path,
+    profiles: tuple[str, ...] = ("best", "interpreter"),
 ) -> dict[str, dict[str, Path | None]]:
     MODULE_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     WAZERO_CACHE.mkdir(parents=True, exist_ok=True)
+    interruptible = "interruptible" in profiles
+    if interruptible:
+        WAZERO_INTERRUPTIBLE_CACHE.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, dict[str, Path | None]] = {}
     for workload in workloads:
         spec = WORKLOAD_SPECS[workload]
@@ -238,8 +266,59 @@ def prepare(
                 str(WAZERO_CACHE),
                 str(module),
             ])
+        if interruptible:
+            prepare_interruptible(spec, module, artifacts, workload)
         outputs[workload] = artifacts
     return outputs
+
+
+def prepare_interruptible(
+    spec: WorkloadSpec,
+    module: Path,
+    artifacts: dict[str, Path | None],
+    workload: str,
+) -> None:
+    """Compile each interruptible peer's artifact, checks included."""
+    artifacts["wasmtime-epoch"] = None
+    artifacts["wasmedge-interruptible"] = None
+    if "wasmtime" in spec.runtime_keys:
+        artifacts["wasmtime-epoch"] = ARTIFACT_DIR / f"{workload}.epoch.cwasm"
+        run_checked([
+            "wasmtime",
+            "compile",
+            "-W",
+            "epoch-interruption=y",
+            "-o",
+            str(artifacts["wasmtime-epoch"]),
+            str(module),
+        ])
+    if "wasmedge" in spec.runtime_keys:
+        artifacts["wasmedge-interruptible"] = (
+            ARTIFACT_DIR / f"{workload}.interruptible.aot.wasm"
+        )
+        run_checked([
+            "wasmedge",
+            "compile",
+            "--interruptible",
+            str(module),
+            str(artifacts["wasmedge-interruptible"]),
+        ])
+    if "wazero" in spec.runtime_keys:
+        # `wazero compile` has no termination flag; one checked run populates
+        # the terminating variant of the cache before measurement.
+        run_checked(wazero_interruptible_command(module))
+
+
+def wazero_interruptible_command(module: Path) -> tuple[str, ...]:
+    return (
+        "wazero",
+        "run",
+        "-cachedir",
+        str(WAZERO_INTERRUPTIBLE_CACHE),
+        "-timeout",
+        f"{INTERRUPT_DEADLINE_SECONDS}s",
+        str(module),
+    )
 
 
 def configs(
@@ -376,7 +455,85 @@ def configs(
             "interpreter",
             ("wasm3", module),
         ))
+    selected.extend(interruptible_configs(spec, artifacts, wasmlight))
     return tuple(selected)
+
+
+def interruptible_configs(
+    spec: WorkloadSpec,
+    artifacts: dict[str, Path | None],
+    wasmlight: Path,
+) -> list[RuntimeConfig]:
+    """Like-for-like peers: each runs with its interruption checks compiled in.
+
+    Present only when prepare() compiled the interruptible artifacts.
+    """
+    if "wasmtime-epoch" not in artifacts:
+        return []
+    assert artifacts["module"] is not None
+    module = str(artifacts["module"])
+    selected = []
+    if "wasmlight" in spec.runtime_keys:
+        assert artifacts["wasmlight"] is not None
+        selected.append(RuntimeConfig(
+            "wasmlight-aot-interruptible",
+            "wasmlight",
+            "interruptible",
+            "AOT",
+            (
+                str(wasmlight),
+                "run",
+                "--aot",
+                str(artifacts["wasmlight"]),
+                module,
+            ),
+            artifacts["wasmlight"],
+            note="Epoch polling is always compiled in; this is the best-profile command.",
+        ))
+    epoch = artifacts.get("wasmtime-epoch")
+    if "wasmtime" in spec.runtime_keys and epoch is not None:
+        selected.append(RuntimeConfig(
+            "wasmtime-aot-epoch",
+            "Wasmtime",
+            "interruptible",
+            "Cranelift AOT, epoch interruption",
+            (
+                "wasmtime",
+                "run",
+                "--allow-precompiled",
+                "-W",
+                f"epoch-interruption=y,timeout={INTERRUPT_DEADLINE_SECONDS}s",
+                str(epoch),
+            ),
+            epoch,
+        ))
+    interruptible_aot = artifacts.get("wasmedge-interruptible")
+    if "wasmedge" in spec.runtime_keys and interruptible_aot is not None:
+        selected.append(RuntimeConfig(
+            "wasmedge-aot-interruptible",
+            "WasmEdge",
+            "interruptible",
+            "LLVM AOT, interruptible",
+            (
+                "wasmedge",
+                "run",
+                "--run-mode=aot",
+                "--time-limit",
+                str(INTERRUPT_DEADLINE_SECONDS * 1000),
+                str(interruptible_aot),
+            ),
+            interruptible_aot,
+        ))
+    if "wazero" in spec.runtime_keys:
+        selected.append(RuntimeConfig(
+            "wazero-compiler-timeout",
+            "wazero",
+            "interruptible",
+            "compiler cache, termination checks",
+            wazero_interruptible_command(Path(module)),
+            note="The terminating native-code cache was populated before measurement.",
+        ))
+    return selected
 
 
 @contextlib.contextmanager
@@ -464,6 +621,8 @@ def render_markdown(result: dict) -> str:
     ]
     for profile in result["profiles"]:
         lines.extend((f"## {profile.title()}", ""))
+        if profile == "interruptible":
+            lines.extend(interruptible_notes())
         rows = [row for row in result["results"] if row["profile"] == profile]
         runtime_order = PROFILE_RUNTIME_ORDER[profile]
         lines.append("| Workload | " + " | ".join(runtime_order) + " |")
@@ -493,6 +652,21 @@ def render_markdown(result: dict) -> str:
     return "\n".join(lines)
 
 
+def interruptible_notes() -> list[str]:
+    lines = [
+        "Like-for-like: every runtime runs guest code that the embedder can interrupt, "
+        "as wasmlight always does. Each deadline is far longer than any workload, so it "
+        "arms the checks without firing.",
+        "",
+    ]
+    for runtime, mechanism in INTERRUPTION_MECHANISMS.items():
+        lines.append(f"- {runtime}: {mechanism}.")
+    for runtime, reason in INTERRUPTION_UNAVAILABLE.items():
+        lines.append(f"- {runtime}: not measured, {reason}.")
+    lines.append("")
+    return lines
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=7)
@@ -500,7 +674,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         action="append",
-        choices=("best", "interpreter"),
+        choices=PROFILES,
         dest="profiles",
     )
     parser.add_argument(
@@ -527,11 +701,11 @@ def main() -> int:
     args = parse_args()
     if args.samples < 1 or args.warmups < 0:
         raise RuntimeError("--samples must be positive and --warmups non-negative")
-    profiles = tuple(args.profiles or ("best", "interpreter"))
+    profiles = tuple(args.profiles or PROFILES)
     workloads = tuple(args.workloads or DEFAULT_WORKLOADS)
     wasmlight = args.wasmlight.resolve()
     require_commands(wasmlight)
-    artifacts_by_workload = prepare(workloads, wasmlight)
+    artifacts_by_workload = prepare(workloads, wasmlight, profiles)
     if args.prepare_only:
         print(f"prepared and validated {len(workloads)} workloads in {BUILD_DIR}")
         return 0

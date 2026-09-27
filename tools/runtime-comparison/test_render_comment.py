@@ -52,6 +52,23 @@ class RenderCommentTests(unittest.TestCase):
         self.assertIn("Timing deltas are informational", body)
         self.assertIn("runtime-comparison-results", body)
 
+    def test_like_for_like_table_uses_the_interruptible_rows(self) -> None:
+        current = report(row(80.0, 79.0, 81.0), row(48.0, 47.0, 49.0))
+        current["results"].extend((
+            {"profile": "interruptible", "workload": "loop",
+             "runtime": "wasmlight", **row(80.0, 79.0, 81.0)},
+            {"profile": "interruptible", "workload": "loop",
+             "runtime": "Wasmtime", **row(100.0, 99.0, 101.0)},
+        ))
+        body = build_comment(None, current)
+        self.assertIn("### Like-for-like: interruption checks on", body)
+        self.assertIn("| Workload | PR | Wasmtime | WasmEdge | wazero |", body)
+        self.assertIn("| loop | 80.000 ms | 100.000 ms (0.80x) | — | — |", body)
+
+    def test_like_for_like_table_is_omitted_without_interruptible_rows(self) -> None:
+        body = build_comment(None, report(row(80.0, 79.0, 81.0), row(48.0, 47.0, 49.0)))
+        self.assertNotIn("Like-for-like", body)
+
     def test_missing_candidate_reports_failure(self) -> None:
         body = build_comment(None, None, run_url="https://example.invalid/run")
         self.assertIn("did not produce a valid report", body)
