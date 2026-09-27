@@ -564,11 +564,11 @@ procedure TX64Tests.TestEpochBackEdgeBytes;
 var
   Buf: TWasmCodeBuffer;
 begin
-  { A loop head bound at 0, one body byte, then the back-edge: mov rax,[r13]
-    (49 8B 45 00); cmp rax,r14 (4C 39 F0); je head (0F 84 rel32, rel32 =
-    0 - (8 + 6) = -14); mov edi,wtkEpochInterrupt (BF imm32); call
-    [r15] (41 FF 17). The only taken branch is the je; the trap falls
-    through. }
+  { A loop head bound at 0, one body byte, then the back-edge: cmp r14,
+    [r13 + 0] (4D 3B 75 00, CMP r64, r/m64; GNU as agrees); je head (0F 84
+    rel32, rel32 = 0 - (5 + 6) = -11); mov edi,wtkEpochInterrupt (BF
+    imm32); call [r15] (41 FF 17). The only taken branch is the je; the
+    trap falls through. }
   Buf := TWasmCodeBuffer.Create;
   try
     Buf.NewLabel;
@@ -577,9 +577,8 @@ begin
     X64EmitEpochBackEdge(Buf, 0);
     X64ResolvePatches(Buf);
     CheckSeq(Buf, [$90,
-      $49, $8B, $45, $00,
-      $4C, $39, $F0,
-      $0F, $84, $F2, $FF, $FF, $FF,
+      $4D, $3B, $75, $00,
+      $0F, $84, $F5, $FF, $FF, $FF,
       $BF, Byte(Ord(wtkEpochInterrupt)), $00, $00, $00,
       $41, $FF, $17]);
   finally

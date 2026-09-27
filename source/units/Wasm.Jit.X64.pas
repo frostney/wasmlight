@@ -495,9 +495,9 @@ procedure X64AlignCode(const ABuf: TWasmCodeBuffer;
   position for every measured loop, and a line start never was. The padding
   runs once per loop entry, on the fall-through path only. }
 procedure X64EmitLoopHeadAlign(const ABuf: TWasmCodeBuffer);
-{ The loop back-edge safepoint (§6): `mov rax,[r13]; cmp rax,r14; je
-  ATarget` then the epoch-interrupt trap call, which does not return. One
-  taken branch per iteration; the trap stays on the fall-through. }
+{ The loop back-edge safepoint (§6): `cmp r14,[r13]; je ATarget` then the
+  epoch-interrupt trap call, which does not return. One taken branch per
+  iteration; the trap stays on the fall-through. }
 procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
   const ATarget: UInt32);
 
@@ -4710,8 +4710,11 @@ end;
 procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
   const ATarget: UInt32);
 begin
-  X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_EPOCHADDR, 0);       { rax := *r13 }
-  X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_REG_EPOCH);   { cmp rax, r14 }
+  { cmp r14, [r13] (CMP r64, r/m64 = REX.W 3B /r): the same equality test
+    as loading the epoch into rax and comparing, with no scratch write. }
+  X64EmitRex(ABuf, 1, X64_REG_EPOCH shr 3, 0, X64_REG_EPOCHADDR shr 3);
+  ABuf.EmitByte($3B);
+  EmitMemOperand(ABuf, X64_REG_EPOCH, X64_REG_EPOCHADDR, 0);
   X64EmitJccTo(ABuf, X64_CC_E, ATarget);                       { je target }
   EmitTrapCall(ABuf, wtkEpochInterrupt);                       { no return }
 end;
