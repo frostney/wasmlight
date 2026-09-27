@@ -3,6 +3,9 @@
 
   Owns host/target names, the unpacked tree layout, the line-based MANIFEST,
   GNU SHA-256 checksum-file syntax, and ELF/Mach-O structural recognition.
+  An archive carries the shells its compiler can emit: the host's own
+  architecture for Linux and macOS. Cross-architecture emission is not in
+  the 0.2.0 archive contract, so a foreign-architecture shell is rejected.
   Packing and checksum *computation* stay in scripts/ (they shell out to
   tar and sha256sum/shasum). This unit is not on the decode, validation,
   or execution path. }
@@ -25,7 +28,10 @@ const
   DISTRO_CHECKSUMS_SUFFIX = '-checksums.txt';
   DISTRO_ARCHIVE_EXT = '.tar.gz';
   DISTRO_HOST_COUNT = 4;
+  { Released runtime-shell triples across all archives. }
   DISTRO_SHELL_COUNT = 4;
+  { Shells in one host archive: the host architecture, Linux and macOS. }
+  DISTRO_HOST_SHELL_COUNT = 2;
 
 type
   TWasmDistroImage = (wdiUnknown, wdiElf64, wdiMachO64);
@@ -57,7 +63,9 @@ type
     ddsChecksumMalformed,
     ddsChecksumMismatch,
     ddsForbiddenName,
-    ddsVersionMismatch
+    ddsVersionMismatch,
+    ddsForeignShell,
+    ddsBadEmission
   );
 
   TWasmDistroResult = record
@@ -94,6 +102,11 @@ function DistroShell(const AIndex: Integer): TWasmDistroShell;
 function DistroFindHost(const AName: string; out AHost: TWasmDistroHost): Boolean;
 function DistroFindShell(const ATriple: string; out AShell: TWasmDistroShell): Boolean;
 function DistroCurrentHost(out AHost: TWasmDistroHost): Boolean;
+{ The shell triples a host archive carries, in release order: the host
+  architecture for Linux, then macOS. }
+function DistroHostShells(const AHost: TWasmDistroHost): TStringArray;
+function DistroHostCarriesShell(const AHost: TWasmDistroHost;
+  const ATriple: string): Boolean;
 
 function DistroArchiveBase(const AVersion, ADisplay: string): string;
 function DistroArchiveFileName(const AVersion, ADisplay: string): string;
@@ -123,8 +136,19 @@ function DistroIsForbiddenName(const AName: string): Boolean;
 
 function DistroValidateTree(const ARoot: string;
   const AExpectedVersion: string = ''): TWasmDistroResult;
-function DistroSynthesizeCatalog(const ARoot: string): TWasmDistroResult;
-procedure DistroWriteCatalog(const ARoot, AVersion: string);
+{ Structural placeholder shells for AHost's catalog (a fixture, never live). }
+function DistroSynthesizeCatalog(const ARoot: string;
+  const AHost: TWasmDistroHost): TWasmDistroResult;
+{ Write the catalog index for the shells already staged under ARoot. }
+procedure DistroWriteCatalog(const ARoot, AVersion: string;
+  const ATriples: array of string);
+
+{ Check an executable `wasmlight compile --target ATriple` wrote without
+  running it: the image is ATriple's ELF/Mach-O (a Mach-O ad-hoc signature
+  verifies), and its extracted native payload parses, names ATriple's
+  arch/OS, and binds AShell — the catalog shell it was packaged onto. }
+function DistroCheckEmission(const AImage, APayload, AShell: TBytes;
+  const ATriple: string): TWasmDistroResult;
 
 function DistroHelpListsCompile(const AHelpText: string): Boolean;
 function DistroUnknownCompileCommand(const AText: string): Boolean;
@@ -140,6 +164,7 @@ uses
   Wasm.Compile.Catalog,
   Wasm.Core,
   Wasm.MachO,
+  Wasm.Native.Payload,
   Wasm.Package.Elf;
 
 const
@@ -240,6 +265,40 @@ begin
   Triple := 'x86_64-darwin';
 {$ENDIF}
   Result := (Triple <> '') and DistroFindHost(Triple, AHost);
+end;
+
+function TripleArch(const ATriple: string): string;
+var
+  Dash: Integer;
+begin
+  Dash := Pos('-', ATriple);
+  if Dash = 0 then
+    Result := ''
+  else
+    Result := Copy(ATriple, 1, Dash - 1);
+end;
+
+function DistroHostCarriesShell(const AHost: TWasmDistroHost;
+  const ATriple: string): Boolean;
+var
+  Shell: TWasmDistroShell;
+begin
+  if not DistroFindShell(ATriple, Shell) then
+    Exit(False);
+  Result := TripleArch(Shell.Triple) = TripleArch(AHost.Triple);
+end;
+
+function DistroHostShells(const AHost: TWasmDistroHost): TStringArray;
+var
+  I: Integer;
+begin
+  Result := nil;
+  for I := 0 to High(SHELLS) do
+    if DistroHostCarriesShell(AHost, SHELLS[I].Triple) then
+    begin
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := SHELLS[I].Triple;
+    end;
 end;
 
 function DistroArchiveBase(const AVersion, ADisplay: string): string;
@@ -411,8 +470,9 @@ function DistroValidateManifest(const AManifest: TWasmDistroManifest): TWasmDist
 var
   Host: TWasmDistroHost;
   Shell: TWasmDistroShell;
-  Seen: array[0..DISTRO_SHELL_COUNT - 1] of Boolean;
+  Expected: TStringArray;
   I, J: Integer;
+  Found: Boolean;
 begin
   if Trim(AManifest.Version) = '' then
     Exit(TWasmDistroResult.Fail(ddsMalformedManifest, 'missing version'));
@@ -425,23 +485,28 @@ begin
     Exit(TWasmDistroResult.Fail(ddsUnknownHost, AManifest.HostTriple));
   if Length(AManifest.Shells) = 0 then
     Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, 'no shells listed'));
-  FillChar(Seen, SizeOf(Seen), 0);
   for I := 0 to High(AManifest.Shells) do
   begin
     if not DistroFindShell(AManifest.Shells[I], Shell) then
       Exit(TWasmDistroResult.Fail(ddsUnknownShell, AManifest.Shells[I]));
-    for J := 0 to High(SHELLS) do
-      if SHELLS[J].Triple = Shell.Triple then
-      begin
-        if Seen[J] then
-          Exit(TWasmDistroResult.Fail(ddsDuplicateShell, Shell.Triple));
-        Seen[J] := True;
-      end;
+    if not DistroHostCarriesShell(Host, Shell.Triple) then
+      Exit(TWasmDistroResult.Fail(ddsForeignShell,
+        Shell.Triple + ' is not emitted by a ' + Host.Triple + ' compiler'));
+    for J := 0 to I - 1 do
+      if SameText(AManifest.Shells[J], Shell.Triple) then
+        Exit(TWasmDistroResult.Fail(ddsDuplicateShell, Shell.Triple));
   end;
-  for J := 0 to High(Seen) do
-    if not Seen[J] then
+  Expected := DistroHostShells(Host);
+  for I := 0 to High(Expected) do
+  begin
+    Found := False;
+    for J := 0 to High(AManifest.Shells) do
+      if SameText(AManifest.Shells[J], Expected[I]) then
+        Found := True;
+    if not Found then
       Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog,
-        'missing shell ' + SHELLS[J].Triple));
+        'missing shell ' + Expected[I]));
+  end;
   Result := TWasmDistroResult.Ok;
 end;
 
@@ -736,6 +801,9 @@ var
   ManifestPath, MetaPath, ShellPath, CompilerPath: string;
   Text: TStringList;
   Manifest: TWasmDistroManifest;
+  Host: TWasmDistroHost;
+  Triples: TStringArray;
+  Triple: string;
   I: Integer;
   Bytes: TBytes;
   MetaTriple: string;
@@ -762,38 +830,42 @@ begin
   Result := WalkForbidden(ARoot);
   if not Result.IsOk then
     Exit;
+  DistroFindHost(Manifest.HostTriple, Host);
+  Triples := DistroHostShells(Host);
   if LoadShellCatalog(DistroJoin(ARoot, DISTRO_SHELL_ROOT), Catalog) <> slrOk then
     Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, 'invalid compiler shell catalog'));
-  if Length(Catalog.Entries) <> DISTRO_SHELL_COUNT then
-    Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, 'compiler catalog needs four targets'));
+  if Length(Catalog.Entries) <> Length(Triples) then
+    Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog,
+      'compiler catalog needs exactly the ' + Host.Triple + ' host shells'));
   CompilerPath := DistroJoin(ARoot, DISTRO_COMPILER_NAME);
   if not FileExists(CompilerPath) then
     Exit(TWasmDistroResult.Fail(ddsMissingFile, DISTRO_COMPILER_NAME));
-  for I := 0 to High(SHELLS) do
+  for I := 0 to High(Triples) do
   begin
-    ShellPath := DistroJoin(ARoot, DistroShellRelPath(SHELLS[I].Triple));
-    MetaPath := DistroJoin(ARoot, DistroMetaRelPath(SHELLS[I].Triple));
+    Triple := Triples[I];
+    ShellPath := DistroJoin(ARoot, DistroShellRelPath(Triple));
+    MetaPath := DistroJoin(ARoot, DistroMetaRelPath(Triple));
     Found := False;
     for J := 0 to High(Catalog.Entries) do
-      if Catalog.Entries[J].Triple = SHELLS[I].Triple then
+      if Catalog.Entries[J].Triple = Triple then
       begin
         Entry := Catalog.Entries[J];
         Found := True;
         Break;
       end;
     if not Found then
-      Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, SHELLS[I].Triple));
+      Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, Triple));
     if Entry.Version <> Manifest.Version then
       Exit(TWasmDistroResult.Fail(ddsVersionMismatch, Entry.Triple));
-    if Entry.FileName <> SHELLS[I].Triple + '/' + DISTRO_SHELL_NAME then
+    if Entry.FileName <> Triple + '/' + DISTRO_SHELL_NAME then
       Exit(TWasmDistroResult.Fail(ddsBadMeta, Entry.FileName));
     if not FileExists(ShellPath) then
-      Exit(TWasmDistroResult.Fail(ddsMissingFile, DistroShellRelPath(SHELLS[I].Triple)));
+      Exit(TWasmDistroResult.Fail(ddsMissingFile, DistroShellRelPath(Triple)));
     if not FileExists(MetaPath) then
-      Exit(TWasmDistroResult.Fail(ddsMissingFile, DistroMetaRelPath(SHELLS[I].Triple)));
+      Exit(TWasmDistroResult.Fail(ddsMissingFile, DistroMetaRelPath(Triple)));
     Bytes := LoadBytes(ShellPath);
-    if not DistroImageMatchesShell(Bytes, SHELLS[I].Triple) then
-      Exit(TWasmDistroResult.Fail(ddsBadShellImage, SHELLS[I].Triple));
+    if not DistroImageMatchesShell(Bytes, Triple) then
+      Exit(TWasmDistroResult.Fail(ddsBadShellImage, Triple));
     if Entry.Checksum <> ShellChecksumBytes(Bytes) then
       Exit(TWasmDistroResult.Fail(ddsChecksumMismatch, Entry.Triple));
     Text := TStringList.Create;
@@ -802,9 +874,8 @@ begin
       Result := DistroParseMeta(Text.Text, MetaTriple);
       if not Result.IsOk then
         Exit;
-      if MetaTriple <> SHELLS[I].Triple then
-        Exit(TWasmDistroResult.Fail(ddsBadMeta,
-          MetaTriple + ' in ' + SHELLS[I].Triple));
+      if MetaTriple <> Triple then
+        Exit(TWasmDistroResult.Fail(ddsBadMeta, MetaTriple + ' in ' + Triple));
     finally
       Text.Free;
     end;
@@ -815,23 +886,27 @@ begin
   Result := TWasmDistroResult.Ok;
 end;
 
-procedure DistroWriteCatalog(const ARoot, AVersion: string);
+procedure DistroWriteCatalog(const ARoot, AVersion: string;
+  const ATriples: array of string);
 var
   Entries: TWasmShellEntries;
+  Shell: TWasmDistroShell;
   I: Integer;
   Lines: TStringList;
 begin
-  SetLength(Entries, DISTRO_SHELL_COUNT);
+  SetLength(Entries, Length(ATriples));
   for I := 0 to High(Entries) do
   begin
-    ParseTargetTriple(SHELLS[I].Triple, Entries[I].Target);
-    Entries[I].Triple := SHELLS[I].Triple;
+    if not DistroFindShell(ATriples[I], Shell) then
+      raise EArgumentException.Create('unknown shell target: ' + ATriples[I]);
+    ParseTargetTriple(Shell.Triple, Entries[I].Target);
+    Entries[I].Triple := Shell.Triple;
     Entries[I].Version := AVersion;
-    if Pos('aarch64-', SHELLS[I].Triple) = 1 then
+    if TripleArch(Shell.Triple) = 'aarch64' then
       Entries[I].Arch := wtaAArch64
     else
       Entries[I].Arch := wtaX64;
-    if SHELLS[I].Image = wdiElf64 then
+    if Shell.Image = wdiElf64 then
     begin
       Entries[I].Os := wtoLinux;
       Entries[I].Format := wsfElf;
@@ -841,9 +916,9 @@ begin
       Entries[I].Os := wtoDarwin;
       Entries[I].Format := wsfMachO;
     end;
-    Entries[I].FileName := SHELLS[I].Triple + '/' + DISTRO_SHELL_NAME;
+    Entries[I].FileName := Shell.Triple + '/' + DISTRO_SHELL_NAME;
     Entries[I].Checksum := ShellChecksumBytes(
-      LoadBytes(DistroJoin(ARoot, DistroShellRelPath(SHELLS[I].Triple))));
+      LoadBytes(DistroJoin(ARoot, DistroShellRelPath(Shell.Triple))));
   end;
   Lines := TStringList.Create;
   try
@@ -854,18 +929,60 @@ begin
   end;
 end;
 
-function DistroSynthesizeCatalog(const ARoot: string): TWasmDistroResult;
+function DistroSynthesizeCatalog(const ARoot: string;
+  const AHost: TWasmDistroHost): TWasmDistroResult;
 var
+  Triples: TStringArray;
   I: Integer;
 begin
-  for I := 0 to High(SHELLS) do
+  Triples := DistroHostShells(AHost);
+  if Length(Triples) <> DISTRO_HOST_SHELL_COUNT then
+    Exit(TWasmDistroResult.Fail(ddsUnknownHost, AHost.Triple));
+  for I := 0 to High(Triples) do
   begin
-    DistroWriteStructuralShell(DistroJoin(ARoot, DistroShellRelPath(SHELLS[I].Triple)),
-      SHELLS[I].Triple);
-    DistroWriteShellMeta(DistroJoin(ARoot, DistroMetaRelPath(SHELLS[I].Triple)),
-      SHELLS[I].Triple);
+    DistroWriteStructuralShell(DistroJoin(ARoot, DistroShellRelPath(Triples[I])),
+      Triples[I]);
+    DistroWriteShellMeta(DistroJoin(ARoot, DistroMetaRelPath(Triples[I])),
+      Triples[I]);
   end;
-  DistroWriteCatalog(ARoot, PROGRAM_VERSION);
+  DistroWriteCatalog(ARoot, PROGRAM_VERSION, Triples);
+  Result := TWasmDistroResult.Ok;
+end;
+
+function DistroCheckEmission(const AImage, APayload, AShell: TBytes;
+  const ATriple: string): TWasmDistroResult;
+var
+  Shell: TWasmDistroShell;
+  Parsed: TWasmNativePayload;
+  Parse: TWasmNativePayloadParseResult;
+  Arch, Os: Byte;
+begin
+  if not DistroFindShell(ATriple, Shell) then
+    Exit(TWasmDistroResult.Fail(ddsUnknownShell, ATriple));
+  if not DistroImageMatchesShell(AImage, Shell.Triple) then
+    Exit(TWasmDistroResult.Fail(ddsBadEmission,
+      'image is not a ' + Shell.Triple + ' executable'));
+  if (Shell.Image = wdiMachO64) and (VerifyMachOAdHocSignature(AImage) <> mmrOk) then
+    Exit(TWasmDistroResult.Fail(ddsBadEmission,
+      'Mach-O ad-hoc signature does not verify'));
+  Parse := ParseNativePayload(APayload, Parsed);
+  if Parse <> nprOk then
+    Exit(TWasmDistroResult.Fail(ddsBadEmission,
+      'native payload does not parse (' + IntToStr(Ord(Parse)) + ')'));
+  if TripleArch(Shell.Triple) = 'aarch64' then
+    Arch := WNEP_ARCH_AARCH64
+  else
+    Arch := WNEP_ARCH_X64;
+  if Shell.Image = wdiElf64 then
+    Os := WNEP_OS_LINUX
+  else
+    Os := WNEP_OS_DARWIN;
+  if (Parsed.Header.TargetArch <> Arch) or (Parsed.Header.TargetOs <> Os) then
+    Exit(TWasmDistroResult.Fail(ddsBadEmission,
+      'native payload names another target than ' + Shell.Triple));
+  if not WnepHash128Equal(Parsed.Header.ShellHash, WnepHash128Bytes(AShell)) then
+    Exit(TWasmDistroResult.Fail(ddsBadEmission,
+      'native payload is not bound to the archive ' + Shell.Triple + ' shell'));
   Result := TWasmDistroResult.Ok;
 end;
 
