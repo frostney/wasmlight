@@ -12,8 +12,9 @@
   `wasmlight compile` is not this unit.
 - `wasmlight compile --connector` embeds the plan in the executable; the
   runtime shell re-resolves it at startup, loads its libraries beside the
-  executable, and binds each import as a host function. Scalar
-  declarations are callable; other shapes fail closed at compile time.
+  executable, and binds each import as a host function. Scalars,
+  buffers, borrows, opaque handles, and callbacks are callable; strings,
+  structs, and by-reference parameters fail closed at compile time.
 
 ## Resolve contract
 
@@ -86,8 +87,8 @@ and its executable is unchanged.
 At startup the runtime shell:
 
 1. decodes the section strictly — a bad magic or version, a truncated
-   record, an out-of-range enum, a non-canonical boolean or `SizeConst`, a
-   non-numeric wasm type, or a trailing byte is
+   record, an out-of-range enum, a non-canonical boolean, `SizeConst`, or
+   `SizeParamIndex`, a non-numeric wasm type, or a trailing byte is
    `EWasmLinkError: malformed connector plan`, never a partial plan;
 2. re-resolves the decoded connectors against the embedded module and
    requires the result to re-encode to the same bytes, so an edited
@@ -100,13 +101,16 @@ At startup the runtime shell:
    `EWasmLinkError: unknown symbol`;
 4. defines each import on the deny-by-default linker next to WASI
    (`Wasm.Connector.Host`), calling the native symbol through the
-   precompiled C-ABI gate.
+   precompiled C-ABI gate. After instantiation it binds the exported
+   `memory` for buffers and table 0 for callbacks; a plan with an array
+   parameter and no exported `memory` is `EWasmLinkError`.
 
 Declared but unused libraries are not in the plan and are never opened.
 
 ### Lowering a compiled executable can call
 
-`Wasm.Connector.Host` lowers each parameter and the result to one C scalar:
+`Wasm.Connector.Host` lowers each parameter and the result with fixed
+marshalling. Scalars pass by value:
 
 | Declaration | C type | Guest value |
 | --- | --- | --- |
@@ -117,13 +121,61 @@ Declared but unused libraries are not in the plan and are never opened.
 | enum | its underlying type (default `int`) | as that type |
 | `void` result | — | no result |
 
-`MarshalAs` with a numeric `UnmanagedType` selects that width. Arrays,
-strings, pointer-sized names, structs, delegates, `[Scoped]` parameters,
-and `ref`/`out`/`in` parameters have no lowering yet: `wasmlight compile`
-rejects them with `EWasmLinkError: unsupported connector type`, and the
-shell rejects them the same way. The compiler also checks every call plan
-against the selected target's C ABI, so a plan that target cannot call is
-`EWasmLinkError: incompatible call plan` before any executable is written.
+`MarshalAs` with a numeric `UnmanagedType` selects that width.
+
+**Arrays.** The guest passes an `i32` offset into its exported `memory`.
+The element type is a scalar or enum; the element count comes from
+exactly one of `SizeConst` or `SizeParamIndex`, which must name another
+integer parameter. The direction decides the transfer, all of it through
+the memory chokepoint (`Wasm.Connector.Memory`):
+
+| Declaration | Transfer |
+| --- | --- |
+| `[In]` | copied from guest memory into a host buffer before the call |
+| `[Out]` | a zeroed host buffer, copied back to guest memory after the call |
+| `[In, Out]` | copied in before and back after |
+| `[Scoped]` | the guest range itself, borrowed for this call only |
+
+An array with none of these is rejected. The whole range is checked before
+the native call runs: an out-of-range or wrapping range, or a negative
+signed count, traps with `out of bounds memory access`. A live borrow
+cannot be used by a callback (`EWasmConnectorError`).
+
+**Opaque handles.** `IntPtr`, `nint`, `UIntPtr`, `nuint`, and
+`MarshalAs(SysInt)` / `MarshalAs(SysUInt)` are handles, never addresses. A
+returned native pointer becomes a small guest `i32` handle (NULL is `0`); a
+handle argument resolves back to its pointer (`0` is NULL). An unknown
+handle is `EWasmConnectorError: stale connector handle`. Handles live for
+the process; the language has no release form yet.
+
+**Callbacks.** A delegate argument is an `i32` index into the module's
+table 0, the way C and Rust compile function pointers. A null,
+out-of-range, or wrong-signature entry traps exactly as `call_indirect`
+does (`uninitialized element`, `undefined element`,
+`indirect call type mismatch`). Only `void()`, `void(i32)`, `i32()`, and
+`i32(i32)` delegates are callable. The native function receives a thunk
+from `Wasm.Connector.Callbacks` with the delegate's lifetime:
+
+- retained (the default) stays valid until the executable exits;
+- `[Scoped]` ends when the connector call returns;
+- `[Queued]` may be called from a foreign thread; the notification is
+  delivered on the store thread after each connector call returns and once
+  more when `_start` returns.
+
+A compiled executable re-enters the guest through the native invoke; there
+is no interpreter. A trap, uncaught exception, or `proc_exit` inside a
+callback never unwinds through the native frame: the thunk returns zero,
+and the failure is rethrown unchanged when the connector call returns,
+before any `[Out]` copy. At most eight distinct callbacks are bound at
+once; the ninth is `EWasmCallbackError: callback thunk slots exhausted`.
+
+**Not lowered.** Strings, structs, and `ref` / `out` / `in` parameters are
+rejected by `wasmlight compile` with
+`EWasmLinkError: unsupported connector type`, and by the shell the same
+way. The compiler also checks every call plan against the selected
+target's C ABI, so a plan that target cannot call is
+`EWasmLinkError: incompatible call plan` before any executable is
+written.
 
 ## Related documents
 

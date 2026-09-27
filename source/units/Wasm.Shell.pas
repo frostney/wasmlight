@@ -224,7 +224,8 @@ end;
 { nil for an empty connector-plan section. A malformed or inconsistent
   plan, a missing library or symbol, or an unsupported lowering is
   EWasmLinkError before instantiation. }
-function LoadShellConnectors(const ALoaded: TWasmLoadedModule;
+function LoadShellConnectors(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
   const AConnector: TWasmBytes): TWasmConnectorHost;
 var
   Plan: TWlcConnectorPlan;
@@ -234,7 +235,10 @@ begin
     Exit;
   Plan := CheckConnectorPlanForModule(AConnector, ALoaded.Model,
     [WLC_WASI_MODULE]);
-  Result := TWasmConnectorHost.Create(Plan, NativeExecutableDirectory);
+  { Callbacks re-enter through the native invoke: the shell has no
+    interpreter. }
+  Result := TWasmConnectorHost.Create(AStore, Plan, NativeExecutableDirectory,
+    @NativeInvoke);
 end;
 
 function RunLoadedShellCore(const ALoaded: TWasmLoadedModule;
@@ -281,13 +285,15 @@ begin
 
     try
       WasiCheckCommandEntry(ALoaded);
-      Connectors := LoadShellConnectors(ALoaded, AConnector);
+      Connectors := LoadShellConnectors(Store, ALoaded, AConnector);
       if Connectors <> nil then
         Connectors.DefineImports(Linker);
       Imports := Linker.ResolveImports(ALoaded);
       Inst := InstantiateModule(Store, ALoaded.Ir, ALoaded.BytesPtr,
         ALoaded.BytesLength, Imports);
       Instance := TWasmInstance.Create(Store, Inst);
+      if Connectors <> nil then
+        Connectors.Attach(Instance);
     except
       on E: EWasmError do
         Exit(FailResult(E.ClassName + ': ' + E.Message));
@@ -324,6 +330,10 @@ begin
         NativeInvoke(Store, Inst.FuncAddrs[Inst.PendingStartFuncIndex], nil, nil);
       Inst.HasPendingStart := False;
       NativeInvoke(StartFn.Store, StartFn.Addr, nil, nil);
+      { Queued connector notifications still pending when `_start`
+        returns are delivered before the executable exits. }
+      if Connectors <> nil then
+        Connectors.DrainQueued;
       Result.ExitCode := 0;
     except
       on E: EWasmExit do

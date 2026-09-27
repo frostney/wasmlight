@@ -66,7 +66,9 @@ Fixed attributes:
 - `DllImport("library")` on each extern method, with optional
   `EntryPoint = "symbol"` (also accepted as a standalone `[EntryPoint("symbol")]`)
 - `MarshalAs(UnmanagedType.Kind)` on parameters, fields, and
-  `[return: MarshalAs(...)]`, with optional `SizeConst`
+  `[return: MarshalAs(...)]`, with optional `SizeConst` (a fixed element
+  count) or `SizeParamIndex` (the zero-based index of the parameter that
+  carries the element count; a negative index is rejected)
 - `In` and `Out` on parameters (combinable as copy-in, copy-out, or inout)
 - `Scoped` on a delegate (same-call callback) or on a parameter/field
   (scoped borrow)

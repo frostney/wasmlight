@@ -21,6 +21,9 @@ program Wasm.Connector.Host.Test;
 {$ENDIF}
 
 uses
+  {$IFDEF UNIX}
+  cthreads,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -30,7 +33,9 @@ uses
   Wasm.Compile,
   Wasm.Compile.Catalog,
   Wasm.Connector,
+  Wasm.Connector.Callbacks,
   Wasm.Connector.Host,
+  Wasm.Connector.Memory,
   Wasm.Connector.Plan,
   Wasm.Connector.Resolve,
   Wasm.Core,
@@ -43,6 +48,7 @@ uses
   Wasm.Package.Elf,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
+  Wasm.Runtime.Traps,
   Wasm.Runtime.Values,
   Wasm.Shell,
   Wasm.Wasi,
@@ -98,6 +104,97 @@ const
     '  (memory (export "memory") 1)' + sLineBreak +
     '  (func (export "_start") (call $exit (i32.const 7))))';
 
+  { Buffers, handles, and callbacks, run through the interpreter. Table 0:
+    1 $double i32(i32), 2 $tick void(), 3 $get i32(), 4 $note void(i32),
+    5 $boom i32(i32) traps, 6 $wrong i32(i64); 0 and 7 are null. }
+  SHAPES_WAT =
+    '(module' + sLineBreak +
+    '  (import "Conn" "SumBytes" (func $sum (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "Fill" (func $fill (param i32 i32 i32)))' + sLineBreak +
+    '  (import "Conn" "Reverse4" (func $rev (param i32)))' + sLineBreak +
+    '  (import "Conn" "ScaleInPlace" (func $scale (param i32 i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CounterNew" (func $cnew (param i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CounterAdd" (func $cadd (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "Apply" (func $apply (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "ApplyTwice" (func $twice (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CallVoid" (func $cvoid (param i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CallGet" (func $cget (param i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "Register" (func $reg (param i32)))' + sLineBreak +
+    '  (import "Conn" "Fire" (func $fire (param i32)))' + sLineBreak +
+    '  (import "Conn" "Post" (func $post (param i32 i32)))' + sLineBreak +
+    '  (import "Conn" "BorrowAndCall" (func $bac (param i32 i32 i32) (result i32)))' + sLineBreak +
+    '  (memory (export "memory") 1)' + sLineBreak +
+    '  (global $seen (mut i32) (i32.const 0))' + sLineBreak +
+    '  (table 8 funcref)' + sLineBreak +
+    '  (elem (i32.const 1) func $double $tick $get $note $boom $wrong)' + sLineBreak +
+    '  (func $double (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))' + sLineBreak +
+    '  (func $tick (global.set $seen (i32.add (global.get $seen) (i32.const 1))))' + sLineBreak +
+    '  (func $get (result i32) (i32.const 21))' + sLineBreak +
+    '  (func $note (param i32) (global.set $seen (local.get 0)))' + sLineBreak +
+    '  (func $boom (param i32) (result i32) (unreachable))' + sLineBreak +
+    '  (func $wrong (param i64) (result i32) (i32.const 0))' + sLineBreak +
+    '  (func (export "seen") (result i32) (global.get $seen))' + sLineBreak +
+    '  (func (export "sum") (param i32 i32) (result i32) (call $sum (local.get 0) (local.get 1)))' + sLineBreak +
+    '  (func (export "fill") (param i32 i32 i32) (call $fill (local.get 0) (local.get 1) (local.get 2)))' + sLineBreak +
+    '  (func (export "rev") (param i32) (call $rev (local.get 0)))' + sLineBreak +
+    '  (func (export "scale") (param i32 i32 i32) (result i32)' + sLineBreak +
+    '    (call $scale (local.get 0) (local.get 1) (local.get 2)))' + sLineBreak +
+    '  (func (export "cnew") (param i32) (result i32) (call $cnew (local.get 0)))' + sLineBreak +
+    '  (func (export "cadd") (param i32 i32) (result i32) (call $cadd (local.get 0) (local.get 1)))' + sLineBreak +
+    '  (func (export "apply") (param i32 i32) (result i32) (call $apply (local.get 0) (local.get 1)))' + sLineBreak +
+    '  (func (export "twice") (param i32 i32) (result i32) (call $twice (local.get 0) (local.get 1)))' + sLineBreak +
+    '  (func (export "cvoid") (param i32) (result i32) (call $cvoid (local.get 0)))' + sLineBreak +
+    '  (func (export "cget") (param i32) (result i32) (call $cget (local.get 0)))' + sLineBreak +
+    '  (func (export "reg") (param i32) (call $reg (local.get 0)))' + sLineBreak +
+    '  (func (export "fire") (param i32) (call $fire (local.get 0)))' + sLineBreak +
+    '  (func (export "post") (param i32 i32) (call $post (local.get 0) (local.get 1)))' + sLineBreak +
+    '  (func (export "bac") (param i32 i32 i32) (result i32)' + sLineBreak +
+    '    (call $bac (local.get 0) (local.get 1) (local.get 2))))';
+
+  { The same shapes from a compiled `_start`: bytes 1..4 summed (10), a
+    handle counter (5 + 3 = 8), a retained callback through the table (6
+    doubled + 1 = 13), a scoped one (3 doubled twice = 12), a void callback
+    (7), and a queued notification of 50 read back from the global. Exit
+    code 10 + 8 + 13 + 12 + 7 + 50 = 100. }
+  NATIVE_SHAPES_WAT =
+    '(module' + sLineBreak +
+    '  (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))' + sLineBreak +
+    '  (import "Conn" "SumBytes" (func $sum (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CounterNew" (func $cnew (param i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CounterAdd" (func $cadd (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "Apply" (func $apply (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "ApplyTwice" (func $twice (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "CallVoid" (func $cvoid (param i32) (result i32)))' + sLineBreak +
+    '  (import "Conn" "Post" (func $post (param i32 i32)))' + sLineBreak +
+    '  (memory (export "memory") 1)' + sLineBreak +
+    '  (data (i32.const 100) "\01\02\03\04")' + sLineBreak +
+    '  (global $seen (mut i32) (i32.const 0))' + sLineBreak +
+    '  (table 4 funcref)' + sLineBreak +
+    '  (elem (i32.const 1) func $double $tick $note)' + sLineBreak +
+    '  (func $double (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))' + sLineBreak +
+    '  (func $tick (global.set $seen (i32.add (global.get $seen) (i32.const 1))))' + sLineBreak +
+    '  (func $note (param i32) (global.set $seen (local.get 0)))' + sLineBreak +
+    '  (func (export "_start")' + sLineBreak +
+    '    (local $acc i32)' + sLineBreak +
+    '    (local.set $acc (call $sum (i32.const 100) (i32.const 4)))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc)' + sLineBreak +
+    '      (call $cadd (call $cnew (i32.const 5)) (i32.const 3))))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc) (call $apply (i32.const 1) (i32.const 6))))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc) (call $twice (i32.const 1) (i32.const 3))))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc) (call $cvoid (i32.const 2))))' + sLineBreak +
+    '    (call $post (i32.const 3) (i32.const 50))' + sLineBreak +
+    '    (call $exit (i32.add (local.get $acc) (global.get $seen)))))';
+
+  { A callback that traps inside a native connector call. }
+  NATIVE_CALLBACK_TRAP_WAT =
+    '(module' + sLineBreak +
+    '  (import "Conn" "Apply" (func $apply (param i32 i32) (result i32)))' + sLineBreak +
+    '  (memory (export "memory") 1)' + sLineBreak +
+    '  (table 2 funcref)' + sLineBreak +
+    '  (elem (i32.const 1) func $boom)' + sLineBreak +
+    '  (func $boom (param i32) (result i32) (unreachable))' + sLineBreak +
+    '  (func (export "_start") (drop (call $apply (i32.const 1) (i32.const 1)))))';
+
   ANSWER_WAT =
     '(module (import "Conn" "Answer" (func $a (result i32)))' + sLineBreak +
     '  (func (export "answer") (result i32) (call $a)))';
@@ -120,8 +217,15 @@ type
     procedure Instantiate(const AWlc, AWat: string);
     function CallI32(const AName: string; const AArgs: array of TWasmValue): Int32;
     function LinkErrorOf(const AWlc, AWat: string): string;
-    function LowerError(const AParamDecl: string): string;
+    function LowerError(const AParamDecl: string;
+      const AWatParams: string = 'i32'): string;
     function CommandWlc(const ALibrary: string): string;
+    function ShapesWlc(const ALibrary: string): string;
+    procedure WriteGuest(const AOffset: UInt32; const ABytes: array of Byte);
+    function ReadGuest(const AOffset, ALength: UInt32): TBytes;
+    function CallError(const AName: string; const AArgs: array of TWasmValue;
+      out AClass: string): string;
+    procedure CallVoid(const AName: string; const AArgs: array of TWasmValue);
     procedure WriteText(const APath, AText: string);
     procedure WriteHostCatalog;
     function CompileCommand(const AWat, AWlc: string;
@@ -138,7 +242,11 @@ type
 
     procedure TestScalarLowering;
     procedure TestEnumLowersToUnderlyingType;
+    procedure ExpectUnsupported(const AMessage, ADetail: string);
     procedure TestUnsupportedShapesFailClosed;
+    procedure TestArrayLowering;
+    procedure TestArrayRulesFailClosed;
+    procedure TestHandleAndCallbackLowering;
     procedure TestIncompatibleTargetIsALinkError;
     procedure TestScalarCallsThroughTheGate;
     procedure TestNarrowIntegersExtend;
@@ -148,7 +256,20 @@ type
     procedure TestMissingSymbolIsALinkError;
     procedure TestUnusedLibraryIsNeverLoaded;
     procedure TestSignaturesLinkWithoutLoading;
+    procedure TestBuffersCopyThroughTheChokepoint;
+    procedure TestBufferRangesTrap;
+    procedure TestScopedBorrowWritesInPlace;
+    procedure TestHandlesAreOpaque;
+    procedure TestCallbacksReenterTheGuest;
+    procedure TestQueuedNotificationDrainsAfterTheCall;
+    procedure TestCallbackTableEntriesTrap;
+    procedure TestCallbackFailureIsDeferred;
+    procedure TestBorrowCannotJoinACallback;
+    procedure TestNinthCallbackIsRejected;
+    procedure TestMissingMemoryIsALinkError;
     procedure TestCompiledExecutableCallsTheLibrary;
+    procedure TestCompiledExecutableRunsEveryShape;
+    procedure TestCompiledCallbackTrapUnwinds;
     procedure TestCompiledExecutableLoadsBesideItself;
     procedure TestCompiledMissingLibraryFailsAtStartup;
     procedure TestCompiledTamperedPlanFails;
@@ -190,9 +311,9 @@ begin
   if FixtureSource = '' then
     Exit;
   {$IFDEF DARWIN}
-  Cmd := 'cc -dynamiclib -o ';
+  Cmd := 'cc -dynamiclib -pthread -o ';
   {$ELSE}
-  Cmd := 'cc -shared -fPIC -o ';
+  Cmd := 'cc -shared -fPIC -pthread -o ';
   {$ENDIF}
   Cmd := Cmd + QuoteUnix(FLibPath) + ' ' + QuoteUnix(FixtureSource);
   try
@@ -295,11 +416,12 @@ begin
   FEngine := TWasmEngine.Create;
   FStore := TWasmStore.Create(FEngine);
   FLinker := TWasmLinker.Create(FStore);
-  FHost := TWasmConnectorHost.Create(
+  FHost := TWasmConnectorHost.Create(FStore,
     ResolveConnectorModule([ParseConnector(AWlc)], FLoaded.Model,
-      [WLC_WASI_MODULE]), FWork);
+      [WLC_WASI_MODULE]), FWork, nil);
   FHost.DefineImports(FLinker);
   FInstance := Wasm.Engine.Instantiate(FStore, FLinker, FLoaded);
+  FHost.Attach(FInstance);
 end;
 
 function TConnectorHostTests.CallI32(const AName: string;
@@ -324,7 +446,8 @@ begin
   end;
 end;
 
-function TConnectorHostTests.LowerError(const AParamDecl: string): string;
+function TConnectorHostTests.LowerError(const AParamDecl: string;
+  const AWatParams: string): string;
 var
   Plan: TWlcConnectorPlan;
 begin
@@ -333,9 +456,12 @@ begin
     'static class C {' + sLineBreak +
     '  public struct S { public int A; }' + sLineBreak +
     '  public delegate void Cb(int x);' + sLineBreak +
+    '  public delegate long Wide(long x);' + sLineBreak +
+    '  public delegate int Two(int a, int b);' + sLineBreak +
     '  [DllImport("libc")] static extern int f(' + AParamDecl + ');' +
     sLineBreak + '}',
-    '(module (import "C" "f" (func (param i32) (result i32))))');
+    '(module (import "C" "f" (func (param ' + AWatParams +
+    ') (result i32))))');
   try
     LowerConnectorThunk(Plan, 0);
   except
@@ -351,20 +477,21 @@ var
 begin
   Plan := PlanFor(LiveWlc('/opt/app/libconn.so'), LIVE_WAT);
   Call := LowerConnectorThunk(Plan, 3);
-  Expect<Integer>(Ord(Call.ParamScalars[0])).ToBe(Ord(wcsF64));
-  Expect<Integer>(Ord(Call.ParamScalars[1])).ToBe(Ord(wcsF32));
+  Expect<Integer>(Ord(Call.Params[0].Scalar)).ToBe(Ord(wcsF64));
+  Expect<Integer>(Ord(Call.Params[1].Scalar)).ToBe(Ord(wcsF32));
   Expect<Integer>(Ord(Call.ResultScalar)).ToBe(Ord(wcsF64));
   Call := LowerConnectorThunk(Plan, 4);
-  Expect<Integer>(Ord(Call.ParamScalars[0])).ToBe(Ord(wcsI8));
+  Expect<Integer>(Ord(Call.Params[0].Scalar)).ToBe(Ord(wcsI8));
   Call := LowerConnectorThunk(Plan, 5);
-  Expect<Integer>(Ord(Call.ParamScalars[0])).ToBe(Ord(wcsU8));
+  Expect<Integer>(Ord(Call.Params[0].Scalar)).ToBe(Ord(wcsU8));
   Expect<Integer>(Ord(Call.ResultScalar)).ToBe(Ord(wcsU16));
   Call := LowerConnectorThunk(Plan, 7);
-  Expect<Boolean>(Call.ParamBools[0]).ToBe(True);
-  Expect<Boolean>(Call.ResultBool).ToBe(True);
+  Expect<Integer>(Ord(Call.Params[0].Kind)).ToBe(Ord(wcpBool));
+  Expect<Integer>(Ord(Call.ResultKind)).ToBe(Ord(wcrBool));
   Expect<Integer>(Ord(Call.ResultScalar)).ToBe(Ord(wcsU8));
   Call := LowerConnectorThunk(Plan, 9);
-  Expect<Integer>(Ord(Call.ResultScalar)).ToBe(Ord(wcsVoid));
+  Expect<Integer>(Ord(Call.ResultKind)).ToBe(Ord(wcrVoid));
+  Expect<Boolean>(Call.NeedsMemory).ToBe(False);
 end;
 
 procedure TConnectorHostTests.TestEnumLowersToUnderlyingType;
@@ -380,26 +507,114 @@ begin
     '}',
     '(module (import "C" "f" (func (param i32) (result i32))))');
   Call := LowerConnectorThunk(Plan, 0);
-  Expect<Integer>(Ord(Call.ParamScalars[0])).ToBe(Ord(wcsU16));
-  Expect<Integer>(Ord(Call.ResultScalar)).ToBe(Ord(wcsI32));
+  Expect<Integer>(Ord(Call.Params[0].Scalar)).ToBe(Ord(wcsU16));
+  Expect<Integer>(Ord(Call.ResultScalar)).ToBe(Ord(Wasm.Abi.wcsI32));
+end;
+
+procedure TConnectorHostTests.ExpectUnsupported(const AMessage,
+  ADetail: string);
+begin
+  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE + ': "C"."f"', AMessage) = 1)
+    .ToBe(True);
+  Expect<Boolean>(Pos(ADetail, AMessage) > 0).ToBe(True);
 end;
 
 procedure TConnectorHostTests.TestUnsupportedShapesFailClosed;
 begin
-  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE,
-    LowerError('[In, MarshalAs(UnmanagedType.LPArray, SizeConst = 4)] byte[] b')) = 1)
-    .ToBe(True);
-  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE, LowerError('string s')) = 1)
-    .ToBe(True);
-  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE, LowerError('S s')) = 1)
-    .ToBe(True);
-  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE, LowerError('Cb cb')) = 1)
-    .ToBe(True);
-  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE, LowerError('IntPtr p')) = 1)
-    .ToBe(True);
-  Expect<Boolean>(Pos(MSG_WLC_UNSUPPORTED_TYPE, LowerError('ref int p')) = 1)
-    .ToBe(True);
-  Expect<Boolean>(Pos('"C"."f"', LowerError('string s')) > 0).ToBe(True);
+  { D14: strings, structs, and by-reference parameters have no lowering. }
+  ExpectUnsupported(LowerError('string s'), 'string');
+  ExpectUnsupported(LowerError('S s'), 'S');
+  ExpectUnsupported(LowerError('ref int p'), 'by reference');
+  ExpectUnsupported(LowerError('out int p'), 'by reference');
+  ExpectUnsupported(LowerError('[MarshalAs(UnmanagedType.LPStr)] string s'),
+    'string');
+  ExpectUnsupported(LowerError('[Scoped] int p'), '[Scoped]');
+  { D13: only void(), void(i32), i32(), and i32(i32) delegates. }
+  ExpectUnsupported(LowerError('Wide w'), 'delegate Wide');
+  ExpectUnsupported(LowerError('Two t'), 'delegate Two');
+end;
+
+procedure TConnectorHostTests.TestArrayLowering;
+var
+  Plan: TWlcConnectorPlan;
+  Call: TWasmConnectorCall;
+begin
+  Plan := PlanFor(
+    'static class C {' + sLineBreak +
+    '  [DllImport("libc")] static extern int f(' +
+    '[In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] short[] a,' +
+    ' uint n, [Out, MarshalAs(UnmanagedType.LPArray, SizeConst = 3)] long[] b,' +
+    ' [Scoped, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] byte[] c,' +
+    ' [In, Out, MarshalAs(UnmanagedType.LPArray, SizeConst = 2)] double[] d);' +
+    sLineBreak + '}',
+    '(module (import "C" "f" (func (param i32 i32 i32 i32 i32) (result i32))))');
+  Call := LowerConnectorThunk(Plan, 0);
+  Expect<Boolean>(Call.NeedsMemory).ToBe(True);
+  Expect<Integer>(Ord(Call.Params[0].Kind)).ToBe(Ord(wcpBuffer));
+  Expect<Integer>(Ord(Call.Params[0].Direction)).ToBe(Ord(wldIn));
+  Expect<Integer>(Integer(Call.Params[0].ElemSize)).ToBe(2);
+  Expect<Integer>(Call.Params[0].SizeConst).ToBe(-1);
+  Expect<Integer>(Call.Params[0].SizeParam).ToBe(1);
+  Expect<Integer>(Ord(Call.Params[2].Direction)).ToBe(Ord(wldOut));
+  Expect<Integer>(Integer(Call.Params[2].ElemSize)).ToBe(8);
+  Expect<Integer>(Call.Params[2].SizeConst).ToBe(3);
+  Expect<Integer>(Ord(Call.Params[3].Kind)).ToBe(Ord(wcpBorrow));
+  Expect<Integer>(Ord(Call.Params[4].Direction)).ToBe(Ord(wldInOut));
+end;
+
+procedure TConnectorHostTests.TestArrayRulesFailClosed;
+begin
+  { D11: a direction or [Scoped] is required, and exactly one length. }
+  ExpectUnsupported(LowerError(
+    '[MarshalAs(UnmanagedType.LPArray, SizeConst = 4)] byte[] b'),
+    'needs [In], [Out], or [Scoped]');
+  ExpectUnsupported(LowerError('[In] byte[] b'),
+    'exactly one of SizeConst or SizeParamIndex');
+  ExpectUnsupported(LowerError(
+    '[In, MarshalAs(UnmanagedType.LPArray, SizeConst = 4, SizeParamIndex = 1)]' +
+    ' byte[] b, int n', 'i32 i32'), 'exactly one of');
+  ExpectUnsupported(LowerError(
+    '[In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] byte[] b'),
+    'names no count parameter');
+  ExpectUnsupported(LowerError(
+    '[In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 5)] byte[] b'),
+    'names no count parameter');
+  ExpectUnsupported(LowerError(
+    '[In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] byte[] b,' +
+    ' float n', 'i32 f32'), 'not an integer');
+  ExpectUnsupported(LowerError(
+    '[In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] byte[] b,' +
+    ' bool n', 'i32 i32'), 'not an integer');
+  ExpectUnsupported(LowerError('[In, MarshalAs(UnmanagedType.LPArray,' +
+    ' SizeConst = 2)] string[] b'), 'string[]');
+  ExpectUnsupported(LowerError('[In, MarshalAs(UnmanagedType.ByValArray,' +
+    ' SizeConst = 2)] int[] b'), 'int[]');
+end;
+
+procedure TConnectorHostTests.TestHandleAndCallbackLowering;
+var
+  Plan: TWlcConnectorPlan;
+  Call: TWasmConnectorCall;
+begin
+  Plan := PlanFor(
+    'static class C {' + sLineBreak +
+    '  [Scoped] public delegate int Map(int x);' + sLineBreak +
+    '  [Queued] public delegate void Note(uint x);' + sLineBreak +
+    '  public delegate void Tick();' + sLineBreak +
+    '  [DllImport("libc")] static extern IntPtr f(nint a, UIntPtr b,' +
+    ' [MarshalAs(UnmanagedType.SysInt)] int c, Map m, Note n, Tick t);' +
+    sLineBreak + '}',
+    '(module (import "C" "f" (func (param i32 i32 i32 i32 i32 i32) (result i32))))');
+  Call := LowerConnectorThunk(Plan, 0);
+  Expect<Integer>(Ord(Call.ResultKind)).ToBe(Ord(wcrHandle));
+  Expect<Integer>(Ord(Call.Params[0].Kind)).ToBe(Ord(wcpHandle));
+  Expect<Integer>(Ord(Call.Params[1].Kind)).ToBe(Ord(wcpHandle));
+  Expect<Integer>(Ord(Call.Params[2].Kind)).ToBe(Ord(wcpHandle));
+  Expect<Integer>(Ord(Call.Params[3].Kind)).ToBe(Ord(wcpCallback));
+  Expect<Integer>(Ord(Call.Params[3].Lifetime)).ToBe(Ord(wckScoped));
+  Expect<Integer>(Ord(Call.Params[4].Lifetime)).ToBe(Ord(wckQueued));
+  Expect<Integer>(Ord(Call.Params[5].Lifetime)).ToBe(Ord(wckRetained));
+  Expect<Boolean>(Call.NeedsMemory).ToBe(False);
 end;
 
 procedure TConnectorHostTests.TestIncompatibleTargetIsALinkError;
@@ -564,6 +779,334 @@ begin
     Engine.Free;
     Loaded.Free;
   end;
+end;
+
+{ --- buffers, handles, and callbacks ---------------------------------------- }
+
+function TConnectorHostTests.ShapesWlc(const ALibrary: string): string;
+
+  function Ext(const AEntry, ADecl: string): string;
+  begin
+    Result := '  [DllImport("' + ALibrary + '", EntryPoint = "' + AEntry +
+      '")] static extern ' + ADecl + ';' + sLineBreak;
+  end;
+
+begin
+  Result :=
+    'static class Conn {' + sLineBreak +
+    '  public delegate int Map(int x);' + sLineBreak +
+    '  [Scoped] public delegate int ScopedMap(int x);' + sLineBreak +
+    '  public delegate void Tick();' + sLineBreak +
+    '  public delegate int Get();' + sLineBreak +
+    '  public delegate void Notify(int v);' + sLineBreak +
+    '  [Queued] public delegate void Posted(int v);' + sLineBreak +
+    Ext('conn_sum_bytes', 'int SumBytes([In, MarshalAs(UnmanagedType.LPArray,' +
+      ' SizeParamIndex = 1)] byte[] buf, int n)') +
+    Ext('conn_fill', 'void Fill([Out, MarshalAs(UnmanagedType.LPArray,' +
+      ' SizeParamIndex = 1)] byte[] buf, int n, byte v)') +
+    Ext('conn_reverse4', 'void Reverse4([In, Out, MarshalAs(' +
+      'UnmanagedType.LPArray, SizeConst = 4)] int[] vals)') +
+    Ext('conn_scale_in_place', 'int ScaleInPlace([Scoped, MarshalAs(' +
+      'UnmanagedType.LPArray, SizeParamIndex = 1)] short[] vals, uint n,' +
+      ' short k)') +
+    Ext('conn_counter_new', 'IntPtr CounterNew(int start)') +
+    Ext('conn_counter_add', 'int CounterAdd(IntPtr c, int by)') +
+    Ext('conn_apply', 'int Apply(Map f, int x)') +
+    Ext('conn_apply_twice', 'int ApplyTwice(ScopedMap f, int x)') +
+    Ext('conn_call_void', 'int CallVoid(Tick f)') +
+    Ext('conn_call_get', 'int CallGet(Get f)') +
+    Ext('conn_register', 'void Register(Notify f)') +
+    Ext('conn_fire', 'void Fire(int v)') +
+    Ext('conn_post', 'void Post(Posted f, int v)') +
+    Ext('conn_borrow_and_call', 'int BorrowAndCall([Scoped, MarshalAs(' +
+      'UnmanagedType.LPArray, SizeParamIndex = 1)] byte[] buf, int n, Map f)') +
+    '}' + sLineBreak;
+end;
+
+procedure TConnectorHostTests.WriteGuest(const AOffset: UInt32;
+  const ABytes: array of Byte);
+var
+  Mem: TWasmMemoryRef;
+begin
+  Expect<Boolean>(FInstance.FindExportMemory('memory', Mem)).ToBe(True);
+  Expect<Boolean>(MemWrite(Mem, AOffset, Length(ABytes), @ABytes[0]))
+    .ToBe(True);
+end;
+
+function TConnectorHostTests.ReadGuest(const AOffset, ALength: UInt32): TBytes;
+var
+  Mem: TWasmMemoryRef;
+begin
+  Result := nil;
+  SetLength(Result, ALength);
+  Expect<Boolean>(FInstance.FindExportMemory('memory', Mem)).ToBe(True);
+  Expect<Boolean>(MemRead(Mem, AOffset, ALength, @Result[0])).ToBe(True);
+end;
+
+function TConnectorHostTests.CallError(const AName: string;
+  const AArgs: array of TWasmValue; out AClass: string): string;
+var
+  Fn: TWasmFunc;
+  Results: array of TWasmValue;
+begin
+  Result := '';
+  AClass := '';
+  Expect<Boolean>(FInstance.FindExportFunc(AName, Fn)).ToBe(True);
+  SetLength(Results, Length(Fn.ResultTypes));
+  try
+    Call(Fn, AArgs, Results);
+  except
+    on E: EWasmError do
+    begin
+      AClass := E.ClassName;
+      Result := E.Message;
+    end;
+  end;
+end;
+
+procedure TConnectorHostTests.CallVoid(const AName: string;
+  const AArgs: array of TWasmValue);
+var
+  Fn: TWasmFunc;
+  NoResults: array of TWasmValue;
+begin
+  Expect<Boolean>(FInstance.FindExportFunc(AName, Fn)).ToBe(True);
+  NoResults := nil;
+  Call(Fn, AArgs, NoResults);
+end;
+
+procedure TConnectorHostTests.TestBuffersCopyThroughTheChokepoint;
+var
+  Got: TBytes;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  { Copy-in with a SizeParamIndex count. }
+  WriteGuest(100, [1, 2, 3, 4, 250]);
+  Expect<Int32>(CallI32('sum', [MakeValueI32(100), MakeValueI32(4)])).ToBe(10);
+  Expect<Int32>(CallI32('sum', [MakeValueI32(100), MakeValueI32(0)])).ToBe(0);
+  { Copy-out writes exactly the counted bytes. }
+  WriteGuest(200, [0, 0, 0, 99]);
+  CallVoid('fill', [MakeValueI32(200), MakeValueI32(3), MakeValueI32(7)]);
+  Got := ReadGuest(200, 4);
+  Expect<Integer>(Got[0]).ToBe(7);
+  Expect<Integer>(Got[2]).ToBe(9);
+  Expect<Integer>(Got[3]).ToBe(99);
+  { Inout with SizeConst = 4 int elements. }
+  WriteGuest(300, [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
+  CallVoid('rev', [MakeValueI32(300)]);
+  Got := ReadGuest(300, 16);
+  Expect<Integer>(Got[0]).ToBe(4);
+  Expect<Integer>(Got[12]).ToBe(1);
+end;
+
+procedure TConnectorHostTests.TestBufferRangesTrap;
+var
+  Cls, Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  Msg := CallError('sum', [MakeValueI32(65534), MakeValueI32(4)], Cls);
+  Expect<string>(Cls).ToBe('EWasmTrap');
+  Expect<string>(Msg).ToBe(MSG_TRAP_MEMORY_OUT_OF_BOUNDS);
+  { A negative signed count names no range. }
+  Msg := CallError('sum', [MakeValueI32(0), MakeValueI32(-1)], Cls);
+  Expect<string>(Cls).ToBe('EWasmTrap');
+  { An out-only range is checked before the native call runs. }
+  Msg := CallError('rev', [MakeValueI32(65530)], Cls);
+  Expect<string>(Cls).ToBe('EWasmTrap');
+  Msg := CallError('scale', [MakeValueI32(65535), MakeValueI32(1),
+    MakeValueI32(2)], Cls);
+  Expect<string>(Cls).ToBe('EWasmTrap');
+end;
+
+procedure TConnectorHostTests.TestScopedBorrowWritesInPlace;
+var
+  Got: TBytes;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  { int16 1, -2, 3 scaled by 10 in guest memory. }
+  WriteGuest(400, [1, 0, $FE, $FF, 3, 0]);
+  Expect<Int32>(CallI32('scale', [MakeValueI32(400), MakeValueI32(3),
+    MakeValueI32(10)])).ToBe(20);
+  Got := ReadGuest(400, 6);
+  Expect<Integer>(Got[0]).ToBe(10);
+  Expect<Integer>(Got[2]).ToBe($EC);
+  Expect<Integer>(Got[3]).ToBe($FF);
+  Expect<Integer>(Got[4]).ToBe(30);
+end;
+
+procedure TConnectorHostTests.TestHandlesAreOpaque;
+var
+  H1, H2: Int32;
+  Cls, Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  H1 := CallI32('cnew', [MakeValueI32(5)]);
+  H2 := CallI32('cnew', [MakeValueI32(100)]);
+  { Small table indexes, never the native address. }
+  Expect<Int32>(H1).ToBe(1);
+  Expect<Int32>(H2).ToBe(2);
+  Expect<Int32>(CallI32('cadd', [MakeValueI32(H1), MakeValueI32(3)])).ToBe(8);
+  Expect<Int32>(CallI32('cadd', [MakeValueI32(H2), MakeValueI32(1)])).ToBe(101);
+  { NULL is handle 0 both ways. }
+  Expect<Int32>(CallI32('cnew', [MakeValueI32(-1)])).ToBe(0);
+  Expect<Int32>(CallI32('cadd', [MakeValueI32(0), MakeValueI32(1)])).ToBe(-1);
+  Msg := CallError('cadd', [MakeValueI32(99), MakeValueI32(1)], Cls);
+  Expect<string>(Cls).ToBe('EWasmConnectorError');
+  Expect<string>(Msg).ToBe(MSG_CONNECTOR_STALE_HANDLE);
+end;
+
+procedure TConnectorHostTests.TestCallbacksReenterTheGuest;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  Expect<Int32>(CallI32('apply', [MakeValueI32(1), MakeValueI32(6)])).ToBe(13);
+  { A scoped delegate is valid for the call that received it. }
+  Expect<Int32>(CallI32('twice', [MakeValueI32(1), MakeValueI32(3)])).ToBe(12);
+  Expect<Int32>(CallI32('cvoid', [MakeValueI32(2)])).ToBe(7);
+  Expect<Int32>(CallI32('seen', [])).ToBe(1);
+  Expect<Int32>(CallI32('cget', [MakeValueI32(3)])).ToBe(42);
+  { A retained delegate outlives the call that registered it. }
+  CallVoid('reg', [MakeValueI32(4)]);
+  CallVoid('fire', [MakeValueI32(55)]);
+  Expect<Int32>(CallI32('seen', [])).ToBe(55);
+end;
+
+procedure TConnectorHostTests.TestQueuedNotificationDrainsAfterTheCall;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  { The library notifies from its own thread; the guest runs on the store
+    thread once the connector call returns. }
+  CallVoid('post', [MakeValueI32(4), MakeValueI32(77)]);
+  Expect<Int32>(CallI32('seen', [])).ToBe(77);
+end;
+
+procedure TConnectorHostTests.TestCallbackTableEntriesTrap;
+var
+  Cls, Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  Msg := CallError('apply', [MakeValueI32(0), MakeValueI32(1)], Cls);
+  Expect<string>(Cls).ToBe('EWasmTrap');
+  Expect<string>(Msg).ToBe(MSG_TRAP_UNINITIALIZED_ELEMENT);
+  Msg := CallError('apply', [MakeValueI32(8), MakeValueI32(1)], Cls);
+  Expect<string>(Msg).ToBe(MSG_TRAP_UNDEFINED_ELEMENT);
+  Msg := CallError('apply', [MakeValueI32(6), MakeValueI32(1)], Cls);
+  Expect<string>(Msg).ToBe(MSG_TRAP_INDIRECT_CALL_TYPE_MISMATCH);
+  Msg := CallError('apply', [MakeValueI32(2), MakeValueI32(1)], Cls);
+  Expect<string>(Msg).ToBe(MSG_TRAP_INDIRECT_CALL_TYPE_MISMATCH);
+end;
+
+procedure TConnectorHostTests.TestCallbackFailureIsDeferred;
+var
+  Cls, Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  { $boom traps inside the native call; the trap surfaces unchanged once
+    conn_apply has returned. }
+  Msg := CallError('apply', [MakeValueI32(5), MakeValueI32(1)], Cls);
+  Expect<string>(Cls).ToBe('EWasmTrap');
+  Expect<string>(Msg).ToBe(MSG_TRAP_UNREACHABLE);
+  Expect<Int32>(CallI32('apply', [MakeValueI32(1), MakeValueI32(2)])).ToBe(5);
+end;
+
+procedure TConnectorHostTests.TestBorrowCannotJoinACallback;
+var
+  Cls, Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
+  Msg := CallError('bac', [MakeValueI32(100), MakeValueI32(1),
+    MakeValueI32(1)], Cls);
+  Expect<string>(Cls).ToBe('EWasmConnectorError');
+  Expect<string>(Msg).ToBe(MSG_CONNECTOR_BORROW_CALLBACK);
+  { The borrow ended with the call. }
+  Expect<Int32>(CallI32('apply', [MakeValueI32(1), MakeValueI32(2)])).ToBe(5);
+end;
+
+procedure TConnectorHostTests.TestNinthCallbackIsRejected;
+var
+  Wat: string;
+  I: Integer;
+  Cls, Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Wat := '(module (import "Conn" "Register" (func $reg (param i32)))' +
+    ' (table 9 funcref) (elem (i32.const 0) func';
+  for I := 0 to 8 do
+    Wat := Wat + ' $n' + IntToStr(I);
+  Wat := Wat + ')';
+  for I := 0 to 8 do
+    Wat := Wat + ' (func $n' + IntToStr(I) + ' (param i32))';
+  Wat := Wat + ' (func (export "reg") (param i32) (call $reg (local.get 0))))';
+  Instantiate(ShapesWlc(FLibPath), Wat);
+  for I := 0 to WASM_CALLBACK_SLOT_COUNT - 1 do
+    CallVoid('reg', [MakeValueI32(I)]);
+  { Re-registering a bound function reuses its thunk. }
+  CallVoid('reg', [MakeValueI32(0)]);
+  Msg := CallError('reg', [MakeValueI32(8)], Cls);
+  Expect<string>(Cls).ToBe('EWasmCallbackError');
+  Expect<string>(Msg).ToBe(MSG_CALLBACK_SLOTS);
+end;
+
+procedure TConnectorHostTests.TestMissingMemoryIsALinkError;
+var
+  Msg: string;
+begin
+  if not BuildFixture then
+  begin
+    Expect<Boolean>(NativeCallSupported).ToBe(False);
+    Exit;
+  end;
+  Msg := LinkErrorOf(ShapesWlc(FLibPath),
+    '(module (import "Conn" "SumBytes" (func (param i32 i32) (result i32))))');
+  Expect<Boolean>(Pos('exported "memory"', Msg) > 0).ToBe(True);
 end;
 
 { --- compiled executables -------------------------------------------------- }
@@ -737,6 +1280,42 @@ begin
   Run := RunPayload(Payload);
   Expect<string>(Run.Diagnostic).ToBe('');
   Expect<Integer>(Run.ExitCode).ToBe(100);
+end;
+
+procedure TConnectorHostTests.TestCompiledExecutableRunsEveryShape;
+var
+  Payload: TWasmBytes;
+  Res: TWasmCompileResult;
+  Run: TWasmShellResult;
+begin
+  if not CanRunNative then
+    Exit;
+  { Copy-in, handles, retained / scoped / void callbacks re-entering
+    through the native invoke, and a queued notification drained after
+    its call. }
+  Res := CompileCommand(NATIVE_SHAPES_WAT, ShapesWlc(FLibPath), Payload);
+  Expect<string>(Res.Diagnostic).ToBe('');
+  Run := RunPayload(Payload);
+  Expect<string>(Run.Diagnostic).ToBe('');
+  Expect<Integer>(Run.ExitCode).ToBe(100);
+end;
+
+procedure TConnectorHostTests.TestCompiledCallbackTrapUnwinds;
+var
+  Payload: TWasmBytes;
+  Res: TWasmCompileResult;
+  Run: TWasmShellResult;
+begin
+  if not CanRunNative then
+    Exit;
+  { The trap never unwinds through conn_apply's C frame: it is retained at
+    the thunk and rethrown when the connector call returns. }
+  Res := CompileCommand(NATIVE_CALLBACK_TRAP_WAT, ShapesWlc(FLibPath),
+    Payload);
+  Expect<string>(Res.Diagnostic).ToBe('');
+  Run := RunPayload(Payload);
+  Expect<Integer>(Run.ExitCode).ToBe(WASM_SHELL_EXIT_TRAP);
+  Expect<string>(Run.Diagnostic).ToBe('trap: ' + MSG_TRAP_UNREACHABLE);
 end;
 
 procedure TConnectorHostTests.TestCompiledExecutableLoadsBesideItself;
@@ -929,6 +1508,12 @@ begin
     TestEnumLowersToUnderlyingType);
   Test('shapes without a fixed lowering fail closed',
     TestUnsupportedShapesFailClosed);
+  Test('arrays lower to buffers and borrows with their counts',
+    TestArrayLowering);
+  Test('array direction and length rules fail closed',
+    TestArrayRulesFailClosed);
+  Test('handles and delegates lower with their lifetimes',
+    TestHandleAndCallbackLowering);
   Test('a target without a C-ABI gate is a link error',
     TestIncompatibleTargetIsALinkError);
   Test('scalar calls reach the fixture through the gate',
@@ -942,8 +1527,29 @@ begin
     TestUnusedLibraryIsNeverLoaded);
   Test('compile-time signatures link without loading',
     TestSignaturesLinkWithoutLoading);
+  Test('buffers copy in, out, and both ways', TestBuffersCopyThroughTheChokepoint);
+  Test('out-of-range buffers trap before the call', TestBufferRangesTrap);
+  Test('a scoped borrow writes guest memory in place',
+    TestScopedBorrowWritesInPlace);
+  Test('handles are opaque and NULL is zero', TestHandlesAreOpaque);
+  Test('retained, scoped, and void callbacks re-enter the guest',
+    TestCallbacksReenterTheGuest);
+  Test('a queued notification drains after the call',
+    TestQueuedNotificationDrainsAfterTheCall);
+  Test('null, out-of-range, and mistyped table entries trap',
+    TestCallbackTableEntriesTrap);
+  Test('a callback trap is deferred to Pascal ground',
+    TestCallbackFailureIsDeferred);
+  Test('a live borrow cannot join a callback', TestBorrowCannotJoinACallback);
+  Test('a ninth distinct callback is rejected', TestNinthCallbackIsRejected);
+  Test('buffers without an exported memory are a link error',
+    TestMissingMemoryIsALinkError);
   Test('a compiled executable calls the connector library',
     TestCompiledExecutableCallsTheLibrary);
+  Test('a compiled executable runs every connector shape',
+    TestCompiledExecutableRunsEveryShape);
+  Test('a compiled callback trap unwinds on Pascal ground',
+    TestCompiledCallbackTrapUnwinds);
   Test('a bare library name loads beside the executable',
     TestCompiledExecutableLoadsBesideItself);
   Test('a missing library fails the executable at startup',

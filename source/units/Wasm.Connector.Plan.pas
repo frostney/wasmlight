@@ -5,8 +5,8 @@
   PURE FORMAT plus one consistency check. EncodeConnectorPlan writes the
   semantic content of a TWlcConnectorPlan; DecodeConnectorPlan is strict — a
   bad magic or version, a truncated or oversized count, an out-of-range
-  enum ordinal, a non-canonical boolean or SizeConst, a non-numeric wasm
-  value type, or a trailing byte rejects the whole section. There is no
+  enum ordinal, a non-canonical boolean, SizeConst, or SizeParamIndex, a
+  non-numeric wasm value type, or a trailing byte rejects the whole section. There is no
   partial plan. Source positions (Line / Column) are not carried: they are
   diagnostics for `.wlc` text, not binding semantics, and leaving them out
   keeps the section independent of source formatting.
@@ -164,6 +164,11 @@ begin
   WBool(AW, AMarshal.HasSizeConst);
   if AMarshal.HasSizeConst then
     WU32(AW, UInt32(AMarshal.SizeConst))
+  else
+    WU32(AW, 0);
+  WBool(AW, AMarshal.HasSizeParamIndex);
+  if AMarshal.HasSizeParamIndex then
+    WU32(AW, UInt32(AMarshal.SizeParamIndex))
   else
     WU32(AW, 0);
 end;
@@ -442,13 +447,18 @@ begin
   if (not Result.HasSizeConst) and (Size <> 0) then
     SetFail(AR, wpdBadValue);
   Result.SizeConst := Integer(Int32(Size));
+  Result.HasSizeParamIndex := RBool(AR);
+  Size := RU32(AR);
+  if ((not Result.HasSizeParamIndex) and (Size <> 0)) or (Size > $7FFFFFFF) then
+    SetFail(AR, wpdBadValue);
+  Result.SizeParamIndex := Integer(Size and $7FFFFFFF);
 end;
 
 { Minimum encoded sizes, used to bound counts before allocation. }
 const
   MIN_STR = 4;
   MIN_TYPEREF = MIN_STR + 1;
-  MIN_MARSHAL = 1 + 1 + 4;
+  MIN_MARSHAL = 1 + 1 + 4 + 1 + 4;
   MIN_PARAM = MIN_STR + MIN_TYPEREF + 1 + 1 + MIN_MARSHAL + 1;
   MIN_METHOD = 3 * MIN_STR + MIN_TYPEREF + MIN_MARSHAL + 4;
   MIN_FIELD = MIN_STR + MIN_TYPEREF + MIN_MARSHAL + 1;

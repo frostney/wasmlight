@@ -36,7 +36,7 @@ const
     '    [DllImport("/opt/app/libpair.so")]' + sLineBreak +
     '    [return: MarshalAs(UnmanagedType.Float64)]' + sLineBreak +
     '    public static extern double Scale(ref Pair p,' + sLineBreak +
-    '        [In, Out, MarshalAs(UnmanagedType.LPArray, SizeConst = 4)] byte[] buf,' + sLineBreak +
+    '        [In, Out, MarshalAs(UnmanagedType.LPArray, SizeConst = 4, SizeParamIndex = 3)] byte[] buf,' + sLineBreak +
     '        Notify cb, float f);' + sLineBreak +
     '    [DllImport("libunused")] public static extern void unused();' + sLineBreak +
     '}' + sLineBreak;
@@ -89,6 +89,7 @@ type
     procedure TestNonCanonicalBooleanRejected;
     procedure TestOutOfRangeMarshalKindRejected;
     procedure TestSizeConstWithoutFlagRejected;
+    procedure TestSizeParamIndexWithoutFlagRejected;
     procedure TestTrailingByteRejected;
     procedure TestEveryTruncationRejected;
     procedure TestCheckAcceptsTheResolvedPlan;
@@ -198,12 +199,14 @@ begin
     $00, $00, $00, $00, $00, $00, $00, $00,   { method name, library }
     $00, $00, $00, $00,                       { entry point }
     $00, $00, $00, $00, $00,                  { return type: '' not array }
-    $00, $00, $00, $00, $00, $00,             { return marshal }
+    $00, $00, $00, $00, $00, $00,             { return marshal: kind, }
+    $00, $00, $00, $00, $00,                  { SizeConst, SizeParamIndex }
     $01, $00, $00, $00,                       { 1 param }
     $00, $00, $00, $00, $00, $00, $00, $00,   { name '', type '' }
     $00,                                      { not array }
     $00, $00,                                 { modifier, direction }
     $00, $00, $00, $00, $00, $00,             { marshal }
+    $00, $00, $00, $00, $00,
     AScopedByte,                              { IsScoped }
     $01, $00, $00, $00, AValueCode,           { 1 wasm param }
     $00, $00, $00, $00,                       { 0 wasm results }
@@ -248,6 +251,9 @@ begin
   Expect<Boolean>(Scale.Params[1].TypeRef.IsArray).ToBe(True);
   Expect<Boolean>(Scale.Params[1].Marshal.HasSizeConst).ToBe(True);
   Expect<Integer>(Scale.Params[1].Marshal.SizeConst).ToBe(4);
+  Expect<Boolean>(Scale.Params[1].Marshal.HasSizeParamIndex).ToBe(True);
+  Expect<Integer>(Scale.Params[1].Marshal.SizeParamIndex).ToBe(3);
+  Expect<Boolean>(Scale.Params[0].Marshal.HasSizeParamIndex).ToBe(False);
 
   Expect<Integer>(Length(Back.Connectors)).ToBe(1);
   C := Back.Connectors[0];
@@ -390,6 +396,19 @@ begin
     .ToBe(Ord(wpdBadValue));
 end;
 
+procedure TConnectorPlanTests.TestSizeParamIndexWithoutFlagRejected;
+var
+  Section: TWasmBytes;
+  Plan: TWlcConnectorPlan;
+begin
+  Section := MinimalThunk($7F, $00);
+  { Byte 55 is the return marshal's HasSizeParamIndex; 56..59 its index. }
+  Expect<Integer>(Section[55]).ToBe(0);
+  Section[56] := 1;
+  Expect<Integer>(Ord(DecodeConnectorPlan(Section, Plan)))
+    .ToBe(Ord(wpdBadValue));
+end;
+
 procedure TConnectorPlanTests.TestTrailingByteRejected;
 begin
   Expect<Integer>(Ord(DecodeResult(Concat(MinimalThunk($7F, $00),
@@ -496,6 +515,8 @@ begin
     TestOutOfRangeMarshalKindRejected);
   Test('a SizeConst without its flag is rejected',
     TestSizeConstWithoutFlagRejected);
+  Test('a SizeParamIndex without its flag is rejected',
+    TestSizeParamIndexWithoutFlagRejected);
   Test('a trailing byte is rejected', TestTrailingByteRejected);
   Test('every proper prefix of a plan is rejected',
     TestEveryTruncationRejected);
