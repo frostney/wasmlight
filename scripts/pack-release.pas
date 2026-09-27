@@ -5,6 +5,16 @@ program PackRelease;
   SHA-256 checksums file. InstantFPC entry: run from the repo root with
   `-Fusource/units -Fisource/units` so Wasm.Distro is visible.
 
+  The archive carries the runtime shells its compiler can emit: the host
+  architecture for Linux and macOS (Wasm.Distro). Shells come from one
+  source:
+
+    --shell TRIPLE=PATH  a live shell built on TRIPLE's own runner; repeat
+                         once per host shell (the release workflow path)
+    --catalog DIR        a live catalog; only the host shells are taken
+    --synthesize-catalog structural placeholders (a CI fixture, never a
+                         release)
+
   This writes archives; it does not publish a GitHub release. /create-release
   remains the single publication path. }
 
@@ -22,7 +32,8 @@ uses
 const
   USAGE =
     'usage: pack-release --compiler PATH --out DIR [--version VER] ' +
-    '[--host TRIPLE|DISPLAY] [--catalog DIR] [--synthesize-catalog]';
+    '[--host TRIPLE|DISPLAY] ' +
+    '(--shell TRIPLE=PATH... | --catalog DIR | --synthesize-catalog)';
 
 function ArgValue(const AName: string; out AValue: string): Boolean;
 var
@@ -43,6 +54,28 @@ begin
     end;
     AValue := ParamStr(I + 1);
     Exit(True);
+  end;
+end;
+
+{ Every value of a repeatable flag, in command-line order. }
+function ArgValues(const AName: string): TStringArray;
+var
+  I: Integer;
+  Flag: string;
+begin
+  Result := nil;
+  Flag := '--' + AName;
+  for I := 1 to ParamCount do
+  begin
+    if ParamStr(I) <> Flag then
+      Continue;
+    if I = ParamCount then
+    begin
+      WriteLn(ErrOutput, 'pack-release: ', Flag, ' needs a value');
+      Halt(2);
+    end;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := ParamStr(I + 1);
   end;
 end;
 
@@ -120,28 +153,108 @@ begin
   end;
 end;
 
-procedure CopyCatalogShell(const AEntry: TWasmShellEntry; const ADestination: string);
+function ReadFileBytes(const APath: string): TWasmBytes;
 var
   Stream: TFileStream;
-  Bytes: TWasmBytes;
 begin
-  Stream := TFileStream.Create(AEntry.ShellPath, fmOpenRead or fmShareDenyWrite);
+  Result := nil;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
   try
-    SetLength(Bytes, Stream.Size);
-    if Length(Bytes) > 0 then
-      Stream.ReadBuffer(Bytes[0], Length(Bytes));
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then
+      Stream.ReadBuffer(Result[0], Length(Result));
   finally
     Stream.Free;
   end;
-  if ShellChecksumBytes(Bytes) <> AEntry.Checksum then
-    raise Exception.Create('shell checksum mismatch: ' + AEntry.Triple);
-  ForceDirectories(ExtractFilePath(ADestination));
-  Stream := TFileStream.Create(ADestination, fmCreate);
+end;
+
+procedure WriteFileBytes(const APath: string; const ABytes: TWasmBytes);
+var
+  Stream: TFileStream;
+begin
+  ForceDirectories(ExtractFilePath(APath));
+  Stream := TFileStream.Create(APath, fmCreate);
   try
-    if Length(Bytes) > 0 then
-      Stream.WriteBuffer(Bytes[0], Length(Bytes));
+    if Length(ABytes) > 0 then
+      Stream.WriteBuffer(ABytes[0], Length(ABytes));
   finally
     Stream.Free;
+  end;
+end;
+
+function IndexOfTriple(const ATriples: TStringArray; const ATriple: string): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ATriples) do
+    if ATriples[I] = ATriple then
+      Exit(I);
+  Result := -1;
+end;
+
+{ `--shell TRIPLE=PATH`: exactly one live shell per host triple. }
+function ShellSourcesFromFlags(const AFlags, ATriples: TStringArray): TStringArray;
+var
+  I, Eq, Index: Integer;
+  Triple, Path: string;
+begin
+  Result := nil;
+  SetLength(Result, Length(ATriples));
+  for I := 0 to High(AFlags) do
+  begin
+    Eq := Pos('=', AFlags[I]);
+    if Eq < 2 then
+      raise Exception.Create('--shell needs TRIPLE=PATH: ' + AFlags[I]);
+    Triple := Copy(AFlags[I], 1, Eq - 1);
+    Path := ExpandFileName(Copy(AFlags[I], Eq + 1, MaxInt));
+    Index := IndexOfTriple(ATriples, Triple);
+    if Index < 0 then
+      raise Exception.Create('shell ' + Triple +
+        ' is not emitted by this host''s compiler');
+    if Result[Index] <> '' then
+      raise Exception.Create('duplicate --shell for ' + Triple);
+    if not FileExists(Path) then
+      raise Exception.Create('shell not found: ' + Path);
+    Result[Index] := Path;
+  end;
+  for I := 0 to High(ATriples) do
+    if Result[I] = '' then
+      raise Exception.Create('missing --shell for ' + ATriples[I]);
+end;
+
+{ `--catalog DIR`: the host shells of a live catalog, checksum-verified. }
+function ShellSourcesFromCatalog(const ADir, AVersion: string;
+  const ATriples: TStringArray): TStringArray;
+var
+  Root: string;
+  Catalog: TWasmShellCatalog;
+  I, J: Integer;
+  Found: Boolean;
+begin
+  Result := nil;
+  Root := ExpandFileName(ADir);
+  if DirectoryExists(DistroJoin(Root, DISTRO_SHELL_ROOT)) then
+    Root := DistroJoin(Root, DISTRO_SHELL_ROOT);
+  if LoadShellCatalog(Root, Catalog) <> slrOk then
+    raise Exception.Create('invalid compiler shell catalog: ' + Root);
+  SetLength(Result, Length(ATriples));
+  for I := 0 to High(ATriples) do
+  begin
+    Found := False;
+    for J := 0 to High(Catalog.Entries) do
+      if Catalog.Entries[J].Triple = ATriples[I] then
+      begin
+        if Catalog.Entries[J].Version <> AVersion then
+          raise Exception.Create('shell version mismatch: ' + ATriples[I]);
+        if ShellChecksumBytes(ReadFileBytes(Catalog.Entries[J].ShellPath)) <>
+          Catalog.Entries[J].Checksum then
+          raise Exception.Create('shell checksum mismatch: ' + ATriples[I]);
+        Result[I] := Catalog.Entries[J].ShellPath;
+        Found := True;
+        Break;
+      end;
+    if not Found then
+      raise Exception.Create('missing shell: ' + ATriples[I]);
   end;
 end;
 
@@ -206,10 +319,9 @@ var
   CatalogKind: TWasmDistroCatalog;
   Status: TWasmDistroResult;
   Lines: TStringList;
-  Catalog: TWasmShellCatalog;
-  Entry: TWasmShellEntry;
-  J: Integer;
-  Found: Boolean;
+  Triples, ShellFlags, Sources: TStringArray;
+  SourceCount: Integer;
+  Bytes: TWasmBytes;
 begin
   try
     if HasFlag('help') or HasFlag('h') then
@@ -250,30 +362,41 @@ begin
       WriteLn(ErrOutput, 'pack-release: not a 0.2.0 Unix compiler host');
       Halt(1);
     end;
+    Triples := DistroHostShells(Host);
 
-    CatalogKind := wdcLive;
+    ShellFlags := ArgValues('shell');
+    SourceCount := 0;
+    if Length(ShellFlags) > 0 then
+      Inc(SourceCount);
     if ArgValue('catalog', CatalogDir) then
+      Inc(SourceCount);
+    if HasFlag('synthesize-catalog') then
+      Inc(SourceCount);
+    if SourceCount <> 1 then
     begin
-      CatalogDir := ExpandFileName(CatalogDir);
-      CatalogKind := wdcLive;
-    end
-    else if HasFlag('synthesize-catalog') then
+      WriteLn(ErrOutput, 'pack-release: pass exactly one of --shell TRIPLE=PATH, ',
+        '--catalog DIR, or --synthesize-catalog');
+      Halt(2);
+    end;
+    CatalogKind := wdcLive;
+    if Length(ShellFlags) > 0 then
+      Sources := ShellSourcesFromFlags(ShellFlags, Triples)
+    else if CatalogDir <> '' then
+      Sources := ShellSourcesFromCatalog(CatalogDir, Version, Triples)
+    else
     begin
       CatalogDir := IncludeTrailingPathDelimiter(GetTempDir) +
         'wasmlight-catalog-' + IntToHex(Random(MaxInt), 8);
-      Status := DistroSynthesizeCatalog(CatalogDir);
+      Status := DistroSynthesizeCatalog(CatalogDir, Host);
       if not Status.IsOk then
       begin
         WriteLn(ErrOutput, 'pack-release: ', Status.Detail);
         Halt(1);
       end;
+      SetLength(Sources, Length(Triples));
+      for I := 0 to High(Triples) do
+        Sources[I] := DistroJoin(CatalogDir, DistroShellRelPath(Triples[I]));
       CatalogKind := wdcFixture;
-    end
-    else
-    begin
-      WriteLn(ErrOutput,
-        'pack-release: pass --catalog DIR or --synthesize-catalog');
-      Halt(2);
     end;
 
     ForceDirectories(OutDir);
@@ -296,30 +419,15 @@ begin
         DistroJoin(Stage, DISTRO_COMPILER_NAME));
       Halt(1);
     end;
-    if DirectoryExists(DistroJoin(CatalogDir, DISTRO_SHELL_ROOT)) then
-      CatalogDir := DistroJoin(CatalogDir, DISTRO_SHELL_ROOT);
-    if LoadShellCatalog(CatalogDir, Catalog) <> slrOk then
-      raise Exception.Create('invalid compiler shell catalog: ' + CatalogDir);
-    if Length(Catalog.Entries) <> DISTRO_SHELL_COUNT then
-      raise Exception.Create('compiler shell catalog must contain four targets');
-    for I := 0 to DISTRO_SHELL_COUNT - 1 do
+    for I := 0 to High(Triples) do
     begin
-      Found := False;
-      for J := 0 to High(Catalog.Entries) do
-        if Catalog.Entries[J].Triple = DistroShell(I).Triple then
-        begin
-          Entry := Catalog.Entries[J];
-          Found := True;
-          Break;
-        end;
-      if not Found then
-        raise Exception.Create('missing shell: ' + DistroShell(I).Triple);
-      if Entry.Version <> Version then
-        raise Exception.Create('shell version mismatch: ' + Entry.Triple);
-      CopyCatalogShell(Entry, DistroJoin(Stage, DistroShellRelPath(Entry.Triple)));
-      DistroWriteShellMeta(DistroJoin(Stage, DistroMetaRelPath(Entry.Triple)), Entry.Triple);
+      Bytes := ReadFileBytes(Sources[I]);
+      if not DistroImageMatchesShell(Bytes, Triples[I]) then
+        raise Exception.Create('not a ' + Triples[I] + ' runtime shell: ' + Sources[I]);
+      WriteFileBytes(DistroJoin(Stage, DistroShellRelPath(Triples[I])), Bytes);
+      DistroWriteShellMeta(DistroJoin(Stage, DistroMetaRelPath(Triples[I])), Triples[I]);
     end;
-    DistroWriteCatalog(Stage, Version);
+    DistroWriteCatalog(Stage, Version, Triples);
     if FileExists('README.md') then
     begin
       CopyFileTo('README.md', DistroJoin(Stage, 'README.md'));
@@ -329,18 +437,18 @@ begin
     Manifest.HostTriple := Host.Triple;
     Manifest.Display := Host.Display;
     Manifest.Catalog := CatalogKind;
-    SetLength(Manifest.Shells, DISTRO_SHELL_COUNT);
+    SetLength(Manifest.Shells, Length(Triples));
     SetLength(Manifest.Files, 0);
     SetLength(Manifest.Hashes, 0);
     AddFile(Manifest.Files, DISTRO_COMPILER_NAME);
     AddFile(Manifest.Files, DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME);
     if FileExists(DistroJoin(Stage, 'README.md')) then
       AddFile(Manifest.Files, 'README.md');
-    for I := 0 to DISTRO_SHELL_COUNT - 1 do
+    for I := 0 to High(Triples) do
     begin
-      Manifest.Shells[I] := DistroShell(I).Triple;
-      AddFile(Manifest.Files, DistroShellRelPath(DistroShell(I).Triple));
-      AddFile(Manifest.Files, DistroMetaRelPath(DistroShell(I).Triple));
+      Manifest.Shells[I] := Triples[I];
+      AddFile(Manifest.Files, DistroShellRelPath(Triples[I]));
+      AddFile(Manifest.Files, DistroMetaRelPath(Triples[I]));
     end;
     SetLength(Manifest.Hashes, Length(Manifest.Files));
     for I := 0 to High(Manifest.Files) do
