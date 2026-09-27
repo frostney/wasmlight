@@ -31,8 +31,11 @@ uses
   Wasm.Core,
   Wasm.Engine,
   Wasm.Jit.CodeBuffer,
+  Wasm.Native,
   Wasm.Package.Elf,
+  Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
+  Wasm.Runtime.Values,
   Wasm.Shell,
   Wasm.Shell.Payload,
   Wasm.Wasi,
@@ -128,6 +131,7 @@ type
     procedure TestAddExitNativeOrClosed;
     procedure TestProcExitNativeOrClosed;
     procedure TestCallNativeOrClosed;
+    procedure TestNativeLeafEntriesWired;
     procedure TestMissingPayloadFile;
     procedure TestIncompletePayloadFile;
     procedure TestHelloViaPayloadFile;
@@ -441,6 +445,93 @@ begin
   Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
 end;
 
+procedure TShellTests.TestNativeLeafEntriesWired;
+const
+  { $mrw is an x64 memory leaf (three parameters, the caller instance's
+    memory); run(10) adds 1 at [64] ten times, returning 1..10, so it
+    yields 10 + (1 or 2 or ... or 10) = 25. }
+  LEAF_WAT =
+    '(module (memory 1)' + sLineBreak +
+    '  (func $mrw (export "mrw") (param $id i32) (param $d i64)' +
+    ' (param $p i32) (result i32)' + sLineBreak +
+    '    (i64.store (local.get $p) (i64.add (i64.load (local.get $p))' +
+    ' (i64.add (local.get $d) (i64.extend_i32_u (local.get $id)))))' +
+    sLineBreak +
+    '    (i32.wrap_i64 (i64.load (local.get $p))))' + sLineBreak +
+    '  (func (export "run") (param $n i32) (result i32)' +
+    ' (local $i i32) (local $s i32)' + sLineBreak +
+    '    (loop $l' + sLineBreak +
+    '      (local.set $s (i32.or (local.get $s)' +
+    ' (call $mrw (i32.const 1) (i64.const 0) (i32.const 64))))' +
+    sLineBreak +
+    '      (local.set $i (i32.add (local.get $i) (i32.const 1)))' +
+    sLineBreak +
+    '      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))' +
+    sLineBreak +
+    '    (i32.add (i32.load (i32.const 64)) (local.get $s))))';
+var
+  Bytes, Waot: TWasmBytes;
+  Loaded: TWasmLoadedModule;
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Imports: TWasmImports;
+  Inst: TWasmModuleInstance;
+  Native: TWasmNativeContext;
+  LoadRes: TWasmNativeLoadResult;
+  Kind: TWasmExternKind;
+  LeafAddr, RunAddr: UInt32;
+  P, R: array[0 .. 0] of TWasmValue;
+begin
+  Bytes := AssembleWatText(LEAF_WAT);
+  Waot := BuildNative(Bytes);
+  Loaded := nil;
+  Engine := nil;
+  Store := nil;
+  Native := nil;
+  Imports.Funcs := nil;
+  Imports.Tables := nil;
+  Imports.Mems := nil;
+  Imports.Globals := nil;
+  Imports.Tags := nil;
+  try
+    Loaded := LoadModule(Bytes);
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Inst := InstantiateModule(Store, Loaded.Ir, Loaded.BytesPtr,
+      Loaded.BytesLength, Imports);
+    Native := NativeLoadComplete(Store, Loaded, Inst, Waot, LoadRes);
+    {$IFDEF WASM_JIT_BACKEND}
+    if JitExecMemSupported then
+    begin
+      Expect<Boolean>(Native <> nil).ToBe(True);
+      Expect<Boolean>(Inst.FindExport('mrw', Kind, LeafAddr)).ToBe(True);
+      Expect<Boolean>(Inst.FindExport('run', Kind, RunAddr)).ToBe(True);
+      {$IFDEF WASM_JIT_X64}
+      { The leaf's code carries its lightweight entry at the canonical
+        entry point (test rcx, rcx selects it); the caller's leaf-call site
+        reads CompiledNativeScalarEntry and would otherwise take the helper
+        fallback on every call. }
+      Expect<Boolean>(Store.Funcs[LeafAddr].CompiledNativeScalarEntry =
+        Store.Funcs[LeafAddr].CompiledEntry).ToBe(True);
+      Expect<Boolean>(Store.Funcs[RunAddr].CompiledNativeScalarEntry = nil)
+        .ToBe(True);
+      {$ENDIF}
+      P[0] := MakeValueI32(10);
+      R[0].Bits := 0;
+      NativeInvoke(Store, RunAddr, @P[0], @R[0]);
+      Expect<UInt64>(R[0].Bits and $FFFFFFFF).ToBe(25);
+      Exit;
+    end;
+    {$ENDIF}
+    Expect<Boolean>(Native = nil).ToBe(True);
+  finally
+    Native.Free;
+    Store.Free;
+    Engine.Free;
+    Loaded.Free;
+  end;
+end;
+
 procedure TShellTests.TestMissingPayloadFile;
 var
   Res: TWasmShellResult;
@@ -579,6 +670,8 @@ begin
     TestProcExitNativeOrClosed);
   Test('a wasm-to-wasm call runs natively, or fails closed',
     TestCallNativeOrClosed);
+  Test('a native image wires x64 leaf entries for its leaf-call sites',
+    TestNativeLeafEntriesWired);
   Test('a missing payload file is rejected', TestMissingPayloadFile);
   Test('an incomplete payload file is EWasmLinkError, not interpreted',
     TestIncompletePayloadFile);
