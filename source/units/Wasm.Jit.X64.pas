@@ -1937,6 +1937,36 @@ begin
     ((AValue >= -2147483648) and (AValue <= 2147483647));
 end;
 
+{ X64CachedDestBegin, except that a deferred dynamic entry holding
+  AOperandSlot, just read and now dead (no planned read left, visible to no
+  local, result, or loop-carried use), is taken first, so a one-operand op
+  runs in place instead of copying into the other dynamic host. Taking a
+  dead entry needs no write-back, exactly as when X64PickDynamicVictim
+  picks it. }
+function X64CachedDestBeginInPlace(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlot, AOperandSlot: UInt32): Integer;
+var
+  I: Integer;
+begin
+  if ACache.WriteBackDynamics and (AOperandSlot < ACache.SlotCount) and
+    not ACache.VisibleSlots[AOperandSlot] and
+    (ACache.UseCounts[AOperandSlot] = 0) then
+  begin
+    for I := 0 to High(ACache.Entries) do
+      if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+        Exit(X64CachedDestBegin(ABuf, ACache, ASlot));
+    for I := 2 to 3 do
+      if ACache.Entries[I].Valid and
+        (ACache.Entries[I].Slot = AOperandSlot) then
+      begin
+        ACache.Entries[I].Dirty := False;
+        ACache.Next := Byte(1 - (I - 2));
+        Exit(I);
+      end;
+  end;
+  Result := X64CachedDestBegin(ABuf, ACache, ASlot);
+end;
+
 function X64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AValue: Int64;
   var ACache: TX64RegCache): Boolean;
@@ -1959,7 +1989,7 @@ begin
     Exit;
   end;
   X64ImmediateShape(AIns.Op, Kind, Subop, Wide);
-  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
+  Index := X64CachedDestBeginInPlace(ABuf, ACache, AIns.Dest, AIns.A);
   HostD := X64CacheHostReg(Index);
   case Kind of
     1:
