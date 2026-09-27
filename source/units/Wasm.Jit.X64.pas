@@ -6115,13 +6115,19 @@ var
   procedure MoveArguments;
   var
     Pending: array[0..3] of Boolean;
+    { Cycle breaking re-points a pending source at rcx while it emits; the
+      fallback emitted later (WriteCanonicalArguments) still needs the
+      original hosts, so work on a copy. }
+    Srcs: array[0..3] of Byte;
     N, M: Integer;
     Progress, Blocked, Any: Boolean;
     Dest: Byte;
   begin
+    for N := 0 to High(Srcs) do
+      Srcs[N] := SrcHosts[N];
     for N := 0 to ArgN - 1 do
-      Pending[N] := (SrcHosts[N] <> $FF) and
-        (SrcHosts[N] <> X64LeafArgReg(N));
+      Pending[N] := (Srcs[N] <> $FF) and
+        (Srcs[N] <> X64LeafArgReg(N));
     repeat
       Any := False;
       Progress := False;
@@ -6132,11 +6138,11 @@ var
           Dest := X64LeafArgReg(N);
           Blocked := False;
           for M := 0 to ArgN - 1 do
-            if Pending[M] and (M <> N) and (SrcHosts[M] = Dest) then
+            if Pending[M] and (M <> N) and (Srcs[M] = Dest) then
               Blocked := True;
           if not Blocked then
           begin
-            X64EmitMovRegReg(ABuf, Dest, SrcHosts[N]);
+            X64EmitMovRegReg(ABuf, Dest, Srcs[N]);
             Pending[N] := False;
             Progress := True;
           end;
@@ -6149,15 +6155,15 @@ var
             Dest := X64LeafArgReg(N);
             X64EmitMovRegReg(ABuf, X64_RCX, Dest);
             for M := 0 to ArgN - 1 do
-              if Pending[M] and (SrcHosts[M] = Dest) then
-                SrcHosts[M] := X64_RCX;
+              if Pending[M] and (Srcs[M] = Dest) then
+                Srcs[M] := X64_RCX;
             Break;
           end;
     until not Any;
     for N := 0 to ArgN - 1 do
       if Plan.ArgConst[N] then
         X64EmitMovRegConst(ABuf, X64LeafArgReg(N), Plan.ArgValues[N])
-      else if SrcHosts[N] = $FF then
+      else if Srcs[N] = $FF then
         X64EmitLoadSlot64(ABuf, X64LeafArgReg(N), SrcSlots[N]);
   end;
 

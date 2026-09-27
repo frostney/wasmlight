@@ -2915,6 +2915,7 @@ type
     procedure TestX64NativeCoreShape;
     procedure TestNativeLeafStaticCaller;
     procedure TestNativeLeafStaticCallerHosts;
+    procedure TestLeafCallArgumentCycleFallback;
     procedure TestX64MemoryLeafShape;
     procedure TestMemoryLeafCallers;
     procedure TestScaledIndexAroundLeafCalls;
@@ -7787,6 +7788,71 @@ begin
   end;
 end;
 
+{ A leaf call whose arguments permute their r8/r9/rdi hosts is emitted as a
+  parallel move that parks one destination in rcx. The cold fallback,
+  emitted after it, must still marshal from the ORIGINAL hosts: breaking
+  the cycle once re-pointed the shared source table at rcx, so with only
+  the callers compiled `x := f(y, x)` read x back from a slot it had never
+  stored (Fable 5.1 CR-1 on #142). Expected values come from an
+  independent model of the wasm arithmetic (i32 wrap). }
+procedure TJitTests.TestLeafCallArgumentCycleFallback;
+var
+  Bytes: TWasmBytes;
+begin
+  Bytes := AssembleWatText('(module ' +
+    '(func $f2 (export "f2") (param i32 i32) (result i32) ' +
+    ' (i32.sub (local.get 0) (local.get 1))) ' +
+    '(func $g2 (export "g2") (param i32 i32) (result i32) ' +
+    ' (i32.add (i32.mul (local.get 0) (i32.const 3)) (local.get 1))) ' +
+    '(func $f3 (export "f3") (param i32 i32 i32) (result i32) ' +
+    ' (i32.add (i32.sub (local.get 0) (i32.mul (local.get 1) (i32.const 3))) ' +
+    '  (i32.shl (local.get 2) (i32.const 1)))) ' +
+    '(func (export "ra") (param $x i32) (param $y i32) (param $n i32) ' +
+    ' (result i32) ' +
+    ' (loop $l ' +
+    '  (local.set $x (call $f2 (local.get $y) (local.get $x))) ' +
+    '  (local.set $y (call $g2 (local.get $x) (local.get $y))) ' +
+    '  (local.set $x (i32.add (local.get $x) (local.get $y))) ' +
+    '  (local.set $y (i32.xor (local.get $y) (local.get $x))) ' +
+    '  (local.set $n (i32.sub (local.get $n) (i32.const 1))) ' +
+    '  (br_if $l (local.get $n))) ' +
+    ' (i32.add (local.get $x) (local.get $y))) ' +
+    '(func (export "rot2") (param $x i32) (param $y i32) (param $z i32) ' +
+    ' (param $n i32) (result i32) ' +
+    ' (loop $l ' +
+    '  (local.set $x (call $f3 (local.get $z) (local.get $x) (local.get $y))) ' +
+    '  (local.set $y (i32.xor (local.get $y) (local.get $x))) ' +
+    '  (local.set $z (i32.add (local.get $z) (local.get $y))) ' +
+    '  (local.set $n (i32.sub (local.get $n) (i32.const 1))) ' +
+    '  (br_if $l (local.get $n))) ' +
+    ' (i32.add (i32.add (local.get $x) (local.get $y)) (local.get $z))))');
+  { Callers only: every call takes the fallback. }
+  CompileExports(['ra', 'rot2']);
+  Expect<Boolean>(DiffFresh(Bytes, 'ra', [MakeValueI32(7), MakeValueI32(3),
+    MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(11411);
+  Expect<Boolean>(DiffFresh(Bytes, 'ra', [MakeValueI32(-4), MakeValueI32(9),
+    MakeValueI32(40)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(441928818);
+  Expect<Boolean>(DiffFresh(Bytes, 'rot2', [MakeValueI32(7),
+    MakeValueI32(3), MakeValueI32(5), MakeValueI32(6)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(699);
+  Expect<Boolean>(DiffFresh(Bytes, 'rot2', [MakeValueI32(123),
+    MakeValueI32(-7), MakeValueI32(55), MakeValueI32(33)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt32(-659344518));
+  { Every function compiled: the lightweight path, same values. }
+  CompileExports(['ra', 'rot2', 'f2', 'g2', 'f3']);
+  Expect<Boolean>(DiffFresh(Bytes, 'ra', [MakeValueI32(7), MakeValueI32(3),
+    MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(11411);
+  Expect<Boolean>(DiffFresh(Bytes, 'rot2', [MakeValueI32(7),
+    MakeValueI32(3), MakeValueI32(5), MakeValueI32(6)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(699);
+end;
+
 procedure TJitTests.TestNativeLeafStaticCallerHosts;
 var
   Bytes: TWasmBytes;
@@ -10596,6 +10662,8 @@ begin
     TestNativeLeafStaticCaller);
   Test('rdi/rdx static hosts survive native leaf calls',
     TestNativeLeafStaticCallerHosts);
+  Test('a permuted leaf-call argument move keeps the fallback exact',
+    TestLeafCallArgumentCycleFallback);
   Test('x64 memory leaves run frameless and callers pass Base in rsi',
     TestX64MemoryLeafShape);
   Test('memory and four-parameter leaves match independent values in every mix',
