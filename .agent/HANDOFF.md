@@ -10,8 +10,8 @@
   (the `return_call` tail-cap decline) were reopened. New gaps are tracked in
   #146 (connector plan loading), #148 (cross-architecture emission), #149
   (Windows preopen containment bug), and #150 (stale docs).
-- **New release order.** Milestones were renamed in place and every issue
-  body updated:
+- **New release order.** Milestones were renamed in place, and every issue
+  body that named a milestone or the sequence was updated:
   - 0.2.0: a usable compiler. #33, #40, #46 narrowed to same-architecture
     archives plus a live catalog, #146, #149, #150.
   - 0.3.0: WASI P1 judged by wasi-testsuite (#78–#85) plus #148.
@@ -21,7 +21,7 @@
   - 0.5.0: Win64 (#47–#53, #151, #152). #49 is now a baseline ABI with the
     SysV fast paths off.
   - 0.6.0: i386 (#54–#61).
-  - 0.7.0: observability.
+  - 0.7.0: observability (#86–#90).
 - **Connector language:** WIT was rejected (ADR-0015 note, PR #147). Any
   future support for WIT-built guests must reuse the canonical ABI's flat
   lowering.
