@@ -149,6 +149,36 @@
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (i32.add (local.get $s) (local.get $x)))
 
+  ;; One leaf with select: rdx is its scratch, so a single-target caller
+  ;; must not keep a local in rdx across the call.
+  (func (export "loopsel3") (param $n i32) (result i32)
+    (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $i i32)
+    (local.set $a (i32.const 5)) (local.set $b (i32.const 6))
+    (local.set $c (i32.const 7)) (local.set $d (i32.const 8))
+    (loop $l
+      (local.set $a (call $sel3 (local.get $a)
+        (i32.xor (local.get $b) (local.get $i))
+        (i32.and (local.get $i) (i32.const 1))))
+      (local.set $b (i32.add (local.get $b) (local.get $a)))
+      (local.set $c (i32.xor (local.get $c)
+        (i32.mul (local.get $b) (i32.const 5))))
+      (local.set $d (i32.add (local.get $d)
+        (i32.xor (local.get $c) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (i32.xor (local.get $a) (local.get $b))
+             (i32.xor (local.get $c) (local.get $d))))
+
+  ;; An i64 constant argument whose upper half the leaf reads.
+  (func (export "wide") (param $n i32) (result i64)
+    (local $acc i64) (local $i i32)
+    (loop $l
+      (local.set $acc (i64.add (local.get $acc)
+        (call $l3 (local.get $i) (i64.const 0x123456789abc) (i32.const -6))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $acc))
+
   (func (export "loopsel") (param $n i32) (result i32)
     (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32)
     (local $i i32)
@@ -342,6 +372,10 @@
 (assert_return (invoke "loopord" (i32.const 19)) (i32.const -256435135))
 (assert_return (invoke "teeargs" (i32.const 1)) (i32.const 1113))
 (assert_return (invoke "teeargs" (i32.const 9)) (i32.const 73965))
+(assert_return (invoke "loopsel3" (i32.const 1)) (i32.const 50))
+(assert_return (invoke "loopsel3" (i32.const 40)) (i32.const -12032))
+(assert_return (invoke "wide" (i32.const 1)) (i64.const -20015998343236))
+(assert_return (invoke "wide" (i32.const 5)) (i64.const -100079991716150))
 (assert_return (invoke "loopsel" (i32.const 1)) (i32.const 57))
 (assert_return (invoke "loopsel" (i32.const 2)) (i32.const 175))
 (assert_return (invoke "loopsel" (i32.const 33)) (i32.const 73803))

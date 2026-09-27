@@ -190,6 +190,27 @@ class Machine:
                 break
         return w32(s + x)
 
+    def loopsel3(self, n):
+        a, b, c, d, i = 5, 6, 7, 8, 0
+        while True:
+            a = self.sel3(a, w32(b ^ i), w32(i & 1))
+            b = w32(b + a)
+            c = w32(c ^ w32(b * 5))
+            d = w32(d + w32(c ^ i))
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return w32(w32(a ^ b) + w32(c ^ d))
+
+    def wide(self, n):
+        acc, i = 0, 0
+        while True:
+            acc = w64(acc + self.l3(i, 0x123456789ABC, M32 - 5))
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return acc
+
     def loopsel(self, n):
         a, b, c, d, e, i = 9, 4, 1, 0, 0, 0
         while True:
@@ -461,6 +482,36 @@ WAT = r'''
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (i32.add (local.get $s) (local.get $x)))
 
+  ;; One leaf with select: rdx is its scratch, so a single-target caller
+  ;; must not keep a local in rdx across the call.
+  (func (export "loopsel3") (param $n i32) (result i32)
+    (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $i i32)
+    (local.set $a (i32.const 5)) (local.set $b (i32.const 6))
+    (local.set $c (i32.const 7)) (local.set $d (i32.const 8))
+    (loop $l
+      (local.set $a (call $sel3 (local.get $a)
+        (i32.xor (local.get $b) (local.get $i))
+        (i32.and (local.get $i) (i32.const 1))))
+      (local.set $b (i32.add (local.get $b) (local.get $a)))
+      (local.set $c (i32.xor (local.get $c)
+        (i32.mul (local.get $b) (i32.const 5))))
+      (local.set $d (i32.add (local.get $d)
+        (i32.xor (local.get $c) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (i32.xor (local.get $a) (local.get $b))
+             (i32.xor (local.get $c) (local.get $d))))
+
+  ;; An i64 constant argument whose upper half the leaf reads.
+  (func (export "wide") (param $n i32) (result i64)
+    (local $acc i64) (local $i i32)
+    (loop $l
+      (local.set $acc (i64.add (local.get $acc)
+        (call $l3 (local.get $i) (i64.const 0x123456789abc) (i32.const -6))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $acc))
+
   (func (export "loopsel") (param $n i32) (result i32)
     (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32)
     (local $i i32)
@@ -657,6 +708,10 @@ COMMANDS = [
     ('loopord', 'i', (19,)),
     ('teeargs', 'i', (1,)),
     ('teeargs', 'i', (9,)),
+    ('loopsel3', 'i', (1,)),
+    ('loopsel3', 'i', (40,)),
+    ('wide', 'i', (1,)),
+    ('wide', 'i', (5,)),
     ('loopsel', 'i', (1,)),
     ('loopsel', 'i', (2,)),
     ('loopsel', 'i', (33,)),
@@ -751,7 +806,8 @@ def main():
             lines.append('(assert_exhaustion %s "call stack exhausted")'
                          % call)
             continue
-        kind = 'I' if name in ('l3', 'loop3', 'ldall', 'peek', 'loopmem') \
+        kind = 'I' if name in ('l3', 'loop3', 'ldall', 'peek', 'loopmem',
+                               'wide') \
             else 'i'
         lines.append('(assert_return %s %s)' % (call, const(kind, result)))
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
