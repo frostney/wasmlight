@@ -132,7 +132,19 @@ type
     Entries: array[0..3] of TX64RegCacheEntry;
     Next: Byte;
     StaticAllocation: Boolean;
-    FixedWriteThrough: Boolean;
+    { Native scalar core (leaf or self): Entries[0..NativeFixedCount-1] fix
+      the parameters in r8/r9, arriving in the native ABI registers with
+      their slots unwritten. A fixed entry tracks Dirty like a dynamic one
+      and is written back only where X64EntryNeedsWriteBack says a later
+      read can observe the slot. }
+    NativeCore: Boolean;
+    NativeFixedCount: Byte;
+    { Native self core only: a native self call clobbers r8, so a fixed
+      entry may be non-resident (Valid False, its Slot canonical in the
+      frame) after one. A read or write makes it resident again, every
+      canonical point (branch, jump, join fall-through) reloads it, and a
+      join assumes it resident and dirty. }
+    NativeSelfReload: Boolean;
     { Static allocation only: r10/r11 defer their register-file stores until
       eviction or a canonical point (branch, join, exit), and skip them for a
       temporary whose planned reads are exhausted and that no local, result,
@@ -509,9 +521,15 @@ function X64EmitOp(const ABuf: TWasmCodeBuffer;
   const AUseNativeScalarCall: Boolean = False;
   const ADirectCallee: PX64DirectCallee = nil): Boolean;
 procedure X64InitRegCache(out ACache: TX64RegCache);
+{ The native scalar core's cache: the parameters are fixed in r8/r9 (dirty:
+  neither the leaf entry nor the self call stores them), r10/r11 are the
+  dynamic pair. ASelf marks the self-recursive core, whose native self call
+  may leave a fixed host non-resident. Follow with X64EnableDynamicWriteBack
+  for deferred stores; without it every dirty value is still stored where a
+  write-back is due. }
 procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
   const AParamCount, AParam0Slot, AParam1Slot: UInt32;
-  const AStaticParams: Boolean = True);
+  const ASelf: Boolean = False);
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlots: array of UInt32);
 { Mark a static allocation as base-pinned: rsi holds the memory Base (see
@@ -642,6 +660,8 @@ procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
 function X64CachedOperand(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlot: UInt32; const AProtect: Byte;
   out AProtectMoved: Boolean): Byte; forward;
+procedure X64PrepareNativeSelfCall(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache); forward;
 procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
   const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
   AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache); forward;
@@ -1006,10 +1026,16 @@ begin
     iroCall:
       if ANativeScalarSelf then
       begin
-        X64FlushDynamicRegCache(ABuf, ACache);
-        X64CachedLoad(ABuf, ACache, X64_R8,
-          IrAuxBlockItem(AAux, AIns.A, 0));
-        X64InvalidateRegCache(ACache);
+        { r8 carries the one argument and result. Read the argument first,
+          so a dead expression is never stored; then write back exactly the
+          values a later read in this frame can observe (the callee's frame
+          is a fresh region, so this frame's slots survive the call). The
+          callee receives its parameter unstored, as a dirty fixed host. }
+        Host := X64CachedOperand(ABuf, ACache,
+          IrAuxBlockItem(AAux, AIns.A, 0), $FF, Moved);
+        X64PrepareNativeSelfCall(ABuf, ACache);
+        if Host <> X64_R8 then
+          X64EmitMovRegReg(ABuf, X64_R8, Host);
         X64EmitNativeSelfCall(ABuf, ANativeRegisterCount, ANativeParamReg,
           ANativeCoreLabel, ANativeExhaustedLabel);
         X64CachedStore(ABuf, ACache, X64_R8,
@@ -1120,18 +1146,21 @@ end;
 
 procedure X64SeedNativeCoreCache(var ACache: TX64RegCache;
   const AParamCount, AParam0Slot, AParam1Slot: UInt32;
-  const AStaticParams: Boolean);
+  const ASelf: Boolean);
 begin
   X64InitRegCache(ACache);
-  ACache.StaticAllocation := AStaticParams;
-  ACache.FixedWriteThrough := AStaticParams;
+  ACache.StaticAllocation := True;
+  ACache.NativeCore := True;
+  ACache.NativeSelfReload := ASelf;
+  ACache.NativeFixedCount := 1;
   ACache.Entries[0].Valid := True;
+  ACache.Entries[0].Dirty := True;
   ACache.Entries[0].Slot := AParam0Slot;
-  if not AStaticParams then
-    ACache.Next := 1;
   if AParamCount = 2 then
   begin
+    ACache.NativeFixedCount := 2;
     ACache.Entries[1].Valid := True;
+    ACache.Entries[1].Dirty := True;
     ACache.Entries[1].Slot := AParam1Slot;
   end;
 end;
@@ -1203,6 +1232,68 @@ begin
   if ACache.WriteBackDynamics and (ASlot < ACache.SlotCount) and
     (ACache.UseCounts[ASlot] > 0) then
     Dec(ACache.UseCounts[ASlot]);
+end;
+
+{ Native self core: make a non-resident fixed entry resident again, from the
+  dynamic entry now holding its slot (dropped afterwards, so no slot has two
+  hosts) or else from the slot, which the self call's write-back left
+  canonical. Callers spill the dynamic entries first. }
+procedure X64ReloadNativeFixed(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
+var
+  I, J: Integer;
+  Found: Boolean;
+begin
+  if not ACache.NativeSelfReload then
+    Exit;
+  for I := 0 to ACache.NativeFixedCount - 1 do
+    if not ACache.Entries[I].Valid then
+    begin
+      Found := False;
+      for J := 2 to 3 do
+        if ACache.Entries[J].Valid and
+          (ACache.Entries[J].Slot = ACache.Entries[I].Slot) then
+        begin
+          X64EmitMovRegReg(ABuf, X64CacheHostReg(I), X64CacheHostReg(J));
+          { The spill may have skipped a store its liveness did not need;
+            keep the fixed copy dirty so a later write-back decides again. }
+          ACache.Entries[I].Dirty := True;
+          ACache.Entries[J].Valid := False;
+          ACache.Entries[J].Dirty := False;
+          Found := True;
+          Break;
+        end;
+      if not Found then
+      begin
+        X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+        ACache.Entries[I].Dirty := False;
+      end;
+      ACache.Entries[I].Valid := True;
+    end;
+end;
+
+{ Native self core, at the self call: store each dirty fixed parameter a
+  later read can observe (the callee frame is a fresh region, so the
+  caller's slot survives the call), spill the dynamic pair by the same rule,
+  and mark the fixed hosts non-resident: the call clobbers r8-r11. }
+procedure X64PrepareNativeSelfCall(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache);
+var
+  I: Integer;
+begin
+  for I := 0 to ACache.NativeFixedCount - 1 do
+    if ACache.Entries[I].Valid then
+    begin
+      X64SpillCacheEntry(ABuf, ACache, I);
+      ACache.Entries[I].Valid := False;
+      ACache.Entries[I].Dirty := False;
+    end;
+  for I := 2 to 3 do
+  begin
+    X64SpillCacheEntry(ABuf, ACache, I);
+    ACache.Entries[I].Valid := False;
+  end;
+  ACache.Next := 0;
 end;
 
 { --- the v128 xmm cache ---------------------------------------------------
@@ -1414,6 +1505,9 @@ begin
   if ACache.VecCache then
     for I := 0 to High(ACache.VecEntries) do
       X64VecSpill(ABuf, ACache, I);
+  { Every canonical point leaves the native self core's parameter hosts
+    resident: the join state X64InvalidateRegCache assumes. }
+  X64ReloadNativeFixed(ABuf, ACache);
 end;
 
 procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
@@ -1424,7 +1518,8 @@ begin
   if not ACache.StaticAllocation then
     Exit;
   for I := 0 to 1 do
-    if ACache.Entries[I].Valid then
+    if ACache.Entries[I].Valid and
+      not (ACache.NativeCore and not ACache.Entries[I].Dirty) then
       X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
   { Fixed v128 hosts need no store: the driver fixes only declared locals
     and parameters and constant temporaries, and no exit reads either — a
@@ -1445,6 +1540,11 @@ begin
     ACache.Entries[3].Valid := False;
     ACache.Entries[3].Dirty := False;
     ACache.Next := 0;
+    { A native core's parameter hosts survive, but whether a predecessor
+      stored one is path-dependent: assume dirty. }
+    if ACache.NativeCore then
+      for I := 0 to ACache.NativeFixedCount - 1 do
+        ACache.Entries[I].Dirty := True;
     for I := 0 to High(ACache.VecEntries) do
       if not ACache.VecEntries[I].Fixed then
       begin
@@ -1478,6 +1578,19 @@ begin
       X64ConsumeUse(ACache, ASlot);
       Exit;
     end;
+  { A non-resident native-core parameter reloads into its own fixed host,
+    which holds nothing else (the self call left its slot canonical). }
+  if ACache.NativeSelfReload then
+    for I := 0 to ACache.NativeFixedCount - 1 do
+      if ACache.Entries[I].Slot = ASlot then
+      begin
+        Result := X64CacheHostReg(I);
+        X64EmitLoadSlot64(ABuf, Result, ASlot);
+        ACache.Entries[I].Valid := True;
+        ACache.Entries[I].Dirty := False;
+        X64ConsumeUse(ACache, ASlot);
+        Exit;
+      end;
   if ACache.WriteBackDynamics then
     Victim := X64PickDynamicVictim(ACache)
   else if ACache.StaticAllocation then
@@ -1550,6 +1663,12 @@ begin
       ASlot is superseded, as in X64CachedStore. }
     if Result >= 0 then
       Exit;
+    { A non-resident native-core parameter is written into its own fixed
+      host (Commit marks it resident and dirty). }
+    if ACache.NativeSelfReload then
+      for I := 0 to ACache.NativeFixedCount - 1 do
+        if ACache.Entries[I].Slot = ASlot then
+          Exit(I);
     if ACache.WriteBackDynamics then
     begin
       Result := X64PickDynamicVictim(ACache);
@@ -1580,8 +1699,13 @@ begin
   begin
     if AIndex <= 1 then
     begin
-      if ACache.FixedWriteThrough then
-        X64EmitStoreSlot64(ABuf, Host, ASlot);
+      { A native-core parameter host holds the only current copy until a
+        write-back proves a later read needs the slot. }
+      if ACache.NativeCore then
+      begin
+        ACache.Entries[AIndex].Valid := True;
+        ACache.Entries[AIndex].Dirty := True;
+      end;
       Exit;
     end;
     if not (ACache.WriteBackDynamics or AStoreEmitted) then
@@ -3549,11 +3673,10 @@ begin
   X64EmitPushReg(ABuf, X64_RBX);
   X64EmitSubRsp(ABuf, Int32(FrameBytes));
   X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RSP);
-  { Keep the native frame canonical as well as register-cached. This makes the
-    bridge safe if an eligible operation uses a memory-backed template. }
-  X64EmitStoreSlot64(ABuf, X64_R8, AParam0Reg);
-  if AParamCount = 2 then
-    X64EmitStoreSlot64(ABuf, X64_R9, AParam1Reg);
+  { The parameters stay unstored: the core fixes them in r8/r9 as dirty
+    hosts, every leaf op is cache-emitted (never a memory-backed template),
+    and the straight-line leaf has no call, branch, or trap that could read
+    a slot. The frame backs only dynamic-entry spills. }
   X64EmitCallTo(ABuf, ACoreLabel);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
   X64EmitPopReg(ABuf, X64_RBX);
@@ -3602,24 +3725,26 @@ procedure X64EmitNativeSelfCall(const ABuf: TWasmCodeBuffer;
 var
   FrameBytes: UInt32;
 begin
-  { Test and decrement before native-stack mutation. Ordinary calls are not
-    epoch safepoints; real IR back-edges retain their existing checks. }
-  X64EmitAluRegReg(ABuf, $85, True, X64_R12, X64_R12);
-  X64EmitJccTo(ABuf, X64_CC_E, UInt32(AExhaustedLabel));
-  X64EmitMovRegImm32(ABuf, X64_RAX, 1);
-  X64EmitAluRegReg(ABuf, $29, True, X64_R12, X64_RAX);
+  { Subtract-and-test the exact budget before native-stack mutation: the
+    borrow (CF) is set exactly when the budget was already zero, the old
+    `test; je` condition. The exhausted path traps without returning and
+    unwinds to the invocation trampoline, which restores r12 itself, so the
+    underflowed value is never read. Ordinary calls are not epoch
+    safepoints; real IR back-edges retain their existing checks. }
+  X64EmitAluRegImm8(ABuf, 5, True, X64_R12, 1);            { sub r12, 1 }
+  X64EmitJccTo(ABuf, X64_CC_B, UInt32(AExhaustedLabel));
 
+  { The callee core receives its parameter in r8 as a dirty fixed host and
+    stores it only if a read of its slot follows (AParamReg is unused). }
   FrameBytes := (ARegisterCount * X64_SLOT_SIZE + 15) and not UInt32(15);
   X64EmitPushReg(ABuf, X64_RBX);
   X64EmitSubRsp(ABuf, Int32(FrameBytes));
   X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RSP);
-  X64EmitStoreSlot64(ABuf, X64_R8, AParamReg);
   X64EmitCallTo(ABuf, ACoreLabel);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
   X64EmitPopReg(ABuf, X64_RBX);
 
-  X64EmitMovRegImm32(ABuf, X64_RAX, 1);
-  X64EmitAluRegReg(ABuf, $01, True, X64_R12, X64_RAX);
+  X64EmitAluRegImm8(ABuf, 0, True, X64_R12, 1);            { add r12, 1 }
 end;
 
 procedure X64EmitPinHelperTable(const ABuf: TWasmCodeBuffer;

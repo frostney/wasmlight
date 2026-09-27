@@ -2838,7 +2838,7 @@ begin
     AnalyzeDynamicWriteBack;
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
-    if UseStaticCache then
+    if UseStaticCache or UseNativeScalarCore then
     begin
       { Masked-shift fusion is ARM64-only; the shared liveness walk reads its
         plan, so give x64 the empty one. }
@@ -2927,8 +2927,18 @@ begin
         UsePinnedMemoryBase and UseStaticCache);
     X64InitRegCache(X64Cache);
     if UseNativeScalarCore then
+    begin
       X64SeedNativeCoreCache(X64Cache, NativeParamCount, NativeParamReg,
-        NativeParam1Reg, UseNativeScalarLeaf)
+        NativeParam1Reg, UseNativeScalarSelf);
+      { The closed helper-free native core defers its stores like ARM64's:
+        its only exits are return (the caller reads r8 alone), the
+        non-returning exhaustion and epoch traps (the trampoline reads no
+        slot), and the native self call, which writes back just the values
+        this frame reads after it. Branches, joins and back-edges write back
+        what a later read, local, result, or loop-carried use can observe. }
+      X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
+    end
     else if UseStaticCache then
     begin
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
