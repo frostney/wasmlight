@@ -73,6 +73,15 @@
     (i64.load (local.get $p)))
   (func $m0get (export "m0get") (param $p i32) (result i32)
     (i32.load (local.get $p)))
+  ;; Enough live values to spill: a leaf with a frame of its own.
+  (func $quad (export "quad") (param $p i32) (result i32)
+    (i32.add
+      (i32.add (i32.load (local.get $p))
+               (i32.load (i32.add (local.get $p) (i32.const 4))))
+      (i32.mul
+        (i32.xor (i32.load (i32.add (local.get $p) (i32.const 8)))
+                 (i32.load (i32.add (local.get $p) (i32.const 12))))
+        (i32.const 3))))
 
   ;; --- outside the leaf proof ------------------------------------------
   ;; A fourth parameter lives in rdx, which select needs.
@@ -278,6 +287,15 @@
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (i32.add (local.get $s) (i32.load (local.get $p))))
 
+  (func (export "quadloop") (param $n i32) (param $p i32) (result i32)
+    (local $s i32) (local $i i32)
+    (loop $l
+      (local.set $s (i32.add (local.get $s) (call $quad (i32.add (local.get $p)
+        (i32.mul (local.get $i) (i32.const 4))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $s))
+
   ;; memory.grow between leaf calls: the leaf must see the new Base/size.
   (func (export "growloop") (param $n i32) (result i32)
     (local $s i32) (local $i i32) (local $top i32)
@@ -380,6 +398,11 @@
 (assert_return (invoke "loopsel" (i32.const 2)) (i32.const 175))
 (assert_return (invoke "loopsel" (i32.const 33)) (i32.const 73803))
 (assert_return (invoke "fill" (i32.const 0) (i32.const 96)) (i32.const 0))
+(assert_return (invoke "quad" (i32.const 0)) (i32.const -1836521902))
+(assert_return (invoke "quad" (i32.const 17)) (i32.const 1691519364))
+(assert_return (invoke "quadloop" (i32.const 9) (i32.const 3)) (i32.const 817884752))
+(assert_trap (invoke "quad" (i32.const 65524)) "out of bounds memory access")
+(assert_trap (invoke "quad" (i32.const 65525)) "out of bounds memory access")
 (assert_return (invoke "ldall" (i32.const 0)) (i64.const -8908337655592307700))
 (assert_return (invoke "ldall" (i32.const 3)) (i64.const -878578482204331712))
 (assert_return (invoke "ldall" (i32.const 65)) (i64.const -1601980211090399032))

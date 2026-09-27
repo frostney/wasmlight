@@ -139,6 +139,20 @@ class Machine:
     def peek(self, p):
         return self.load(0, p, 8)
 
+    def quad(self, p):
+        return w32(w32(self.load(0, p, 4) + self.load(0, w32(p + 4), 4)) +
+                   w32(w32(self.load(0, w32(p + 8), 4) ^
+                           self.load(0, w32(p + 12), 4)) * 3))
+
+    def quadloop(self, n, p):
+        s, i = 0, 0
+        while True:
+            s = w32(s + self.quad(w32(p + w32(i * 4))))
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return s
+
     def ident(self, a, b, c):
         return c
 
@@ -406,6 +420,15 @@ WAT = r'''
     (i64.load (local.get $p)))
   (func $m0get (export "m0get") (param $p i32) (result i32)
     (i32.load (local.get $p)))
+  ;; Enough live values to spill: a leaf with a frame of its own.
+  (func $quad (export "quad") (param $p i32) (result i32)
+    (i32.add
+      (i32.add (i32.load (local.get $p))
+               (i32.load (i32.add (local.get $p) (i32.const 4))))
+      (i32.mul
+        (i32.xor (i32.load (i32.add (local.get $p) (i32.const 8)))
+                 (i32.load (i32.add (local.get $p) (i32.const 12))))
+        (i32.const 3))))
 
   ;; --- outside the leaf proof ------------------------------------------
   ;; A fourth parameter lives in rdx, which select needs.
@@ -611,6 +634,15 @@ WAT = r'''
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (i32.add (local.get $s) (i32.load (local.get $p))))
 
+  (func (export "quadloop") (param $n i32) (param $p i32) (result i32)
+    (local $s i32) (local $i i32)
+    (loop $l
+      (local.set $s (i32.add (local.get $s) (call $quad (i32.add (local.get $p)
+        (i32.mul (local.get $i) (i32.const 4))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $s))
+
   ;; memory.grow between leaf calls: the leaf must see the new Base/size.
   (func (export "growloop") (param $n i32) (result i32)
     (local $s i32) (local $i i32) (local $top i32)
@@ -716,6 +748,11 @@ COMMANDS = [
     ('loopsel', 'i', (2,)),
     ('loopsel', 'i', (33,)),
     ('fill', 'ii', (0, 96)),
+    ('quad', 'i', (0,)),
+    ('quad', 'i', (17,)),
+    ('quadloop', 'ii', (9, 3)),
+    ('quad', 'i', (65524,)),
+    ('quad', 'i', (65525,)),
     ('ldall', 'i', (0,)),
     ('ldall', 'i', (3,)),
     ('ldall', 'i', (65,)),
