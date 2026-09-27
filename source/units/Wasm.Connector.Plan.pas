@@ -14,9 +14,16 @@
   CheckConnectorPlanForModule is the startup re-validation: it re-resolves
   the plan's own (already stripped) connectors against the embedded
   module's imports and requires the re-encoded result to equal the section
-  byte for byte. A plan edited to bind a different symbol, library, or
-  signature than resolution produces is rejected before any library loads.
-  This does not load a library or emit machine code.
+  byte for byte. A thunk that disagrees with its own declaration, or a plan
+  resolved for another module, is rejected before any library loads.
+  Whole-section integrity is the payload's checksum and section hash; the
+  payload is not a trust boundary (ADR-0015). This does not load a library
+  or emit machine code.
+
+  The fixed-width primitives mirror Wasm.Native.Payload's private ones
+  rather than sharing them: that unit's reader stays private to its own
+  container, and this decoder reports a sticky TWlcPlanDecodeResult reason
+  where the payload reader keeps a Boolean.
 
   WHY FIXED-WIDTH LE, like Wasm.Native.Payload: the section is an internal
   container, so every count and length is checked against the remaining

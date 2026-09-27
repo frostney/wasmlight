@@ -6,9 +6,8 @@
   except the documented `run` pre-scan (see AGENTS.md).
 
   `compile` emits an interpreter-free native executable for a released
-  64-bit UNIX `--target` (WASI preview1 only; connector host functions
-  are not embedded). There is never a `.waot`, JIT, or interpreter
-  fallback. }
+  64-bit UNIX `--target`: WASI preview1 plus the `--connector` plan it
+  embeds. There is never a `.waot`, JIT, or interpreter fallback. }
 program wasmlight;
 
 {$I Shared.inc}

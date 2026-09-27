@@ -48,8 +48,9 @@ state, or adapter expression language.
 
 ## Marshalling used for matching
 
-Fixed lowering, for signature comparison only. ABI placement and memory
-copies are later work.
+Fixed lowering, for signature comparison only. The C ABI and memory
+lowering a compiled executable calls through is in
+[Embedding and startup](#embedding-and-startup).
 
 - Integers through 32 bits, `bool`, and `char` become `i32`; 64-bit
   integers become `i64`; `float`/`double` become `f32`/`f64`.
@@ -91,8 +92,10 @@ At startup the runtime shell:
    `SizeParamIndex`, a non-numeric wasm type, or a trailing byte is
    `EWasmLinkError: malformed connector plan`, never a partial plan;
 2. re-resolves the decoded connectors against the embedded module and
-   requires the result to re-encode to the same bytes, so an edited
-   symbol, library, or signature is rejected the same way;
+   requires the result to re-encode to the same bytes, so a thunk that
+   does not match its own declaration, or a plan for another module, is
+   rejected the same way (whole-section integrity is the payload's own
+   checksum and section hash);
 3. loads each plan library once, before instantiation, through
    `Wasm.Native.Load`: a bare name gains the platform file name beside the
    executable, a relative path joins the executable directory, an absolute
@@ -114,7 +117,7 @@ marshalling. Scalars pass by value:
 
 | Declaration | C type | Guest value |
 | --- | --- | --- |
-| `sbyte`, `short`, `int`, `long` (and `Int8`…`Int64`) | signed, same width | truncated from `i32`/`i64` in, sign-extended out |
+| `sbyte`, `short`, `int`, `long` (and `SByte`, `Int16`, `Int32`, `Int64`) | signed, same width | truncated from `i32`/`i64` in, sign-extended out |
 | `byte`, `ushort`, `char`, `uint`, `ulong` | unsigned, same width | truncated in, zero-extended out |
 | `float`, `double` | `float`, `double` | `f32`, `f64` |
 | `bool` / `MarshalAs(Bool)` | C `bool` (one byte) | non-zero `i32` in is `1`; result is `0` or `1` |
