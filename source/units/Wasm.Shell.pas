@@ -8,10 +8,14 @@
        or, for the attach-seam tests, the temporary WSHL envelope.
     3. Re-decode and re-validate the embedded module (LoadModule). That
        fresh validation is the safety oracle, same as `run --aot`.
-    4. Reject a non-empty connector plan or capability set — compiled
-       WASI is deny-by-default (stdio + clock + random); connector host
-       functions and compiled `--dir`/`--env` apply later.
-    5. Link deny-by-default WASI, instantiate, and require exported
+    4. Reject a non-empty capability set — compiled WASI is
+       deny-by-default (stdio + clock + random); compiled `--dir`/`--env`
+       apply later.
+    5. Link deny-by-default WASI plus the embedded connector plan: the plan
+       is decoded strictly and re-resolved against the module
+       (Wasm.Connector.Plan), its application-local libraries are loaded
+       beside the executable, and Wasm.Connector.Host turns each bound
+       import into a host function. Instantiate, and require exported
        memory + `_start`.
     6. Wire ONLY a complete native image (Wasm.Native). Incomplete or
        incompatible code is EWasmLinkError; there is no interpreter
@@ -31,6 +35,7 @@ uses
   Classes,
   SysUtils,
 
+  Wasm.Connector.Host,
   Wasm.Core,
   Wasm.Engine,
   Wasm.MachO,
@@ -106,6 +111,11 @@ function ExtractPackagedPayloadFromFile(const APath: string;
   out APayload: TWasmBytes): Boolean;
 
 implementation
+
+uses
+  Wasm.Connector.Plan,
+  Wasm.Connector.Resolve,
+  Wasm.Native.Load;
 
 type
   PWasmNativePayload = ^TWasmNativePayload;
@@ -211,6 +221,22 @@ begin
   Result := AInstance.FindExportFunc('_initialize', Fn);
 end;
 
+{ nil for an empty connector-plan section. A malformed or inconsistent
+  plan, a missing library or symbol, or an unsupported lowering is
+  EWasmLinkError before instantiation. }
+function LoadShellConnectors(const ALoaded: TWasmLoadedModule;
+  const AConnector: TWasmBytes): TWasmConnectorHost;
+var
+  Plan: TWlcConnectorPlan;
+begin
+  Result := nil;
+  if Length(AConnector) = 0 then
+    Exit;
+  Plan := CheckConnectorPlanForModule(AConnector, ALoaded.Model,
+    [WLC_WASI_MODULE]);
+  Result := TWasmConnectorHost.Create(Plan, NativeExecutableDirectory);
+end;
+
 function RunLoadedShellCore(const ALoaded: TWasmLoadedModule;
   const AConnector, ACapability: TWasmBytes;
   const AConfig: TWasmWasiConfig; const AWaot: TWasmBytes;
@@ -227,6 +253,7 @@ var
   StartFn: TWasmFunc;
   Imports: TWasmImports;
   Inst: TWasmModuleInstance;
+  Connectors: TWasmConnectorHost;
 begin
   Result.ExitCode := 0;
   Result.Diagnostic := '';
@@ -235,8 +262,6 @@ begin
   if (AConfig = nil) or (ALoaded = nil) then
     Exit(FailResult('shell needs a module and a WASI config'));
 
-  if Length(AConnector) > 0 then
-    Exit(FailResult('EWasmLinkError: connector plan is not yet loadable'));
   if Length(ACapability) > 0 then
     Exit(FailResult('EWasmLinkError: compiled capability set is not yet loadable'));
 
@@ -246,6 +271,7 @@ begin
   Context := nil;
   Instance := nil;
   Native := nil;
+  Connectors := nil;
   try
     Engine := TWasmEngine.Create;
     Store := TWasmStore.Create(Engine);
@@ -255,6 +281,9 @@ begin
 
     try
       WasiCheckCommandEntry(ALoaded);
+      Connectors := LoadShellConnectors(ALoaded, AConnector);
+      if Connectors <> nil then
+        Connectors.DefineImports(Linker);
       Imports := Linker.ResolveImports(ALoaded);
       Inst := InstantiateModule(Store, ALoaded.Ir, ALoaded.BytesPtr,
         ALoaded.BytesLength, Imports);
@@ -325,6 +354,7 @@ begin
     Native.Free;
     Context.Free;
     Linker.Free;
+    Connectors.Free;
     FreeAndNil(Store);
     Engine.Free;
   end;

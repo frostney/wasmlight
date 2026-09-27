@@ -5,8 +5,8 @@
   interpreter-free executable. Selected `--connector` files are parsed through
   `Wasm.Connector` and resolved through `Wasm.Connector.Resolve`. WASI
   preview1 is a built-in of the runtime shell; other imports must resolve
-  uniquely. Connector host functions are not yet embedded in the generated
-  executable, so a resolved non-WASI import fails closed at link.
+  uniquely, and the resolved connector plan is embedded in the payload for
+  the shell to bind at startup (Wasm.Connector.Host).
 
   It is a THIN driver over shipped stages, adding no tier logic and never
   publishing output until every stage succeeds:
@@ -22,7 +22,8 @@
                            malformed `.wlc` is EWasmConnectorError.
     4. Link              — deny-by-default: `wasi_snapshot_preview1` is
                            granted; any other import is EWasmLinkError
-                           unless a selected connector binds it uniquely.
+                           unless a selected connector binds it uniquely
+                           with a fixed lowering the target ABI can call.
     5. Strict compile    — AotCompileModuleStrict for the requested
                            target. A decline is EWasmCompileError.
     6. Packaging         — WriteNativePayload into a catalog (or host
@@ -155,10 +156,13 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
+  Wasm.Abi,
   Wasm.Aot,
   Wasm.Aot.Artifact,
   Wasm.Compile.Catalog,
   Wasm.Connector,
+  Wasm.Connector.Host,
+  Wasm.Connector.Plan,
   Wasm.Connector.Resolve,
   Wasm.MachO,
   Wasm.Native.Payload,
@@ -368,8 +372,34 @@ begin
   end;
 end;
 
-procedure CheckConnectorsAndLink(const ALoaded: TWasmLoadedModule;
-  const AConnectors: array of string);
+function CompileWasmTarget(const ATriple: string;
+  out ATarget: TWasmTarget): Boolean; forward;
+
+{ The connector call ABI of a released compile target. }
+function CompileAbiTarget(const ATriple: string): TWasmAbiTarget;
+var
+  Target: TWasmTarget;
+begin
+  Result := wabNone;
+  if not CompileWasmTarget(ATriple, Target) then
+    Exit;
+  if Target.Arch = wtaAArch64 then
+  begin
+    if Target.Os = wtoDarwin then
+      Result := wabAapcs64Apple
+    else
+      Result := wabAapcs64;
+  end
+  else if Target.Arch = wtaX86_64 then
+    Result := wabSysvX64;
+end;
+
+{ Parse the selected connectors, resolve the module's imports, and prove
+  the result links: WASI plus exactly the connector plan's imports, each
+  callable on ATarget's C ABI. Returns the encoded plan for the payload —
+  empty when no connector import is bound. }
+function CheckConnectorsAndLink(const ALoaded: TWasmLoadedModule;
+  const AConnectors: array of string; const ATarget: string): TWasmBytes;
 var
   I, J: Integer;
   Path: string;
@@ -407,9 +437,7 @@ begin
   end;
   BuiltIn[0] := WLC_WASI_MODULE;
   Plan := ResolveConnectorModule(Docs, ALoaded.Model, BuiltIn);
-  if Length(Plan.Thunks) > 0 then
-    raise EWasmLinkError.Create(
-      'compiled executables grant WASI only; connector host functions are not embedded');
+  CheckConnectorPlanTarget(Plan, CompileAbiTarget(ATarget));
   Engine := TWasmEngine.Create;
   Store := nil;
   Linker := nil;
@@ -421,6 +449,7 @@ begin
     Context := TWasmWasiContext.Create(Config);
     Linker := TWasmLinker.Create(Store);
     WasiDefineAll(Linker, Context);
+    DefineConnectorSignatures(Linker, Plan);
     { Resolve the shell's actual names, kinds and signatures without
       instantiating the module or executing its start function. }
     Linker.ResolveImports(ALoaded);
@@ -431,6 +460,7 @@ begin
     Store.Free;
     Engine.Free;
   end;
+  Result := EncodeConnectorPlan(Plan);
 end;
 
 function CompileWasmTarget(const ATriple: string;
@@ -506,7 +536,7 @@ end;
 
 function NativePayloadFromArtifact(const ALoaded: TWasmLoadedModule;
   const AArtifact, ATemplate: TWasmBytes;
-  const ATarget: string): TWasmBytes;
+  const ATarget: string; const AConnectorPlan: TWasmBytes): TWasmBytes;
 var
   Parsed: TWasmAotArtifact;
   Params: TWasmNativePayloadWriteParams;
@@ -543,7 +573,7 @@ begin
   Params.ShellHash := WnepHash128Bytes(ATemplate);
   Params.ModuleBytes := CopyLoadedBytes(ALoaded);
   Params.Funcs := Funcs;
-  Params.ConnectorPlan := nil;
+  Params.ConnectorPlan := AConnectorPlan;
   Params.CapabilitySet := nil;
   Result := WriteNativePayload(Params);
 end;
@@ -706,17 +736,19 @@ function CompileLoaded(const ALoaded: TWasmLoadedModule;
   const ARequest: TWasmCompileRequest): TWasmCompileResult;
 var
   Target: string;
-  Artifact, Template, Payload, Packaged: TWasmBytes;
+  Artifact, Template, Payload, Packaged, ConnectorPlan: TWasmBytes;
 begin
   if not ResolvedCompileTarget(ARequest.Target, Target, Result) then
     Exit;
 
   try
-    CheckConnectorsAndLink(ALoaded, ARequest.Connectors);
+    ConnectorPlan := CheckConnectorsAndLink(ALoaded, ARequest.Connectors,
+      Target);
     WasiCheckCommandEntry(ALoaded);
     Artifact := StrictCompileNative(ALoaded, Target);
     Template := LoadCompileTemplate(Target, ARequest.CatalogRoot);
-    Payload := NativePayloadFromArtifact(ALoaded, Artifact, Template, Target);
+    Payload := NativePayloadFromArtifact(ALoaded, Artifact, Template, Target,
+      ConnectorPlan);
     Packaged := PackageCompilePayload(Target, Payload, ARequest.CatalogRoot,
       ARequest.OutputPath);
     WriteCompileOutput(ARequest.OutputPath, Packaged);

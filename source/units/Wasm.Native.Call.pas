@@ -406,7 +406,13 @@ begin
       Piece := APlan.Args[I].Pieces[J];
       case Piece.Kind of
         wapIntReg:
-          IntRegs[Piece.Reg] := SliceU64(AArgs[I], Piece.Offset, Piece.Size);
+          { A single-piece scalar keeps the caller's extension: Apple
+            AArch64 and SysV callers widen a narrow integer, so a value the
+            caller supplied wider than its C type is passed whole. }
+          if (Length(APlan.Args[I].Pieces) = 1) and (Piece.Offset = 0) then
+            IntRegs[Piece.Reg] := SliceU64(AArgs[I], 0, 8)
+          else
+            IntRegs[Piece.Reg] := SliceU64(AArgs[I], Piece.Offset, Piece.Size);
         wapFloatReg:
           FloatRegs[Piece.Reg] := SliceU64(AArgs[I], Piece.Offset, Piece.Size);
         wapStack:
