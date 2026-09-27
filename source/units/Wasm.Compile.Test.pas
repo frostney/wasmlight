@@ -545,8 +545,7 @@ var
   Connector: string;
 begin
   { Class `Env` is not guest module `env`, so resolve does not bind the
-    import. A matching connector would still fail closed: compiled
-    executables grant WASI only. }
+    import: matching is exact and deny-by-default. }
   Connector := IncludeTrailingPathDelimiter(FTempDir) + 'env.wlc';
   WriteUtf8File(Connector,
     'static class Env {' + sLineBreak +

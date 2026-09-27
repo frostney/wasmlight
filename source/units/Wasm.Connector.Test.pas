@@ -28,6 +28,8 @@ type
     procedure TestAttributesAndDirections;
     procedure TestCallbackKinds;
     procedure TestInOutAndSizeConst;
+    procedure TestSizeParamIndex;
+    procedure TestRejectsNegativeSizeParamIndex;
     procedure TestEmptyFile;
     procedure TestRejectsMethodBody;
     procedure TestRejectsProperty;
@@ -187,6 +189,34 @@ begin
     .ToBe('queued');
   Expect<string>(WlcCallbackKindName(Doc.Connectors[0].Delegates[2].CallbackKind))
     .ToBe('scoped');
+end;
+
+procedure TWlcParserTests.TestSizeParamIndex;
+var
+  Doc: TWlcDocument;
+  M: TWlcMarshal;
+begin
+  Doc := ParseConnector(
+    'static class C {' +
+    '  [DllImport("lib")] static extern int write(int fd,' +
+    '    [In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] byte[] buf,' +
+    '    int count);' +
+    '}');
+  M := Doc.Connectors[0].Methods[0].Params[1].Marshal;
+  Expect<Boolean>(M.HasSizeParamIndex).ToBe(True);
+  Expect<Integer>(M.SizeParamIndex).ToBe(2);
+  Expect<Boolean>(M.HasSizeConst).ToBe(False);
+  Expect<Boolean>(Doc.Connectors[0].Methods[0].Params[0].Marshal.HasSizeParamIndex)
+    .ToBe(False);
+end;
+
+procedure TWlcParserTests.TestRejectsNegativeSizeParamIndex;
+begin
+  ExpectPrefix(ParseError(
+    'static class C {' +
+    '  [DllImport("lib")] static extern void f(' +
+    '    [In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = -1)] byte[] b);' +
+    '}'), 'SizeParamIndex must be a non-negative integer');
 end;
 
 procedure TWlcParserTests.TestInOutAndSizeConst;
@@ -354,6 +384,9 @@ begin
   Test('attributes and directions', TestAttributesAndDirections);
   Test('callback kinds', TestCallbackKinds);
   Test('in-out and SizeConst', TestInOutAndSizeConst);
+  Test('SizeParamIndex names the count parameter', TestSizeParamIndex);
+  Test('a negative SizeParamIndex is rejected',
+    TestRejectsNegativeSizeParamIndex);
   Test('empty file', TestEmptyFile);
   Test('rejects method body', TestRejectsMethodBody);
   Test('rejects property', TestRejectsProperty);
