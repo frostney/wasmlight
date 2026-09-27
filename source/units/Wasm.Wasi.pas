@@ -426,6 +426,11 @@ function WinGetFileAttributesW(AFileName: PWideChar): UInt32; stdcall;
   external 'kernel32.dll' name 'GetFileAttributesW';
 function WinCloseHandle(AObject: THandle): LongBool; stdcall;
   external 'kernel32.dll' name 'CloseHandle';
+{ String-only: it applies Win32 path rules, including the DOS device mapping,
+  without touching the file system. }
+function WinGetFullPathNameW(AFileName: PWideChar; ABufferLength: UInt32;
+  ABuffer: PWideChar; AFilePart: Pointer): UInt32; stdcall;
+  external 'kernel32.dll' name 'GetFullPathNameW';
 {$ENDIF}
 
 const
@@ -1879,6 +1884,97 @@ begin
     (AChild[Length(Root) + 1] = PathDelim);
 end;
 
+{$IFDEF WINDOWS}
+{ True iff Win32 may treat the path component AName as a legacy DOS device
+  (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the superscript COM/LPT digits, and
+  the console names CONIN$ / CONOUT$) rather than as a file. Win32 applies
+  this to the base name: the part before the first '.' (an extension) or ':'
+  (a stream), with trailing spaces and dots ignored, in any letter case.
+  Which forms still count as devices changes between Windows versions, so
+  every form any version has honoured is refused. }
+function WinComponentIsDevice(const AName: UnicodeString): Boolean;
+var
+  Base: UnicodeString;
+  Index: Integer;
+  Prefix: UnicodeString;
+  Digit: WideChar;
+begin
+  Base := AName;
+  for Index := 1 to Length(Base) do
+    if (Base[Index] = '.') or (Base[Index] = ':') then
+    begin
+      SetLength(Base, Index - 1);
+      Break;
+    end;
+  while (Length(Base) > 0) and
+    ((Base[Length(Base)] = ' ') or (Base[Length(Base)] = '.')) do
+    SetLength(Base, Length(Base) - 1);
+  for Index := 1 to Length(Base) do
+    if (Base[Index] >= 'a') and (Base[Index] <= 'z') then
+      Base[Index] := WideChar(Ord(Base[Index]) - 32);
+  if (Base = 'CON') or (Base = 'PRN') or (Base = 'AUX') or (Base = 'NUL') or
+    (Base = 'CONIN$') or (Base = 'CONOUT$') then
+    Exit(True);
+  Result := False;
+  if Length(Base) <> 4 then
+    Exit;
+  Prefix := Copy(Base, 1, 3);
+  if (Prefix <> 'COM') and (Prefix <> 'LPT') then
+    Exit;
+  Digit := Base[4];
+  { U+00B9, U+00B2, U+00B3: superscript one, two, three. }
+  Result := ((Digit >= '0') and (Digit <= '9')) or (Ord(Digit) = $B9) or
+    (Ord(Digit) = $B2) or (Ord(Digit) = $B3);
+end;
+
+{ True iff the guest-relative path ARel, or the full candidate host path
+  ACandidate built from it, would reach a DOS device instead of a file under
+  the preopen (#163). Two checks, because the device rules move between
+  Windows versions: every component of ARel is tested against the known
+  device names, and ACandidate is put through GetFullPathNameW (Win32 path
+  rules only, no file-system access), which on this host maps a device name
+  to the \\.\ namespace. A result in the \\.\ or \\?\ namespace, or a
+  failure to compute one, is treated as a device. }
+function WinPathNamesDevice(const ARel, ACandidate: string): Boolean;
+const
+  DEVICE_PREFIX = '\\.\';
+  VERBATIM_PREFIX = '\\?\';
+var
+  Rel, Wide, Full: UnicodeString;
+  Index, Start: Integer;
+  Len: UInt32;
+begin
+  Rel := UnicodeString(ARel);
+  Start := 1;
+  for Index := 1 to Length(Rel) + 1 do
+    if (Index > Length(Rel)) or (Rel[Index] = '\') or (Rel[Index] = '/') then
+    begin
+      if WinComponentIsDevice(Copy(Rel, Start, Index - Start)) then
+        Exit(True);
+      Start := Index + 1;
+    end;
+  Result := True;
+  Wide := UnicodeString(ACandidate);
+  SetLength(Full, 512);
+  Len := WinGetFullPathNameW(PWideChar(Wide), UInt32(Length(Full)),
+    PWideChar(Full), nil);
+  if Len >= UInt32(Length(Full)) then
+  begin
+    { Too small: Len is the required size, terminating NUL included. }
+    SetLength(Full, Len);
+    Len := WinGetFullPathNameW(PWideChar(Wide), UInt32(Length(Full)),
+      PWideChar(Full), nil);
+    if Len >= UInt32(Length(Full)) then
+      Exit;
+  end;
+  if Len = 0 then
+    Exit;
+  SetLength(Full, Len);
+  Result := (Copy(Full, 1, Length(DEVICE_PREFIX)) = DEVICE_PREFIX) or
+    (Copy(Full, 1, Length(VERBATIM_PREFIX)) = VERBATIM_PREFIX);
+end;
+{$ENDIF}
+
 { Lexically normalise a guest path into a relative host fragment, REJECTING any
   escape at the syntax level: an absolute path (leading '/') or a `..` that
   ascends above the root is weNotCapable — the deny-by-default code. `.` and
@@ -1939,6 +2035,8 @@ end;
        (symlink escape -> weNotCapable)
     3. if it does not exist: weNoEnt when ARequireExists, else resolve the
        PARENT real path and require IT under the root (so a create lands inside)
+  On Windows a path that names a DOS device (WinPathNamesDevice) is refused
+  with weNotCapable between steps 1 and 2.
   The root itself is realpath'd first so a preopen given as a symlink is handled. }
 function ResolveContained(const ARootHost, AGuestPath: string;
   const ARequireExists: Boolean; out AHostPath: string): TWasmWasiErrno;
@@ -1959,6 +2057,13 @@ begin
     Exit(weSuccess);
   end;
   Candidate := RootReal + PathDelim + Rel;
+  {$IFDEF WINDOWS}
+  { A DOS device is not in the preopen directory, whatever the path around it
+    says. Refused before the first OS call, since opening a device path even
+    to resolve it can already reach the device. }
+  if WinPathNamesDevice(Rel, Candidate) then
+    Exit(weNotCapable);
+  {$ENDIF}
   if HostRealPath(Candidate, CandReal) then
   begin
     { Exists: the resolved real path (all symlinks followed) must be contained.
