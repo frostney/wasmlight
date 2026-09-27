@@ -562,6 +562,7 @@ var
   X64VecConsts: array of UInt32;
   X64VecConstLo: array of UInt64;
   X64VecConstHi: array of UInt64;
+  X64ImmediateValues: array of Int64;
   {$ENDIF}
 
   procedure MarkTarget(const ATarget: UInt32);
@@ -1115,6 +1116,9 @@ var
   var
     K: Integer;
     Value: UInt32;
+    {$IFDEF WASM_JIT_X64}
+    Value64: Int64;
+    {$ENDIF}
   begin
     SetLength(ImmediateFusion, Length(AFn^.Code));
     SetLength(ImmediateValues, Length(AFn^.Code));
@@ -1138,6 +1142,34 @@ var
           SkipPlanned[K] := True;
           ImmediateFusion[K + 1] := True;
           ImmediateValues[K + 1] := Value;
+        end;
+      end;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    { Every x64 cache mode reads a fused constant from the consumer's
+      immediate field, and an immediate form is never costlier than the
+      register form it replaces. The same proof as ARM64's: an adjacent,
+      single-read, non-visible constant temporary with no join on either
+      instruction is read by nothing else, so its slot is never needed. A
+      fused compare keeps its compare-branch plan (AnalyzeFusion runs next). }
+    SetLength(X64ImmediateValues, Length(AFn^.Code));
+    for K := 0 to High(PlannedCode) - 1 do
+      if (PlannedCode[K].Op in [iroI32Const, iroI64Const]) and
+        (PlannedCode[K + 1].B = PlannedCode[K].Dest) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) and
+        not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K] and not Targets[K + 1] then
+      begin
+        if PlannedCode[K].Op = iroI32Const then
+          Value64 := Int32(UInt32(PlannedCode[K].Imm and $FFFFFFFF))
+        else
+          Value64 := PlannedCode[K].Imm;
+        if X64CanUseImmediate(PlannedCode[K + 1].Op, Value64) then
+        begin
+          SkipPlanned[K] := True;
+          ImmediateFusion[K + 1] := True;
+          X64ImmediateValues[K + 1] := Value64;
         end;
       end;
     {$ENDIF}
@@ -3042,9 +3074,13 @@ begin
       if Fusion[I] >= 0 then
       begin
         X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
-          PlannedCode[I], X64Cache);
+          PlannedCode[I], X64Cache, ImmediateFusion[Fusion[I]],
+          X64ImmediateValues[Fusion[I]]);
         Emitted := True;
       end
+      else if ImmediateFusion[I] then
+        Emitted := X64EmitOpCachedImmediate(Buf, PlannedCode[I],
+          X64ImmediateValues[I], X64Cache)
       else
         Emitted := X64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
           UInt32(I),

@@ -361,6 +361,34 @@ procedure X64EmitImul(const ABuf: TWasmCodeBuffer; const AWide: Boolean;
   `count and (N-1)`. }
 procedure X64EmitShiftCl(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
   const AWide: Boolean; const AReg: Byte);
+
+{ Immediate-operand forms. Group-1 ALU AReg, imm: 83 /subop ib when AImm
+  fits a sign-extended byte, else 81 /subop id (ADD=0, OR=1, AND=4, SUB=5,
+  XOR=6, CMP=7). A 32-bit form takes the low 32 bits of AImm as they are; a
+  REX.W form sign-extends the imm32 to 64 bits. }
+procedure X64EmitAluRegImm(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg: Byte; const AImm: Int32);
+{ imul ADst, ASrc, imm: 6B /r ib or 69 /r id (sign-extended immediate). }
+procedure X64EmitImulRegImm(const ABuf: TWasmCodeBuffer; const AWide: Boolean;
+  const ADst, ASrc: Byte; const AImm: Int32);
+{ <shift> AReg, imm8: C1 /subop ib. A wasm shift passes its masked count
+  (count and 31 / and 63), so the hardware mask never changes it. }
+procedure X64EmitShiftImm(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg, AImm: Byte);
+{ lea ADst, [ABase + ADisp] (8D /r); the 32-bit form keeps the low half of
+  the 64-bit address sum, zero-extended. }
+procedure X64EmitLeaRegDisp(const ABuf: TWasmCodeBuffer; const AWide: Boolean;
+  const ADst, ABase: Byte; const ADisp: Int32);
+{ mov ADst32, ASrc32 (89 /r): copies the low half and zero-extends. }
+procedure X64EmitMovRegReg32(const ABuf: TWasmCodeBuffer;
+  const ADst, ASrc: Byte);
+{ Materialize the 64-bit AValue into AReg in its shortest exact form:
+  xor r32, r32 for zero (clobbers the flags), mov r32, imm32 when the value
+  zero-extends, REX.W C7 /0 id when it sign-extends from 32 bits, else
+  movabs. An i32 or f32 constant passes its zero-extended 32-bit value. }
+procedure X64EmitMovRegConst(const ABuf: TWasmCodeBuffer; const AReg: Byte;
+  const AValue: UInt64);
+
 { setcc al (0F 90+cc /0) then movzx eax, al (0F B6 /r): eax := (cc) ? 1 : 0,
   zero-extended into rax. }
 procedure X64EmitSetccAl(const ABuf: TWasmCodeBuffer; const ACc: Byte);
@@ -585,8 +613,24 @@ procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
 procedure X64EmitGcArrayAccess(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AInsIndex: UInt32; const AShape: UInt64;
   var ACache: TX64RegCache);
+{ AHasImmediate: the compare's right operand is a fused constant (the
+  driver's x64 AnalyzeImmediateFusion plan), compared as cmp r, imm. }
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
-  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache;
+  const AHasImmediate: Boolean = False; const AImmediate: Int64 = 0);
+{ Whether AOp can take its right operand B as the constant AValue in an
+  immediate form: every 32-bit ALU op, shift, rotate, and integer compare
+  (a 32-bit op uses the value's low half); the 64-bit ones when AValue fits
+  a sign-extended imm32 (shifts and rotates always, by their masked count).
+  AValue is the constant as an i64 (an i32 constant sign-extended). }
+function X64CanUseImmediate(const AOp: TWasmIrOp;
+  const AValue: Int64): Boolean;
+{ Emit AIns with its right operand replaced by the constant AValue, under
+  the same cache discipline as X64EmitOpCached. False (nothing emitted) when
+  X64CanUseImmediate declines. }
+function X64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AValue: Int64;
+  var ACache: TX64RegCache): Boolean;
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -644,11 +688,16 @@ function X64CachedOperand(const ABuf: TWasmCodeBuffer;
   out AProtectMoved: Boolean): Byte; forward;
 procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
   const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
-  AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache); forward;
+  AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache;
+  const AHasImmediate: Boolean = False;
+  const AImmediate: Int32 = 0); forward;
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ASrc: Byte; const ASlot: UInt32); forward;
+procedure X64CachedConst(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const AValue: UInt64;
+  const ASlot: UInt32); forward;
 procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
   var ACache: TX64RegCache); forward;
@@ -968,15 +1017,10 @@ begin
         X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
       end;
     iroI32Const, iroF32Const:
-      begin
-        X64EmitMovRegImm32(ABuf, X64_RAX, UInt32(AIns.Imm and $FFFFFFFF));
-        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
-      end;
+      X64CachedConst(ABuf, ACache, UInt64(AIns.Imm) and $FFFFFFFF,
+        AIns.Dest);
     iroI64Const, iroF64Const:
-      begin
-        X64EmitMovRegImm64(ABuf, X64_RAX, UInt64(AIns.Imm));
-        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
-      end;
+      X64CachedConst(ABuf, ACache, UInt64(AIns.Imm), AIns.Dest);
     iroBranchIf, iroBranchIfNot:
       begin
         Host := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
@@ -1619,6 +1663,19 @@ begin
   X64CachedDestCommit(ABuf, ACache, Index, ASlot, StoreFirst);
 end;
 
+{ A constant goes straight into the host X64CachedDestBegin picks, with no
+  rax bounce; the commit then stores or defers it exactly as a computed
+  result. }
+procedure X64CachedConst(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const AValue: UInt64; const ASlot: UInt32);
+var
+  Index: Integer;
+begin
+  Index := X64CachedDestBegin(ABuf, ACache, ASlot);
+  X64EmitMovRegConst(ABuf, X64CacheHostReg(Index), AValue);
+  X64CachedDestCommit(ABuf, ACache, Index, ASlot);
+end;
+
 { The operands and the result stay in their cache hosts; rax serves only a
   non-commutative op whose result host is its right operand's. A 32-bit form
   zero-extends its destination, as the scratch path's did. }
@@ -1685,22 +1742,35 @@ end;
   otherwise the flags come first and the byte is widened after SETcc. }
 procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
   const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
-  AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache);
+  AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache;
+  const AHasImmediate: Boolean; const AImmediate: Int32);
+
+  procedure EmitFlags;
+  begin
+    if AHasImmediate then
+      { AOpcode is cmp (39); its group-1 immediate subop is 7. }
+      X64EmitAluRegImm(ABuf, 7, AWide, AHostA, AImmediate)
+    else
+      X64EmitAluRegReg(ABuf, AOpcode, AWide, AHostA, AHostB);
+  end;
+
 var
   HostD: Byte;
   Index: Integer;
 begin
   Index := X64CachedDestBegin(ABuf, ACache, ADest);
   HostD := X64CacheHostReg(Index);
+  { With an immediate there is no right operand host: AHostB repeats
+    AHostA. }
   if (HostD <> AHostA) and (HostD <> AHostB) then
   begin
     X64EmitAluRegReg(ABuf, $31, False, HostD, HostD);
-    X64EmitAluRegReg(ABuf, AOpcode, AWide, AHostA, AHostB);
+    EmitFlags;
     X64EmitSetccReg(ABuf, ACc, HostD);
   end
   else
   begin
-    X64EmitAluRegReg(ABuf, AOpcode, AWide, AHostA, AHostB);
+    EmitFlags;
     X64EmitSetccReg(ABuf, ACc, HostD);
     X64EmitMovzxReg8(ABuf, HostD, HostD);
   end;
@@ -1719,10 +1789,11 @@ begin
 end;
 
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
-  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
+  const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache;
+  const AHasImmediate: Boolean; const AImmediate: Int64);
 var
   Cond, HostA, HostB: Byte;
-  Wide: Boolean;
+  Wide, Moved: Boolean;
 begin
   Wide := False;
   case ACompare.Op of
@@ -1750,8 +1821,19 @@ begin
   end;
   if ABranch.Op = iroBranchIfNot then
     Cond := Cond xor 1;
-  X64CachedOperands(ABuf, ACache, ACompare.A, ACompare.B, HostA, HostB);
-  X64EmitAluRegReg(ABuf, $39, Wide, HostA, HostB);
+  if AHasImmediate then
+  begin
+    if not X64CanUseImmediate(ACompare.Op, AImmediate) then
+      raise EWasmInternal.Create(
+        'internal: x64 fused compare constant has no immediate form');
+    HostA := X64CachedOperand(ABuf, ACache, ACompare.A, $FF, Moved);
+    X64EmitAluRegImm(ABuf, 7, Wide, HostA, Int32(AImmediate and $FFFFFFFF));
+  end
+  else
+  begin
+    X64CachedOperands(ABuf, ACache, ACompare.A, ACompare.B, HostA, HostB);
+    X64EmitAluRegReg(ABuf, $39, Wide, HostA, HostB);
+  end;
   { MOV stores leave the compare's flags intact. }
   X64FlushDynamicRegCache(ABuf, ACache);
   X64EmitJccTo(ABuf, Cond, ABranch.B);
@@ -1767,6 +1849,166 @@ begin
   X64CachedOperands(ABuf, ACache, AIns.A, AIns.B, HostA, HostB);
   X64CachedFlagResult(ABuf, $39, AWide, ACc, HostA, HostB, AIns.Dest,
     ACache);
+end;
+
+{ The integer compare's condition code and width, or False for any other
+  op. }
+function X64CompareCond(const AOp: TWasmIrOp; out ACc: Byte;
+  out AWide: Boolean): Boolean;
+begin
+  Result := True;
+  AWide := AOp in [iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS,
+    iroI64GtU, iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU];
+  case AOp of
+    iroI32Eq, iroI64Eq: ACc := X64_CC_E;
+    iroI32Ne, iroI64Ne: ACc := X64_CC_NE;
+    iroI32LtS, iroI64LtS: ACc := X64_CC_L;
+    iroI32LtU, iroI64LtU: ACc := X64_CC_B;
+    iroI32GtS, iroI64GtS: ACc := X64_CC_G;
+    iroI32GtU, iroI64GtU: ACc := X64_CC_A;
+    iroI32LeS, iroI64LeS: ACc := X64_CC_LE;
+    iroI32LeU, iroI64LeU: ACc := X64_CC_BE;
+    iroI32GeS, iroI64GeS: ACc := X64_CC_GE;
+    iroI32GeU, iroI64GeU: ACc := X64_CC_AE;
+  else
+    ACc := 0;
+    Result := False;
+  end;
+end;
+
+{ Group-1 subop (ADD=0, OR=1, AND=4, SUB=5, XOR=6), shift subop (ROL=0,
+  ROR=1, SHL=4, SHR=5, SAR=7), or 0 for imul; AKind is 0 (group 1),
+  1 (imul), 2 (shift), or 3 (anything else). }
+procedure X64ImmediateShape(const AOp: TWasmIrOp; out AKind, ASubop: Byte;
+  out AWide: Boolean);
+begin
+  AWide := AOp in [iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or,
+    iroI64Xor, iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr];
+  AKind := 0;
+  ASubop := 0;
+  case AOp of
+    iroI32Add, iroI64Add: ASubop := 0;
+    iroI32Or, iroI64Or: ASubop := 1;
+    iroI32And, iroI64And: ASubop := 4;
+    iroI32Sub, iroI64Sub: ASubop := 5;
+    iroI32Xor, iroI64Xor: ASubop := 6;
+    iroI32Mul, iroI64Mul: AKind := 1;
+    iroI32Rotl, iroI64Rotl: AKind := 2;
+    iroI32Rotr, iroI64Rotr:
+      begin
+        AKind := 2;
+        ASubop := 1;
+      end;
+    iroI32Shl, iroI64Shl:
+      begin
+        AKind := 2;
+        ASubop := 4;
+      end;
+    iroI32ShrU, iroI64ShrU:
+      begin
+        AKind := 2;
+        ASubop := 5;
+      end;
+    iroI32ShrS, iroI64ShrS:
+      begin
+        AKind := 2;
+        ASubop := 7;
+      end;
+  else
+    AKind := 3;
+  end;
+end;
+
+function X64CanUseImmediate(const AOp: TWasmIrOp;
+  const AValue: Int64): Boolean;
+var
+  Kind, Subop, Cc: Byte;
+  Wide: Boolean;
+begin
+  if not X64CompareCond(AOp, Cc, Wide) then
+  begin
+    X64ImmediateShape(AOp, Kind, Subop, Wide);
+    if Kind = 3 then
+      Exit(False);
+    if Kind = 2 then
+      Exit(True);
+  end;
+  Result := not Wide or
+    ((AValue >= -2147483648) and (AValue <= 2147483647));
+end;
+
+function X64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AValue: Int64;
+  var ACache: TX64RegCache): Boolean;
+var
+  Kind, Subop, Cc, HostA, HostD, Count: Byte;
+  Wide, Moved: Boolean;
+  Imm, Disp: Int32;
+  Index: Integer;
+begin
+  Result := X64CanUseImmediate(AIns.Op, AValue);
+  if not Result then
+    Exit;
+  { A 32-bit op reads only the low half; a wide one was proven to fit. }
+  Imm := Int32(AValue and $FFFFFFFF);
+  HostA := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
+  if X64CompareCond(AIns.Op, Cc, Wide) then
+  begin
+    X64CachedFlagResult(ABuf, $39, Wide, Cc, HostA, HostA, AIns.Dest, ACache,
+      True, Imm);
+    Exit;
+  end;
+  X64ImmediateShape(AIns.Op, Kind, Subop, Wide);
+  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
+  HostD := X64CacheHostReg(Index);
+  case Kind of
+    1:
+      { imul HostD, HostA, imm: three-operand, so no copy first. }
+      X64EmitImulRegImm(ABuf, Wide, HostD, HostA, Imm);
+    2:
+      begin
+        if Wide then
+          Count := Byte(AValue and 63)
+        else
+          Count := Byte(AValue and 31);
+        if Count = 0 then
+        begin
+          { wasm masks the count; a zero count is the identity. The 32-bit
+            copy keeps the result zero-extended as a 32-bit shift would. }
+          if not Wide then
+            X64EmitMovRegReg32(ABuf, HostD, HostA)
+          else if HostD <> HostA then
+            X64EmitMovRegReg(ABuf, HostD, HostA);
+        end
+        else
+        begin
+          if HostD <> HostA then
+            X64EmitMovRegReg(ABuf, HostD, HostA);
+          X64EmitShiftImm(ABuf, Subop, Wide, HostD, Count);
+        end;
+      end;
+  else
+    if HostD = HostA then
+      X64EmitAluRegImm(ABuf, Subop, Wide, HostD, Imm)
+    else if (Subop = 0) or ((Subop = 5) and
+      (not Wide or (Imm <> Low(Int32)))) then
+    begin
+      { add/sub into a distinct host: one lea. An i32 negation wraps
+        modulo 2^32 like the sub it replaces; an i64 sub of -2^31 has no
+        imm32 negation and takes the copy below. }
+      if Subop = 0 then
+        Disp := Imm
+      else
+        Disp := Int32(UInt32(0 - Int64(Imm)) and $FFFFFFFF);
+      X64EmitLeaRegDisp(ABuf, Wide, HostD, HostA, Disp);
+    end
+    else
+    begin
+      X64EmitMovRegReg(ABuf, HostD, HostA);
+      X64EmitAluRegImm(ABuf, Subop, Wide, HostD, Imm);
+    end;
+  end;
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest);
 end;
 
 { The natively emitted v128 ops over the xmm cache: the same instructions as
@@ -3343,6 +3585,90 @@ begin
   X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
   ABuf.EmitByte($D3);
   ABuf.EmitByte($C0 or (ASubop shl 3) or (AReg and 7));
+end;
+
+function X64FitsInt8(const AValue: Int32): Boolean;
+begin
+  Result := (AValue >= -128) and (AValue <= 127);
+end;
+
+procedure X64EmitAluRegImm(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg: Byte; const AImm: Int32);
+begin
+  { Group 1: 83 /subop ib sign-extends a byte; 81 /subop id takes 32 bits
+    (sign-extended to 64 under REX.W). }
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  if X64FitsInt8(AImm) then
+  begin
+    ABuf.EmitByte($83);
+    EmitModRMReg(ABuf, ASubop, AReg);
+    ABuf.EmitByte(Byte(AImm and $FF));
+  end
+  else
+  begin
+    ABuf.EmitByte($81);
+    EmitModRMReg(ABuf, ASubop, AReg);
+    ABuf.EmitU32(UInt32(AImm));
+  end;
+end;
+
+procedure X64EmitImulRegImm(const ABuf: TWasmCodeBuffer; const AWide: Boolean;
+  const ADst, ASrc: Byte; const AImm: Int32);
+begin
+  { IMUL r, r/m, imm = 6B /r ib or 69 /r id; reg=ADst, rm=ASrc. }
+  X64EmitRex(ABuf, Ord(AWide), ADst shr 3, 0, ASrc shr 3);
+  if X64FitsInt8(AImm) then
+  begin
+    ABuf.EmitByte($6B);
+    EmitModRMReg(ABuf, ADst, ASrc);
+    ABuf.EmitByte(Byte(AImm and $FF));
+  end
+  else
+  begin
+    ABuf.EmitByte($69);
+    EmitModRMReg(ABuf, ADst, ASrc);
+    ABuf.EmitU32(UInt32(AImm));
+  end;
+end;
+
+procedure X64EmitLeaRegDisp(const ABuf: TWasmCodeBuffer; const AWide: Boolean;
+  const ADst, ABase: Byte; const ADisp: Int32);
+begin
+  { LEA r, m = 8D /r. The 32-bit destination form truncates the 64-bit
+    effective address, which is exactly an i32 add modulo 2^32. }
+  X64EmitRex(ABuf, Ord(AWide), ADst shr 3, 0, ABase shr 3);
+  ABuf.EmitByte($8D);
+  EmitMemOperand(ABuf, ADst, ABase, ADisp);
+end;
+
+procedure X64EmitMovRegReg32(const ABuf: TWasmCodeBuffer;
+  const ADst, ASrc: Byte);
+begin
+  { MOV r/m32, r32 = 89 /r; rm=ADst, reg=ASrc. }
+  X64EmitRex(ABuf, 0, ASrc shr 3, 0, ADst shr 3);
+  ABuf.EmitByte($89);
+  EmitModRMReg(ABuf, ASrc, ADst);
+end;
+
+procedure X64EmitMovRegConst(const ABuf: TWasmCodeBuffer; const AReg: Byte;
+  const AValue: UInt64);
+begin
+  if AValue = 0 then
+    { xor r32, r32 zero-extends; it writes the flags, which no cached op
+      carries across an IR instruction. }
+    X64EmitAluRegReg(ABuf, $31, False, AReg, AReg)
+  else if AValue <= High(UInt32) then
+    X64EmitMovRegImm32(ABuf, AReg, UInt32(AValue))
+  else if (Int64(AValue) < 0) and (Int64(AValue) >= -2147483648) then
+  begin
+    { MOV r/m64, imm32 = REX.W C7 /0 id, sign-extended. }
+    X64EmitRex(ABuf, 1, 0, 0, AReg shr 3);
+    ABuf.EmitByte($C7);
+    EmitModRMReg(ABuf, 0, AReg);
+    ABuf.EmitU32(UInt32(AValue and $FFFFFFFF));
+  end
+  else
+    X64EmitMovRegImm64(ABuf, AReg, AValue);
 end;
 
 procedure X64EmitSetccAl(const ABuf: TWasmCodeBuffer; const ACc: Byte);
