@@ -179,6 +179,17 @@ class Machine:
                 break
         return w32(w32(a + b) + w32(c + d))
 
+    def teeargs(self, n):
+        x, s, i = 3, 0, 0
+        while True:
+            a0 = x
+            x = w32(x + 7)
+            s = w32(s + self.ord4(a0, x, x, i))
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return w32(s + x)
+
     def loopsel(self, n):
         a, b, c, d, e, i = 9, 4, 1, 0, 0, 0
         while True:
@@ -412,6 +423,19 @@ WAT = r'''
     (i32.add (i32.add (local.get $a) (local.get $b))
              (i32.add (local.get $c) (local.get $d))))
 
+  ;; A forwarded argument copy must not see the local.tee after it.
+  (func (export "teeargs") (param $n i32) (result i32)
+    (local $x i32) (local $s i32) (local $i i32)
+    (local.set $x (i32.const 3))
+    (loop $l
+      (local.set $s (i32.add (local.get $s)
+        (call $ord4 (local.get $x)
+          (local.tee $x (i32.add (local.get $x) (i32.const 7)))
+          (local.get $x) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (local.get $s) (local.get $x)))
+
   (func (export "loopsel") (param $n i32) (result i32)
     (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32)
     (local $i i32)
@@ -565,6 +589,8 @@ COMMANDS = [
     ('loopord', 'i', (1,)),
     ('loopord', 'i', (2,)),
     ('loopord', 'i', (19,)),
+    ('teeargs', 'i', (1,)),
+    ('teeargs', 'i', (9,)),
     ('loopsel', 'i', (1,)),
     ('loopsel', 'i', (2,)),
     ('loopsel', 'i', (33,)),

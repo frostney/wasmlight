@@ -1511,9 +1511,9 @@ procedure TWastRunnerTests.TestX64LeafFixtureAllTiers;
 const
   FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
     + PathDelim + 'x64-leaf.wast';
-  { One module plus 80 assertions. }
-  COMMANDS = 81;
-  COMPILED_FUNCTIONS = 28;
+  { One module plus 82 assertions. }
+  COMMANDS = 83;
+  COMPILED_FUNCTIONS = 29;
 var
   Mode: TWastTierMode;
   Run: TWastRunResult;

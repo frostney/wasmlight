@@ -136,6 +136,19 @@
     (i32.add (i32.add (local.get $a) (local.get $b))
              (i32.add (local.get $c) (local.get $d))))
 
+  ;; A forwarded argument copy must not see the local.tee after it.
+  (func (export "teeargs") (param $n i32) (result i32)
+    (local $x i32) (local $s i32) (local $i i32)
+    (local.set $x (i32.const 3))
+    (loop $l
+      (local.set $s (i32.add (local.get $s)
+        (call $ord4 (local.get $x)
+          (local.tee $x (i32.add (local.get $x) (i32.const 7)))
+          (local.get $x) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (local.get $s) (local.get $x)))
+
   (func (export "loopsel") (param $n i32) (result i32)
     (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32)
     (local $i i32)
@@ -286,6 +299,8 @@
 (assert_return (invoke "loopord" (i32.const 1)) (i32.const 35701817))
 (assert_return (invoke "loopord" (i32.const 2)) (i32.const -1491708357))
 (assert_return (invoke "loopord" (i32.const 19)) (i32.const -256435135))
+(assert_return (invoke "teeargs" (i32.const 1)) (i32.const 1113))
+(assert_return (invoke "teeargs" (i32.const 9)) (i32.const 73965))
 (assert_return (invoke "loopsel" (i32.const 1)) (i32.const 57))
 (assert_return (invoke "loopsel" (i32.const 2)) (i32.const 175))
 (assert_return (invoke "loopsel" (i32.const 33)) (i32.const 73803))
