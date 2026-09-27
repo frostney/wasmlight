@@ -183,16 +183,36 @@ var
     until (Result < 0) or not ASkip[Result];
   end;
 
-  { The next emitted instruction after AIndex, or -1 when a label comes
-    first or the code ends. }
-  function NextEmitted(const AIndex: Integer): Integer;
+  { The access reading D after S: the first emitted instruction after S
+    that reads D, reached with no label and across at most a short run of
+    straight-line value computation (integer ALU ops, constants, moves, and
+    scalar accesses) that neither writes X or D nor reads D; -1 otherwise.
+    A crossed instruction may evict X's host, but X's slot then gets its
+    value (the access's read of X keeps it live), so the access reloads it;
+    one that faults or traps does so before the access, exactly as the
+    elided shift, which has no effect, lets it. }
+  function AccessAfterShift: Integer;
+  var
+    N: Integer;
   begin
-    Result := AIndex;
-    repeat
-      Inc(Result);
-      if (Result > High(APlanned)) or ATargets[Result] then
+    Result := S;
+    for N := 0 to 8 do
+    begin
+      repeat
+        Inc(Result);
+        if (Result > High(APlanned)) or ATargets[Result] then
+          Exit(-1);
+      until not ASkip[Result];
+      if MayReadSlot(APlanned[Result], D) then
+        Exit;
+      if not (IntAluOp(APlanned[Result].Op) or LoadOp(APlanned[Result].Op) or
+        StoreOp(APlanned[Result].Op) or
+        (APlanned[Result].Op in [iroMove, iroI32Const, iroI64Const])) or
+        (not StoreOp(APlanned[Result].Op) and
+        ((APlanned[Result].Dest = X) or (APlanned[Result].Dest = D))) then
         Exit(-1);
-    until not ASkip[Result];
+    end;
+    Result := -1;
   end;
 
   { The nearest instruction before AIndex, in its straight line, that
@@ -239,7 +259,7 @@ begin
     X := APlanned[S].A;
     D := APlanned[S].Dest;
     P := PrevEmitted(S);
-    M := NextEmitted(S);
+    M := AccessAfterShift;
     if (K < 1) or (K > 3) or (X = D) or (P < 0) or (M < 0) or
       (APlanned[P].Op <> iroI32And) or not AImmediate[P] or
       (APlanned[P].Dest <> X) or
