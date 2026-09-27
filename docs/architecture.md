@@ -35,8 +35,8 @@
   and 32-bit targets the runtime is interpreter-only and still fully
   conformant. The interpreter-free runtime shell (`wasmlight-shell`) is
   shipped as a template that `wasmlight compile` populates. [roadmap.md](roadmap.md)
-  is the honest picture of what remains: connector host functions and
-  compiled `--dir`/`--env` on that spine
+  is the honest picture of what remains: compiled `--dir`/`--env` on that
+  spine
   ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)), broader
   optimizing-compiler work, and later platform and host-surface releases.
   Nothing in v1 Core 3 behaviour is staged.
@@ -48,10 +48,10 @@ Read bottom-up; each layer may use only the layers below it.
 | Layer | Units | Role | Status |
 | --- | --- | --- | --- |
 | Native compile catalog | `Wasm.Compile.Catalog` | installed runtime-shell discovery and deterministic target selection for `wasmlight compile` ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); no ambient search | **shipped** |
-| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Connector.Memory`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, `wasmlight compile` to an interpreter-free native executable (WASI only; catalog or host-sibling shell), the immutable compiled capability set, connector copy-in/out/inout, scoped borrows, and opaque handles, and the interpreter-free runtime-shell startup path ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** (compile on 64-bit UNIX; Windows/32-bit hosts cannot emit) |
+| Host surface | `Wasm.Wasi.*`, `Wasm.Run`, `Wasm.Compile`, `Wasm.Compile.Capabilities`, `Wasm.Connector.Memory`, `Wasm.Connector.Host`, `Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native` | deny-by-default WASI preview1 host, the `wasmlight run` driver, `wasmlight compile` to an interpreter-free native executable (WASI plus an embedded connector plan; catalog or host-sibling shell), the immutable compiled capability set, connector copy-in/out/inout, scoped borrows, and opaque handles, connector host functions bound from the embedded plan, and the interpreter-free runtime-shell startup path ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)); component decode and canonical ABI are post-v1 ([ADR-0014](adr/0014-the-component-model-is-deferred-to-post-v1.md)) | **shipped** (compile on 64-bit UNIX; Windows/32-bit hosts cannot emit) |
 | Embedding API | `Wasm.Engine`, `Wasm.Connector.Callbacks` | what a Pascal host calls: load, link, instantiate, invoke, memory, host roots; target-ABI callback thunks with retained/scoped/queued lifetimes | **shipped** |
 | Native C ABI | `Wasm.Abi`, `Wasm.Native.Load`, `Wasm.Native.Call` | 64-bit Unix C-ABI call plans (AAPCS64, Apple AAPCS64, SysV x86-64), application-local library load, precompiled call gates; no TinyCC or libffi ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)) | **shipped** (planning on every host; live calls on 64-bit Unix) |
-| Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
+| Connector plan | `Wasm.Connector` (+ `Wasm.Connector.Lexer`, `Wasm.Connector.Parser`), `Wasm.Connector.Resolve`, `Wasm.Connector.Plan` | parse `.wlc` into declaration records; unique, deny-by-default import matching into a stripped connector plan; the versioned byte form embedded in a compiled executable and its strict decoder; uses the module model, not a store; `wasmlight compile` is not this layer | **shipped** |
 | Runtime state | `Wasm.Runtime.Values`, `Wasm.Runtime.Traps`, `Wasm.Runtime.Memory`, `Wasm.Runtime.Store`, `Wasm.Runtime.Instantiate`, `Wasm.Runtime.Gc` | the untagged value slot; store, instances, memories, tables, globals; the memory-access chokepoint (guard-page and bounds-checked); the trap path; instantiation; the precise collector | **shipped** |
 | Execution tiers | `Wasm.Interp` (+ `Wasm.Interp.Numeric`, `Wasm.Interp.Vector`); baseline JIT (`Wasm.Jit`, `Wasm.Jit.CodeBuffer`, `Wasm.Jit.Arm64`, `Wasm.Jit.X64` + `Wasm.Jit.X64.Plan` + `Wasm.Jit.X64.Leaf`, sharing `Wasm.Jit.Runtime` and `Wasm.Jit.Vector`); AOT (`Wasm.Aot`, `Wasm.Aot.Artifact`) | three implementations of one seam — the interpreter is the tier of record; JIT/AOT accelerate a 64-bit UNIX host | interpreter **shipped** (every platform); JIT + AOT **shipped** (64-bit UNIX, two backends) |
 | Native executable payload | `Wasm.Native.Payload` | versioned embedded-executable container (original module, complete native code, connector plan, capability set), distinct from the `.waot` cache | **shipped**; `wasmlight compile` embeds it |
@@ -456,10 +456,12 @@ different.
   publishes the callee's activation and GC frame in generated code — the
   same fields, order, and exhaustion predicates as `JitPrepareDirectCall`
   and `JitFinishDirectCall` — and falls back to those helpers whenever the
-  callee has no live direct entry. Large register files, wide non-tail calls, and out-of-range
-  conditional branches are encoded, not declined. The remaining compile
-  declines are an unsupported target (no backend) and a `return_call*`
-  whose argument block exceeds the shared cross-tier tail channel.
+  callee has no live direct entry. Large register files, wide calls and
+  `return_call*`s, and out-of-range conditional branches are encoded, not
+  declined: an argument or result block wider than the 1024-slot inline
+  buffers marshals through heap blocks the interpreter context owns, in
+  every tier. The remaining compile decline is an unsupported target (no
+  backend); every IR op has a template on both backends.
   Compiled and interpreted functions interoperate transparently across the
   seam (a throw from a compiled callee reaches an outer interpreted
   handler, and a cross-tier tail call stays O(1)).
@@ -497,9 +499,10 @@ payload and packages it onto a catalog or host-sibling runtime shell.
 The **runtime shell** (`Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native`,
 program `wasmlight-shell`) is the interpreter-free template
 `wasmlight compile` populates. Startup always re-decodes and
-re-validates the embedded module, then wires only a complete native
-image; an incomplete or incompatible image is `EWasmLinkError` and is
-never interpreted. `.waot` remains the fallback-capable cache for
+re-validates the embedded module, strictly decodes and applies the
+embedded capability set, then wires only a complete native image; an
+incomplete or incompatible image is `EWasmLinkError` and is never
+interpreted. `.waot` remains the fallback-capable cache for
 `run --aot`. Packaged ELF/Mach-O images carry the product payload;
 the attach-seam `.wshl` envelope remains for template tests.
 
@@ -606,18 +609,29 @@ boundary is drawn.
   once, strict-AOT every defined function for `--target`, write a native-
   executable payload, and package it onto a catalog or host-sibling
   runtime shell. WASI preview1 is a built-in; other imports fail at link
-  unless a selected connector uniquely binds them, and connector host
-  functions are not yet embedded. There is no `.waot`, JIT, or interpreter
-  fallback. A missing catalog or unusable shell is `EWasmPackagingError`.
+  unless a selected connector uniquely binds them with a fixed lowering the
+  target C ABI can call, and the resolved plan is embedded for the shell.
+  `--dir GUEST=HOST` and `--env KEY=VALUE` build the compiled capability set,
+  which the payload embeds; a malformed spec is a usage error before decode.
+  There is no `.waot`, JIT, or interpreter fallback. A missing catalog or
+  unusable shell is `EWasmPackagingError`.
 - **`Wasm.Connector` / `Wasm.Connector.Resolve`** are compile-time linking,
   not a runtime host. `ParseConnector` turns `.wlc` into declaration
   records. `ResolveConnectorPlan` matches each non-built-in import exactly
   once by connector class, method name, and the wasm signature after fixed
   marshalling, treats `EntryPoint` as a native-symbol alias only, and
   strips unused libraries and types. Failures are `EWasmLinkError`. The
-  plan is the immutable input later compile work embeds; resolve does not
-  load a library. See [connector-language.md](connector-language.md) and
+  plan is the immutable input `wasmlight compile` embeds through
+  `Wasm.Connector.Plan`; resolve does not load a library. See
+  [connector-language.md](connector-language.md) and
   [connector-resolve.md](connector-resolve.md).
+- **`Wasm.Connector.Host`** turns an embedded plan into host functions at
+  runtime-shell startup: it lowers each binding with fixed marshalling
+  (scalars, buffers through `Wasm.Connector.Memory`, opaque handles, and
+  table-0 callbacks through `Wasm.Connector.Callbacks`), loads the plan's
+  application-local libraries, and defines the imports on the
+  deny-by-default linker next to WASI. The compiler uses the same lowering
+  to reject a plan before it writes an executable.
 
 - **`Wasm.Compile.Capabilities`** is the immutable compiled WASI capability
   set ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)):
@@ -628,7 +642,13 @@ boundary is drawn.
   the guest. Embedded environment values are visible in the executable and
   are not a secret mechanism. The set cannot grow after it is frozen, and
   apply refuses a config that already has preopens or env. Containment
-  stays in `Wasm.Wasi`.
+  stays in `Wasm.Wasi`. The unit also owns the capability-set section
+  encoding: versioned, fixed-width little-endian, order-preserving, with
+  the empty set as no bytes so every set has one encoding, and a strict
+  decoder that rejects anything the compile path could not have written.
+  `CompiledGuestArgv` is the one argv builder: `wasmlight run` passes the
+  module path and a compiled executable passes its own path, so the guest
+  sees the same argc for the same arguments.
 
 ### Target-shell discovery
 

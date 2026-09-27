@@ -112,7 +112,37 @@ type
     {$IFDEF UNIX}
     procedure TestContainmentEscapingSymlink;
     {$ENDIF}
+    procedure TestEmptySetEncodesAsNoBytes;
+    procedure TestEncodingIsExactAndDeterministic;
+    procedure TestEncodingRoundTripsInOrder;
+    procedure TestDecodedSetIsFrozen;
+    procedure TestDecodeRejectsMalformedHeader;
+    procedure TestDecodeRejectsMalformedEntries;
   end;
+
+{ Bytes spelled next to the assertion that reads them. }
+function CapBytes(const AValues: array of Byte): TWasmBytes;
+var
+  Index: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(AValues));
+  for Index := 0 to High(AValues) do
+    Result[Index] := AValues[Index];
+end;
+
+function DecodeError(const ABytes: TWasmBytes): string;
+var
+  Caps: TWasmCompiledCapabilities;
+begin
+  if TryDecodeCompiledCapabilities(ABytes, Caps, Result) then
+  begin
+    Caps.Free;
+    Result := '';
+  end
+  else if Caps <> nil then
+    Result := 'decoder returned a set on failure';
+end;
 
 function MakeTempDir(const APrefix: string): string;
 var
@@ -742,6 +772,172 @@ begin
 end;
 {$ENDIF}
 
+procedure TCompileCapabilitiesTests.TestEmptySetEncodesAsNoBytes;
+var
+  Caps, Decoded: TWasmCompiledCapabilities;
+  Err: string;
+begin
+  Expect<Integer>(Length(EncodeCompiledCapabilities(nil))).ToBe(0);
+  Caps := TWasmCompiledCapabilities.Create;
+  Decoded := nil;
+  try
+    Expect<Integer>(Length(EncodeCompiledCapabilities(Caps))).ToBe(0);
+    Expect<Boolean>(TryDecodeCompiledCapabilities(nil, Decoded, Err))
+      .ToBe(True);
+    Expect<Integer>(Decoded.PreopenCount).ToBe(0);
+    Expect<Integer>(Decoded.EnvCount).ToBe(0);
+  finally
+    Decoded.Free;
+    Caps.Free;
+  end;
+end;
+
+procedure TCompileCapabilitiesTests.TestEncodingIsExactAndDeterministic;
+var
+  Caps: TWasmCompiledCapabilities;
+  Encoded, Again, Want: TWasmBytes;
+  Err: string;
+  Index: Integer;
+begin
+  Caps := TWasmCompiledCapabilities.Create;
+  try
+    Expect<Boolean>(Caps.TryAddDirSpec('/d=x', Err)).ToBe(True);
+    Expect<Boolean>(Caps.TryAddEnvSpec('K=V', Err)).ToBe(True);
+    Encoded := EncodeCompiledCapabilities(Caps);
+    Again := EncodeCompiledCapabilities(Caps);
+  finally
+    Caps.Free;
+  end;
+  Want := CapBytes([
+    $01, $00,                          { version 1 }
+    $00, $00,                          { flags }
+    $01, $00, $00, $00,                { one directory }
+    $01, $00, $00, $00,                { one env entry }
+    $02, $00, $00, $00, $2F, $64,      { guest "/d" }
+    $01, $00, $00, $00, $78,           { host "x" }
+    $03, $00, $00, $00, $4B, $3D, $56  { "K=V" }
+  ]);
+  Expect<Integer>(Length(Encoded)).ToBe(Length(Want));
+  for Index := 0 to High(Want) do
+    Expect<Integer>(Encoded[Index]).ToBe(Want[Index]);
+  Expect<Integer>(Length(Again)).ToBe(Length(Encoded));
+  for Index := 0 to High(Encoded) do
+    Expect<Integer>(Again[Index]).ToBe(Encoded[Index]);
+end;
+
+procedure TCompileCapabilitiesTests.TestEncodingRoundTripsInOrder;
+var
+  Caps, Decoded: TWasmCompiledCapabilities;
+  Err: string;
+begin
+  Caps := TWasmCompiledCapabilities.Create;
+  Decoded := nil;
+  try
+    Expect<Boolean>(Caps.TryAddDirSpec('/data=data', Err)).ToBe(True);
+    Expect<Boolean>(Caps.TryAddDirSpec('/abs=/srv/x=y', Err)).ToBe(True);
+    Expect<Boolean>(Caps.TryAddEnvSpec('B=x=y', Err)).ToBe(True);
+    Expect<Boolean>(Caps.TryAddEnvSpec('A=', Err)).ToBe(True);
+    Expect<Boolean>(TryDecodeCompiledCapabilities(
+      EncodeCompiledCapabilities(Caps), Decoded, Err)).ToBe(True);
+    Expect<string>(Err).ToBe('');
+    Expect<Integer>(Decoded.PreopenCount).ToBe(2);
+    Expect<string>(Decoded.PreopenAt(0).GuestPath).ToBe('/data');
+    Expect<string>(Decoded.PreopenAt(0).HostPath).ToBe('data');
+    Expect<string>(Decoded.PreopenAt(1).GuestPath).ToBe('/abs');
+    Expect<string>(Decoded.PreopenAt(1).HostPath).ToBe('/srv/x=y');
+    Expect<Integer>(Decoded.EnvCount).ToBe(2);
+    Expect<string>(Decoded.EnvAt(0)).ToBe('B=x=y');
+    Expect<string>(Decoded.EnvAt(1)).ToBe('A=');
+  finally
+    Decoded.Free;
+    Caps.Free;
+  end;
+end;
+
+procedure TCompileCapabilitiesTests.TestDecodedSetIsFrozen;
+var
+  Decoded: TWasmCompiledCapabilities;
+  Err: string;
+begin
+  Decoded := nil;
+  try
+    Expect<Boolean>(TryDecodeCompiledCapabilities(CapBytes([
+      $01, $00, $00, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+      $03, $00, $00, $00, $4B, $3D, $56]), Decoded, Err)).ToBe(True);
+    Expect<Boolean>(Decoded.Frozen).ToBe(True);
+    Expect<Boolean>(Decoded.TryAddEnvSpec('MORE=1', Err)).ToBe(False);
+    Expect<Boolean>(Decoded.TryAddDirSpec('/x=/', Err)).ToBe(False);
+    Expect<Integer>(Decoded.EnvCount).ToBe(1);
+    Expect<Integer>(Decoded.PreopenCount).ToBe(0);
+  finally
+    Decoded.Free;
+  end;
+end;
+
+procedure TCompileCapabilitiesTests.TestDecodeRejectsMalformedHeader;
+begin
+  { Shorter than the 12-byte header. }
+  Expect<string>(DecodeError(CapBytes([$01, $00, $00, $00, $01])))
+    .ToBe('truncated capability set header');
+  { Version 2. }
+  Expect<string>(DecodeError(CapBytes([
+    $02, $00, $00, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+    $03, $00, $00, $00, $4B, $3D, $56])))
+    .ToBe('unsupported capability set version 2');
+  { A reserved flag bit. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $01, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+    $03, $00, $00, $00, $4B, $3D, $56])))
+    .ToBe('reserved capability set flags are set');
+  { A header with no entries is a second encoding of the empty set. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00])))
+    .ToBe('an empty capability set must be encoded as no bytes');
+  { A forged count with no entry bytes behind it. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $FF, $FF, $FF, $FF, $00, $00, $00, $00])))
+    .ToBe('truncated capability set directory entry');
+end;
+
+procedure TCompileCapabilitiesTests.TestDecodeRejectsMalformedEntries;
+begin
+  { Env length 4 with three bytes left. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+    $04, $00, $00, $00, $4B, $3D, $56])))
+    .ToBe('truncated capability set environment entry');
+  { A length that would wrap a 32-bit offset. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+    $FF, $FF, $FF, $FF, $4B, $3D, $56])))
+    .ToBe('truncated capability set environment entry');
+  { One trailing byte after a complete set. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+    $03, $00, $00, $00, $4B, $3D, $56, $00])))
+    .ToBe('trailing bytes after the capability set');
+  { Env entry "KV" has no '='. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $00, $00, $00, $00, $01, $00, $00, $00,
+    $02, $00, $00, $00, $4B, $56])))
+    .ToBe('invalid --env "KV": expected KEY=VALUE');
+  { Directory with an empty guest path. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $01, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $01, $00, $00, $00, $78])))
+    .ToBe('invalid --dir: guest path is empty');
+  { Directory with an empty host path. }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $01, $00, $00, $00, $00, $00, $00, $00,
+    $02, $00, $00, $00, $2F, $64, $00, $00, $00, $00])))
+    .ToBe('invalid --dir: HOST path is empty');
+  { Host path "x<NUL>". }
+  Expect<string>(DecodeError(CapBytes([
+    $01, $00, $00, $00, $01, $00, $00, $00, $00, $00, $00, $00,
+    $02, $00, $00, $00, $2F, $64, $02, $00, $00, $00, $78, $00])))
+    .ToBe('invalid --dir: path contains a NUL');
+end;
+
 procedure TCompileCapabilitiesTests.SetupTests;
 begin
   Test('a default set grants no directories and no environment',
@@ -781,6 +977,17 @@ begin
   Test('path_open through an applied preopen refuses an escaping symlink',
     TestContainmentEscapingSymlink);
   {$ENDIF}
+  Test('the empty set encodes as no bytes and decodes back',
+    TestEmptySetEncodesAsNoBytes);
+  Test('the capability-set encoding is exact and deterministic',
+    TestEncodingIsExactAndDeterministic);
+  Test('an encoded set round-trips with its grant order',
+    TestEncodingRoundTripsInOrder);
+  Test('a decoded set is frozen and cannot grow', TestDecodedSetIsFrozen);
+  Test('a malformed capability-set header is rejected',
+    TestDecodeRejectsMalformedHeader);
+  Test('a malformed capability-set entry is rejected',
+    TestDecodeRejectsMalformedEntries);
 end;
 
 begin

@@ -219,6 +219,7 @@ type
     procedure TestHostCallRoundTrip;
     procedure TestHostCallTrapPropagates;
     procedure TestHostCallReentrancy;
+    procedure TestWideHostCallsMarshal;
     procedure TestM7ExternConvertCrossHierarchy;
     { SIMD / v128 (Track G). }
     procedure TestSimdSplatAddExtract;
@@ -302,6 +303,43 @@ begin
     trampoline. The nested activation region sits above the outer frames. }
   Inner[0] := AParams[0];
   InterpInvoke(GReenterStore, GReenterDouble, @Inner[0], @AResults[0]);
+end;
+
+const
+  { One past the interpreter's 1024-slot inline marshal buffers. }
+  WIDE_HOST_ARITY = 1025;
+
+procedure HostWideReverseCallback(const AStore: TWasmStore;
+  const AData: Pointer; const AParams: PWasmValue; const AResults: PWasmValue);
+var
+  K: Integer;
+begin
+  { (i32 x 1025) -> (i32 x 1025): result k is parameter 1024-k plus one, so a
+    marshal that drops, truncates, or overlaps a block changes the fold. }
+  for K := 0 to WIDE_HOST_ARITY - 1 do
+    AResults[K] := MakeValueI32(AParams[WIDE_HOST_ARITY - 1 - K].I32 + 1);
+end;
+
+const
+  { 513 v128 results: 1026 flat slots, past the inline buffers. }
+  WIDE_HOST_V128 = 513;
+
+function WideHostLane(const AK, ALane: Integer): UInt64;
+begin
+  Result := UInt64(AK) * 7919 + UInt64(ALane) * 104729 + 1;
+end;
+
+procedure HostWideVecCallback(const AStore: TWasmStore;
+  const AData: Pointer; const AParams: PWasmValue; const AResults: PWasmValue);
+var
+  K: Integer;
+begin
+  { () -> (v128 x 513): a v128 is two flat slots, low i64 lane first. }
+  for K := 0 to WIDE_HOST_V128 - 1 do
+  begin
+    AResults[2 * K].Bits := WideHostLane(K, 0);
+    AResults[2 * K + 1].Bits := WideHostLane(K, 1);
+  end;
 end;
 
 { --- fixture ------------------------------------------------------------- }
@@ -1674,6 +1712,111 @@ begin
   Expect<Int32>(Call1('cr', [MakeValueI32(21)]).I32).ToBe(42);
 end;
 
+{ Host imports whose blocks are past the 1024-slot inline marshal buffers,
+  valid wasm, so no path may raise an internal cap: 1025 i32 in and out by
+  `call` (HostCall) and by `return_call` (ReturnHostCall), and 513 v128
+  results (1026 flat slots) by `return_call`, which sizes the block in flat
+  slots, not values. The guest folds every result order-sensitively and the
+  model below recomputes each fold. }
+procedure TInterpTests.TestWideHostCallsMarshal;
+var
+  Canon, TypeIdx: TWasmEngineTypeIds;
+  TypeWide, TypeWideOut, TypeVecOut, Args, Fold, VecFold: TWasmBytes;
+  K: Integer;
+  Expected: UInt32;
+  Lane0, Lane1: UInt64;
+
+  function I32Const(const AValue: Integer): TWasmBytes;
+  begin
+    if AValue < 64 then
+      Result := BLit([$41, Byte(AValue)])
+    else
+      Result := BLit([$41, Byte((AValue and $7F) or $80), Byte(AValue shr 7)]);
+  end;
+
+  function Repeated(const AItem: TWasmBytes; const ACount: Integer): TWasmBytes;
+  var
+    I: Integer;
+  begin
+    Result := nil;
+    for I := 1 to ACount do
+      Result := Cat([Result, AItem]);
+  end;
+
+begin
+  TypeWide := Cat([BLit([$60]), ULeb(WIDE_HOST_ARITY),
+    Repeated(BLit([$7F]), WIDE_HOST_ARITY), ULeb(WIDE_HOST_ARITY),
+    Repeated(BLit([$7F]), WIDE_HOST_ARITY)]);
+  TypeWideOut := Cat([BLit([$60, $00]), ULeb(WIDE_HOST_ARITY),
+    Repeated(BLit([$7F]), WIDE_HOST_ARITY)]);
+  TypeVecOut := Cat([BLit([$60, $00]), ULeb(WIDE_HOST_V128),
+    Repeated(BLit([$7B]), WIDE_HOST_V128)]);
+  Args := nil;
+  for K := 0 to WIDE_HOST_ARITY - 1 do
+    Args := Cat([Args, I32Const(K)]);
+  { acc := r1024; for k = 1023 downto 0: acc := rotl(r_k xor acc, 1) }
+  Fold := Repeated(BLit([$73, $41, $01, $77]), WIDE_HOST_ARITY - 1);
+  { acc := v512; for k = 511 downto 0: acc := v_k - acc (i64x2.sub); then
+    lane0 xor rotl(lane1, 17) through v128 local 0. }
+  VecFold := Cat([Repeated(BLit([$FD, $D1, $01]), WIDE_HOST_V128 - 1),
+    BLit([$21, $00, $20, $00, $FD, $1D, $00, $20, $00, $FD, $1D, $01,
+      $42, $11, $89, $85])]);
+  { imports "h"."w" (type 0) = func 0, "h"."v" (type 3) = func 1
+    $wc  () -> i32         args; call 0; fold               (func 2)
+    $wt  () -> i32 x 1025  args; return_call 0              (func 3)
+    $wtc () -> i32         call 3; fold                     (func 4)
+    $tv  () -> v128 x 513  return_call 1                    (func 5)
+    $tvc () -> i64         call 5; vector fold              (func 6) }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([TypeWide, BLit([$60, $00, $01, $7F]), TypeWideOut,
+      TypeVecOut, BLit([$60, $00, $01, $7E])])),
+    Sect(2, VecOf([BLit([$01, $68, $01, $77, $00, $00]),
+      BLit([$01, $68, $01, $76, $00, $03])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$02]), BLit([$01]), BLit([$03]),
+      BLit([$04])])),
+    Sect(7, VecOf([
+      BLit([$02, $77, $63, $00, $02]),
+      BLit([$03, $77, $74, $63, $00, $04]),
+      BLit([$03, $74, $76, $63, $00, $06])])),
+    Sect(10, VecOf([
+      CodeEntry(Cat([BLit([$00]), Args, BLit([$10, $00]), Fold, BLit([$0B])])),
+      CodeEntry(Cat([BLit([$00]), Args, BLit([$12, $00, $0B])])),
+      CodeEntry(Cat([BLit([$00, $10, $03]), Fold, BLit([$0B])])),
+      CodeEntry([$00, $12, $01, $0B]),
+      CodeEntry(Cat([BLit([$01, $01, $7B, $10, $05]), VecFold,
+        BLit([$0B])]))]))
+  ]));
+  FEngine.InternModule(FIr, Canon, TypeIdx);
+  SetLength(FImports.Funcs, 2);
+  FImports.Funcs[0] := FStore.AddHostFunc(TypeIdx[0],
+    @HostWideReverseCallback, nil);
+  FImports.Funcs[1] := FStore.AddHostFunc(TypeIdx[3],
+    @HostWideVecCallback, nil);
+  DoInstantiate;
+
+  { r_k = (1024 - k) + 1 }
+  Expected := 1;   { r1024 }
+  for K := WIDE_HOST_ARITY - 2 downto 0 do
+    Expected := RolDWord(UInt32(WIDE_HOST_ARITY - K) xor Expected, 1);
+  Expect<Int32>(Call1('wc', []).I32).ToBe(Int32(Expected));
+  Expect<Int32>(Call1('wtc', []).I32).ToBe(Int32(Expected));
+
+  {$PUSH}
+  {$OVERFLOWCHECKS OFF}
+  {$RANGECHECKS OFF}
+  Lane0 := WideHostLane(WIDE_HOST_V128 - 1, 0);
+  Lane1 := WideHostLane(WIDE_HOST_V128 - 1, 1);
+  for K := WIDE_HOST_V128 - 2 downto 0 do
+  begin
+    Lane0 := WideHostLane(K, 0) - Lane0;
+    Lane1 := WideHostLane(K, 1) - Lane1;
+  end;
+  {$POP}
+  Expect<UInt64>(Call1('tvc', []).Bits)
+    .ToBe(Lane0 xor RolQWord(Lane1, 17));
+end;
+
 { --- M7: extern/any conversion crosses the hierarchy (interp-spec §3.9 O-4) -
   extern.convert_any / any.convert_extern move a value between the `any` and
   `extern` hierarchies through Wasm.Runtime.Gc's wrapper pair, so a ref.test
@@ -2660,6 +2803,8 @@ begin
   Test('a host call round-trips params and results', TestHostCallRoundTrip);
   Test('a host callback trap propagates', TestHostCallTrapPropagates);
   Test('a host callback re-enters guest code', TestHostCallReentrancy);
+  Test('host call and return_call marshal blocks past the inline buffers',
+    TestWideHostCallsMarshal);
   Test('M7: extern.convert_any moves a struct into the extern hierarchy, so '
     + 'ref.test flips across the boundary', TestM7ExternConvertCrossHierarchy);
   Test('v128 splat/add/extract_lane computes end to end',

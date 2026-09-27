@@ -178,6 +178,44 @@ jobs:
           set -euo pipefail
           ./build/wasmlight compile tests/fixtures/wasi/hello.wasm -o build/hello-native
           test "$(./build/hello-native)" = "hello"
+          # Compiled capabilities (#40). caps.wasm exits with
+          # argc + 10*envc + 100 if it can open probe.txt through fd 3.
+          expect_exit() {
+            local want="$1"; shift
+            local got=0
+            "$@" || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          export AMBIENT=1
+          CAPS="$PWD/tests/fixtures/wasi/caps.wasm"
+          APP="$RUNNER_TEMP/caps-app"
+          MOVED="$RUNNER_TEMP/caps-moved"
+          mkdir -p "$APP/data" "$MOVED"
+          echo probe > "$APP/data/probe.txt"
+          # argc parity: `run` and a compiled executable both see 3.
+          expect_exit 3 ./build/wasmlight run "$CAPS" a --b
+          ./build/wasmlight compile "$CAPS" -o "$APP/plain"
+          expect_exit 3 "$APP/plain" a --b
+          # Embedded env only (no ambient AMBIENT), and a relative preopen
+          # resolved from the executable directory, not the CWD.
+          ./build/wasmlight compile "$CAPS" --dir /d=data --env A=1 --env B=2 \
+            -o "$APP/caps"
+          expect_exit 123 ./build/wasmlight run --dir "/d=$APP/data" \
+            --env A=1 --env B=2 "$CAPS" a --b
+          (cd / && expect_exit 123 "$APP/caps" a --b)
+          # Started by a PATH lookup or through a symlink, the grant still
+          # resolves from the real executable's directory.
+          (cd / && export PATH="$APP:$PATH" && expect_exit 123 caps a --b)
+          ln -sf "$APP/caps" "$MOVED/link"
+          (cd / && expect_exit 123 "$MOVED/link" a --b)
+          # Relocated without a data directory: the grant does not follow CWD.
+          cp "$APP/caps" "$MOVED/caps"
+          (cd "$APP" && expect_exit 21 "$MOVED/caps")
+          # An absolute host path stays literal after relocation.
+          ./build/wasmlight compile "$CAPS" --dir "/d=$APP/data" -o "$MOVED/abs"
+          (cd / && expect_exit 101 "$MOVED/abs")
 
       - name: lwpt test (co-located unit suites)
         run: lwpt test

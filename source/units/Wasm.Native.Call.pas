@@ -6,6 +6,11 @@
   per-signature compiler. The gate's meta-ABI is cdecl; the callee sees
   the planned AAPCS64 or SysV register/stack placement.
 
+  A single-piece integer argument in a register is passed with all the
+  bytes the caller supplied (up to eight), not just its C width: Apple
+  AArch64 and SysV callers extend narrow integers, so a caller passes a
+  narrow value already sign- or zero-extended (AbiValueI64 / AbiValueU64).
+
   An incompatible plan, a missing function pointer, or a host/target
   mismatch is EWasmLinkError. Guest memory is not touched here — that is
   issue #44. }
@@ -406,7 +411,13 @@ begin
       Piece := APlan.Args[I].Pieces[J];
       case Piece.Kind of
         wapIntReg:
-          IntRegs[Piece.Reg] := SliceU64(AArgs[I], Piece.Offset, Piece.Size);
+          { A single-piece scalar keeps the caller's extension: Apple
+            AArch64 and SysV callers widen a narrow integer, so a value the
+            caller supplied wider than its C type is passed whole. }
+          if (Length(APlan.Args[I].Pieces) = 1) and (Piece.Offset = 0) then
+            IntRegs[Piece.Reg] := SliceU64(AArgs[I], 0, 8)
+          else
+            IntRegs[Piece.Reg] := SliceU64(AArgs[I], Piece.Offset, Piece.Size);
         wapFloatReg:
           FloatRegs[Piece.Reg] := SliceU64(AArgs[I], Piece.Offset, Piece.Size);
         wapStack:

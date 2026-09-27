@@ -442,6 +442,15 @@ begin
       Result.HasSizeConst := True;
       Result.SizeConst := Integer(AAttr.Args[I].IntValue);
     end
+    else if (AAttr.Args[I].Name = 'SizeParamIndex') and AAttr.Args[I].IsInt then
+    begin
+      if (AAttr.Args[I].IntValue < 0) or
+        (AAttr.Args[I].IntValue > High(Integer)) then
+        RaiseConnectorError('SizeParamIndex must be a non-negative integer',
+          AAttr.Line, AAttr.Column);
+      Result.HasSizeParamIndex := True;
+      Result.SizeParamIndex := Integer(AAttr.Args[I].IntValue);
+    end
     else
       RaiseConnectorError('unknown MarshalAs argument',
         AAttr.Line, AAttr.Column);

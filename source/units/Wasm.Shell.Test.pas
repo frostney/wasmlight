@@ -28,11 +28,15 @@ uses
 
   TestingPascalLibrary,
   Wasm.Aot,
+  Wasm.Compile.Capabilities,
   Wasm.Core,
+  Wasm.Decoder,
   Wasm.Engine,
   Wasm.Jit.CodeBuffer,
   Wasm.Native,
+  Wasm.Native.Load,
   Wasm.Package.Elf,
+  Wasm.Run,
   Wasm.Runtime.Instantiate,
   Wasm.Runtime.Store,
   Wasm.Runtime.Values,
@@ -99,6 +103,44 @@ const
   INVALID_WAT =
     '(module (func (result i32) (i32.const 1) (i32.const 2)))';
 
+  { tests/fixtures/wasi/caps.wat: exits with argc + 10 * envc, plus 100
+    when fd 3 opens probe.txt. }
+  CAPS_COMMAND_WAT =
+    '(module' + sLineBreak +
+    '  (import "wasi_snapshot_preview1" "args_sizes_get"' + sLineBreak +
+    '    (func $args_sizes_get (param i32 i32) (result i32)))' + sLineBreak +
+    '  (import "wasi_snapshot_preview1" "environ_sizes_get"' + sLineBreak +
+    '    (func $environ_sizes_get (param i32 i32) (result i32)))' +
+    sLineBreak +
+    '  (import "wasi_snapshot_preview1" "path_open"' + sLineBreak +
+    '    (func $path_open' + sLineBreak +
+    '      (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))' +
+    sLineBreak +
+    '  (import "wasi_snapshot_preview1" "proc_exit"' + sLineBreak +
+    '    (func $proc_exit (param i32)))' + sLineBreak +
+    '  (memory (export "memory") 1)' + sLineBreak +
+    '  (data (i32.const 64) "probe.txt")' + sLineBreak +
+    '  (func (export "_start")' + sLineBreak +
+    '    (local $code i32)' + sLineBreak +
+    '    (drop (call $args_sizes_get (i32.const 0) (i32.const 4)))' +
+    sLineBreak +
+    '    (drop (call $environ_sizes_get (i32.const 8) (i32.const 12)))' +
+    sLineBreak +
+    '    (local.set $code' + sLineBreak +
+    '      (i32.add' + sLineBreak +
+    '        (i32.load (i32.const 0))' + sLineBreak +
+    '        (i32.mul (i32.load (i32.const 8)) (i32.const 10))))' +
+    sLineBreak +
+    '    (if (i32.eqz (call $path_open' + sLineBreak +
+    '          (i32.const 3) (i32.const 0) (i32.const 64) (i32.const 9)' +
+    sLineBreak +
+    '          (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 0)' +
+    sLineBreak +
+    '          (i32.const 16)))' + sLineBreak +
+    '      (then (local.set $code (i32.add (local.get $code)' +
+    ' (i32.const 100)))))' + sLineBreak +
+    '    (call $proc_exit (local.get $code))))';
+
 type
   TShellTests = class(TTestSuite)
   private
@@ -107,6 +149,7 @@ type
     function BuildNative(const ABytes: TWasmBytes): TWasmBytes;
     function PayloadForWat(const AWat: string): TWasmBytes;
     function WriteTempPayload(const ABytes: TWasmBytes): string;
+    function CapsPayload(const ADirs, AEnvs: array of string): TWasmBytes;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -119,8 +162,13 @@ type
     procedure TestInvalidModuleIsValidationError;
     procedure TestIncompleteNativeRejected;
     procedure TestStaleNativeRejected;
-    procedure TestConnectorStubRejected;
-    procedure TestCapabilityStubRejected;
+    procedure TestMalformedConnectorPlanRejected;
+    procedure TestMalformedCapabilitySetRejected;
+    procedure TestCapabilitySetCannotBeExpanded;
+    procedure TestCompiledCapabilitiesReachGuest;
+    procedure TestArgcMatchesRun;
+    procedure TestCapsFixtureMatchesSource;
+    procedure TestExecutablePathIsAbsolute;
     procedure TestNoStart;
     procedure TestStartParameter;
     procedure TestStartResult;
@@ -294,7 +342,7 @@ begin
   Expect<Boolean>(CapturedStdout = '').ToBe(True);
 end;
 
-procedure TShellTests.TestConnectorStubRejected;
+procedure TShellTests.TestMalformedConnectorPlanRejected;
 var
   Module, Plan, Payload: TWasmBytes;
   Res: TWasmShellResult;
@@ -306,22 +354,152 @@ begin
   FConfig := TWasmWasiConfig.Create;
   Res := RunShellBytes(Payload, FConfig);
   Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
-  Expect<Boolean>(Pos('connector plan', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('EWasmLinkError: malformed connector plan',
+    Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(CapturedStdout = '').ToBe(True);
 end;
 
-procedure TShellTests.TestCapabilityStubRejected;
+procedure TShellTests.TestMalformedCapabilitySetRejected;
 var
   Module, Caps, Payload: TWasmBytes;
   Res: TWasmShellResult;
 begin
   Module := AssembleWatText(HELLO_WAT);
+  { One byte: shorter than the 12-byte capability-set header. }
   SetLength(Caps, 1);
   Caps[0] := 1;
   Payload := WriteShellPayload(Module, BuildNative(Module), nil, Caps);
   FConfig := TWasmWasiConfig.Create;
   Res := RunShellBytes(Payload, FConfig);
   Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
-  Expect<Boolean>(Pos('capability set', Res.Diagnostic) > 0).ToBe(True);
+  Expect<string>(Res.Diagnostic)
+    .ToBe('EWasmLinkError: malformed capability set: truncated capability set header');
+  Expect<Boolean>(CapturedStdout = '').ToBe(True);
+end;
+
+function TShellTests.CapsPayload(const ADirs, AEnvs: array of string):
+  TWasmBytes;
+var
+  Module: TWasmBytes;
+  Caps: TWasmCompiledCapabilities;
+  Err: string;
+  I: Integer;
+begin
+  Module := AssembleWatText(CAPS_COMMAND_WAT);
+  Caps := TWasmCompiledCapabilities.Create;
+  try
+    for I := 0 to High(ADirs) do
+      if not Caps.TryAddDirSpec(ADirs[I], Err) then
+        raise EWasmError.Create(Err);
+    for I := 0 to High(AEnvs) do
+      if not Caps.TryAddEnvSpec(AEnvs[I], Err) then
+        raise EWasmError.Create(Err);
+    Result := WriteShellPayload(Module, BuildNative(Module), nil,
+      EncodeCompiledCapabilities(Caps));
+  finally
+    Caps.Free;
+  end;
+end;
+
+procedure TShellTests.TestCapabilitySetCannotBeExpanded;
+var
+  Res: TWasmShellResult;
+begin
+  FConfig := TWasmWasiConfig.Create;
+  FConfig.AddEnv('AMBIENT=1');
+  Res := RunShellBytes(CapsPayload([], ['A=1']), FConfig,
+    ShellInvocation('/opt/app/tool', []));
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<string>(Res.Diagnostic)
+    .ToBe('EWasmLinkError: cannot expand a compiled capability set');
+  Expect<Integer>(Length(FConfig.Env)).ToBe(1);
+
+  FreeAndNil(FConfig);
+  FConfig := TWasmWasiConfig.Create;
+  FConfig.AddPreopenDir('/ambient', GetTempDir, WASM_COMPILED_DIR_RIGHTS);
+  Res := RunShellBytes(CapsPayload([], ['A=1']), FConfig,
+    ShellInvocation('/opt/app/tool', []));
+  Expect<string>(Res.Diagnostic)
+    .ToBe('EWasmLinkError: cannot expand a compiled capability set');
+  Expect<Integer>(Length(FConfig.Env)).ToBe(0);
+end;
+
+procedure TShellTests.TestCompiledCapabilitiesReachGuest;
+var
+  Root, AppDir: string;
+  Res: TWasmShellResult;
+  Probe: TFileStream;
+begin
+  { <root>/app/tool is the executable; <root>/app/data/probe.txt is only
+    reachable if `/d=data` resolves from the executable directory. }
+  Root := IncludeTrailingPathDelimiter(GetTempDir) + 'wasmlight-shell-caps-' +
+    IntToStr(GetTickCount64);
+  AppDir := IncludeTrailingPathDelimiter(Root) + 'app';
+  ForceDirectories(IncludeTrailingPathDelimiter(AppDir) + 'data');
+  Probe := TFileStream.Create(IncludeTrailingPathDelimiter(AppDir) +
+    'data' + PathDelim + 'probe.txt', fmCreate);
+  Probe.Free;
+  try
+    FConfig := TWasmWasiConfig.Create;
+    Res := RunShellBytes(CapsPayload(['/d=data'], ['A=1', 'B=2']), FConfig,
+      ShellInvocation(IncludeTrailingPathDelimiter(AppDir) + 'tool',
+      ['a', '--dir=/etc']));
+    Expect<Integer>(Length(FConfig.Argv)).ToBe(3);
+    Expect<string>(FConfig.Argv[0]).ToBe('tool');
+    Expect<Integer>(Length(FConfig.Env)).ToBe(2);
+    Expect<Integer>(Length(FConfig.Preopens)).ToBe(1);
+    {$IFDEF WASM_JIT_BACKEND}
+    if JitExecMemSupported then
+    begin
+      { argc 3 + 10 * envc 2 + 100 for the opened probe. }
+      Expect<Integer>(Res.ExitCode).ToBe(123);
+      Exit;
+    end;
+    {$ENDIF}
+    Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+    Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
+  finally
+    DeleteFile(IncludeTrailingPathDelimiter(AppDir) + 'data' + PathDelim +
+      'probe.txt');
+    RemoveDir(IncludeTrailingPathDelimiter(AppDir) + 'data');
+    RemoveDir(AppDir);
+    RemoveDir(Root);
+  end;
+end;
+
+procedure TShellTests.TestArgcMatchesRun;
+const
+  ARGS: array[0..2] of string = ('a', '--b', '--env=K=V');
+var
+  RunConfig: TWasmWasiConfig;
+  RunRes: TWasmRunResult;
+  Res: TWasmShellResult;
+begin
+  { `wasmlight run caps.wasm a --b --env=K=V` sets argv through the same
+    CompiledGuestArgv; the interpreter gives the reference argc. }
+  RunConfig := TWasmWasiConfig.Create;
+  try
+    RunConfig.SetArgv(CompiledGuestArgv('caps.wasm', ARGS));
+    RunRes := RunModuleBytes(AssembleWatText(CAPS_COMMAND_WAT), RunConfig);
+    Expect<Integer>(RunRes.ExitCode).ToBe(4);
+  finally
+    RunConfig.Free;
+  end;
+
+  FConfig := TWasmWasiConfig.Create;
+  Res := RunShellBytes(CapsPayload([], []), FConfig,
+    ShellInvocation('/opt/app/caps', ARGS));
+  Expect<Integer>(Length(FConfig.Argv)).ToBe(4);
+  Expect<Integer>(Length(FConfig.Env)).ToBe(0);
+  {$IFDEF WASM_JIT_BACKEND}
+  if JitExecMemSupported then
+  begin
+    Expect<Integer>(Res.ExitCode).ToBe(RunRes.ExitCode);
+    Exit;
+  end;
+  {$ENDIF}
+  Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
 end;
 
 procedure TShellTests.TestNoStart;
@@ -639,6 +817,47 @@ begin
   Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
 end;
 
+procedure TShellTests.TestCapsFixtureMatchesSource;
+const
+  CAPS_FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wasi' +
+    PathDelim + 'caps.wasm';
+var
+  Fixture: TWasmBytes;
+  FromFile, FromText: TWasmRunResult;
+  Config: TWasmWasiConfig;
+begin
+  Fixture := LoadFileBytes(CAPS_FIXTURE);
+  Config := TWasmWasiConfig.Create;
+  try
+    Config.SetArgv(CompiledGuestArgv('caps.wasm', ['x']));
+    Config.AddEnv('A=1');
+    FromFile := RunModuleBytes(Fixture, Config);
+  finally
+    Config.Free;
+  end;
+  Config := TWasmWasiConfig.Create;
+  try
+    Config.SetArgv(CompiledGuestArgv('caps.wasm', ['x']));
+    Config.AddEnv('A=1');
+    FromText := RunModuleBytes(AssembleWatText(CAPS_COMMAND_WAT), Config);
+  finally
+    Config.Free;
+  end;
+  { argc 2 + 10 * envc 1, no preopen. }
+  Expect<Integer>(FromFile.ExitCode).ToBe(12);
+  Expect<Integer>(FromText.ExitCode).ToBe(FromFile.ExitCode);
+end;
+
+procedure TShellTests.TestExecutablePathIsAbsolute;
+var
+  Path: string;
+begin
+  Path := NativeExecutablePath;
+  Expect<string>(ExpandFileName(Path)).ToBe(Path);
+  Expect<Boolean>(FileExists(Path)).ToBe(True);
+  Expect<Boolean>(ExtractFileName(Path) <> '').ToBe(True);
+end;
+
 procedure TShellTests.SetupTests;
 begin
   Test('corrupt embedded trailers fail before the attach seam', TestCorruptEmbeddedTrailer);
@@ -651,10 +870,20 @@ begin
     TestIncompleteNativeRejected);
   Test('a native image for a different module is EWasmLinkError',
     TestStaleNativeRejected);
-  Test('a non-empty connector plan is rejected (stub until later issues)',
-    TestConnectorStubRejected);
-  Test('a non-empty capability set is rejected (stub until #40)',
-    TestCapabilityStubRejected);
+  Test('a malformed connector plan is a link error before instantiation',
+    TestMalformedConnectorPlanRejected);
+  Test('a malformed capability set is rejected before instantiation',
+    TestMalformedCapabilitySetRejected);
+  Test('a config that already grants env or a preopen cannot expand the set',
+    TestCapabilitySetCannotBeExpanded);
+  Test('compiled preopens, env, and argv reach the guest, or fail closed',
+    TestCompiledCapabilitiesReachGuest);
+  Test('a compiled executable gives the guest the argc run gives',
+    TestArgcMatchesRun);
+  Test('the committed caps.wasm behaves as its wat source',
+    TestCapsFixtureMatchesSource);
+  Test('the executable path comes from the OS and is absolute',
+    TestExecutablePathIsAbsolute);
   Test('a module with no _start is rejected', TestNoStart);
   Test('_start parameters fail the command contract', TestStartParameter);
   Test('_start results fail the command contract', TestStartResult);

@@ -229,11 +229,6 @@ const
     threshold, not a compile decline. }
   ARM64_MAX_SLOT = 2047;
 
-  { Historical single-`sub sp,#imm12` marshaling bound. Call sites above this
-    use a multi-instruction SP adjust; the constant remains as the short-form
-    threshold and for tests that name it. }
-  ARM64_MAX_CALL_SLOTS = 256;
-
   { AArch64 condition codes (C1.2.4). Only the ones the relop templates use. }
   ARM64_COND_EQ = 0;
   ARM64_COND_NE = 1;
@@ -650,15 +645,6 @@ procedure Arm64EmitMaskedShiftCached(const ABuf: TWasmCodeBuffer;
   var ACache: TArm64RegCache);
 procedure Arm64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TArm64RegCache);
-
-{ The INSTRUCTION-level half of the compile predicate. Arm64CanEmitOp answers
-  "is there a template for this op"; this answers "can this particular
-  instruction's template be emitted". Direct call-site arity is encoded with a
-  multi-instruction SP adjust. A return_call* whose argument block exceeds
-  WASM_TIER_TAIL_CAP stays interpreted — that is the shared GTierTail bound,
-  not an encoding limit. }
-function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32): Boolean;
 
 { The compiled-entry invocation trampoline (jit-spec §4.5, §5.2) — what the
   driver's JitInvokeCompiled hook delegates to. Builds the callee's frame
@@ -1889,11 +1875,11 @@ end;
   loop, and return to the compiled body (which then runs its epilogue). No
   frame work happens here: the loop owns the pop/push so the replacement costs
   no native stack (§4.5). }
-procedure Arm64SetPendingTail(const AAddr: TWasmFuncAddr;
-  const AArgs: PWasmValue; const ACount: UInt32);
+procedure Arm64SetPendingTail(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AArgs: PWasmValue; const ACount: UInt32);
 begin
   { Publish into the SHARED cross-tier channel (Fix A). }
-  SetTierPendingTail(AAddr, AArgs, ACount);
+  SetTierPendingTail(AStore, AAddr, AArgs, ACount);
 end;
 
 { --- the six cdecl helpers the emitted call sequences call --------------- }
@@ -1923,23 +1909,25 @@ procedure JitReturnCallHelper(const AStore: TWasmStore;
   const AFuncIdx: PtrUInt; const AArgs: PWasmValue;
   const ACount: PtrUInt); cdecl;
 begin
-  Arm64SetPendingTail(Arm64CallerInstance(AStore).FuncAddrs[UInt32(AFuncIdx)],
-    AArgs, UInt32(ACount));
+  Arm64SetPendingTail(AStore,
+    Arm64CallerInstance(AStore).FuncAddrs[UInt32(AFuncIdx)], AArgs,
+    UInt32(ACount));
 end;
 
 procedure JitReturnCallIndirectHelper(const AStore: TWasmStore;
   const APacked: PtrUInt; const AIndexBits: UInt64; const AArgs: PWasmValue;
   const ACount: PtrUInt); cdecl;
 begin
-  Arm64SetPendingTail(Arm64ResolveIndirect(AStore, UInt64(APacked), AIndexBits),
-    AArgs, UInt32(ACount));
+  Arm64SetPendingTail(AStore,
+    Arm64ResolveIndirect(AStore, UInt64(APacked), AIndexBits), AArgs,
+    UInt32(ACount));
 end;
 
 procedure JitReturnCallRefHelper(const AStore: TWasmStore;
   const ARefBits: PtrUInt; const AArgs: PWasmValue;
   const ACount: PtrUInt); cdecl;
 begin
-  Arm64SetPendingTail(Arm64ResolveRef(AStore, ARefBits), AArgs,
+  Arm64SetPendingTail(AStore, Arm64ResolveRef(AStore, ARefBits), AArgs,
     UInt32(ACount));
 end;
 
@@ -1994,7 +1982,7 @@ begin
         Exit;
       Pend^.Pending := False;
       CurAddr := Pend^.Addr;
-      CurArgs := @Pend^.Args[0];
+      CurArgs := Pend^.Args;
       Continue;
     end;
 
@@ -2052,7 +2040,7 @@ begin
           Exit;
         Pend^.Pending := False;
         CurAddr := Pend^.Addr;
-        CurArgs := @Pend^.Args[0];
+        CurArgs := Pend^.Args;
         Continue;
       end;
       if CurrentSeamCatch <> nil then
@@ -2073,7 +2061,7 @@ begin
       Exit;
     Pend^.Pending := False;
     CurAddr := Pend^.Addr;
-    CurArgs := @Pend^.Args[0];
+    CurArgs := Pend^.Args;
   end;
 end;
 
@@ -5712,18 +5700,6 @@ begin
     or Arm64RuntimeOp(AOp) or Arm64BranchRefOp(AOp)
     or Arm64VecOp(AOp)
     or (AOp in [iroThrow, iroThrowRef]);
-end;
-
-function Arm64CanEmitInstr(const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32): Boolean;
-begin
-  { Direct/indirect/ref calls marshal on the native stack. return_call*
-    publishes arguments through GTierTail, which is bounded. }
-  Result := True;
-  case AIns.Op of
-    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
-      Result := IrAuxBlockCount(AAux, AIns.A) <= WASM_TIER_TAIL_CAP;
-  end;
 end;
 
 function Arm64EmitOp(const ABuf: TWasmCodeBuffer;
