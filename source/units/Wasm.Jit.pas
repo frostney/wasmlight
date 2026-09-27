@@ -499,8 +499,20 @@ var
   {$IFDEF WASM_JIT_X64}
   LoopHeads: array of Boolean;
   {$ENDIF}
-  AllocatedSlots: array[0..2] of UInt32;
+  { The static cache's fixed-host slots, High(UInt32) when unused: three on
+    ARM64 (x24/x25 and the extended frame's third), four on x64
+    (r8/r9/rdi/rdx). }
+  AllocatedSlots: array[0..{$IFDEF WASM_JIT_X64}3{$ELSE}2{$ENDIF}] of UInt32;
   SlotScores: array of UInt32;
+  {$IFDEF WASM_JIT_X64}
+  { SlotScores restricted to instructions inside a loop span; ranks the x64
+    static cache's rdi/rdx hosts (AnalyzeStaticCache). }
+  LoopSlotScores: array of UInt32;
+  ScoringInLoop: Boolean;
+  { X64LoadAluFirst[K]: PlannedCode[K] is an i32.load emitted as the memory
+    operand of PlannedCode[K + 1] (AnalyzeX64LoadAluFusion). }
+  X64LoadAluFirst: array of Boolean;
+  {$ENDIF}
   SlotUseCounts: array of UInt32;
   VisibleSlots: array of Boolean;
   Fusion: array of Integer;
@@ -1111,6 +1123,31 @@ var
       end;
   end;
 
+  {$IFDEF WASM_JIT_X64}
+  { In the helper-free base-pinned loop shape, an i32.load whose value only
+    the next i32 ALU op reads becomes that op's memory operand. Every
+    analysis still sees two instructions (the load's address read and the
+    temporary's definition and read keep their use counts and liveness);
+    only emission changes, so the access traps at the same point with the
+    same kind. The value is never visible and the ALU op carries no label,
+    so nothing can observe the temporary's absence. }
+  procedure AnalyzeX64LoadAluFusion;
+  var
+    K: Integer;
+  begin
+    SetLength(X64LoadAluFirst, Length(PlannedCode));
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K + 1] and (Fusion[K] = -1) and (Fusion[K + 1] = -1) and
+        X64CanFuseLoadAlu(PlannedCode[K], PlannedCode[K + 1]) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) then
+        X64LoadAluFirst[K] := True;
+  end;
+  {$ENDIF}
+
   procedure AnalyzeImmediateFusion;
   var
     K: Integer;
@@ -1206,18 +1243,22 @@ var
   end;
   {$ENDIF}
 
+  { True when ASlot has a fixed static-cache host. }
+  function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+  var
+    N: Integer;
+  begin
+    for N := 0 to High(AllocatedSlots) do
+      if (AllocatedSlots[N] <> High(UInt32)) and
+        (AllocatedSlots[N] = ASlot) then
+        Exit(True);
+    Result := False;
+  end;
+
   procedure AnalyzeMemoryMoves;
   var
     K, P, First: Integer;
     Source, Temp: UInt32;
-
-    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
-    begin
-      Result := (ASlot = AllocatedSlots[0]) or
-        (ASlot = AllocatedSlots[1]) or
-        ((AllocatedSlots[2] <> High(UInt32)) and
-          (ASlot = AllocatedSlots[2]));
-    end;
 
     function ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
     begin
@@ -1272,14 +1313,6 @@ var
   var
     K, L, Last, Arg: Integer;
     Source, Alias_: UInt32;
-
-    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
-    begin
-      Result := (ASlot = AllocatedSlots[0]) or
-        (ASlot = AllocatedSlots[1]) or
-        ((AllocatedSlots[2] <> High(UInt32)) and
-          (ASlot = AllocatedSlots[2]));
-    end;
 
     function RewriteUse(var AIns: TWasmIrInstr; const AOld,
       ANew: UInt32): Boolean;
@@ -1444,14 +1477,6 @@ var
     K, L, Last: Integer;
     StoreIns, LoadIns: TWasmIrInstr;
 
-    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
-    begin
-      Result := (ASlot = AllocatedSlots[0]) or
-        (ASlot = AllocatedSlots[1]) or
-        ((AllocatedSlots[2] <> High(UInt32)) and
-          (ASlot = AllocatedSlots[2]));
-    end;
-
   begin
     {$IFDEF WASM_JIT_BACKEND}
     { This is deliberately not general memory value numbering. In the
@@ -1572,7 +1597,13 @@ var
   procedure ScoreSlot(const ASlot: UInt32; const AWeight: UInt32 = 1);
   begin
     if ASlot < UInt32(Length(SlotScores)) then
+    begin
       Inc(SlotScores[ASlot], AWeight);
+      {$IFDEF WASM_JIT_X64}
+      if ScoringInLoop then
+        Inc(LoopSlotScores[ASlot], AWeight);
+      {$ENDIF}
+    end;
   end;
 
   procedure ScoreInstruction(const AIns: TWasmIrInstr);
@@ -2000,20 +2031,92 @@ var
 
   procedure AnalyzeStaticCache;
   var
-    K, Best, Second, Third: Integer;
+    K, N, M: Integer;
+    Ranked: array[0..High(AllocatedSlots)] of Integer;
     HasBackEdge, Eligible: Boolean;
     {$IFDEF WASM_JIT_ARM64}
     HasInlineCall: Boolean;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    InLoop: array of Boolean;
+
+    { rdi and rdx serve the declared locals and parameters the loops use
+      most, instead of ARM64's next-best slot overall. A fixed host removes
+      a local's per-iteration slot traffic: as a dynamic entry a local is
+      visible, so it is written back at every back-edge and reloaded after
+      every join, and a loop-invariant one (a bound) is reloaded on every
+      use. A short-lived temporary already lives well in r10/r11, and one
+      outside a loop only pays an entry load and an exit store. Candidates
+      are numeric (a v128 local stays in the xmm cache), rank by in-loop
+      score, then total score, then slot order. }
+    procedure SelectX64LoopLocals;
+    var
+      L, P, Q: Integer;
+      Slot: UInt32;
+      Taken: Boolean;
+      Picked: array[2..3] of Integer;
+
+      function Beats(const AA, AB: Integer): Boolean;
+      begin
+        if LoopSlotScores[AA] <> LoopSlotScores[AB] then
+          Result := LoopSlotScores[AA] > LoopSlotScores[AB]
+        else if SlotScores[AA] <> SlotScores[AB] then
+          Result := SlotScores[AA] > SlotScores[AB]
+        else
+          Result := AA < AB;
+      end;
+
+    begin
+      Picked[2] := -1;
+      Picked[3] := -1;
+      for L := 0 to High(AFn^.LocalRegs) do
+      begin
+        Slot := AFn^.LocalRegs[L];
+        if (Slot >= UInt32(Length(SlotScores))) or
+          (LoopSlotScores[Slot] = 0) or
+          (Slot = AllocatedSlots[0]) or (Slot = AllocatedSlots[1]) or
+          (Slot >= UInt32(Length(AFn^.RegTypes))) or
+          (AFn^.RegTypes[Slot].Kind <> wvkNum) then
+          Continue;
+        Taken := False;
+        for P := 2 to 3 do
+          Taken := Taken or (Picked[P] = Integer(Slot));
+        if Taken then
+          Continue;
+        for P := 2 to 3 do
+          if (Picked[P] < 0) or Beats(Integer(Slot), Picked[P]) then
+          begin
+            for Q := 3 downto P + 1 do
+              Picked[Q] := Picked[Q - 1];
+            Picked[P] := Integer(Slot);
+            Break;
+          end;
+      end;
+      for P := 2 to 3 do
+        if Picked[P] >= 0 then
+          AllocatedSlots[P] := UInt32(Picked[P])
+        else
+          AllocatedSlots[P] := High(UInt32);
+    end;
     {$ENDIF}
   begin
     UseStaticCache := False;
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := False;
     {$ENDIF}
-    AllocatedSlots[2] := High(UInt32);
+    for N := 2 to High(AllocatedSlots) do
+      AllocatedSlots[N] := High(UInt32);
     if AFn^.RegisterCount = 0 then
       Exit;
     SetLength(SlotScores, AFn^.RegisterCount);
+    {$IFDEF WASM_JIT_X64}
+    SetLength(LoopSlotScores, AFn^.RegisterCount);
+    SetLength(InLoop, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      if (AFn^.Code[K].Op = iroJump) and (AFn^.Code[K].A <= UInt32(K)) then
+        for N := Integer(AFn^.Code[K].A) to K do
+          InLoop[N] := True;
+    {$ENDIF}
     HasBackEdge := False;
     Eligible := True;
     {$IFDEF WASM_JIT_ARM64}
@@ -2031,8 +2134,14 @@ var
       if (AFn^.Code[K].Op = iroJump) and
         (AFn^.Code[K].A <= UInt32(K)) then
         HasBackEdge := True;
+      {$IFDEF WASM_JIT_X64}
+      ScoringInLoop := InLoop[K];
+      {$ENDIF}
       ScoreInstruction(AFn^.Code[K]);
     end;
+    {$IFDEF WASM_JIT_X64}
+    ScoringInLoop := False;
+    {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     if HasInlineCall then
     begin
@@ -2046,35 +2155,32 @@ var
     if not Eligible or not HasBackEdge then
       Exit;
 
-    Best := -1;
-    Second := -1;
-    Third := -1;
+    { The highest scores in descending order; an earlier slot wins a tie. }
+    for N := 0 to High(Ranked) do
+      Ranked[N] := -1;
     for K := 0 to High(SlotScores) do
-      if (Best < 0) or (SlotScores[K] > SlotScores[Best]) then
-      begin
-        Third := Second;
-        Second := Best;
-        Best := K;
-      end
-      else if (Second < 0) or (SlotScores[K] > SlotScores[Second]) then
-      begin
-        Third := Second;
-        Second := K;
-      end
-      else if (Third < 0) or (SlotScores[K] > SlotScores[Third]) then
-        Third := K;
+      for N := 0 to High(Ranked) do
+        if (Ranked[N] < 0) or (SlotScores[K] > SlotScores[Ranked[N]]) then
+        begin
+          for M := High(Ranked) downto N + 1 do
+            Ranked[M] := Ranked[M - 1];
+          Ranked[N] := K;
+          Break;
+        end;
     { Loading and preserving a one-use expression register costs more than the
       old write-through cache. Require both physical registers to serve slots
       that occur repeatedly in the loop-shaped function. }
-    if (Best < 0) or (Second < 0) or
-      (SlotScores[Best] < 3) or (SlotScores[Second] < 3) then
+    if (Ranked[0] < 0) or (Ranked[1] < 0) or
+      (SlotScores[Ranked[0]] < 3) or (SlotScores[Ranked[1]] < 3) then
       Exit;
-    AllocatedSlots[0] := UInt32(Best);
-    AllocatedSlots[1] := UInt32(Second);
-    if (Third >= 0) and (SlotScores[Third] >= 3) then
-      AllocatedSlots[2] := UInt32(Third)
-    else
-      AllocatedSlots[2] := High(UInt32);
+    { ARM64's third host takes the next slot by the same measure; x64 then
+      re-picks its rdi and rdx hosts from the loop locals. }
+    for N := 0 to High(Ranked) do
+      if (Ranked[N] >= 0) and (SlotScores[Ranked[N]] >= 3) then
+        AllocatedSlots[N] := UInt32(Ranked[N]);
+    {$IFDEF WASM_JIT_X64}
+    SelectX64LoopLocals;
+    {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := HasInlineCall;
     if UsePreservedInlineCache then
@@ -2804,7 +2910,8 @@ begin
       { x26 is unavailable to the shared native core cache: recursion pins its
         additional-frame budget there, while a leaf uses the wider x14-x17
         dynamic set and does not need a third static entry. }
-      AllocatedSlots[2] := High(UInt32);
+      for I := 2 to High(AllocatedSlots) do
+        AllocatedSlots[I] := High(UInt32);
       { The native core seeds x12/x13 before any canonical register-file load;
         use its bounded write-back cache rather than the ordinary entry loads. }
       UseStaticCache := False;
@@ -2824,6 +2931,9 @@ begin
     {$ENDIF}
     AnalyzeImmediateFusion;
     AnalyzeFusion;
+    {$IFDEF WASM_JIT_X64}
+    AnalyzeX64LoadAluFusion;
+    {$ENDIF}
     { After fusion planning, so already-folded constants are not offered a
       host register their defining instruction would never have used. }
     AnalyzeConstSlots;
@@ -3039,7 +3149,16 @@ begin
       if not UseNativeScalarCore and not NativeScalarCall and
         PlanX64DirectCallee(AFn^.Code[I], X64Callee) then
         X64CalleePtr := @X64Callee;
-      if Fusion[I] >= 0 then
+      if X64LoadAluFirst[I] then
+        { The next instruction emits this access as its memory operand. }
+        Emitted := True
+      else if (I > 0) and X64LoadAluFirst[I - 1] then
+      begin
+        X64EmitLoadAluCached(Buf, PlannedCode[I - 1], PlannedCode[I],
+          X64Cache);
+        Emitted := True;
+      end
+      else if Fusion[I] >= 0 then
       begin
         X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
           PlannedCode[I], X64Cache);
