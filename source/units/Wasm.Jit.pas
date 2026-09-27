@@ -2173,8 +2173,8 @@ var
     if (Ranked[0] < 0) or (Ranked[1] < 0) or
       (SlotScores[Ranked[0]] < 3) or (SlotScores[Ranked[1]] < 3) then
       Exit;
-    { Every further host (ARM64's third; x64's rdi and rdx) takes the next
-      slot by the same measure. }
+    { ARM64's third host takes the next slot by the same measure; x64 then
+      re-picks its rdi and rdx hosts from the loop locals. }
     for N := 0 to High(Ranked) do
       if (Ranked[N] >= 0) and (SlotScores[Ranked[N]] >= 3) then
         AllocatedSlots[N] := UInt32(Ranked[N]);
