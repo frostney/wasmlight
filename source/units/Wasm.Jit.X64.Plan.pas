@@ -19,6 +19,8 @@ uses
 
 type
   TX64GcAllocShapeList = array of TX64GcAllocShape;
+  { Per-instruction SIB scale (0 = none) of a rewritten pinned access. }
+  TX64IndexScaleList = array of Byte;
 
   { The xmm plan for a static-cache function holding natively emitted v128
     ops (X64EnableVecCache's inputs). }
@@ -60,12 +62,218 @@ procedure X64PlanGcInlineAlloc(const AIr: TWasmIrModule;
   const AFn: TWasmIrFunction; const ANativeScalarCore: Boolean;
   var AShapes: TX64GcAllocShapeList);
 
+{ Scaled pinned index. In a base-pinned static-cache function (AEnabled),
+  the address shape `X := i32.and(Y, m); D := i32.shl(X, k); access [D]`,
+  k = count mod 32 in 1..3 with both constants fused immediates, becomes the
+  access over [base + X * 2^k]; the shl is skipped (ASkip) and the access
+  reads X (APlanned[M].A), with AScales[M] = k.
+
+  Exactness: wasm's i32.shl wraps at 32 bits and a 64-bit scaled index does
+  not, so the fusion needs X < 2^(32 - k). The 32-bit `and` writes exactly
+  X = Y and m <= m, and m * 2^k < 2^32 is required, so X * 2^k is the
+  wasm address, unwrapped, with no assumption about the host's upper half
+  (the access zero-extends X first unless that host is known Zx32).
+  and, shl, and the access are consecutive emitted instructions with no
+  label between them, so the access sees the `and`'s X; a guard-page fault
+  or trap then happens at the same access with the same address.
+
+  The skipped shl never writes D, so D must be dead after the access: D is
+  no result slot, and every other emitted read of D has, scanning back
+  within its own straight line (no label crossed, and not falling off the
+  entry), a nearest defining instruction other than the shl. That proves
+  no read — lexical or through a back-edge or join, since every block start
+  is a label — can observe D's unwritten value. The defining set is an
+  under-approximation (moves, constants, and integer ALU/shift/rotate ops),
+  and any op outside the static-cache read set counts as reading D. }
+procedure X64PlanScaledIndex(const AFn: TWasmIrFunction;
+  var APlanned: TWasmIrCode; var ASkip: array of Boolean;
+  const ATargets, AImmediate: array of Boolean;
+  const AImmValues: array of Int64; const AEnabled: Boolean;
+  var AScales: TX64IndexScaleList);
+
 implementation
 
 uses
   Wasm.Core,
   Wasm.Runtime.Gc,
   Wasm.Runtime.Values;
+
+function LoadOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Load, iroI64Load, iroF32Load, iroF64Load,
+    iroI32Load8S, iroI32Load8U, iroI32Load16S, iroI32Load16U,
+    iroI64Load8S, iroI64Load8U, iroI64Load16S, iroI64Load16U,
+    iroI64Load32S, iroI64Load32U];
+end;
+
+function StoreOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Store, iroI64Store, iroF32Store, iroF64Store,
+    iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
+    iroI64Store32];
+end;
+
+function IntAluOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := AOp in [
+    iroI32Add, iroI32Sub, iroI32Mul, iroI32And, iroI32Or, iroI32Xor,
+    iroI32Shl, iroI32ShrS, iroI32ShrU, iroI32Rotl, iroI32Rotr,
+    iroI64Add, iroI64Sub, iroI64Mul, iroI64And, iroI64Or, iroI64Xor,
+    iroI64Shl, iroI64ShrS, iroI64ShrU, iroI64Rotl, iroI64Rotr];
+end;
+
+{ Whether AIns may read ASlot. Every op outside the known read shapes is
+  assumed to. A return reads only result slots, which the caller excludes. }
+function MayReadSlot(const AIns: TWasmIrInstr; const ASlot: UInt32): Boolean;
+begin
+  if IntAluOp(AIns.Op) then
+    Exit((AIns.A = ASlot) or (AIns.B = ASlot));
+  if LoadOp(AIns.Op) then
+    Exit(AIns.A = ASlot);
+  if StoreOp(AIns.Op) then
+    Exit((AIns.A = ASlot) or (AIns.Dest = ASlot));
+  case AIns.Op of
+    iroJump, iroReturn, iroUnreachable,
+    iroI32Const, iroI64Const, iroF32Const, iroF64Const:
+      Result := False;
+    iroMove, iroBranchIf, iroBranchIfNot, iroI32Eqz, iroI64Eqz:
+      Result := AIns.A = ASlot;
+    iroI32Eq, iroI32Ne, iroI32LtS, iroI32LtU, iroI32GtS, iroI32GtU,
+    iroI32LeS, iroI32LeU, iroI32GeS, iroI32GeU,
+    iroI64Eq, iroI64Ne, iroI64LtS, iroI64LtU, iroI64GtS, iroI64GtU,
+    iroI64LeS, iroI64LeU, iroI64GeS, iroI64GeU:
+      Result := (AIns.A = ASlot) or (AIns.B = ASlot);
+  else
+    Result := True;
+  end;
+end;
+
+function IsResultSlot(const AFn: TWasmIrFunction;
+  const ASlot: UInt32): Boolean;
+var
+  K: Integer;
+begin
+  for K := 0 to High(AFn.ResultRegs) do
+    if AFn.ResultRegs[K] = ASlot then
+      Exit(True);
+  Result := False;
+end;
+
+procedure X64PlanScaledIndex(const AFn: TWasmIrFunction;
+  var APlanned: TWasmIrCode; var ASkip: array of Boolean;
+  const ATargets, AImmediate: array of Boolean;
+  const AImmValues: array of Int64; const AEnabled: Boolean;
+  var AScales: TX64IndexScaleList);
+var
+  S, P, M: Integer;
+  K: Byte;
+  X, D: UInt32;
+
+  { The nearest emitted instruction before AIndex, or -1 when a label or
+    the entry comes first. }
+  function PrevEmitted(const AIndex: Integer): Integer;
+  begin
+    Result := AIndex;
+    repeat
+      if ATargets[Result] then
+        Exit(-1);
+      Dec(Result);
+    until (Result < 0) or not ASkip[Result];
+  end;
+
+  { The access reading D after S: the first emitted instruction after S
+    that reads D, reached with no label and across at most a short run of
+    straight-line value computation (integer ALU ops, constants, moves, and
+    scalar accesses) that neither writes X or D nor reads D; -1 otherwise.
+    A crossed instruction may evict X's host, but X's slot then gets its
+    value (the access's read of X keeps it live), so the access reloads it;
+    one that faults or traps does so before the access, exactly as the
+    elided shift, which has no effect, lets it. }
+  function AccessAfterShift: Integer;
+  var
+    N: Integer;
+  begin
+    Result := S;
+    for N := 0 to 8 do
+    begin
+      repeat
+        Inc(Result);
+        if (Result > High(APlanned)) or ATargets[Result] then
+          Exit(-1);
+      until not ASkip[Result];
+      if MayReadSlot(APlanned[Result], D) then
+        Exit;
+      if not (IntAluOp(APlanned[Result].Op) or LoadOp(APlanned[Result].Op) or
+        StoreOp(APlanned[Result].Op) or
+        (APlanned[Result].Op in [iroMove, iroI32Const, iroI64Const])) or
+        (not StoreOp(APlanned[Result].Op) and
+        ((APlanned[Result].Dest = X) or (APlanned[Result].Dest = D))) then
+        Exit(-1);
+    end;
+    Result := -1;
+  end;
+
+  { The nearest instruction before AIndex, in its straight line, that
+    writes D; -1 when a label or the entry comes first. }
+  function ReachingDef(const AIndex: Integer): Integer;
+  begin
+    Result := AIndex;
+    repeat
+      if ATargets[Result] then
+        Exit(-1);
+      Dec(Result);
+      if Result < 0 then
+        Exit;
+    until not ASkip[Result] and (APlanned[Result].Dest = D) and
+      ((APlanned[Result].Op in [iroMove, iroI32Const, iroI64Const]) or
+      IntAluOp(APlanned[Result].Op));
+  end;
+
+  function DeadAfterAccess: Boolean;
+  var
+    R, W: Integer;
+  begin
+    if IsResultSlot(AFn, D) then
+      Exit(False);
+    for R := 0 to High(APlanned) do
+      if (R <> M) and not ASkip[R] and MayReadSlot(APlanned[R], D) then
+      begin
+        W := ReachingDef(R);
+        if (W < 0) or (W = S) then
+          Exit(False);
+      end;
+    Result := True;
+  end;
+
+begin
+  SetLength(AScales, Length(APlanned));
+  if not AEnabled then
+    Exit;
+  for S := 0 to High(APlanned) do
+  begin
+    if ASkip[S] or (APlanned[S].Op <> iroI32Shl) or not AImmediate[S] then
+      Continue;
+    K := Byte(AImmValues[S] and 31);
+    X := APlanned[S].A;
+    D := APlanned[S].Dest;
+    P := PrevEmitted(S);
+    M := AccessAfterShift;
+    if (K < 1) or (K > 3) or (X = D) or (P < 0) or (M < 0) or
+      (APlanned[P].Op <> iroI32And) or not AImmediate[P] or
+      (APlanned[P].Dest <> X) or
+      ((UInt64(UInt32(AImmValues[P] and $FFFFFFFF)) shl K) > $FFFFFFFF) or
+      not (LoadOp(APlanned[M].Op) or StoreOp(APlanned[M].Op)) or
+      (APlanned[M].A <> D) or (APlanned[M].Imm <> 0) or
+      (StoreOp(APlanned[M].Op) and (APlanned[M].Dest = D)) or
+      not DeadAfterAccess then
+      Continue;
+    ASkip[S] := True;
+    APlanned[M].A := X;
+    AScales[M] := K;
+  end;
+end;
 
 function IsVisibleFrameReg(const AFn: TWasmIrFunction;
   const AReg: UInt32): Boolean;

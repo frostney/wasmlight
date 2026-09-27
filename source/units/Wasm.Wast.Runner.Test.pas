@@ -271,6 +271,7 @@ type
     procedure TestAotModeLoadsAndPasses;
     procedure TestX64WriteBackFixtureAllTiers;
     procedure TestX64V128CacheFixtureAllTiers;
+    procedure TestX64ScaledIndexFixtureAllTiers;
     procedure TestGcV128FixtureAllTiers;
     procedure TestExnV128FixtureAllTiers;
     procedure TestAotModeMixedTiersCoexist;
@@ -1535,6 +1536,45 @@ begin
   end;
 end;
 
+{ The committed adversarial net for the x64 scaled pinned index
+  (tests/fixtures/wast/x64-scaled-index.py computes every expected value
+  with an independent model): masks at and across the m * 2^k < 2^32
+  bound, shift counts 0..4 and >= 32, i32 shifts that must wrap, traps at
+  and far past the end of memory, every store and load width, and address
+  locals read after the loop, before their redefinition, on another path,
+  and after the access. Each tier must pass every command, and on a backend
+  host the compiled tiers must compile every function. }
+procedure TWastRunnerTests.TestX64ScaledIndexFixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'x64-scaled-index.wast';
+  { One module plus 112 assertions. }
+  COMMANDS = 113;
+  COMPILED_FUNCTIONS = 52;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
 { The committed net for v128 struct fields and array elements
   (tests/fixtures/wast/gc-v128.wast, expected lanes spelled out by hand):
   every allocation form (struct.new at each field position, the ten-field
@@ -1869,6 +1909,8 @@ begin
     TestX64WriteBackFixtureAllTiers);
   Test('the x64 v128 cache fixture passes in every tier',
     TestX64V128CacheFixtureAllTiers);
+  Test('the x64 scaled-index fixture passes in every tier',
+    TestX64ScaledIndexFixtureAllTiers);
   Test('the GC v128 field fixture passes in every tier',
     TestGcV128FixtureAllTiers);
   Test('the v128 exception payload fixture passes in every tier',
