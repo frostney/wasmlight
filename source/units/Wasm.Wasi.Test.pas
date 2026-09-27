@@ -278,6 +278,10 @@ type
     function DoPathFilestat(const APath: string): Int32;
     { fd_close, so a Windows case leaves no open handle to block cleanup. }
     function DoFdClose(const AFd: UInt32): Int32;
+    function DoUnlinkFile(const APath: string): Int32;
+    { The names in the preopen and its "sub" directory, so a device case can
+      tell whether a create made a real file instead of reaching a device. }
+    function SandboxListing: string;
     {$ENDIF}
     procedure WriteHostFile(const APath: string; const AContent: string);
     function ReadHostFile(const APath: string): string;
@@ -338,6 +342,10 @@ type
     procedure TestWinBackslashDotDotEscapeRefused;
     procedure TestWinInPreopenLinksWork;
     procedure TestWinPreopenRootThroughJunctionWorks;
+    { --- Windows DOS device names (#163) --------------------------------- }
+    procedure TestWinDeviceNamesRefusedOnCreate;
+    procedure TestWinDeviceNamesRefusedByEveryPathOp;
+    procedure TestWinDeviceLookAlikesStillWork;
     {$ENDIF}
 
     { The CSPRNG DEFAULT (not injected): two random_get calls differ + fill. }
@@ -695,6 +703,43 @@ begin
   SetLength(Results, 1);
   Call(Wrapper('w_fd_close'), Args, Results);
   Result := Results[0].I32;
+end;
+
+function TWasiTests.DoUnlinkFile(const APath: string): Int32;
+var
+  Args, Results: array of TWasmValue;
+begin
+  SetLength(Args, 3);
+  Args[0] := MakeValueI32(3);
+  Args[1] := MakeValueI32(300);
+  Args[2] := MakeValueI32(Int32(GuestPutStr(300, APath)));
+  SetLength(Results, 1);
+  Call(Wrapper('w_path_unlink_file'), Args, Results);
+  Result := Results[0].I32;
+end;
+
+function TWasiTests.SandboxListing: string;
+
+  procedure AddDir(const ADir, APrefix: string);
+  var
+    Sr: TSearchRec;
+  begin
+    if FindFirst(IncludeTrailingPathDelimiter(ADir) + '*', faAnyFile, Sr) = 0
+    then
+      try
+        repeat
+          if (Sr.Name <> '.') and (Sr.Name <> '..') then
+            Result := Result + APrefix + Sr.Name + '|';
+        until FindNext(Sr) <> 0;
+      finally
+        FindClose(Sr);
+      end;
+  end;
+
+begin
+  Result := '';
+  AddDir(FTempDir, '');
+  AddDir(IncludeTrailingPathDelimiter(FTempDir) + 'sub', 'sub/');
 end;
 {$ENDIF}
 
@@ -1803,6 +1848,123 @@ begin
     RemoveDir(RootLink);
   end;
 end;
+
+{ --- Windows DOS device names (#163) ------------------------------------- }
+
+{ Guest names Win32 has mapped, on some Windows version, to a DOS device
+  rather than a file in the directory: the reserved base names in any case,
+  with an extension, with trailing dots or spaces, nested below a
+  directory, and the console names CreateFile accepts. }
+function WinDeviceForms: TStringArray;
+const
+  FORMS: array[0..21] of string = ('NUL', 'nul', 'CON', 'PRN', 'AUX', 'COM1',
+    'COM9', 'LPT1', 'lpt9', 'COM0', 'LPT0', 'CONIN$', 'CONOUT$', 'NUL.txt',
+    'con.log.txt', 'NUL.', 'NUL..', 'NUL ', 'NUL .txt', 'sub/CON',
+    'sub/NUL.txt', 'AUX:stream');
+var
+  Index: Integer;
+begin
+  SetLength(Result, Length(FORMS));
+  for Index := 0 to High(FORMS) do
+    Result[Index] := FORMS[Index];
+  { COM with a superscript digit is a device too. The guest's bytes reach
+    Win32 through the ANSI code page, so the byte form is only a device where
+    that page maps $B9 to U+00B9 (1252 and friends). }
+  if UnicodeString(AnsiString('COM'#$B9)) = 'COM' + WideChar($00B9) then
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := 'COM'#$B9;
+  end;
+end;
+
+procedure TWasiTests.TestWinDeviceNamesRefusedOnCreate;
+var
+  Forms: TStringArray;
+  OpenedFd: UInt32;
+  Index, Code: Integer;
+  Before, Actual, Expected: string;
+begin
+  { O_CREAT on a device name must not reach the device (weNotCapable, before
+    any OS call) and must not leave a file behind either. Every form is
+    tried and the outcomes compared as one row, so a failure reports what
+    each form did: its errno, plus "+file" if the create made a real file. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Forms := WinDeviceForms;
+  Actual := '';
+  Expected := '';
+  for Index := 0 to High(Forms) do
+  begin
+    Before := SandboxListing;
+    Code := DoPathOpen(3, Forms[Index], WASI_OFLAGS_CREAT, 0, SandboxRights,
+      OpenedFd);
+    if Code = Ord(weSuccess) then
+      DoFdClose(OpenedFd);
+    Actual := Actual + '[' + Forms[Index] + ']=' + IntToStr(Code);
+    if SandboxListing <> Before then
+      Actual := Actual + '+file';
+    Actual := Actual + ' ';
+    Expected := Expected + '[' + Forms[Index] + ']=' +
+      IntToStr(Ord(weNotCapable)) + ' ';
+  end;
+  Expect<string>(Actual).ToBe(Expected);
+end;
+
+procedure TWasiTests.TestWinDeviceNamesRefusedByEveryPathOp;
+var
+  OpenedFd: UInt32;
+  Actual, Expected: string;
+
+  procedure Row(const AOp: string; const ACode: Int32);
+  begin
+    Actual := Actual + AOp + '=' + IntToStr(ACode) + ' ';
+    Expected := Expected + AOp + '=' + IntToStr(Ord(weNotCapable)) + ' ';
+  end;
+
+begin
+  { The refusal is in containment, so it holds for every path op, not only a
+    create: open without O_CREAT, stat, mkdir, and unlink. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Actual := '';
+  Expected := '';
+  Row('open NUL', DoPathOpen(3, 'NUL', 0, 0, SandboxRights, OpenedFd));
+  Row('open CON', DoPathOpen(3, 'CON', 0, 0, SandboxRights, OpenedFd));
+  Row('stat NUL', DoPathFilestat('NUL'));
+  Row('stat sub/COM1', DoPathFilestat('sub/COM1'));
+  Row('mkdir CON', DoCreateDirectory('CON'));
+  Row('mkdir sub/AUX', DoCreateDirectory('sub/AUX'));
+  Row('unlink NUL', DoUnlinkFile('NUL'));
+  Row('open NUL/x', DoPathOpen(3, 'NUL/x', WASI_OFLAGS_CREAT, 0,
+    SandboxRights, OpenedFd));
+  Expect<string>(Actual).ToBe(Expected);
+end;
+
+procedure TWasiTests.TestWinDeviceLookAlikesStillWork;
+const
+  NAMES: array[0..8] of string = ('console.log', 'null_data', 'NULL',
+    'COM10', 'LPT', 'CONx.txt', 'nul_', 'auxiliary', 'sub/CONSOLE');
+var
+  OpenedFd: UInt32;
+  Index, Code: Integer;
+  Actual, Expected: string;
+begin
+  { Names that only contain a device name are ordinary files: they create,
+    and the file lands in the preopen. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Actual := '';
+  Expected := '';
+  for Index := 0 to High(NAMES) do
+  begin
+    Code := DoPathOpen(3, NAMES[Index], WASI_OFLAGS_CREAT, 0, SandboxRights,
+      OpenedFd);
+    if Code = Ord(weSuccess) then
+      DoFdClose(OpenedFd);
+    Actual := Actual + NAMES[Index] + '=' + IntToStr(Code) + ':' +
+      BoolToStr(FileExists(IncludeTrailingPathDelimiter(FTempDir) +
+      StringReplace(NAMES[Index], '/', PathDelim, [rfReplaceAll])), True) + ' ';
+    Expected := Expected + NAMES[Index] + '=0:True ';
+  end;
+  Expect<string>(Actual).ToBe(Expected);
+end;
 {$ENDIF}
 
 procedure TWasiTests.TestDefaultCsprngFillsAndDiffers;
@@ -1924,6 +2086,13 @@ begin
     TestWinInPreopenLinksWork);
   Test('Windows: a preopen root granted through a junction is contained',
     TestWinPreopenRootThroughJunctionWorks);
+  { Windows DOS device names (#163). }
+  Test('Windows: O_CREAT on a DOS device name is weNotCapable, no file made',
+    TestWinDeviceNamesRefusedOnCreate);
+  Test('Windows: every path op on a DOS device name is weNotCapable',
+    TestWinDeviceNamesRefusedByEveryPathOp);
+  Test('Windows: names that only contain a device name still create',
+    TestWinDeviceLookAlikesStillWork);
   {$ENDIF}
 
   Test('the default CSPRNG fills the buffer and two calls differ',
