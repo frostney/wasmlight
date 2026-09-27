@@ -145,6 +145,11 @@ type
       canonical point (branch, jump, join fall-through) reloads it, and a
       join assumes it resident and dirty. }
     NativeSelfReload: Boolean;
+    { Static allocation with native-leaf calls: the extended frame's spare
+      slot [rsp+16] caches LeafEntryFunc's resolved lightweight entry for
+      this activation (X64EnableLeafEntryCache). }
+    LeafEntryCached: Boolean;
+    LeafEntryFunc: UInt32;
     { Static allocation only: r10/r11 defer their register-file stores until
       eviction or a canonical point (branch, join, exit), and skip them for a
       temporary whose planned reads are exhausted and that no local, result,
@@ -547,6 +552,17 @@ procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   X64EmitPinMemory), and scalar memory ops take their address and value from
   the cache hosts instead of making the register file canonical. }
 procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
+{ A static-allocation caller whose native-leaf calls all target AFuncIdx
+  caches that leaf's resolved entry in [rsp+16] for the activation (the
+  driver zeroes the slot after the prologue with X64EmitClearLeafEntry).
+  Once a call site has resolved a non-nil entry and passed both exhaustion
+  predicates, every later call from the same activation sees the same
+  Depth, ValueTop, and caps (each call restores them, and a static frame
+  calls nothing else), the same callee address, and an entry that stays
+  valid for the store's lifetime, so it calls the cached entry directly. }
+procedure X64EnableLeafEntryCache(var ACache: TX64RegCache;
+  const AFuncIdx: UInt32);
+procedure X64EmitClearLeafEntry(const ABuf: TWasmCodeBuffer);
 { Enable deferred dynamic write-back on a static allocation. AUseCounts holds
   each slot's remaining planned reads (consumed as the emitter reads them);
   AVisibleSlots marks locals, results, and loop-carried slots, which are
@@ -1211,6 +1227,15 @@ procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
 begin
   if ACache.StaticAllocation then
     ACache.PinnedMemoryBase := True;
+end;
+
+procedure X64EnableLeafEntryCache(var ACache: TX64RegCache;
+  const AFuncIdx: UInt32);
+begin
+  if not ACache.StaticAllocation then
+    Exit;
+  ACache.LeafEntryCached := True;
+  ACache.LeafEntryFunc := AFuncIdx;
 end;
 
 procedure X64EnableDynamicWriteBack(var ACache: TX64RegCache;
@@ -3826,6 +3851,11 @@ begin
     ABuf.EmitU32(AImm);
 end;
 
+procedure X64EmitClearLeafEntry(const ABuf: TWasmCodeBuffer);
+begin
+  X64EmitStoreMemImm(ABuf, 8, X64_RSP, 16, 0);   { mov qword [rsp+16], 0 }
+end;
+
 { op r64, [ABase + ADisp] for the two-operand r, r/m forms: 03 (ADD) and 3B
   (CMP). }
 procedure X64EmitAluRegMem(const ABuf: TWasmCodeBuffer; const AOpcode: Byte;
@@ -5208,8 +5238,9 @@ var
   ArgSlots: array[0..1] of UInt32;
   ArgHosts: array[0..1] of Byte;
   ResultSlot: UInt32;
-  Fallback, Exhausted, PostCall, Done: TWasmJitLabel;
+  Fallback, Exhausted, PostCall, Done, Slow, Fast: TWasmJitLabel;
   Index: Integer;
+  UseSlot: Boolean;
 
   function Resident(const ASlot: UInt32; out AHost: Byte): Boolean;
   var
@@ -5256,7 +5287,22 @@ begin
   Exhausted := ABuf.NewLabel;
   PostCall := ABuf.NewLabel;
   Done := ABuf.NewLabel;
-  EmitNativeScalarLeafResolve(ABuf, UInt32(AIns.Imm), Fallback, Exhausted);
+  Slow := -1;
+  Fast := -1;
+  UseSlot := ACache.LeafEntryCached and
+    (UInt32(AIns.Imm) = ACache.LeafEntryFunc);
+  if UseSlot then
+  begin
+    { The activation's cached entry, resolved out of line on first use. }
+    Slow := ABuf.NewLabel;
+    Fast := ABuf.NewLabel;
+    X64EmitLoadMem64(ABuf, X64_RDX, X64_RSP, 16);
+    X64EmitAluRegReg(ABuf, $85, True, X64_RDX, X64_RDX);
+    X64EmitJccTo(ABuf, X64_CC_E, UInt32(Slow));
+    ABuf.BindLabel(Fast);
+  end
+  else
+    EmitNativeScalarLeafResolve(ABuf, UInt32(AIns.Imm), Fallback, Exhausted);
   if ArgN = 1 then
     MoveArg(X64_R8, 0)
   else if (ArgHosts[0] = X64_R9) and (ArgHosts[1] = X64_R8) then
@@ -5297,6 +5343,16 @@ begin
   { The cold paths go after the straight line; the caller's next code must
     not fall into them. }
   X64EmitJmpTo(ABuf, UInt32(Done));
+
+  if UseSlot then
+  begin
+    { Cache only a live entry that passed both predicates; a nil entry or
+      an exhausted call takes the same exits as the uncached form. }
+    ABuf.BindLabel(Slow);
+    EmitNativeScalarLeafResolve(ABuf, UInt32(AIns.Imm), Fallback, Exhausted);
+    X64EmitStoreMem64(ABuf, X64_RDX, X64_RSP, 16);
+    X64EmitJmpTo(ABuf, UInt32(Fast));
+  end;
 
   { 3. }
   ABuf.BindLabel(Fallback);

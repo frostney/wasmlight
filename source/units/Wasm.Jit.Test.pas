@@ -6059,6 +6059,22 @@ var
   EntryOffset: NativeUInt;
   StagedCount: UInt32;
   I, Calls, Stores: Integer;
+
+  function CountSeq(const ACode: TWasmBytes;
+    const ASeq: array of Byte): Integer;
+  var
+    N, J: Integer;
+  begin
+    Result := 0;
+    for N := 0 to Length(ACode) - Length(ASeq) do
+    begin
+      J := 0;
+      while (J <= High(ASeq)) and (ACode[N + J] = ASeq[J]) do
+        Inc(J);
+      if J > High(ASeq) then
+        Inc(Result);
+    end;
+  end;
   {$ENDIF}
 begin
   Bytes := NativeLeafCallerModuleBytes;
@@ -6090,6 +6106,19 @@ begin
     end;
     Expect<Integer>(Calls).ToBe(1);
     Expect<Integer>(Stores).ToBe(8);
+    { $ra calls one leaf, so the activation caches its entry: the prologue
+      clears [rsp+16] (mov qword [rsp+16], 0) and the call site reads it
+      (mov rdx, [rsp+16] ; test rdx, rdx ; je resolve). }
+    Expect<Integer>(CountSeq(Code, [$48, $C7, $44, $24, $10, 0, 0, 0, 0]))
+      .ToBe(1);
+    Expect<Integer>(CountSeq(Code, [$48, $8B, $54, $24, $10, $48, $85, $D2,
+      $0F, $84])).ToBe(1);
+    { $re calls two different leaves: no cached entry, both sites resolve. }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[8],
+      Ir.FuncImportCount + 8, EntryOffset, StagedCount);
+    Expect<Integer>(CountSeq(Code, [$48, $8B, $54, $24, $10, $48, $85, $D2]))
+      .ToBe(0);
+    Expect<Integer>(CountSeq(Code, [$31, $C9, $FF, $D2])).ToBe(2);
     {$ENDIF}
   finally
     Ir.Free;

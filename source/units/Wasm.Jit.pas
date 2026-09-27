@@ -568,6 +568,7 @@ var
   X64Callee: TX64DirectCallee;
   X64CalleePtr: PX64DirectCallee;
   X64LeafFallThrough: Boolean;
+  X64LeafEntryFunc: Int64;
   UseX64VecCache: Boolean;
   X64VecStatics: array of UInt32;
   X64VecConsts: array of UInt32;
@@ -2974,6 +2975,20 @@ begin
     if UsePinnedMemory then
       X64EmitPinMemory(Buf, PinnedMemoryIndex,
         UsePinnedMemoryBase and UseStaticCache);
+    { A static caller whose native-leaf calls all target one function
+      caches that leaf's entry per activation in [rsp+16]. }
+    X64LeafEntryFunc := -1;
+    if UseStaticCache and UseNativeScalarCall then
+      for I := 0 to High(AFn^.Code) do
+        if AFn^.Code[I].Op = iroCall then
+        begin
+          if X64LeafEntryFunc = -1 then
+            X64LeafEntryFunc := Int64(UInt32(AFn^.Code[I].Imm))
+          else if X64LeafEntryFunc <> Int64(UInt32(AFn^.Code[I].Imm)) then
+            X64LeafEntryFunc := -2;
+        end;
+    if X64LeafEntryFunc >= 0 then
+      X64EmitClearLeafEntry(Buf);
     X64InitRegCache(X64Cache);
     if UseNativeScalarCore then
     begin
@@ -3003,6 +3018,8 @@ begin
         fault unwinds to the trampoline, which reads no slot. }
       X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
         @VisibleSlots[0], AFn^.RegisterCount);
+      if X64LeafEntryFunc >= 0 then
+        X64EnableLeafEntryCache(X64Cache, UInt32(X64LeafEntryFunc));
       { Admitted v128 ops are helper-free too, so their xmm hosts survive to
         the same exits; a caller-saved xmm is never live across a call. }
       if UseX64VecCache then
