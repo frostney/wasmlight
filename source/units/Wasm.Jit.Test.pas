@@ -7850,9 +7850,10 @@ begin
 end;
 
 procedure TJitTests.TestX64MemoryLeafShape;
-{$IFDEF WASM_JIT_X64}
 var
-  Bytes, Code: TWasmBytes;
+  Bytes: TWasmBytes;
+{$IFDEF WASM_JIT_X64}
+  Code: TWasmBytes;
   Module: TWasmModule;
   Ir: TWasmIrModule;
   EntryOffset: NativeUInt;
