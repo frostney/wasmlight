@@ -67,7 +67,9 @@ jobs:
           if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::version '$VERSION' is not unprefixed SemVer"; exit 1
           fi
-          MANIFEST_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("lwpt.toml", "rb"))["package"]["version"])')
+          # The same first-`version`-in-[package] scan as stamp-version.pas;
+          # lwpt.toml's multi-line inline tables are not TOML 1.0 (tomllib).
+          MANIFEST_VERSION=$(awk -F'"' '/^\[/ { pkg = ($0 == "[package]") } pkg && /^version[[:space:]]*=/ { print $2; exit }' lwpt.toml)
           if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
             echo "::error::version $VERSION does not match [package].version $MANIFEST_VERSION at this ref"; exit 1
           fi
