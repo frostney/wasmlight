@@ -91,7 +91,6 @@ class WorkloadRegistryTests(unittest.TestCase):
         self.assertIn("| gc | 20.000 (1.00x) | 10.000 (2.00x) | — |", markdown)
 
 
-
 def loop_artifacts(interruptible: bool) -> dict:
     artifacts = {
         "module": Path("loop.wasm"),

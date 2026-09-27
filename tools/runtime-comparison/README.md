@@ -78,6 +78,10 @@ The peer commands and fixture tools must be on `PATH`: `wasmtime`, `wasmer`,
 python3 tools/runtime-comparison/bench.py
 ```
 
+A bare run measures all three profiles: `best`, `interpreter`, and
+`interruptible`. The interruptible profile is the slowest, mostly because of
+wazero's termination checks, so pass `--profile best` for a quicker local pass.
+
 Generated modules, artifacts, raw samples, and a rendered result table land in
 `build/runtime-comparison/`. Use `--help` to select workloads, profiles, sample
 counts, or preparation without measurement.
