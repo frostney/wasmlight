@@ -1,5 +1,36 @@
 # Handoff
 
+## Roadmap review and re-plan — 2026-09-27
+
+- Snapshot: `origin/main` 4641af5, CI green. Decisions D1–D5 were accepted by
+  the maintainer. No `ROADMAP-260927.md` was written (the maintainer declined
+  it); GitHub milestones and issues are the record.
+- **0.2.0 was over-closed.** Its 17 issues closed in two days, but end to end
+  only 6 are done. #40 (compiled capabilities, plus argv[0] parity) and #33
+  (the `return_call` tail-cap decline) were reopened. New gaps are tracked in
+  #146 (connector plan loading), #148 (cross-architecture emission), #149
+  (Windows preopen containment bug), and #150 (stale docs).
+- **New release order.** Milestones were renamed in place and every issue
+  body updated:
+  - 0.2.0: a usable compiler. #33, #40, #46 narrowed to same-architecture
+    archives plus a live catalog, #146, #149, #150.
+  - 0.3.0: WASI P1 judged by wasi-testsuite (#78–#85) plus #148.
+  - 0.4.0: SDK core (#62–#70, #73, #75–#77, #154, #155). Interpreter
+    everywhere; compiled tiers where they ship.
+  - 0.4.1: Nim, C# and Go (#71, #72, #74), plus #153 (`SA_ONSTACK`).
+  - 0.5.0: Win64 (#47–#53, #151, #152). #49 is now a baseline ABI with the
+    SysV fast paths off.
+  - 0.6.0: i386 (#54–#61).
+  - 0.7.0: observability.
+- **Connector language:** WIT was rejected (ADR-0015 note, PR #147). Any
+  future support for WIT-built guests must reuse the canonical ABI's flat
+  lowering.
+- **Performance:** the goal counts as met on the CI geomean (0.75× standard,
+  0.63× interruptible). The autonomous x64 waves have ended, and #143/#144
+  are parked as post-v1 work.
+- **Next:** `/milestone-rush 0.2.0` when the maintainer asks. #149 is a
+  sandbox bug and should go first.
+
 ## x64 wave 6 — retained outcome, 2026-09-27
 
 - Delivery branch `codex/optimize-x64-wave6` from exact main `7d4b6ab` (push CI
