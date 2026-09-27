@@ -30,9 +30,11 @@ uses
   Wasm.Aot,
   Wasm.Compile.Capabilities,
   Wasm.Core,
+  Wasm.Decoder,
   Wasm.Engine,
   Wasm.Jit.CodeBuffer,
   Wasm.Native,
+  Wasm.Native.Load,
   Wasm.Package.Elf,
   Wasm.Run,
   Wasm.Runtime.Instantiate,
@@ -818,18 +820,11 @@ const
   CAPS_FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wasi' +
     PathDelim + 'caps.wasm';
 var
-  Stream: TFileStream;
   Fixture: TWasmBytes;
   FromFile, FromText: TWasmRunResult;
   Config: TWasmWasiConfig;
 begin
-  Stream := TFileStream.Create(CAPS_FIXTURE, fmOpenRead or fmShareDenyWrite);
-  try
-    SetLength(Fixture, Stream.Size);
-    Stream.ReadBuffer(Fixture[0], Stream.Size);
-  finally
-    Stream.Free;
-  end;
+  Fixture := LoadFileBytes(CAPS_FIXTURE);
   Config := TWasmWasiConfig.Create;
   try
     Config.SetArgv(CompiledGuestArgv('caps.wasm', ['x']));
@@ -855,10 +850,10 @@ procedure TShellTests.TestExecutablePathIsAbsolute;
 var
   Path: string;
 begin
-  Path := ShellExecutablePath;
+  Path := NativeExecutablePath;
   Expect<string>(ExpandFileName(Path)).ToBe(Path);
   Expect<Boolean>(FileExists(Path)).ToBe(True);
-  Expect<string>(ExtractFileName(Path)).ToBe(ExtractFileName(ParamStr(0)));
+  Expect<Boolean>(ExtractFileName(Path) <> '').ToBe(True);
 end;
 
 procedure TShellTests.SetupTests;
@@ -885,7 +880,7 @@ begin
     TestArgcMatchesRun);
   Test('the committed caps.wasm behaves as its wat source',
     TestCapsFixtureMatchesSource);
-  Test('the shell asks the OS for an absolute executable path',
+  Test('the executable path comes from the OS and is absolute',
     TestExecutablePathIsAbsolute);
   Test('a module with no _start is rejected', TestNoStart);
   Test('_start parameters fail the command contract', TestStartParameter);

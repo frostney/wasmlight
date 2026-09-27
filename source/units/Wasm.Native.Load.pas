@@ -40,6 +40,12 @@ type
     property Path: string read FPath;
   end;
 
+{ The absolute, symlink-resolved path of the running executable, asked of
+  the OS rather than taken from argv[0] (FPC's Darwin ParamStr(0) is raw
+  argv[0]; its Linux one is a 255-byte shortstring). Linux reads
+  /proc/self/exe; Darwin uses _NSGetExecutablePath + realpath; elsewhere
+  ExpandFileName(ParamStr(0)). }
+function NativeExecutablePath: string;
 function NativeExecutableDirectory: string;
 function NativeLibraryFileName(const ABareName: string): string;
 function ResolveLocalLibraryPath(const AName, AExecutableDir: string): string;
@@ -95,6 +101,8 @@ function CDlClose(ALib: Pointer): LongInt; cdecl;
 {$IFDEF DARWIN}
 function NSGetExecutablePath(ABuf: PAnsiChar; var ABufSize: UInt32): Integer; cdecl;
   external 'c' name '_NSGetExecutablePath';
+function CRealPath(APath, AResolved: PAnsiChar): PAnsiChar; cdecl;
+  external 'c' name 'realpath';
 {$ENDIF}
 {$ENDIF}
 
@@ -108,41 +116,39 @@ begin
   inherited Destroy;
 end;
 
-function NativeExecutableDirectory: string;
-{$IFDEF UNIX}
+function NativeExecutablePath: string;
+{$IFDEF DARWIN}
 var
-  {$IFDEF DARWIN}
   BufSize: UInt32;
-  Buf: array[0..4095] of AnsiChar;
-  {$ELSE}
-  Link: array[0..4095] of AnsiChar;
-  N: TSsize;
-  {$ENDIF}
+  Buf, Resolved: array[0..4095] of AnsiChar;
 {$ENDIF}
 begin
+  Result := '';
   {$IFDEF UNIX}
   {$IFDEF DARWIN}
   BufSize := SizeOf(Buf);
   if NSGetExecutablePath(@Buf[0], BufSize) = 0 then
   begin
-    Result := ExpandFileName(string(AnsiString(PAnsiChar(@Buf[0]))));
-    Result := ExcludeTrailingPathDelimiter(ExtractFilePath(Result));
-    Exit;
+    { _NSGetExecutablePath may name a symlink; resolve it like Linux's
+      /proc/self/exe already is. }
+    if CRealPath(@Buf[0], @Resolved[0]) <> nil then
+      Result := string(AnsiString(PAnsiChar(@Resolved[0])))
+    else
+      Result := string(AnsiString(PAnsiChar(@Buf[0])));
   end;
   {$ELSE}
-  N := FpReadLink('/proc/self/exe', @Link[0], SizeOf(Link) - 1);
-  if N > 0 then
-  begin
-    Link[N] := #0;
-    Result := ExpandFileName(string(AnsiString(PAnsiChar(@Link[0]))));
-    Result := ExcludeTrailingPathDelimiter(ExtractFilePath(Result));
-    Exit;
-  end;
+  Result := string(FpReadLink('/proc/self/exe'));
   {$ENDIF}
   {$ENDIF}
-  Result := ExcludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)));
+  if Result = '' then
+    Result := ParamStr(0);
   if Result <> '' then
-    Result := ExcludeTrailingPathDelimiter(ExpandFileName(Result));
+    Result := ExpandFileName(Result);
+end;
+
+function NativeExecutableDirectory: string;
+begin
+  Result := ExcludeTrailingPathDelimiter(ExtractFilePath(NativeExecutablePath));
   if Result = '' then
     raise EWasmLinkError.Create(string(MSG_LINK_UNKNOWN_LIBRARY) +
       ': no executable directory');

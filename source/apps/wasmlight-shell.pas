@@ -34,6 +34,7 @@ uses
   SysUtils,
 
   Wasm.Core,
+  Wasm.Native.Load,
   Wasm.Shell,
   Wasm.Wasi;
 
@@ -57,7 +58,7 @@ var
 begin
   { The OS's view of this executable, not argv[0]: the payload is read from
     it and relative compiled preopens resolve from its directory. }
-  ExePath := ShellExecutablePath;
+  ExePath := NativeExecutablePath;
   Payload := EmbeddedPayload;
   GuestStart := 1;
   AttachPath := '';
