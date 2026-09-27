@@ -58,10 +58,13 @@ deferred to post-v1, deferred rather than dropped
 
 Native application compilation is shipped for WASI command modules:
 `wasmlight compile` produces a complete native executable from a
-validated module on the four released 64-bit UNIX targets
-([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-Connector host functions and compiled `--dir`/`--env` are not yet
-embedded. The shipped execution CLI remains `inspect` / `validate` /
+validated module
+([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)),
+with embedded `.wlc` connector plans and an embedded compiled capability
+set (`--dir`/`--env`). A compiler emits for its own architecture on both
+64-bit UNIX operating systems; emitting every 64-bit UNIX target from every
+host is [#148](https://github.com/frostney/wasmlight/issues/148).
+The shipped execution CLI remains `inspect` / `validate` /
 `run` / `aot` / `compile`.
 
 wasmlight is a member of the lwpt ecosystem: built, tested, formatted, and
@@ -100,8 +103,8 @@ released through lwpt, and consumable by any lwpt project.
   the other. `wasmlight compile` compiles a validated WASI command *to* an
   interpreter-free native executable on supported 64-bit UNIX hosts
   ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
-  Cross-target release delivery remains tracked in
-  [issue #46](https://github.com/frostney/wasmlight/issues/46).
+  Cross-architecture emission is tracked in
+  [issue #148](https://github.com/frostney/wasmlight/issues/148).
 - **Not a browser embedding.** No JavaScript API, no DOM, no `WebAssembly`
   namespace shim. The host is a Pascal program.
 - **Not a general-purpose sandbox for native code.** The isolation

@@ -88,41 +88,43 @@
   CI has now passed all six configured targets; the four 64-bit UNIX legs
   proved interpreter/JIT/AOT tally identity and the Windows legs proved the
   interpreter.
-- **`0.1.0` has shipped.** Native application compilation now emits a
-  WASI command executable on the four released 64-bit UNIX targets
-  (`wasmlight compile`,
-  [ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)).
-  Connector host functions and compiled `--dir`/`--env` are not yet
-  embedded. Merged work after `0.1.0` — JIT/GC performance, CI hardening,
-  and documentation — folds into `0.2.0` rather than a `0.1.1` patch.
-- **Next sequence:** `0.2.0` strict native compiler, connectors,
-  64-bit Unix cross-compilation, and Homebrew; `0.3.0` Win64 native
-  compilation; `0.4.0` i386 Windows native compilation; `0.5.0` portable C,
-  Nim, C#, Rust, Go, and Python embedding SDKs; `0.6.0` independently judged
-  non-network WASI Preview 1; `0.7.0` operational observability. The
-  source-verified comparison, accepted decisions, and issue catalog are in
-  the [2026-08-24 roadmap review](../ROADMAP-260824.md). External review
-  automation ([#23](https://github.com/frostney/wasmlight/issues/23)) is
-  skipped for `0.2.0`.
-- **No dates.** Twenty-five merged pull requests provide a delivery sample,
-  but the observed rate varies too widely to support a calendar commitment.
+- **`0.1.0` has shipped; `0.2.0` is being assembled.** `wasmlight compile`
+  emits an interpreter-free WASI command executable
+  ([ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md)) with
+  embedded connector plans (`--connector`) and an embedded compiled capability
+  set (`--dir` / `--env`). A compiler emits for its own architecture on both
+  64-bit UNIX operating systems; emitting the other architecture is
+  [#148](https://github.com/frostney/wasmlight/issues/148). Release archives
+  carry live same-architecture runtime shells through a manually dispatched
+  release-asset workflow. Merged work after `0.1.0` — JIT/GC performance,
+  CI hardening, and documentation — folds into `0.2.0`.
+- **Next sequence** (re-planned in the 2026-09-27 roadmap review): `0.2.0` a
+  usable native compiler; `0.3.0` independently judged non-network WASI
+  Preview 1 plus all-to-all cross-architecture emission; `0.4.0` the
+  embedding SDK core (C, Rust, Python over `libwasmlight`); `0.4.1` the Nim,
+  C#, and Go bindings; `0.5.0` Win64 native compilation; `0.6.0` i386 Windows
+  native compilation; `0.7.0` operational observability. WASI and the SDK
+  come before the Windows compiled tiers because Windows already runs the
+  conformant interpreter and the embedding API is tier-independent. External
+  review automation ([#23](https://github.com/frostney/wasmlight/issues/23))
+  stays deferred.
+- **No dates.** Delivery is too bursty to support a calendar commitment.
   Releases remain ordered by dependency and exit criteria.
 
 ## Confidence
 
 The original A-J plan was anchored on counted specification surface because
-the repository had no pull-request delivery history. It now has twenty-five
-merged pull requests and one published release, but only two issue-linked
-deliveries and no compiler-implementation sample. The observed rates range
-from 1.94 pull requests per week over 90 days to 14.8 during the twelve-day
-active span; PR-open-to-merge time omits most investigation and
-implementation. Those data support bounded sequencing, not dates. Re-anchor
-after four issue-linked `0.2.0` implementation pull requests have merged.
+the repository had no pull-request delivery history. By 2026-09-27 it had 70
+merged pull requests over 46 days, with weekly counts of 9, 12, 22, 0, 0, 3,
+and 24. The issue-linked sample is one burst, and closing an issue proved a
+weak signal of end-to-end delivery (the 2026-09-27 review reopened two
+`0.2.0` issues). Those data support bounded sequencing and PR-count ranges,
+not dates.
 
-The current throughput calculations, source-level comparison, and confidence
-limits are recorded in the
-[2026-08-24 roadmap review](../ROADMAP-260824.md). The 2026-08-15 review
-remains the historical A-J close-out.
+The 2026-08-24 review ([ROADMAP-260824.md](../ROADMAP-260824.md)) holds the
+original post-`0.1.0` source comparison. The 2026-09-27 re-plan is recorded in
+the GitHub milestones and issues it created. The 2026-08-15 review remains
+the historical A-J close-out.
 
 Spec counts below come from `wasm-mcp` at pinned `spec/main`
 `d7b37e4170d8315f2f1283aed4e8076591a9a333`; testsuite counts from
@@ -542,8 +544,10 @@ stay discoverable. It compiles `try_table` handler tables and
 `UnwindException` by tag store-address, and an uncaught throw is
 `EWasmException` via the trampoline. Direct compiled-to-compiled calls
 still decline handler-bearing and throwing functions so they keep an
-`InvokeCompiled` seam. Remaining portable declines for mixed-tier tests
-are things like call arity greater than 256. The correctness proof is
+`InvokeCompiled` seam. Frame size, handler tables, and `call` /
+`return_call*` arity are encoded rather than declined: a function declines
+only for an op with no template, and a per-backend test requires a template
+for every IR op. The correctness proof is
 differential: `--tier=jit` over the corpus is **byte-identical** to
 `--tier=interp` — locally `compiled=8703` on aarch64,
 `pass=65188 fail=0 skip=0` — with cross-platform identity enforced
@@ -691,35 +695,36 @@ Wasmtime-anchored rather than a neutral conformance bar.
 
 - **`0.1.0`: pinned-Core-3 baseline — shipped.** Changelog-first release of
   the shipped runtime.
-- **`0.2.0`: native compiler and connectors.** Strict all-or-fail
-  `wasmlight compile`, interpreter-free runtime shells, declarative `.wlc`
-  connectors, all-to-all 64-bit Unix cross-compilation, release archives,
-  and Homebrew. Issues [#29](https://github.com/frostney/wasmlight/issues/29)–[#46](https://github.com/frostney/wasmlight/issues/46).
-  The compile contract is [ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md).
-- **`0.3.0`: Win64 native compilation.** Extend strict compilation,
-  connectors, and distribution to `x86_64-win64`. Issues
-  [#47](https://github.com/frostney/wasmlight/issues/47)–[#53](https://github.com/frostney/wasmlight/issues/53).
-- **`0.4.0`: i386 Windows native compilation.** Add the `i386-win32`
-  backend, connectors, and distribution. Issues
-  [#54](https://github.com/frostney/wasmlight/issues/54)–[#61](https://github.com/frostney/wasmlight/issues/61).
-- **`0.5.0`: portable embedding SDKs.** Complete the Pascal facade and ship
-  C, Nim, C#, Rust, Go, and Python bindings over `libwasmlight`. Issues
-  [#62](https://github.com/frostney/wasmlight/issues/62)–[#77](https://github.com/frostney/wasmlight/issues/77).
-- **`0.6.0`: independently judged WASI Preview 1.** Wire `wasi-testsuite`,
-  then complete the 19 missing non-network functions. Sockets remain a
-  later, separately approved capability slice over pre-granted handles.
-  Issues [#78](https://github.com/frostney/wasmlight/issues/78)–[#85](https://github.com/frostney/wasmlight/issues/85).
+- **`0.2.0`: a usable native compiler.** Strict all-or-fail
+  `wasmlight compile`, interpreter-free runtime shells, embedded `.wlc`
+  connector plans, the embedded compiled capability set, guest argv parity
+  with `run`, Windows preopen containment, and same-architecture release
+  archives with Homebrew. The compile contract is
+  [ADR-0015](adr/0015-strict-native-compiler-and-runtime-shell.md).
+- **`0.3.0`: judged WASI Preview 1 and cross-architecture emission.** Wire
+  `wasi-testsuite`, complete the 19 missing non-network functions, and gate
+  cross-platform containment ([#78](https://github.com/frostney/wasmlight/issues/78)–[#85](https://github.com/frostney/wasmlight/issues/85)). Every compiler host emits
+  every 64-bit UNIX target ([#148](https://github.com/frostney/wasmlight/issues/148)). Connector handle release ([#157](https://github.com/frostney/wasmlight/issues/157)) and
+  string/struct/by-reference marshalling ([#158](https://github.com/frostney/wasmlight/issues/158)) follow here.
+- **`0.4.0`: embedding SDK core.** Complete the Pascal facade and ship
+  `libwasmlight` with the C, Rust, and Python bindings; the interpreter runs
+  on every released platform and compiled tiers are used where they ship.
+- **`0.4.1`: remaining bindings.** Nim, C#, and Go over the settled C ABI.
+- **`0.5.0`: Win64 native compilation.** Extend strict compilation,
+  connectors, and distribution to `x86_64-win64` ([#47](https://github.com/frostney/wasmlight/issues/47)–[#53](https://github.com/frostney/wasmlight/issues/53),
+  [#151](https://github.com/frostney/wasmlight/issues/151), [#152](https://github.com/frostney/wasmlight/issues/152)).
+- **`0.6.0`: i386 Windows native compilation.** Add the `i386-win32`
+  backend, connectors, and distribution ([#54](https://github.com/frostney/wasmlight/issues/54)–[#61](https://github.com/frostney/wasmlight/issues/61)).
 - **`0.7.0`: operational runtime.** Name-aware guest stacks, profiler maps,
-  and structured statistics. Async hosting remains deferred to the
-  Component Model re-entry so the runtime designs one suspension mechanism.
-  Issues [#86](https://github.com/frostney/wasmlight/issues/86)–[#90](https://github.com/frostney/wasmlight/issues/90).
+  and structured statistics ([#86](https://github.com/frostney/wasmlight/issues/86)–[#90](https://github.com/frostney/wasmlight/issues/90)). Async hosting remains deferred
+  to the Component Model re-entry so the runtime designs one suspension
+  mechanism.
 - **After `0.7.0`: Components and current WASI.** Re-enter only after a
   fresh ADR proves a reproducible target, independent enough oracle, stable
   Canonical ABI, and deny-by-default capability model. Threads remain a
   separate, demand-led programme because they reverse ADR-0008.
 
-The detailed source evidence, dependency graph, sizing, and accepted
-decisions are in the [2026-08-24 roadmap review](../ROADMAP-260824.md).
+The milestones on GitHub are the authoritative issue lists for each version.
 
 ## Not planned
 
