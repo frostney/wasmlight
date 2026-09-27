@@ -995,14 +995,15 @@ begin
       Cache)).ToBe(True);
     CheckFrom(Start, [$44, $89, $C1, $44, $88, $0C, $0E]);
 
-    { i64.load8_s from [r9] into rax (REX.W 0F BE), then the dirty dynamic
-      host r10 for slot 2: mov r10,rax. No register-file store. }
+    { i64.load8_s from [r9] straight into the dirty dynamic host r10 for
+      slot 2 (REX.WR 0F BE /r, ModRM 14 = r10 + SIB). No rax bounce and no
+      register-file store. r9 was loaded from its slot, so its high half is
+      unknown and the address still goes through ecx. }
     Start := Buf.Size;
     Expect<Boolean>(X64EmitOpCached(Buf,
       MakeIrInstr(iroI64Load8S, 2, 1, 0, 0), Aux, 1, False, True,
       Cache)).ToBe(True);
-    CheckFrom(Start, [$44, $89, $C9, $48, $0F, $BE, $04, $0E,
-      $49, $89, $C2]);
+    CheckFrom(Start, [$44, $89, $C9, $4C, $0F, $BE, $14, $0E]);
     Expect<Boolean>(Cache.Entries[2].Valid and Cache.Entries[2].Dirty and
       (Cache.Entries[2].Slot = 2)).ToBe(True);
 

@@ -27,7 +27,11 @@
   holds the pinned memory's Base (X64_REG_MEMBASE). That frame calls no helper
   after loading it except the non-returning trap entries. For the same reason
   a static-cache frame may keep v128 values in the caller-saved xmm2-xmm15
-  across ops (TX64RegCache.VecCache); xmm0/xmm1 stay per-op scratch.
+  across ops (TX64RegCache.VecCache); xmm0/xmm1 stay per-op scratch. And a
+  static-cache frame keeps its third and fourth hottest slots in rdi and rdx
+  (TX64RegCache.Entries[4/5]): no template the static cache admits uses
+  either, and the only code that writes rdi there is a non-returning trap
+  entry's argument, after which the frame is discarded.
   Scratch is rax/rcx/rdx (caller-saved, dead at op boundaries); the SysV arg
   registers marshal helper arguments. The prologue pushes rbx/r12/r13/r14 and
   reserves one 8-byte alignment/memory slot; scalar-call-bearing functions use
@@ -111,6 +115,14 @@ type
     { Only with WriteBackDynamics: the host register holds a value its
       register-file slot does not have yet. }
     Dirty: Boolean;
+    { Only with WriteBackDynamics: bits 63:32 of the host are known zero,
+      because the last write was a 32-bit operation (which zero-extends its
+      destination, SDM Vol. 1 §3.4.1.1) or a copy of such a value. Every
+      other write clears it, and so does every join (X64InvalidateRegCache),
+      since another predecessor may have written the host differently. A
+      zero-extended i32 address needs no `mov ecx, r32` before it indexes
+      the pinned memory base. }
+    Zx32: Boolean;
     Slot: UInt32;
   end;
 
@@ -128,8 +140,11 @@ type
     Slot: UInt32;
   end;
 
+  { Entries 0/1 are r8/r9, 2/3 r10/r11, 4/5 rdi/rdx (X64CacheHostReg). A
+    static allocation fixes 0, 1, 4, and 5 to the driver's hottest slots and
+    keeps 2/3 dynamic; the write-through and native-core modes use 0/1 only. }
   TX64RegCache = record
-    Entries: array[0..3] of TX64RegCacheEntry;
+    Entries: array[0..5] of TX64RegCacheEntry;
     Next: Byte;
     StaticAllocation: Boolean;
     FixedWriteThrough: Boolean;
@@ -648,7 +663,7 @@ procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
 procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ADest: Byte; const ASlot: UInt32); forward;
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
-  const ASrc: Byte; const ASlot: UInt32); forward;
+  const ASrc: Byte; const ASlot: UInt32; const AZx32: Boolean = False); forward;
 procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
   var ACache: TX64RegCache); forward;
@@ -656,6 +671,8 @@ procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
   var ACache: TX64RegCache); forward;
 procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; var ACache: TX64RegCache); forward;
+procedure X64CachedMove(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; var ACache: TX64RegCache); forward;
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
@@ -963,6 +980,9 @@ begin
   end;
   case AIns.Op of
     iroMove:
+      if ACache.WriteBackDynamics then
+        X64CachedMove(ABuf, AIns, ACache)
+      else
       begin
         X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
         X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
@@ -1108,9 +1128,28 @@ begin
     0: Result := X64_R8;
     1: Result := X64_R9;
     2: Result := X64_R10;
+    3: Result := X64_R11;
+    4: Result := X64_RDI;
   else
-    Result := X64_R11;
+    Result := X64_RDX;
   end;
+end;
+
+{ In a static allocation, the entries whose host keeps one slot for the whole
+  activation (r8, r9, rdi, rdx); r10/r11 are the dynamic pair. }
+function X64CacheEntryFixed(const AIndex: Integer): Boolean;
+begin
+  Result := (AIndex <> 2) and (AIndex <> 3);
+end;
+
+{ The static allocation's entry for its AIndex-th driver slot: the first two
+  keep r8/r9, the third and fourth take rdi/rdx. }
+function X64StaticSlotEntry(const AIndex: Integer): Integer;
+begin
+  if AIndex <= 1 then
+    Result := AIndex
+  else
+    Result := AIndex + 2;
 end;
 
 procedure X64InitRegCache(out ACache: TX64RegCache);
@@ -1139,16 +1178,21 @@ end;
 procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlots: array of UInt32);
 var
-  I: Integer;
+  I, Index: Integer;
 begin
   X64InitRegCache(ACache);
   ACache.StaticAllocation := True;
-  for I := 0 to 1 do
-    if I <= High(ASlots) then
+  { Up to four fixed hosts; High(UInt32) marks an unused driver slot. rdi and
+    rdx are free here: the prologue has already moved the entry arguments
+    into their pins, and a static-cache body admits no template that uses
+    either (StaticCacheOp; only a non-returning trap entry writes rdi). }
+  for I := 0 to 3 do
+    if (I <= High(ASlots)) and (ASlots[I] <> High(UInt32)) then
     begin
-      ACache.Entries[I].Valid := True;
-      ACache.Entries[I].Slot := ASlots[I];
-      X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ASlots[I]);
+      Index := X64StaticSlotEntry(I);
+      ACache.Entries[Index].Valid := True;
+      ACache.Entries[Index].Slot := ASlots[I];
+      X64EmitLoadSlot64(ABuf, X64CacheHostReg(Index), ASlots[I]);
     end;
 end;
 
@@ -1423,8 +1467,8 @@ var
 begin
   if not ACache.StaticAllocation then
     Exit;
-  for I := 0 to 1 do
-    if ACache.Entries[I].Valid then
+  for I := 0 to High(ACache.Entries) do
+    if X64CacheEntryFixed(I) and ACache.Entries[I].Valid then
       X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
   { Fixed v128 hosts need no store: the driver fixes only declared locals
     and parameters and constant temporaries, and no exit reads either — a
@@ -1439,7 +1483,11 @@ var
 begin
   if ACache.StaticAllocation then
   begin
-    { Callers flush first: a dirty entry dropped here would lose its value. }
+    { Callers flush first: a dirty entry dropped here would lose its value.
+      The fixed hosts stay valid, but a join may merge predecessors that
+      wrote them differently, so no zero-extension fact survives it. }
+    for I := 0 to High(ACache.Entries) do
+      ACache.Entries[I].Zx32 := False;
     ACache.Entries[2].Valid := False;
     ACache.Entries[2].Dirty := False;
     ACache.Entries[3].Valid := False;
@@ -1457,6 +1505,18 @@ begin
   ACache.Entries[0].Valid := False;
   ACache.Entries[1].Valid := False;
   ACache.Next := 0;
+end;
+
+{ True when ASlot is resident in a host whose bits 63:32 are known zero
+  (TX64RegCacheEntry.Zx32). }
+function X64SlotZx32(const ACache: TX64RegCache; const ASlot: UInt32): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ACache.Entries) do
+    if ACache.Entries[I].Valid and (ACache.Entries[I].Slot = ASlot) then
+      Exit(ACache.Entries[I].Zx32);
+  Result := False;
 end;
 
 { Make ASlot resident and return its cache host, consuming one planned read.
@@ -1500,6 +1560,7 @@ begin
   end;
   X64EmitLoadSlot64(ABuf, Result, ASlot);
   ACache.Entries[Victim].Valid := True;
+  ACache.Entries[Victim].Zx32 := False;
   ACache.Entries[Victim].Slot := ASlot;
   X64ConsumeUse(ACache, ASlot);
 end;
@@ -1571,14 +1632,18 @@ end;
 
 procedure X64CachedDestCommit(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const AIndex: Integer; const ASlot: UInt32;
-  const AStoreEmitted: Boolean = False);
+  const AStoreEmitted: Boolean = False; const AZx32: Boolean = False);
 var
   Host: Byte;
 begin
   Host := X64CacheHostReg(AIndex);
+  { AZx32: the host was just written by a 32-bit operation (or a copy of a
+    zero-extended value). Only the deferred-write-back static cache reads the
+    fact (X64EmitScalarMemoryPinned). }
+  ACache.Entries[AIndex].Zx32 := AZx32 and ACache.WriteBackDynamics;
   if ACache.StaticAllocation then
   begin
-    if AIndex <= 1 then
+    if X64CacheEntryFixed(AIndex) then
     begin
       if ACache.FixedWriteThrough then
         X64EmitStoreSlot64(ABuf, Host, ASlot);
@@ -1598,7 +1663,7 @@ begin
 end;
 
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
-  const ASrc: Byte; const ASlot: UInt32);
+  const ASrc: Byte; const ASlot: UInt32; const AZx32: Boolean = False);
 var
   Index: Integer;
   Host: Byte;
@@ -1611,12 +1676,12 @@ begin
   Index := X64CachedDestBegin(ABuf, ACache, ASlot);
   Host := X64CacheHostReg(Index);
   StoreFirst := (not ACache.StaticAllocation) or
-    ((Index >= 2) and not ACache.WriteBackDynamics);
+    (not X64CacheEntryFixed(Index) and not ACache.WriteBackDynamics);
   if StoreFirst then
     X64EmitStoreSlot64(ABuf, ASrc, ASlot);
   if ASrc <> Host then
     X64EmitMovRegReg(ABuf, Host, ASrc);
-  X64CachedDestCommit(ABuf, ACache, Index, ASlot, StoreFirst);
+  X64CachedDestCommit(ABuf, ACache, Index, ASlot, StoreFirst, AZx32);
 end;
 
 { The operands and the result stay in their cache hosts; rax serves only a
@@ -1658,7 +1723,9 @@ begin
     EmitOp(X64_RAX, HostB);
     X64EmitMovRegReg(ABuf, HostD, X64_RAX);
   end;
-  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest);
+  { A 32-bit ALU op always writes, and so zero-extends, its destination; the
+    64-bit copy out of rax keeps those zero bits. }
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False, not AWide);
 end;
 
 procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
@@ -1667,8 +1734,15 @@ procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
 var
   HostA, HostB, HostD: Byte;
   Index: Integer;
+  SourceZx32: Boolean;
 begin
   X64CachedOperands(ABuf, ACache, AIns.A, AIns.B, HostA, HostB);
+  { Conservatively, a 32-bit shift keeps the zero-extension of its source
+    rather than being credited with its own: the result host starts as a
+    64-bit copy of the source, and a masked count of zero is then the only
+    case whose destination write the zero-extension argument would rest
+    on. }
+  SourceZx32 := not AWide and X64SlotZx32(ACache, AIns.A);
   Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
   HostD := X64CacheHostReg(Index);
   { The count is copied to CL first, so the result host may be its host. }
@@ -1676,7 +1750,7 @@ begin
   if HostD <> HostA then
     X64EmitMovRegReg(ABuf, HostD, HostA);
   X64EmitShiftCl(ABuf, ASubop, AWide, HostD);
-  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest);
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False, SourceZx32);
 end;
 
 { Set the flags with AOpcode (cmp $39 or test $85) over the operand hosts and
@@ -1704,12 +1778,39 @@ begin
     X64EmitSetccReg(ABuf, ACc, HostD);
     X64EmitMovzxReg8(ABuf, HostD, HostD);
   end;
-  X64CachedDestCommit(ABuf, ACache, Index, ADest);
+  { 0/1 in a host zeroed by a 32-bit xor or widened by a 32-bit movzx. }
+  X64CachedDestCommit(ABuf, ACache, Index, ADest, False, True);
+end;
+
+{ A move in the deferred-write-back static cache: straight from the source
+  host into the destination's, with no rax bounce. The source is resolved
+  (and its read consumed) first, so a dead source's dynamic host is the
+  preferred destination and the copy disappears. Only this mode takes the
+  path; the write-through modes keep their store-first byte sequence. }
+procedure X64CachedMove(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; var ACache: TX64RegCache);
+var
+  HostA, HostD: Byte;
+  Index: Integer;
+  Moved, SourceZx32: Boolean;
+begin
+  HostA := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
+  SourceZx32 := X64SlotZx32(ACache, AIns.A);
+  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
+  HostD := X64CacheHostReg(Index);
+  if HostD <> HostA then
+    X64EmitMovRegReg(ABuf, HostD, HostA);
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False, SourceZx32);
 end;
 
 procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; var ACache: TX64RegCache);
 begin
+  { rdx is this template's condition scratch. StaticCacheOp does not admit
+    select, so it never runs while rdx is a static host (Entries[5]). }
+  if ACache.Entries[5].Valid then
+    raise EWasmInternal.Create(
+      'internal: x64 select would clobber the static rdx host');
   X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
   X64CachedLoad(ABuf, ACache, X64_RCX, AIns.B);
   X64CachedLoad(ABuf, ACache, X64_RDX, UInt32(AIns.Imm));
@@ -2930,22 +3031,36 @@ end;
   trampoline with the same trap kind (ADR-0009); that path reads no
   register-file slot, so dirty cache hosts need no flush first.
 
-  The address is copied into ecx first: the 32-bit move discards stale high
-  bits of a 64-bit host or slot (an i32 is only its low half), and the copy
-  leaves the value side free to evict the address host. }
+  The index must be the zero-extended i32 address: an i32 is only the low
+  half of a 64-bit host or slot, and stale high bits would index outside the
+  reservation. A host whose last write was a 32-bit operation (Zx32) already
+  is that value and indexes directly; any other address is first copied into
+  ecx by a 32-bit move, which discards the high bits. Either way the index
+  register is read by the access itself, so the value side may still evict
+  or reuse the address host (a spill only stores). A load's result goes
+  straight into its destination host. }
 procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAddr64: Boolean;
   var ACache: TX64RegCache);
 var
   Offset: UInt64;
-  Host, ValueReg: Byte;
+  Host, ValueReg, IndexReg: Byte;
+  Index: Integer;
+  Signed, Result64: Boolean;
+  Size: UInt32;
 begin
   Move(AIns.Imm, Offset, SizeOf(Offset));
   if AAddr64 or (Offset <> 0) then
     raise EWasmInternal.Create(
       'internal: base-pinned x64 access is not a zero-offset i32 access');
+  IndexReg := X64_RCX;
   if X64CachedHostForSlot(ACache, AIns.A, Host) then
-    X64EmitAluRegReg(ABuf, $89, False, X64_RCX, Host)
+  begin
+    if X64SlotZx32(ACache, AIns.A) then
+      IndexReg := Host
+    else
+      X64EmitAluRegReg(ABuf, $89, False, X64_RCX, Host);
+  end
   else
     X64EmitLoadSlot32(ABuf, X64_RCX, AIns.A);
   X64ConsumeUse(ACache, AIns.A);
@@ -2963,17 +3078,22 @@ begin
       ValueReg := X64_RAX;
     end;
     X64ConsumeUse(ACache, AIns.Dest);
-    X64EmitStoreScalarIndexed(ABuf, ValueReg, X64_REG_MEMBASE, X64_RCX,
+    X64EmitStoreScalarIndexed(ABuf, ValueReg, X64_REG_MEMBASE, IndexReg,
       X64MemoryAccessSize(AIns.Op));
     Exit;
   end;
 
-  X64EmitLoadScalarIndexed(ABuf, X64_RAX, X64_REG_MEMBASE, X64_RCX,
-    X64MemoryAccessSize(AIns.Op),
-    AIns.Op in [iroI32Load8S, iroI32Load16S, iroI64Load8S, iroI64Load16S,
-      iroI64Load32S],
-    AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S]);
-  X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+  Size := X64MemoryAccessSize(AIns.Op);
+  Signed := AIns.Op in [iroI32Load8S, iroI32Load16S, iroI64Load8S,
+    iroI64Load16S, iroI64Load32S];
+  Result64 := AIns.Op in [iroI64Load8S, iroI64Load16S, iroI64Load32S];
+  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
+  X64EmitLoadScalarIndexed(ABuf, X64CacheHostReg(Index), X64_REG_MEMBASE,
+    IndexReg, Size, Signed, Result64);
+  { Every access narrower than 8 bytes except a sign extension to 64 bits
+    has a 32-bit destination (mov/movzx/movsx r32), which zero-extends. }
+  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False,
+    (Size < 8) and not (Signed and Result64));
 end;
 
 function X64SlotDispFits(const ASlot: UInt32): Boolean;
