@@ -287,7 +287,8 @@ jobs:
           (cd "$RUNNER_TEMP/release" && sha256sum -c "wasmlight-$VERSION-checksums.txt")
 
       # Every archive against the merged file: the complete four-host set,
-      # structure, and MANIFEST hashes. Execution already ran per host.
+      # structure, and MANIFEST hashes. The compile gates ran on each host in
+      # `pack`; here they rerun only for the linux-x64 archive (this host).
       - name: Verify the complete release set
         run: |
           set -euo pipefail

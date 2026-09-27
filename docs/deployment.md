@@ -98,9 +98,13 @@ runs the packed compiler: `--version` must match, and a live archive
 (or `--require-compile`) runs the compile gates against the packed
 catalog. For each shell it compiles a probe whose `_start` calls
 `proc_exit(37)`, and checks that the output is that target's ELF or
-Mach-O (a Mach-O ad-hoc signature must verify) and that its native
+Mach-O and that its native
 payload parses, names that target, and is bound to the archive's shell.
-Only the host-native output runs, and it must exit 37, so a placeholder
+An `aarch64-darwin` image must carry a verifying ad-hoc signature,
+because arm64 macOS runs no unsigned code. The Intel `wasmlight-shell` is
+linked without a signature, so its `x86_64-darwin` output carries the
+appended payload trailer unsigned, which x86-64 macOS runs; any signature
+that is present must still verify. Only the host-native output runs, and it must exit 37, so a placeholder
 that exits zero cannot pass. The other-OS output is checked structurally
 and never executed: four host legs, not a 16-cell execution matrix. A
 foreign-architecture `--target` must be refused. On a foreign host the

@@ -29,6 +29,7 @@ type
       ACatalog: TWasmDistroCatalog): TWasmDistroManifest;
     function ProbePayload(const ATriple: string;
       const AShell: TBytes): TBytes;
+    function UnsignedMachOTemplate(const ATarget: TWasmMachOTarget): TBytes;
   public
     procedure SetupTests; override;
 
@@ -54,6 +55,7 @@ type
     procedure TestCompileEmissionNotShipped;
     procedure TestElfEmissionBindsItsShell;
     procedure TestMachOEmissionBindsItsShell;
+    procedure TestUnsignedMachOEmission;
   end;
 
 function TDistroTests.TempRoot: string;
@@ -312,7 +314,7 @@ begin
   end;
   DistroWriteCatalog(Root, '0.2.0', Triples);
   Status := DistroValidateTree(Root, '0.2.0');
-  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsIncompleteCatalog));
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsForeignShell));
 end;
 
 procedure TDistroTests.TestElfAndMachOMagic;
@@ -485,6 +487,50 @@ begin
   Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
 end;
 
+function TDistroTests.UnsignedMachOTemplate(const ATarget: TWasmMachOTarget): TBytes;
+const
+  LC_CODE_SIGNATURE = $1D;
+  LC_DYLIB_CODE_SIGN_DRS = $2B;
+var
+  Info: TWasmMachOInfo;
+  Off, Cmds, I: Integer;
+begin
+  { Intel `ld` links without a signature. Retag the template's
+    LC_CODE_SIGNATURE as an inert linkedit command to model that shell. }
+  Result := WriteMachOShellTemplate(ATarget);
+  Cmds := Result[16] or (Result[17] shl 8);
+  Off := 32;
+  for I := 1 to Cmds do
+  begin
+    if Result[Off] = LC_CODE_SIGNATURE then
+      Result[Off] := LC_DYLIB_CODE_SIGN_DRS;
+    Off := Off + (Result[Off + 4] or (Result[Off + 5] shl 8));
+  end;
+  Expect<Integer>(Ord(InspectMachO(Result, Info))).ToBe(Ord(mmrOk));
+  Expect<Boolean>(Info.HasSignature).ToBe(False);
+end;
+
+procedure TDistroTests.TestUnsignedMachOEmission;
+var
+  Shell, Image, Extracted: TBytes;
+  Status: TWasmDistroResult;
+begin
+  { x86-64 macOS runs unsigned code: the appended-trailer image passes. }
+  Shell := UnsignedMachOTemplate(wmtX86_64Darwin);
+  Expect<Integer>(Ord(PackageAppendedPayload(Shell,
+    ProbePayload('x86_64-darwin', Shell), Image))).ToBe(Ord(eprOk));
+  Expect<Integer>(Ord(ParseAppendedPayload(Image, Extracted))).ToBe(Ord(eprOk));
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'x86_64-darwin');
+  Expect<Boolean>(Status.IsOk).ToBe(True);
+  { arm64 macOS does not: the same form for AArch64 is rejected. }
+  Shell := UnsignedMachOTemplate(wmtAarch64Darwin);
+  Expect<Integer>(Ord(PackageAppendedPayload(Shell,
+    ProbePayload('aarch64-darwin', Shell), Image))).ToBe(Ord(eprOk));
+  Expect<Integer>(Ord(ParseAppendedPayload(Image, Extracted))).ToBe(Ord(eprOk));
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'aarch64-darwin');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+end;
+
 procedure TDistroTests.TestCompileHelpDetection;
 begin
   Expect<Boolean>(DistroHelpListsCompile(
@@ -570,6 +616,7 @@ begin
   Test('an ELF emission binds its target and the archive shell', TestElfEmissionBindsItsShell);
   Test('a Mach-O emission binds its target, shell, and signature',
     TestMachOEmissionBindsItsShell);
+  Test('an unsigned Mach-O emission is x86-64 only', TestUnsignedMachOEmission);
 end;
 
 begin

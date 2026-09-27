@@ -144,9 +144,10 @@ procedure DistroWriteCatalog(const ARoot, AVersion: string;
   const ATriples: array of string);
 
 { Check an executable `wasmlight compile --target ATriple` wrote without
-  running it: the image is ATriple's ELF/Mach-O (a Mach-O ad-hoc signature
-  verifies), and its extracted native payload parses, names ATriple's
-  arch/OS, and binds AShell — the catalog shell it was packaged onto. }
+  running it: the image is ATriple's ELF/Mach-O (an AArch64 Mach-O carries
+  a verifying ad-hoc signature; any present signature verifies), and its
+  extracted native payload parses, names ATriple's arch/OS, and binds
+  AShell — the catalog shell it was packaged onto. }
 function DistroCheckEmission(const AImage, APayload, AShell: TBytes;
   const ATriple: string): TWasmDistroResult;
 
@@ -834,6 +835,11 @@ begin
   Triples := DistroHostShells(Host);
   if LoadShellCatalog(DistroJoin(ARoot, DISTRO_SHELL_ROOT), Catalog) <> slrOk then
     Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog, 'invalid compiler shell catalog'));
+  for I := 0 to High(Catalog.Entries) do
+    if not DistroHostCarriesShell(Host, Catalog.Entries[I].Triple) then
+      Exit(TWasmDistroResult.Fail(ddsForeignShell, 'catalog indexes ' +
+        Catalog.Entries[I].Triple + ', which a ' + Host.Triple +
+        ' compiler does not emit'));
   if Length(Catalog.Entries) <> Length(Triples) then
     Exit(TWasmDistroResult.Fail(ddsIncompleteCatalog,
       'compiler catalog needs exactly the ' + Host.Triple + ' host shells'));
@@ -955,6 +961,7 @@ var
   Shell: TWasmDistroShell;
   Parsed: TWasmNativePayload;
   Parse: TWasmNativePayloadParseResult;
+  MachInfo: TWasmMachOInfo;
   Arch, Os: Byte;
 begin
   if not DistroFindShell(ATriple, Shell) then
@@ -962,9 +969,25 @@ begin
   if not DistroImageMatchesShell(AImage, Shell.Triple) then
     Exit(TWasmDistroResult.Fail(ddsBadEmission,
       'image is not a ' + Shell.Triple + ' executable'));
-  if (Shell.Image = wdiMachO64) and (VerifyMachOAdHocSignature(AImage) <> mmrOk) then
-    Exit(TWasmDistroResult.Fail(ddsBadEmission,
-      'Mach-O ad-hoc signature does not verify'));
+  if Shell.Image = wdiMachO64 then
+  begin
+    if InspectMachO(AImage, MachInfo) <> mmrOk then
+      Exit(TWasmDistroResult.Fail(ddsBadEmission, 'malformed Mach-O image'));
+    { arm64 macOS refuses to run unsigned code, so an AArch64 image must
+      carry a verifying ad-hoc signature. x86-64 macOS runs unsigned code:
+      a shell linked without a signature is packaged with the appended
+      payload trailer, the form `wasmlight compile` emits for it. A
+      signature that is present must still verify. }
+    if MachInfo.HasSignature then
+    begin
+      if VerifyMachOAdHocSignature(AImage) <> mmrOk then
+        Exit(TWasmDistroResult.Fail(ddsBadEmission,
+          'Mach-O ad-hoc signature does not verify'));
+    end
+    else if TripleArch(Shell.Triple) = 'aarch64' then
+      Exit(TWasmDistroResult.Fail(ddsBadEmission,
+        'an arm64 Mach-O image needs an ad-hoc signature'));
+  end;
   Parse := ParseNativePayload(APayload, Parsed);
   if Parse <> nprOk then
     Exit(TWasmDistroResult.Fail(ddsBadEmission,
