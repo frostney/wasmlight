@@ -280,11 +280,14 @@ begin
   if WasmTargetSupported(ATarget) then
   begin
     Result := WasmTargetAbiFingerprint(WasmTargetAbi(ATarget));
-    { Host code bakes this build's live offsets under the published stamp,
-      so a build whose layout drifted from Wasm.Target would stamp code no
-      conforming runtime can run. }
-    if WasmTargetEqual(ATarget, WasmTargetHost) and
-      (WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore)) <> Result) then
+    { Emission for ANY target bakes this build's live class offsets (the
+      store's tier context, the GC heap) beside the target's published ones,
+      and every supported target shares the published LP64 layout. A build
+      whose layout drifted from Wasm.Target would stamp code no conforming
+      runtime can run, whichever target it names. }
+    if WasmTargetSupported(WasmTargetHost) and
+      (WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore)) <>
+      WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost))) then
       raise EWasmInternal.Create('internal: this build''s runtime layout ' +
         'differs from the published target layout (Wasm.Target)');
   end

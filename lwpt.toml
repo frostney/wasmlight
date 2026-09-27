@@ -66,3 +66,10 @@ max-routine-cognitive = 200
 
 [duplication]
 maximum-percent = 10
+
+# Tests compile at release's optimization level (-O4) so that anything the
+# optimizer changes about compiled code's contract with the runtime - class
+# field order (Shared.inc keeps it), the published layout (Wasm.Target.Test)
+# - is checked in the same shape a release build has. Dev checks stay on.
+[test]
+flags = ["-O4"]

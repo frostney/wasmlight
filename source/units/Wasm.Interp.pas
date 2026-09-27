@@ -3856,6 +3856,8 @@ begin
 end;
 
 function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
+var
+  Live: UInt64;
 begin
   if WasmTargetSupported(WasmTargetHost) then
   begin
@@ -3866,8 +3868,9 @@ begin
       live fingerprint then, so every published-layout artifact or payload
       is rejected instead of wired onto the wrong offsets. Stamping from such
       a build is refused in Wasm.Aot. }
-    if WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore)) <> Result then
-      Result := WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore));
+    Live := WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore));
+    if Live <> Result then
+      Result := Live;
   end
   else
     Result := WasmAotAbiFingerprintFromLiveRuntime(AStore);

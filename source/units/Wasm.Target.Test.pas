@@ -342,6 +342,9 @@ begin
     try
       Published := WasmTargetAbiFingerprint(WasmTargetAbi(Host));
       Live := WasmLiveTargetAbi(Store);
+      { Every one of the published fields, not only the folded hash. }
+      Expect<Integer>(CompareByte(Live.Layout, WasmTargetAbi(Host).Layout,
+        SizeOf(TWasmTargetLayout))).ToBe(0);
       Expect<UInt64>(WasmTargetAbiFingerprint(Live)).ToBe(Published);
       Moved := Live;
       Moved.Layout.StoreJitHelperTable := Live.Layout.StoreJitHelperTable - 8;

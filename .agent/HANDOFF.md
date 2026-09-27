@@ -23,8 +23,14 @@
   - Load side: a drifted build answers with its live fingerprint, so
     `run --aot` falls back to the interpreter and the shell rejects the
     payload.
-  - Stamp side: `aot` and `compile` for the host raise `EWasmInternal`, which
-    now reports cleanly instead of escaping unhandled.
+  - Stamp side: stamping for any target raises `EWasmInternal`. Fable CR-1
+    found that foreign-target code also bakes live class offsets, so the
+    original host-only check was not enough. `wasmlight aot` now reports the
+    error cleanly instead of letting it escape unhandled.
+  - `[test].flags = ["-O4"]`: unit tests compile at release's level, so a
+    reordering regression fails `Wasm.Target.Test`. One test's
+    wrapped-product constants became literals, because `-O4` folds them at
+    compile time. The suite takes 73 s instead of 61 s.
 - Mutation evidence: removing the directive and building release makes
   `aot` exit 1 with the internal message, and `run --aot` of a dev artifact
   falls back to the interpreter with exit 0.

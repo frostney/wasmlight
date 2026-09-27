@@ -54,7 +54,10 @@ code, and `Wasm.Target` publishes them for `.waot` artifacts and native
 executables. Reordering moved those offsets in release builds only, so a
 release runtime accepted a dev-built artifact and then faulted. As a second
 line of defence, a build whose live layout differs from the published one
-refuses to stamp host artifacts and rejects every published-layout artifact.
+refuses to stamp artifacts for any target and rejects every
+published-layout artifact. `[test].flags = ["-O4"]` compiles the unit tests
+at release's optimization level, so `Wasm.Target.Test` checks the release
+layout directly; development checks stay on.
 
 ## Generated version constant
 
