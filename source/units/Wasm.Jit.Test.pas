@@ -5911,14 +5911,16 @@ begin
   Expect<Boolean>(Has([$B8, $40, $42, $0F, $00])).ToBe(True);
   Expect<Boolean>(Has([$41, $83, -1, $01])).ToBe(False);
   {$ENDIF}
-  { A dynamic local ($p: the static hosts go to $a and $b), dirty after
-    its update at the loop head, is read through its alias by two
-    immediate ops: an op may take a dead operand's host in place, never a
-    live one's. The expected sums come from the lane K model. }
+  { A dynamic local ($p: the four static hosts go to hotter locals),
+    dirty after its update at the loop head, is read through its alias by
+    two immediate ops: an op may take a dead operand's host in place, never
+    a live one's (which would drop the dirty value). The expected sums come
+    from the lane K model. }
   Bytes := AssembleWatText('(module (memory 1 1) (data (i32.const 0) ' +
     '"\05\00\00\00\09\00\00\00\11\00\00\00\21\00\00\00") ' +
     '(func (export "run") (param $n i32) (result i32) (local $i i32) ' +
-    '(local $a i32) (local $b i32) (local $p i32) (loop $l ' +
+    '(local $a i32) (local $b i32) (local $p i32) (local $c i32) ' +
+    '(local $d i32) (loop $l ' +
     '(local.set $p (i32.add (local.get $p) (i32.const 4))) ' +
     '(local.set $a (i32.add (local.get $a) (i32.load (i32.and ' +
     '(local.get $p) (i32.const 12))))) ' +
@@ -5926,18 +5928,27 @@ begin
     '(i32.const 3)))) ' +
     '(local.set $a (i32.add (local.get $a) (local.get $b))) ' +
     '(local.set $b (i32.add (local.get $b) (local.get $a))) ' +
+    '(local.set $c (i32.add (local.get $c) (i32.xor (local.get $a) ' +
+    '(local.get $c)))) ' +
+    '(local.set $d (i32.sub (local.get $d) (i32.add (local.get $c) ' +
+    '(local.get $d)))) ' +
+    '(local.set $c (i32.add (local.get $c) (i32.mul (local.get $d) ' +
+    '(local.get $c)))) ' +
+    '(local.set $d (i32.xor (local.get $d) (i32.add (local.get $c) ' +
+    '(local.get $d)))) ' +
     '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
     '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
-    '(i32.add (local.get $a) (local.get $b))))');
+    '(i32.add (i32.add (local.get $a) (local.get $b)) (i32.add ' +
+    '(local.get $c) (local.get $d)))))');
   {$IFDEF WASM_JIT_X64}
   Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
   {$ENDIF}
   Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(10)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
-  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(247786);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1276431346);
   Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(37)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
-  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(82010498);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1963718274);
 end;
 
 { Immediates inside lane M's deferred-write-back native self cores (a
