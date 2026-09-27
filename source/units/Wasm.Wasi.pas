@@ -30,14 +30,14 @@
   seams are injectable, so a hermetic unit test replaces them with fixed values
   and nothing in a WASI test touches the real clock, entropy, fs, or network.
 
-  WAVE SCOPE (embedding-spec.md §3.3, §8.2). This is F2: the wave-1 MUST tier —
+  SCOPE (embedding-spec.md §3.3, §8.2). Shipped: the wave-1 set —
   args/environ, fd_write/read/close/seek/fdstat/prestat, clock, random,
-  proc_exit, sched_yield. The wave-2 filesystem functions (path_open and the
-  file ops, behind preopen containment) are F4, and the wave-3 long tail is
-  stubbed ENOSYS in F5. A module importing only the wave-1 set links and runs
-  today; one importing a wave-2 function fails to link until F4 (which is the
-  honest deny-by-default posture — an undefined import is an EWasmLinkError, not
-  a silent no-op).
+  proc_exit, sched_yield — and the wave-2 filesystem functions (path_open and
+  the file ops) behind preopen containment. The wave-3 long tail (sock_*,
+  poll_oneoff, the link/rename family, and the other non-network functions
+  tracked for 0.3.0) is not defined at all, so a module importing one fails to
+  link with EWasmLinkError — the honest deny-by-default posture, never a
+  silent no-op or an ENOSYS stub.
 
   SOURCE for the preview1 ABI (signatures, struct layouts, errno numbering):
   the frozen wasi_snapshot_preview1 witx, consumed through Wasm.Wasi.Types

@@ -6,24 +6,24 @@ its workload, tier, host, and method attached.
 
 ## Bottom line
 
-wasmlight is already a credible low-latency, self-contained runtime rather than
-a miniature copy of an optimizing server engine. On this host it starts a
-precompiled command faster than every measured peer, and its baseline AOT is
-within 1.48–1.51x of the optimizing compilers on a dependency-heavy integer
-loop. The main performance gap is code quality around calls and memory:
-optimizing compiled peers are 7.96–15.64x faster on recursive Fibonacci and
-2.66–4.66x faster on varying-address memory.
+On the CI x86-64 runner, wasmlight's compiled tier (measured through
+`run --aot`) is at a geometric mean of 0.79x Wasmtime's time across the
+eleven fixtures, and 0.65x when Wasmtime also runs with epoch interruption,
+which wasmlight always polls (ADR-0006). It starts a precompiled command
+faster than every compiled peer and beats Wasmtime on SIMD, GC allocation,
+and WASI host calls. The remaining gaps are store-heavy memory loops and
+`memory.grow`, where Wasmtime's optimizing compiler is ahead, and fib, where
+WasmEdge's and WAMR's LLVM AOT are ahead.
 
-The interpreter has a different shape. It starts fastest and beats the explicit
-WasmEdge and wazero interpreters on all three heavy workloads, but WAMR and
-wasm3 are 4.62–9.32x faster. That makes fast interpreter dispatch and compiled
-call lowering the two clearest performance study targets.
+The interpreter comparison below predates the JIT and AOT work of
+September 2026 and was measured on a different host; it is kept as the
+latest interpreter-only data point, not as a current compiled-tier result.
 
 ## Product shape
 
 | Runtime | Product centre | Execution engines | Standards / host emphasis | Most useful comparison with wasmlight |
 | --- | --- | --- | --- | --- |
-| **wasmlight 0.1.0** | FreePascal runtime-platform building block | Register interpreter, baseline JIT, per-module AOT cache; JIT/AOT on arm64 and x86-64 UNIX | Pinned Core 3.0 draft including GC, exception handling, SIMD, and tail calls; deny-by-default WASI preview1 subset | The subject: one validated IR shared by every tier, unusually small AOT artifacts, full core scope, and no external compiler backend |
+| **wasmlight** (main, 2026-09-27) | FreePascal runtime-platform building block | Register interpreter, baseline JIT, per-module AOT cache, and a strict native compiler; JIT/AOT on arm64 and x86-64 UNIX | Pinned Core 3.0 draft including GC, exception handling, SIMD, and tail calls; deny-by-default WASI preview1 subset | The subject: one validated IR shared by every tier, unusually small AOT artifacts, full core scope, and no external compiler backend |
 | **Wasmtime 47.0.3** | Production standalone and embeddable runtime | Optimizing Cranelift compilation and serialized precompiled modules | Core Wasm, WASI, and the Component Model; strong security and resource-control posture | Performance and production-hardening ceiling; broader component ecosystem. [Official introduction](https://docs.wasmtime.dev/) |
 | **Wasmer 7.2.1** | Cross-platform runtime and package ecosystem | Singlepass, Cranelift, LLVM, plus delegated V8/browser engines | Broad proposal matrix and WASI/WASIX application surface | Backend choice, packaging, and portability across native and constrained platforms. [Runtime features](https://docs.wasmer.io/runtime/features/) |
 | **WasmEdge 0.17.1** | Cloud-native, edge, and AI-oriented runtime | Interpreter, JIT, LLVM AOT | Core 3.0 is the CLI default; resource limits, statistics, and plugin extensions | The closest three-mode CLI comparison and an optimizing AOT ceiling. [CLI guide](https://wasmedge.org/docs/start/build-and-run/cli/) |
@@ -43,37 +43,62 @@ ecosystems than wasmlight intends to carry.
 
 ## Performance snapshot
 
-Measured 2026-08-14 at wasmlight commit
-`83c132b9d52a4a2ec8826b772157d6c24885999c` on a Mac17,6 with an Apple M5 Max,
-arm64, macOS 26.5.2. The remote-default baseline was
-`a7d9565304ee1138b4e76763810559e7ba1112d1`.
+Measured 2026-09-27 by the pull-request `runtime-comparison` job
+([run 36356488359](https://github.com/frostney/wasmlight/actions/runs/36356488359))
+on one GitHub-hosted `Linux-6.17.0-1022-azure-x86_64` runner. The wasmlight
+column is PR #159's head `f82a2c4`, whose tree is main `66562d6`. Every cell
+is the median wall-clock process time of seven rotated samples after one
+warm-up; compilation and cache population are outside the timer, and every
+workload verifies its result. The parenthesized ratio is
+`wasmlight / runtime`: above 1 means that peer was faster.
 
-Every cell below is median wall-clock process time in milliseconds from seven
-samples after one warm-up. Lower is better. Compilation is outside the timer.
-The parenthesized ratio is `wasmlight / runtime`: above 1 means that peer was
-faster; below 1 means wasmlight was faster.
+### Best available configuration
 
-### Best available installed configuration
-
-| Workload | wasmlight AOT | Wasmtime AOT | Wasmer AOT | WasmEdge AOT | WAMR interp | wazero cached compiler | wasm3 interp |
+| Workload | wasmlight | Wasmtime | Wasmer | WasmEdge | WAMR | wazero | wasm3 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| startup | 2.191 (1.00x) | 3.510 (0.62x) | 5.695 (0.38x) | 9.008 (0.24x) | 2.700 (0.81x) | 3.012 (0.73x) | 2.768 (0.79x) |
-| nonlinear loop, 300M | 503.042 (1.00x) | 334.220 (1.51x) | 336.933 (1.49x) | 339.525 (1.48x) | 1126.788 (0.45x) | 334.321 (1.50x) | 830.913 (0.61x) |
-| recursive fib(35) | 353.371 (1.00x) | 32.971 (10.72x) | 34.324 (10.30x) | 22.589 (15.64x) | 222.811 (1.59x) | 44.399 (7.96x) | 216.629 (1.63x) |
-| varying-address memory, 50M | 82.054 (1.00x) | 17.602 (4.66x) | 20.075 (4.09x) | 20.477 (4.01x) | 194.098 (0.42x) | 30.904 (2.66x) | 179.126 (0.46x) |
+| startup | 1.413 | 3.632 (0.39x) | 12.899 (0.11x) | 6.895 (0.20x) | 10.063 (0.14x) | 2.566 (0.55x) | 0.926 (1.53x) |
+| loop | 411.323 | 413.758 (0.99x) | 422.914 (0.97x) | 416.834 (0.99x) | 419.773 (0.98x) | 412.216 (1.00x) | 1799.931 (0.23x) |
+| fib | 52.672 | 70.845 (0.74x) | 79.112 (0.67x) | 28.278 (1.86x) | 35.439 (1.49x) | 79.637 (0.66x) | 547.720 (0.10x) |
+| memory | 30.886 | 33.296 (0.93x) | 43.141 (0.72x) | 28.112 (1.10x) | 33.187 (0.93x) | 57.843 (0.53x) | 438.380 (0.07x) |
+| memory-load | 57.897 | 60.855 (0.95x) | 77.920 (0.74x) | 35.418 (1.63x) | 39.158 (1.48x) | 112.323 (0.52x) | 1020.443 (0.06x) |
+| memory-store | 58.273 | 49.834 (1.17x) | 77.639 (0.75x) | 36.943 (1.58x) | 56.506 (1.03x) | 112.343 (0.52x) | 576.825 (0.10x) |
+| call | 70.701 | 87.096 (0.81x) | 96.892 (0.73x) | 75.838 (0.93x) | 78.762 (0.90x) | 98.884 (0.71x) | 936.541 (0.08x) |
+| memory-grow | 33.342 | 23.905 (1.39x) | 34.733 (0.96x) | 38.064 (0.88x) | 35.752 (0.93x) | 110.738 (0.30x) | 127.185 (0.26x) |
+| gc | 32.404 | 42.400 (0.76x) | — | — | — | — | — |
+| simd | 2.645 | 4.533 (0.58x) | 13.017 (0.20x) | 7.533 (0.35x) | — | 3.401 (0.78x) | — |
+| host-call | 54.949 | 112.854 (0.49x) | 190.486 (0.29x) | 95.282 (0.58x) | 39.682 (1.38x) | 61.015 (0.90x) | — |
 
-This table is intentionally labelled “installed configuration.” WAMR supports
-AOT and JIT as a product, but the official 2.4.5 macOS `wamrc` release is
-x86-64-only and this arm64 host has no Rosetta. Its row therefore measures the
-installed interpreter, not WAMR's performance ceiling. wasm3 is
-interpreter-only. The wazero cache was populated before timing.
+Times are milliseconds. A dash means the runtime cannot run that fixture
+from its CLI. The `memory-grow` and `gc` cells moved by 13–30% between the
+base and candidate builds of the same run with no related code change; treat
+them as noisy.
 
-For the nonlinear-loop artifact, sizes were 830 bytes (wasmlight), 50,832 bytes
-(Wasmtime), 7,608 bytes (Wasmer), and 4,743 bytes (WasmEdge). These formats do
-not package identical metadata, so the values explain load behaviour but are
-not a general footprint ranking.
+### Like-for-like: interruption checks on
 
-### Interpreter-only comparison
+wasmlight always polls its epoch. Here each peer also runs with its own
+interruption checks compiled in: Wasmtime epoch interruption, WasmEdge
+`--interruptible` AOT, and wazero `-timeout`. Wasmer, WAMR AOT, and wasm3
+expose no CLI-reachable interruption and are omitted.
+
+| Workload | wasmlight | Wasmtime | WasmEdge | wazero |
+| --- | ---: | ---: | ---: | ---: |
+| startup | 1.453 | 3.674 (0.40x) | 6.786 (0.21x) | 2.639 (0.55x) |
+| loop | 411.797 | 416.796 (0.99x) | 667.901 (0.62x) | 6824.822 (0.06x) |
+| fib | 52.886 | 73.533 (0.72x) | 28.453 (1.86x) | 79.708 (0.66x) |
+| memory | 30.606 | 48.790 (0.63x) | 121.501 (0.25x) | 1221.931 (0.03x) |
+| memory-load | 57.945 | 87.785 (0.66x) | 236.385 (0.25x) | 2270.885 (0.03x) |
+| memory-store | 58.299 | 62.254 (0.94x) | 237.339 (0.25x) | 2379.679 (0.02x) |
+| call | 71.600 | 115.924 (0.62x) | 116.400 (0.62x) | 1220.706 (0.06x) |
+| memory-grow | 26.719 | 25.228 (1.06x) | 40.358 (0.66x) | 114.612 (0.23x) |
+| gc | 28.165 | 42.379 (0.66x) | — | — |
+| simd | 2.730 | 7.445 (0.37x) | 9.495 (0.29x) | 25.271 (0.11x) |
+| host-call | 54.763 | 114.637 (0.48x) | 96.007 (0.57x) | 82.814 (0.66x) |
+
+### Interpreter-only comparison (2026-08-14, Apple M5 Max)
+
+Measured at commit `83c132b9d52a` on a Mac17,6 (arm64, macOS 26.5.2) with the
+same method. CI does not run the interpreters, so this is the latest
+interpreter-only data point.
 
 | Workload | wasmlight | WasmEdge | WAMR | wazero | wasm3 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -128,21 +153,15 @@ capability-scoped rather than weakened to the least capable peer: unsupported
 runtime cells are recorded as unavailable. See the harness README for the
 current capability matrix.
 
-The substantive compiled-workload spreads were 0.38–4.24%, except wazero's
-memory result at 29.69%; treat that cell as directional. Startup spreads were
-3.48–16.02%, expected for 2–9 ms process measurements. wasmlight's interpreter
-loop spread was 17.08%; other heavy interpreter cells were below 10%.
-
 ## What this does not establish
 
-- It is one Apple Silicon host, not a cross-platform ranking.
+- The compiled-tier numbers come from one GitHub-hosted x86-64 runner; the CI
+  job does not measure aarch64, and the runner's CPU model is not recorded.
 - It does not measure compilation time, peak RSS, repeated instantiation
   throughput, multi-instance density, or concurrent stores.
 - Eleven focused kernels do not predict a full application mix.
 - No security or correctness ranking follows from speed. Conformance claims
   require each project's own pinned corpus and exact feature configuration.
-- WAMR AOT/JIT still needs a native arm64 `wamrc` build before its performance
-  ceiling can be compared fairly.
 
 The next useful benchmark expansion is repeated instantiation throughput and
 one real toolchain-compiled WASI application. The focused kernels should remain
