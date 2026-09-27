@@ -458,8 +458,9 @@ procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer;
   const ARetainContext: Boolean = False);
 { AFrameless: the leaf core touches no register-file slot (the driver's
   first emission pass proved it with X64SlotTouched), so the lightweight
-  path jumps straight into the core and its RET returns to the caller;
-  rbx then still names the caller's frame, which the core never reads. }
+  path falls straight into the core, which the driver binds next, and its
+  RET returns to the caller; rbx then still names the caller's frame, which
+  the core never reads. }
 procedure X64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
   const ARegisterCount, AParamCount, AParam0Reg, AParam1Reg: UInt32;
   const ACoreLabel, AExternalLabel: TWasmJitLabel;
@@ -3714,11 +3715,10 @@ begin
     caller passes nil with scalar arguments in r8/r9 and receives r8. }
   X64EmitAluRegReg(ABuf, $85, True, X64_RCX, X64_RCX);
   X64EmitJccTo(ABuf, X64_CC_NE, UInt32(AExternalLabel));
+  { Frameless: the driver binds the core right here, so the lightweight
+    path falls into it and the core's RET returns to the caller. }
   if AFrameless then
-  begin
-    X64EmitJmpTo(ABuf, UInt32(ACoreLabel));
     Exit;
-  end;
   FrameBytes := (ARegisterCount * X64_SLOT_SIZE + 15) and not UInt32(15);
   X64EmitPushReg(ABuf, X64_RBX);
   X64EmitSubRsp(ABuf, Int32(FrameBytes));

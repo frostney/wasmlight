@@ -567,6 +567,7 @@ var
   X64Cache: TX64RegCache;
   X64Callee: TX64DirectCallee;
   X64CalleePtr: PX64DirectCallee;
+  X64LeafFallThrough: Boolean;
   UseX64VecCache: Boolean;
   X64VecStatics: array of UInt32;
   X64VecConsts: array of UInt32;
@@ -2951,16 +2952,23 @@ begin
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     UseX64ExtendedFrame := UseNativeScalarCall or UseNativeScalarSelf;
+    { A frameless leaf's lightweight entry falls straight into its core; the
+      canonical external entry is emitted after the core instead. }
+    X64LeafFallThrough := UseNativeScalarLeaf and AX64FramelessLeaf;
     if UseNativeScalarLeaf then
     begin
       X64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeParamCount,
         NativeParamReg, NativeParam1Reg, NativeCoreLabel,
         NativeExternalLabel, AX64FramelessLeaf);
-      Buf.BindLabel(NativeExternalLabel);
+      if not X64LeafFallThrough then
+        Buf.BindLabel(NativeExternalLabel);
     end;
-    X64EmitPrologue(Buf, UseX64ExtendedFrame);
-    X64EmitPinHelperTable(Buf, AHelperTableOffset);
-    X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if not X64LeafFallThrough then
+    begin
+      X64EmitPrologue(Buf, UseX64ExtendedFrame);
+      X64EmitPinHelperTable(Buf, AHelperTableOffset);
+      X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    end;
     if UseNativeScalarSelf then
       X64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
@@ -3001,13 +3009,14 @@ begin
         X64EnableVecCache(Buf, X64Cache, X64VecStatics, X64VecConsts,
           X64VecConstLo, X64VecConstHi);
     end;
-    if UseNativeScalarCore then
+    if UseNativeScalarCore and not X64LeafFallThrough then
     begin
       X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
         NativeParam1Reg, NativeResultReg, NativeCoreLabel);
       X64EmitEpilogue(Buf, UseX64ExtendedFrame);
-      Buf.BindLabel(NativeCoreLabel);
     end;
+    if UseNativeScalarCore then
+      Buf.BindLabel(NativeCoreLabel);
     { Only the core's own slot traffic decides the leaf's frame. }
     X64ResetSlotTouched;
     {$ENDIF}
@@ -3144,6 +3153,18 @@ begin
     if AX64FramelessLeaf and AX64LeafTouchedFrame then
       raise EWasmInternal.Create(
         'internal: frameless x64 native leaf touched its frame');
+    if X64LeafFallThrough then
+    begin
+      { The canonical entry, after the core's final RET: the same prologue,
+        epoch capture, and register-file bridge as the framed layout. }
+      Buf.BindLabel(NativeExternalLabel);
+      X64EmitPrologue(Buf, UseX64ExtendedFrame);
+      X64EmitPinHelperTable(Buf, AHelperTableOffset);
+      X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+      X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
+    end;
     if UseNativeScalarSelf then
     begin
       Buf.BindLabel(NativeExhaustedLabel);

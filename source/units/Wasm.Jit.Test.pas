@@ -6009,13 +6009,14 @@ begin
     '(local.get $i)) (i32.const 1664525)) (i32.const 1013904223))))', 0);
   Expect<Integer>(SlotStores(Code)).ToBe(1);
   { Its core never spills, so the lightweight entry is frameless:
-    test rcx, rcx ; jne external ; jmp core (no push rbx / frame). }
+    test rcx, rcx ; jne external, then the core itself (neither push rbx
+    nor a jump). }
   Expect<Byte>(Code[0]).ToBe($48);
   Expect<Byte>(Code[1]).ToBe($85);
   Expect<Byte>(Code[2]).ToBe($C9);
   Expect<Byte>(Code[3]).ToBe($0F);
   Expect<Byte>(Code[4]).ToBe($85);
-  Expect<Byte>(Code[9]).ToBe($E9);
+  Expect<Boolean>(Code[9] in [$53, $E9]).ToBe(False);
 
   { Live temporaries outnumber the dynamic pair here, so the
     core spills and the entry keeps its frame: push rbx after the jne. }
