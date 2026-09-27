@@ -834,6 +834,248 @@ begin
     ' (i32.const 1))) ');
 end;
 
+{ x64 memory leaves (Wasm.Jit.X64.Leaf) and their static and generic
+  callers: the workload's three-parameter read-modify-write leaf ($mrw),
+  a four-parameter leaf with a mixed i32/i64 signature ($l4), a leaf with
+  select and three parameters ($sel3, rdx scratch), a four-parameter
+  select that stays outside the proof ($sel4), and loop callers with
+  constant, forwarded, cyclic, and rdi/rdx-hosted arguments. The same
+  functions and the Python model in tests/fixtures/wast/x64-leaf.py
+  (Machine) compute every constant `check` compares against, in this order
+  on one fresh memory, except $loopc's (the workload's caller shape): five
+  calls add 1 each at a fresh [704], returning 1..5, so it yields
+  5 + (1 or 2 or 3 or 4 or 5) = 12. }
+function NativeMemoryLeafModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory 1) ' +
+    '(func $l3 (export "l3") (param $a i32) (param $b i64) (param $c i32) ' +
+    ' (result i64) ' +
+    ' (i64.xor (i64.add (i64.mul (i64.extend_i32_u (local.get $a)) ' +
+    '  (i64.const 3)) (local.get $b)) ' +
+    '  (i64.shl (i64.extend_i32_s (local.get $c)) (i64.const 7)))) ' +
+    '(func $l4 (export "l4") (param $a i64) (param $b i32) (param $c i64) ' +
+    ' (param $d i32) (result i32) ' +
+    ' (i32.add (i32.wrap_i64 (i64.mul (i64.sub (local.get $a) (local.get $c)) ' +
+    '  (i64.const 5))) ' +
+    '  (i32.xor (local.get $b) (i32.rotl (local.get $d) (i32.const 3))))) ' +
+    '(func $ord4 (export "ord4") (param i32 i32 i32 i32) (result i32) ' +
+    ' (i32.add (i32.add (local.get 0) (i32.mul (local.get 1) (i32.const 10))) ' +
+    '  (i32.add (i32.mul (local.get 2) (i32.const 100)) ' +
+    '   (i32.mul (local.get 3) (i32.const 1000))))) ' +
+    '(func $sel3 (export "sel3") (param $a i32) (param $b i32) (param $c i32) ' +
+    ' (result i32) ' +
+    ' (select (i32.add (local.get $a) (local.get $b)) ' +
+    '  (i32.sub (local.get $a) (local.get $b)) (local.get $c))) ' +
+    '(func $ident (export "ident") (param i32 i32 i32) (result i32) ' +
+    ' (local.get 2)) ' +
+    '(func $sel4 (export "sel4") (param i32 i32 i32 i32) (result i32) ' +
+    ' (select (local.get 0) (local.get 1) ' +
+    '  (i32.xor (local.get 2) (local.get 3)))) ' +
+    '(func $mrw (export "mrw") (param $id i32) (param $d i64) (param $p i32) ' +
+    ' (result i32) ' +
+    ' (i64.store (local.get $p) (i64.add (i64.load (local.get $p)) ' +
+    '  (i64.add (local.get $d) (i64.extend_i32_u (local.get $id))))) ' +
+    ' (i32.wrap_i64 (i64.load (local.get $p)))) ' +
+    '(func $m0get (export "m0get") (param $p i32) (result i32) ' +
+    ' (i32.load (local.get $p))) ' +
+    '(func $peek (export "peek") (param $p i32) (result i64) ' +
+    ' (i64.load (local.get $p))) ' +
+    '(func $loop3 (export "loop3") (param $n i32) (result i64) ' +
+    ' (local $i i32) (local $acc i64) ' +
+    ' (local.set $acc (i64.const 1)) ' +
+    ' (loop $l ' +
+    '  (local.set $acc (call $l3 (local.get $i) (local.get $acc) ' +
+    '   (i32.xor (local.get $i) (i32.const 0x5a5)))) ' +
+    '  (local.set $acc (i64.add (local.get $acc) ' +
+    '   (call $l3 (i32.const 7) (local.get $acc) (i32.const -3)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (local.get $acc)) ' +
+    '(func $loop4 (export "loop4") (param $n i32) (result i32) ' +
+    ' (local $a i32) (local $b i64) (local $c i32) (local $d i32) (local $i i32) ' +
+    ' (local.set $a (i32.const 3)) (local.set $b (i64.const 0x100000001)) ' +
+    ' (local.set $c (i32.const 5)) (local.set $d (i32.const 7)) ' +
+    ' (loop $l ' +
+    '  (local.set $b (i64.add (local.get $b) (i64.extend_i32_u ' +
+    '   (call $l4 (local.get $b) (local.get $a) ' +
+    '    (i64.mul (i64.extend_i32_u (local.get $i)) (i64.const 0x10001)) ' +
+    '    (local.get $d))))) ' +
+    '  (local.set $a (call $l4 (i64.const 0x7fffffffffff) (local.get $i) ' +
+    '   (local.get $b) (local.get $a))) ' +
+    '  (local.set $d (i32.xor (local.get $d) (local.get $a))) ' +
+    '  (local.set $c (i32.add (local.get $c) (local.get $d))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.xor (local.get $a) (i32.wrap_i64 (local.get $b))) ' +
+    '  (i32.xor (local.get $c) (local.get $d)))) ' +
+    '(func $loopord (export "loopord") (param $n i32) (result i32) ' +
+    ' (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $i i32) ' +
+    ' (local $a2 i32) (local $b2 i32) (local $c2 i32) ' +
+    ' (local.set $a (i32.const 1)) (local.set $b (i32.const 2)) ' +
+    ' (local.set $c (i32.const 3)) (local.set $d (i32.const 4)) ' +
+    ' (loop $l ' +
+    '  (local.set $a2 (call $ord4 (local.get $d) (local.get $a) (local.get $b) ' +
+    '   (local.get $c))) ' +
+    '  (local.set $b2 (call $ord4 (local.get $b) (local.get $c) (local.get $d) ' +
+    '   (local.get $a2))) ' +
+    '  (local.set $c2 (call $ord4 (local.get $c) (local.get $c) (local.get $c) ' +
+    '   (local.get $c))) ' +
+    '  (local.set $d (i32.xor (call $ord4 (local.get $a2) (local.get $b2) ' +
+    '   (local.get $c2) (local.get $i)) (local.get $d))) ' +
+    '  (local.set $a (local.get $a2)) ' +
+    '  (local.set $b (local.get $b2)) ' +
+    '  (local.set $c (local.get $c2)) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.add (local.get $a) (local.get $b)) ' +
+    '  (i32.add (local.get $c) (local.get $d)))) ' +
+    '(func $loopsel (export "loopsel") (param $n i32) (result i32) ' +
+    ' (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32) ' +
+    ' (local $i i32) ' +
+    ' (local.set $a (i32.const 9)) (local.set $b (i32.const 4)) ' +
+    ' (local.set $c (i32.const 1)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $sel3 (local.get $a) (local.get $i) ' +
+    '   (i32.and (local.get $i) (i32.const 1)))) ' +
+    '  (local.set $b (i32.add (local.get $b) (call $sel4 (local.get $a) ' +
+    '   (local.get $i) (local.get $c) (local.get $d)))) ' +
+    '  (local.set $c (call $sel3 (local.get $c) (local.get $b) (local.get $a))) ' +
+    '  (local.set $d (i32.add (local.get $d) ' +
+    '   (i32.xor (local.get $a) (local.get $c)))) ' +
+    '  (local.set $e (i32.add (local.get $e) (call $ident (local.get $a) ' +
+    '   (local.get $b) (local.get $c)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.add (local.get $a) (local.get $b)) ' +
+    '  (i32.add (i32.add (local.get $c) (local.get $d)) (local.get $e)))) ' +
+    '(func $loopmem (export "loopmem") (param $n i32) (param $p i32) ' +
+    ' (result i64) (local $failed i32) (local $i i32) ' +
+    ' (loop $l ' +
+    '  (local.set $failed (i32.or (local.get $failed) ' +
+    '   (call $mrw (i32.const 1) (i64.extend_i32_u (local.get $i)) ' +
+    '    (local.get $p)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i64.add (i64.load (local.get $p)) ' +
+    '  (i64.extend_i32_u (local.get $failed)))) ' +
+    '(func $loophosts (export "loophosts") (param $n i32) (param $p i32) ' +
+    ' (result i32) ' +
+    ' (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32) ' +
+    ' (local $e i32) ' +
+    ' (local.set $a (i32.const 1)) (local.set $b (i32.const 2)) ' +
+    ' (local.set $c (i32.const 3)) (local.set $d (i32.const 4)) ' +
+    ' (local.set $e (i32.const 5)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (i32.add (local.get $a) ' +
+    '   (call $mrw (i32.xor (local.get $b) (local.get $i)) ' +
+    '    (i64.extend_i32_u (local.get $c)) (local.get $p)))) ' +
+    '  (local.set $b (i32.add (local.get $b) (i32.mul (local.get $a) ' +
+    '   (i32.const 3)))) ' +
+    '  (local.set $c (i32.xor (local.get $c) (i32.add (local.get $b) ' +
+    '   (local.get $d)))) ' +
+    '  (local.set $d (i32.add (local.get $d) ' +
+    '   (call $m0get (i32.add (local.get $p) (i32.const 8))))) ' +
+    '  (local.set $e (i32.add (local.get $e) (i32.xor (local.get $a) ' +
+    '   (local.get $d)))) ' +
+    '  (i32.store (i32.add (local.get $p) (i32.const 8)) ' +
+    '   (i32.add (local.get $e) (local.get $i))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.xor (local.get $a) (local.get $b)) ' +
+    '  (i32.add (i32.xor (local.get $c) (local.get $d)) (local.get $e)))) ' +
+    '(func $loopc (export "loopc") (param $n i32) (param $p i32) ' +
+    ' (result i32) (local $failed i32) (local $i i32) ' +
+    ' (loop $l ' +
+    '  (local.set $failed (i32.or (local.get $failed) ' +
+    '   (call $mrw (i32.const 1) (i64.const 0) (local.get $p)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.load (local.get $p)) (local.get $failed))) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i64.ne (call $loop3 (i32.const 1)) (i64.const -361)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i64.ne (call $loop3 (i32.const 37)) (i64.const -377)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $loopord (i32.const 1)) (i32.const 35701817)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $loopord (i32.const 19)) (i32.const -256435135)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $loopsel (i32.const 33)) (i32.const 73803)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i64.ne (call $loopmem (i32.const 1) (i32.const 520)) (i64.const 2)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i64.ne (call $loopmem (i32.const 1000) (i32.const 528)) ' +
+    '  (i64.const 1024787)) (then unreachable)) ' +
+    ' (if (i32.ne (call $loophosts (i32.const 1) (i32.const 600)) ' +
+    '  (i32.const 56)) (then unreachable)) ' +
+    ' (if (i32.ne (call $loophosts (i32.const 29) (i32.const 640)) ' +
+    '  (i32.const 849040440)) (then unreachable)) ' +
+    ' (if (i32.ne (call $loop4 (i32.const 41)) (i32.const -143328713)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i64.ne (call $peek (i32.const 528)) (i64.const 500500)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $m0get (i32.const 648)) (i32.const 2036866613)) ' +
+    '  (then unreachable)) ' +
+    ' (if (i32.ne (call $loopc (i32.const 5) (i32.const 704)) (i32.const 12)) ' +
+    '  (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
+{ Recursion through callers of a three-parameter memory leaf. $rec calls
+  $bump at every level before recursing (a write-through caller); $rec2
+  recurses to a static-cache loop that calls $bump three times. On a fresh
+  memory rec(10) = 495 and rec2(n) = 9 (hand-computed: the leaf adds its
+  second argument at [p] and returns its third plus the new value). }
+function MemoryLeafRecursionModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (memory 1) ' +
+    '(func $bump (param $p i32) (param $d i64) (param $k i32) (result i32) ' +
+    ' (i64.store (local.get $p) (i64.add (i64.load (local.get $p)) ' +
+    '  (local.get $d))) ' +
+    ' (i32.add (local.get $k) (i32.wrap_i64 (i64.load (local.get $p))))) ' +
+    '(func $rec (export "rec") (param $n i32) (result i32) (local $r i32) ' +
+    ' (local.set $r (call $bump (i32.const 16) ' +
+    '  (i64.extend_i32_u (local.get $n)) (local.get $n))) ' +
+    ' (if (result i32) (i32.eqz (local.get $n)) (then (local.get $r)) ' +
+    '  (else (i32.add (local.get $r) ' +
+    '   (call $rec (i32.sub (local.get $n) (i32.const 1))))))) ' +
+    '(func $loopy (param $k i32) (result i32) (local $i i32) (local $s i32) ' +
+    ' (loop $l ' +
+    '  (local.set $s (i32.add (local.get $s) ' +
+    '   (call $bump (i32.const 24) (i64.const 1) (local.get $i)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $k)))) ' +
+    ' (local.get $s)) ' +
+    '(func $rec2 (export "rec2") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.eqz (local.get $n)) ' +
+    '  (then (call $loopy (i32.const 3))) ' +
+    '  (else (call $rec2 (i32.sub (local.get $n) (i32.const 1)))))))');
+end;
+
+{ An epoch bump before a loop that calls a memory leaf: run(1) never takes
+  its back-edge and returns 2 ([32] = 1); run(2) interrupts at its first
+  back-edge after exactly one more leaf call, so [32] then holds 2. }
+function MemoryLeafEpochModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module (import "e" "bump" (func $bumpe)) ' +
+    '(memory 1) ' +
+    '(func $leaf (export "leaf") (param $p i32) (param $d i64) (param $k i32) ' +
+    ' (result i32) ' +
+    ' (i64.store (local.get $p) (i64.add (i64.load (local.get $p)) ' +
+    '  (local.get $d))) ' +
+    ' (i32.add (local.get $k) (i32.wrap_i64 (i64.load (local.get $p))))) ' +
+    '(func (export "run") (param $n i32) (result i32) (local $i i32) ' +
+    ' (local $s i32) ' +
+    ' (call $bumpe) ' +
+    ' (loop $l ' +
+    '  (local.set $s (i32.add (local.get $s) ' +
+    '   (call $leaf (i32.const 32) (i64.const 1) (local.get $i)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (local.get $s) (i32.wrap_i64 (i64.load (i32.const 32))))) ' +
+    '(func (export "peek") (result i64) (i64.load (i32.const 32))))');
+end;
+
 { $sq(n) = n*n + $sq(n-1), with the square computed BEFORE the self call so
   a dirty temporary must survive it; $deep never terminates, with the same
   live temporary, so it exhausts. sq(40) = 22140 (sum of squares). }
@@ -2610,6 +2852,10 @@ type
     procedure TestX64NativeCoreShape;
     procedure TestNativeLeafStaticCaller;
     procedure TestNativeLeafStaticCallerHosts;
+    procedure TestX64MemoryLeafShape;
+    procedure TestMemoryLeafCallers;
+    procedure TestMemoryLeafExhaustion;
+    procedure TestMemoryLeafEpoch;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestInlineCallCacheAcrossBranches;
@@ -7291,6 +7537,234 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+procedure TJitTests.TestX64MemoryLeafShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Bytes, Code: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  EntryOffset: NativeUInt;
+  StagedCount: UInt32;
+  I: Integer;
+
+  function Occurs(const ACode: TWasmBytes; const ASeq: array of Byte):
+    Integer;
+  var
+    N, J: Integer;
+  begin
+    Result := 0;
+    for N := 0 to Length(ACode) - Length(ASeq) do
+    begin
+      J := 0;
+      while (J <= High(ASeq)) and (ACode[N + J] = ASeq[J]) do
+        Inc(J);
+      if J > High(ASeq) then
+        Inc(Result);
+    end;
+  end;
+
+const
+  { The workload's leaf, lightweight path: test rcx, rcx ; jne external ;
+    mov ecx, edi ; mov r10, [rsi+rcx] ; mov r11d, r8d ; add r11, r9 ;
+    add r10, r11 ; mov ecx, edi ; mov [rsi+rcx], r10 ; mov ecx, edi ;
+    mov r11, [rsi+rcx] ; mov r10d, r11d ; mov r8, r10 ; ret — no push, no
+    frame, no context or memory-pin load: Base arrives in rsi. }
+  LEAF: array[0 .. 42] of Byte = ($48, $85, $C9, $0F, $85, 0, 0, 0, 0,
+    $89, $F9, $4C, $8B, $14, $0E, $45, $89, $C3, $4D, $01, $CB, $4D, $01,
+    $DA, $89, $F9, $4C, $89, $14, $0E, $89, $F9, $4C, $8B, $1C, $0E, $45,
+    $89, $DA, $4D, $89, $D0, $C3);
+{$ENDIF}
+begin
+  Bytes := NativeMemoryLeafModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[6],
+      Ir.FuncImportCount + 6, EntryOffset, StagedCount);
+    Expect<Boolean>(Length(Code) > Length(LEAF)).ToBe(True);
+    for I := 0 to High(LEAF) do
+      if (I < 5) or (I > 8) then
+        Expect<Byte>(Code[I]).ToBe(LEAF[I]);
+    { The canonical entry pins the memory and loads Base itself before
+      calling the same core: mov rsi, [rax + Base] after the pin chain. }
+    Expect<Integer>(Occurs(Code, [$48, $89, $04, $24])).ToBe(1);
+    { $loopc, the workload's caller: a base-pinned static loop whose leaf
+      call materializes its constant arguments in place (mov r8d, 1 ;
+      xor r9d, r9d), reads the forwarded p from its host, and calls the
+      activation's cached entry (xor ecx, ecx ; call rax); rsi keeps Base
+      across it. }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[15],
+      Ir.FuncImportCount + 15, EntryOffset, StagedCount);
+    Expect<Integer>(Occurs(Code, [$41, $B8, $01, 0, 0, 0, $45, $31, $C9]))
+      .ToBe(1);
+    Expect<Integer>(Occurs(Code, [$31, $C9, $FF, $D0])).ToBe(1);
+    Expect<Integer>(Occurs(Code, [$31, $C9, $FF, $D2])).ToBe(0);
+    { $loopmem widens its argument (i64.extend_i32_u), which the static
+      cache does not admit: a write-through caller loads Base from its
+      pinned instance for each call (mov rsi, [rsp] ; mov rsi, [rsi]),
+      resolves the entry inline, and calls it (call rdx). }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[13],
+      Ir.FuncImportCount + 13, EntryOffset, StagedCount);
+    Expect<Integer>(Occurs(Code, [$48, $8B, $34, $24])).ToBe(1);
+    Expect<Integer>(Occurs(Code, [$31, $C9, $FF, $D2])).ToBe(1);
+    { $loop4 calls a four-parameter leaf twice: no memory, so no Base. }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[10],
+      Ir.FuncImportCount + 10, EntryOffset, StagedCount);
+    Expect<Integer>(Occurs(Code, [$31, $C9, $FF, $D0])).ToBe(2);
+    Expect<Integer>(Occurs(Code, [$48, $8B, $34, $24])).ToBe(0);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  {$ELSE}
+  Expect<Boolean>(Length(Bytes) > 0).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestMemoryLeafCallers;
+var
+  Bytes: TWasmBytes;
+begin
+  Bytes := NativeMemoryLeafModuleBytes;
+  { Everything compiled: leaves take the lightweight entry. }
+  CompileExports(['l3', 'l4', 'ord4', 'sel3', 'ident', 'sel4', 'mrw',
+    'm0get', 'peek', 'loop3', 'loop4', 'loopord', 'loopsel', 'loopmem',
+    'loophosts', 'loopc', 'check']);
+  Expect<Boolean>(DiffFresh(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1);
+  { Callers only: every leaf call takes the helper fallback, which must
+    write the forwarded and constant arguments' canonical slots and restore
+    rdi, rdx, and rsi. }
+  CompileExports(['loop3', 'loop4', 'loopord', 'loopsel', 'loopmem',
+    'loophosts', 'loopc']);
+  Expect<Boolean>(DiffFresh(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1);
+  { Leaves only: interpreted callers reach each leaf's canonical entry,
+    which pins the memory itself. }
+  CompileExports(['l3', 'l4', 'ord4', 'sel3', 'ident', 'mrw', 'm0get',
+    'peek']);
+  Expect<Boolean>(DiffFresh(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1);
+end;
+
+procedure TJitTests.TestMemoryLeafExhaustion;
+var
+  N: Integer;
+  Bytes: TWasmBytes;
+begin
+  Bytes := MemoryLeafRecursionModuleBytes;
+  CompileExports(['rec', 'rec2']);
+  Expect<Boolean>(DiffFresh(Bytes, 'rec', [MakeValueI32(10)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(495);
+  Expect<Boolean>(DiffFresh(Bytes, 'rec2', [MakeValueI32(10)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(9);
+  { Sweep across the shrunk depth cap: every depth either returns the same
+    value or traps 'call stack exhausted' in both tiers, whether the frame
+    that no longer fits is the caller's or the leaf's (rec2's static loop
+    resolves its cached entry, and applies both predicates, on its first
+    call). }
+  WasmInterpMaxDepth := 64;
+  try
+    for N := 56 to 70 do
+    begin
+      Expect<Boolean>(DiffFresh(Bytes, 'rec', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+      Expect<Boolean>(DiffFresh(Bytes, 'rec2', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    Expect<string>(TrapMessageOf(Bytes, 'rec', [MakeValueI32(4000)]))
+      .ToBe('call stack exhausted');
+    Expect<string>(TrapMessageOf(Bytes, 'rec2', [MakeValueI32(4000)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+end;
+
+procedure TJitTests.TestMemoryLeafEpoch;
+
+  procedure RunTier(const ACompile: Boolean);
+  var
+    Bytes: TWasmBytes;
+    Module: TWasmModule;
+    Ir: TWasmIrModule;
+    Engine: TWasmEngine;
+    Store: TWasmStore;
+    Imports: TWasmImports;
+    Instance: TWasmModuleInstance;
+    Jit: TWasmJitContext;
+    Canon, TypeIds: TWasmEngineTypeIds;
+    Kind: TWasmExternKind;
+    RunAddr, LeafAddr, PeekAddr: UInt32;
+    P: array[0 .. 0] of TWasmValue;
+    Res: array[0 .. 0] of TWasmValue;
+    Msg: string;
+  begin
+    Bytes := MemoryLeafEpochModuleBytes;
+    Module := TWasmModule.Create;
+    Engine := TWasmEngine.Create;
+    Store := TWasmStore.Create(Engine);
+    Ir := nil;
+    Jit := nil;
+    Imports.Funcs := nil;
+    Imports.Tables := nil;
+    Imports.Mems := nil;
+    Imports.Globals := nil;
+    Imports.Tags := nil;
+    try
+      DecodeModule(Bytes, Module);
+      Ir := ValidateModule(Module, Bytes);
+      Engine.InternModule(Ir, Canon, TypeIds);
+      SetLength(Imports.Funcs, 1);
+      Imports.Funcs[0] := Store.AddHostFunc(TypeIds[0],
+        @JitBumpEpochCallback, nil);
+      Instance := InstantiateModule(Store, Ir, @Bytes[0],
+        NativeUInt(Length(Bytes)), Imports);
+      RegisterInterpreter(Store);
+      Expect<Boolean>(Instance.FindExport('run', Kind, RunAddr)).ToBe(True);
+      Expect<Boolean>(Instance.FindExport('leaf', Kind, LeafAddr)).ToBe(True);
+      Expect<Boolean>(Instance.FindExport('peek', Kind, PeekAddr)).ToBe(True);
+      if ACompile then
+      begin
+        Jit := RegisterJit(Store);
+        Expect<Boolean>(Jit.ForceCompile(RunAddr) and
+          Jit.ForceCompile(LeafAddr)).ToBe(JIT_BACKEND_AVAILABLE);
+      end;
+      { run(1): the back-edge is never taken. }
+      P[0] := MakeValueI32(1);
+      InterpInvoke(Store, RunAddr, @P[0], @Res[0]);
+      Expect<UInt32>(Res[0].Bits and $FFFFFFFF).ToBe(2);
+      { run(2): one more leaf call, then the interrupt at the back-edge. }
+      P[0] := MakeValueI32(2);
+      Msg := '';
+      try
+        InterpInvoke(Store, RunAddr, @P[0], @Res[0]);
+      except
+        on E: EWasmTrap do
+          Msg := E.Message;
+      end;
+      Expect<string>(Msg).ToBe('interrupt');
+      InterpInvoke(Store, PeekAddr, nil, @Res[0]);
+      Expect<UInt64>(Res[0].Bits).ToBe(2);
+    finally
+      FreeAndNil(Jit);
+      FreeAndNil(Store);
+      FreeAndNil(Engine);
+      FreeAndNil(Ir);
+      FreeAndNil(Module);
+    end;
+  end;
+
+begin
+  RunTier(False);
+  RunTier(True);
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
@@ -9719,6 +10193,14 @@ begin
     TestNativeLeafStaticCaller);
   Test('rdi/rdx static hosts survive native leaf calls',
     TestNativeLeafStaticCallerHosts);
+  Test('x64 memory leaves run frameless and callers pass Base in rsi',
+    TestX64MemoryLeafShape);
+  Test('memory and four-parameter leaves match independent values in every mix',
+    TestMemoryLeafCallers);
+  Test('memory leaf calls exhaust at the interpreter''s depth',
+    TestMemoryLeafExhaustion);
+  Test('an epoch bump interrupts a memory-leaf loop after one call',
+    TestMemoryLeafEpoch);
   Test('inlined scalar body survives relocation without a compiled target',
     TestInlineScalarBodyRelocation);
   Test('inlined scalar calls preserve epoch and caller memory behavior',
