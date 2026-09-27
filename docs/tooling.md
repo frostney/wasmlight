@@ -52,6 +52,8 @@ instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas \
   --compiler ./build/wasmlight --out dist --synthesize-catalog
 instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
   --archive dist/wasmlight-*-*.tar.gz --checksums dist/wasmlight-*-checksums.txt
+# live archives: --shell TRIPLE=PATH per host shell, verify --require-compile
+# (see deployment.md; the release-assets workflow builds the release set)
 npx markdownlint-cli2 "**/*.md"   # docs gate, config .markdownlint-cli2.jsonc
 ```
 
@@ -72,7 +74,7 @@ Never hand-edit any of these; change the input and re-run the owner.
 
 - **`.github/workflows/pr.yml`** — every PR: `install --frozen` →
   `format --check` + `agents --check` → `build` → `test` on Linux, macOS,
-  and Windows runners, plus Unix pack/verify of the host release archive,
+  and Windows runners, plus Unix pack/verify of a fixture host archive,
   blocking markdownlint, and runtime-comparison jobs.
   The comparison builds base and PR release binaries, measures both on one
   runner against checksum-pinned cached peers, uploads raw samples, and updates
@@ -81,6 +83,10 @@ Never hand-edit any of these; change the input and re-run the owner.
 - **`.github/workflows/ci.yml`** — push to `main` only: the full per-arch
   platform matrix. PRs do not trigger it, so the same commit is not built
   twice pre-merge.
+- **`.github/workflows/release-assets.yml`** — manual `workflow_dispatch`
+  only: builds, packs, and verifies the four live release archives and the
+  checksums file for one version, optionally attaching them to an existing
+  release ([deployment.md](deployment.md)).
 
 Both install lwpt from its published release, checksum-verified, and
 resolve dependencies from the same release tag.

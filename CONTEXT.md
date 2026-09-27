@@ -190,8 +190,10 @@ _Avoid_: full AOT, forced AOT, trusted compile
 
 **Release archive**:
 A checksum-pinned per-host tarball that contains the compiler for that
-host and every runtime shell published with the release. The 0.2.0 set is
-the four 64-bit Unix hosts; Windows archives are later releases.
+host and the runtime shells that compiler can emit. The 0.2.0 set is the
+four 64-bit Unix hosts, each carrying its own architecture's Linux and
+macOS shells; cross-architecture shells and Windows archives are later
+releases.
 _Avoid_: bottle, installer package, SDK
 
 **Checksum manifest**:
