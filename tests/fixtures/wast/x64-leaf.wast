@@ -207,6 +207,47 @@
     (i32.add (i32.xor (local.get $a) (local.get $b))
              (i32.add (i32.xor (local.get $c) (local.get $d)) (local.get $e))))
 
+  ;; The same with only static-cache ops: a base-pinned loop keeping locals
+  ;; in rdi/rdx across a memory leaf that clobbers rdi (its third
+  ;; parameter) but not rdx.
+  (func (export "loophosts2") (param $n i32) (param $p i32) (result i32)
+    (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32)
+    (local $e i32)
+    (local.set $a (i32.const 1)) (local.set $b (i32.const 2))
+    (local.set $c (i32.const 3)) (local.set $d (i32.const 4))
+    (local.set $e (i32.const 5))
+    (loop $l
+      (local.set $a (i32.add (local.get $a)
+        (call $mrw (i32.xor (local.get $b) (local.get $i)) (i64.const 77)
+          (local.get $p))))
+      (local.set $b (i32.add (local.get $b) (i32.mul (local.get $a)
+        (i32.const 3))))
+      (local.set $c (i32.xor (local.get $c) (i32.add (local.get $b)
+        (local.get $d))))
+      (local.set $d (i32.add (local.get $d)
+        (i32.load (i32.add (local.get $p) (i32.const 8)))))
+      (local.set $e (i32.add (local.get $e) (i32.xor (local.get $a)
+        (local.get $d))))
+      (i32.store (i32.add (local.get $p) (i32.const 8))
+        (i32.add (local.get $e) (local.get $c)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (i32.xor (local.get $a) (local.get $b))
+             (i32.add (i32.xor (local.get $c) (local.get $d)) (local.get $e))))
+
+  ;; Two different leaves from one base-pinned loop: each call resolves its
+  ;; entry inline, which overwrites rsi, so Base must be reloaded for the
+  ;; memory leaf and for the caller's own store.
+  (func (export "twoleaf") (param $n i32) (param $p i32) (result i32)
+    (local $i i32) (local $s i32)
+    (loop $l
+      (local.set $s (i32.add (local.get $s) (call $m0get (local.get $p))))
+      (i32.store (local.get $p) (i32.add (local.get $s) (local.get $i)))
+      (local.set $s (call $sel3 (local.get $s) (local.get $i) (local.get $n)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (local.get $s) (i32.load (local.get $p))))
+
   ;; memory.grow between leaf calls: the leaf must see the new Base/size.
   (func (export "growloop") (param $n i32) (result i32)
     (local $s i32) (local $i i32) (local $top i32)
@@ -322,6 +363,13 @@
 (assert_return (invoke "loophosts" (i32.const 1) (i32.const 600)) (i32.const 56))
 (assert_return (invoke "loophosts" (i32.const 29) (i32.const 640)) (i32.const 849040440))
 (assert_return (invoke "peek" (i32.const 640)) (i64.const 72189897294))
+(assert_return (invoke "loophosts2" (i32.const 1) (i32.const 1024)) (i32.const 492))
+(assert_return (invoke "loophosts2" (i32.const 37) (i32.const 1056)) (i32.const -208071425))
+(assert_return (invoke "peek" (i32.const 1056)) (i64.const 55830487133))
+(assert_return (invoke "m0get" (i32.const 1064)) (i32.const 879118973))
+(assert_return (invoke "twoleaf" (i32.const 1) (i32.const 1100)) (i32.const 0))
+(assert_return (invoke "twoleaf" (i32.const 23) (i32.const 1104)) (i32.const 16777168))
+(assert_return (invoke "m0get" (i32.const 1104)) (i32.const 8388584))
 (assert_return (invoke "m0get" (i32.const 648)) (i32.const 2036866613))
 (assert_return (invoke "offloop" (i32.const 8) (i32.const 0)) (i32.const 805822388))
 (assert_trap (invoke "offloop" (i32.const 3) (i32.const 65528)) "out of bounds memory access")

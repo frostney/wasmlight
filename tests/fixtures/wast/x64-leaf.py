@@ -226,6 +226,31 @@ class Machine:
                 break
         return w32(w32(a ^ b) + w32(w32(c ^ d) + e))
 
+    def loophosts2(self, n, p):
+        i, a, b, c, d, e = 0, 1, 2, 3, 4, 5
+        while True:
+            a = w32(a + self.mrw(w32(b ^ i), 77, p))
+            b = w32(b + w32(a * 3))
+            c = w32(c ^ w32(b + d))
+            d = w32(d + self.load(0, w32(p + 8), 4))
+            e = w32(e + w32(a ^ d))
+            self.store(0, w32(p + 8), 4, w32(e + c))
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return w32(w32(a ^ b) + w32(w32(c ^ d) + e))
+
+    def twoleaf(self, n, p):
+        i, s = 0, 0
+        while True:
+            s = w32(s + self.m0get(p))
+            self.store(0, p, 4, w32(s + i))
+            s = self.sel3(s, i, n)
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return w32(s + self.load(0, p, 4))
+
     def m0get(self, p):
         return self.load(0, p, 4)
 
@@ -494,6 +519,47 @@ WAT = r'''
     (i32.add (i32.xor (local.get $a) (local.get $b))
              (i32.add (i32.xor (local.get $c) (local.get $d)) (local.get $e))))
 
+  ;; The same with only static-cache ops: a base-pinned loop keeping locals
+  ;; in rdi/rdx across a memory leaf that clobbers rdi (its third
+  ;; parameter) but not rdx.
+  (func (export "loophosts2") (param $n i32) (param $p i32) (result i32)
+    (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32)
+    (local $e i32)
+    (local.set $a (i32.const 1)) (local.set $b (i32.const 2))
+    (local.set $c (i32.const 3)) (local.set $d (i32.const 4))
+    (local.set $e (i32.const 5))
+    (loop $l
+      (local.set $a (i32.add (local.get $a)
+        (call $mrw (i32.xor (local.get $b) (local.get $i)) (i64.const 77)
+          (local.get $p))))
+      (local.set $b (i32.add (local.get $b) (i32.mul (local.get $a)
+        (i32.const 3))))
+      (local.set $c (i32.xor (local.get $c) (i32.add (local.get $b)
+        (local.get $d))))
+      (local.set $d (i32.add (local.get $d)
+        (i32.load (i32.add (local.get $p) (i32.const 8)))))
+      (local.set $e (i32.add (local.get $e) (i32.xor (local.get $a)
+        (local.get $d))))
+      (i32.store (i32.add (local.get $p) (i32.const 8))
+        (i32.add (local.get $e) (local.get $c)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (i32.xor (local.get $a) (local.get $b))
+             (i32.add (i32.xor (local.get $c) (local.get $d)) (local.get $e))))
+
+  ;; Two different leaves from one base-pinned loop: each call resolves its
+  ;; entry inline, which overwrites rsi, so Base must be reloaded for the
+  ;; memory leaf and for the caller's own store.
+  (func (export "twoleaf") (param $n i32) (param $p i32) (result i32)
+    (local $i i32) (local $s i32)
+    (loop $l
+      (local.set $s (i32.add (local.get $s) (call $m0get (local.get $p))))
+      (i32.store (local.get $p) (i32.add (local.get $s) (local.get $i)))
+      (local.set $s (call $sel3 (local.get $s) (local.get $i) (local.get $n)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (local.get $s) (i32.load (local.get $p))))
+
   ;; memory.grow between leaf calls: the leaf must see the new Base/size.
   (func (export "growloop") (param $n i32) (result i32)
     (local $s i32) (local $i i32) (local $top i32)
@@ -612,6 +678,13 @@ COMMANDS = [
     ('loophosts', 'ii', (1, 600)),
     ('loophosts', 'ii', (29, 640)),
     ('peek', 'i', (640,)),
+    ('loophosts2', 'ii', (1, 1024)),
+    ('loophosts2', 'ii', (37, 1056)),
+    ('peek', 'i', (1056,)),
+    ('m0get', 'i', (1064,)),
+    ('twoleaf', 'ii', (1, 1100)),
+    ('twoleaf', 'ii', (23, 1104)),
+    ('m0get', 'i', (1104,)),
     ('m0get', 'i', (648,)),
     ('offloop', 'ii', (8, 0)),
     ('offloop', 'ii', (3, 65528)),
