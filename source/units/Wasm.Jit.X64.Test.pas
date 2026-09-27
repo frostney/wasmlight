@@ -1247,6 +1247,23 @@ begin
     Op(MakeIrInstr(iroI32Store, 1, 6, 0, 0));
     CheckFrom(Start, [$4C, $0F, $BE, $1C, $3E, $44, $89, $D9,
       $44, $89, $0C, $0E]);
+
+    { A dynamic host reloaded from a slot (64-bit mov) inherits nothing
+      from the 32-bit value it held before: both r10 and r11 end i32 adds,
+      then slot 5 is loaded into one of them for an i32.eqz, and a store
+      through slot 5 must copy that host's low half to ecx first. }
+    X64FlushDynamicRegCache(Buf, Cache);
+    X64InvalidateRegCache(Cache);
+    Op(MakeIrInstr(iroI32Add, 6, 0, 1, 0));
+    Op(MakeIrInstr(iroI32Add, 7, 0, 1, 0));
+    Expect<Boolean>(Cache.Entries[2].Zx32 and Cache.Entries[3].Zx32)
+      .ToBe(True);
+    Op(MakeIrInstr(iroI32Eqz, 2, 5, 0, 0));
+    Start := Buf.Size;
+    Op(MakeIrInstr(iroI32Store, 1, 5, 0, 0));
+    Expect<Integer>(Buf.Size - Start).ToBe(7);
+    Expect<Boolean>((FindSeq(Buf, [$44, $89, $D1], Start) = Start) or
+      (FindSeq(Buf, [$44, $89, $D9], Start) = Start)).ToBe(True);
   finally
     Buf.Free;
   end;

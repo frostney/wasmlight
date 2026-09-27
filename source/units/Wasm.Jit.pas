@@ -2076,7 +2076,7 @@ var
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := False;
     {$ENDIF}
-    for N := 0 to High(AllocatedSlots) do
+    for N := 2 to High(AllocatedSlots) do
       AllocatedSlots[N] := High(UInt32);
     if AFn^.RegisterCount = 0 then
       Exit;
