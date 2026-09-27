@@ -1,29 +1,47 @@
 { Wasm.Compile.Capabilities — the immutable compiled WASI capability set
   ([ADR-0015](docs/adr/0015-strict-native-compiler-and-runtime-shell.md)).
 
-  `wasmlight compile` will embed this set in a generated executable. Generated
-  programs expose no Wasmlight runtime flags: every invocation argument belongs
-  to the guest, environment values are exactly the compiled KEY=VALUE pairs
-  (never the process environment), and preopens are exactly the compiled
-  GUEST=HOST mappings. Relative host directories resolve from the executable
-  directory at apply time; absolute host paths stay literal.
+  `wasmlight compile --dir/--env` embeds this set in a generated executable.
+  Generated programs expose no Wasmlight runtime flags: every invocation
+  argument belongs to the guest, environment values are exactly the compiled
+  KEY=VALUE pairs (never the process environment), and preopens are exactly
+  the compiled GUEST=HOST mappings. Relative host directories resolve from the
+  executable directory at apply time; absolute host paths stay literal.
 
   Embedded environment values are visible in the executable and are not a
   secret mechanism.
 
-  This unit is the compile-time model and the runtime apply seam. It does not
-  own the compile CLI (#39), the native payload container (#35), or the
-  interpreter-free shell (#34). Containment, symlink-escape, and rights
-  masking stay in Wasm.Wasi — ApplyToConfig only installs the same preopen
-  fields `wasmlight run --dir` would.
+  This unit is the compile-time model, its payload byte encoding, and the
+  runtime apply seam. Wasm.Compile builds and encodes a set; the runtime
+  shell (Wasm.Shell) decodes and applies it. Wasm.Native.Payload carries the
+  encoding as an opaque capability-set section. Containment, symlink-escape,
+  and rights masking stay in Wasm.Wasi — ApplyToConfig only installs the same
+  preopen fields `wasmlight run --dir` would.
+
+  ENCODING (capability-set section, format version 1). Fixed-width
+  little-endian, like the enclosing payload:
+
+    version  u16   WASM_CAPABILITY_SET_FORMAT_VERSION
+    flags    u16   reserved, must be 0
+    dirCount u32
+    envCount u32
+    dirCount x ( guestLen u32, guest bytes, hostLen u32, host bytes )
+    envCount x ( len u32, KEY=VALUE bytes )
+
+  Entries keep the order they were granted (preopen fd numbering follows
+  it). Host paths are stored unresolved. The empty set is the empty byte
+  string and a header with no entries is rejected, so every set has exactly
+  one encoding. The decoder is strict: an unknown version, a reserved flag, a
+  truncated or overlong string, trailing bytes, or any entry the compile path
+  would refuse (empty guest or host, NUL, env without KEY=) is rejected.
 
   DENY-BY-DEFAULT. A default set grants no directories and no environment.
   ApplyToConfig refuses a config that already has preopens or env, so a
   generated startup path cannot widen the compiled set. Clock, random, and
   stdio remain TWasmWasiConfig's existing defaults.
 
-  Layering: host surface, beside Wasm.Run. Depends on Wasm.Wasi and
-  Wasm.Wasi.Types only. }
+  Layering: host surface, beside Wasm.Run. Depends on Wasm.Core, Wasm.Wasi,
+  and Wasm.Wasi.Types only. }
 unit Wasm.Compile.Capabilities;
 
 {$I Shared.inc}
@@ -33,6 +51,7 @@ interface
 uses
   SysUtils,
 
+  Wasm.Core,
   Wasm.Wasi,
   Wasm.Wasi.Types;
 
@@ -41,6 +60,13 @@ const
     preopen bundle so a compiled `--dir` is observationally identical
     to `wasmlight run --dir`. }
   WASM_COMPILED_DIR_RIGHTS: TWasmWasiRights = WASM_PREOPEN_DIR_RIGHTS;
+
+  { Capability-set encoding version. Bumped only for a layout change an older
+    shell must reject rather than misread. }
+  WASM_CAPABILITY_SET_FORMAT_VERSION = UInt16(1);
+
+  { version(2) + flags(2) + dirCount(4) + envCount(4). }
+  WASM_CAPABILITY_SET_HEADER_SIZE = 12;
 
 type
   { One compiled preopen, stored as the compile-time GUEST=HOST pair. HostPath
@@ -111,10 +137,24 @@ function CompiledExecutableDir(const AExecutablePath: string): string;
 function TryResolveCompiledHostPath(const AHostPath, AExecutableDir: string;
   out AResolved, AError: string): Boolean;
 
-{ argv[0] is the executable basename; every remaining token is a guest
-  argument. Nothing is reserved for Wasmlight. }
-function CompiledGuestArgv(const AExecutablePath: string;
+{ argv[0] is the basename of AProgramPath; every remaining token is a guest
+  argument. Nothing is reserved for Wasmlight. A compiled executable passes
+  its own path and `wasmlight run` passes the module path, so both give the
+  guest the same argc for the same invocation arguments. }
+function CompiledGuestArgv(const AProgramPath: string;
   const AInvocationArgs: array of string): TArray<string>;
+
+{ The capability-set section bytes for ACaps (see ENCODING above). A nil or
+  empty set encodes as no bytes. Equal sets in equal order encode
+  identically. }
+function EncodeCompiledCapabilities(
+  const ACaps: TWasmCompiledCapabilities): TWasmBytes;
+
+{ Strictly decode capability-set section bytes into a new, frozen set the
+  caller owns. No bytes decode to the empty (deny-by-default) set. On failure
+  ACaps is nil and AError names the defect. }
+function TryDecodeCompiledCapabilities(const ABytes: TWasmBytes;
+  out ACaps: TWasmCompiledCapabilities; out AError: string): Boolean;
 
 implementation
 
@@ -231,16 +271,204 @@ begin
   Result := True;
 end;
 
-function CompiledGuestArgv(const AExecutablePath: string;
+function CompiledGuestArgv(const AProgramPath: string;
   const AInvocationArgs: array of string): TArray<string>;
 var
   Index: Integer;
 begin
   Result := nil;
   SetLength(Result, 1 + Length(AInvocationArgs));
-  Result[0] := ExtractFileName(AExecutablePath);
+  Result[0] := ExtractFileName(AProgramPath);
   for Index := 0 to High(AInvocationArgs) do
     Result[Index + 1] := AInvocationArgs[Index];
+end;
+
+{ --- capability-set encoding ---------------------------------------------- }
+
+procedure PutU16(var ABytes: TWasmBytes; var AOffset: Integer;
+  const AValue: UInt16);
+begin
+  ABytes[AOffset] := Byte(AValue and $FF);
+  ABytes[AOffset + 1] := Byte(AValue shr 8);
+  Inc(AOffset, 2);
+end;
+
+procedure PutU32(var ABytes: TWasmBytes; var AOffset: Integer;
+  const AValue: UInt32);
+var
+  Index: Integer;
+begin
+  for Index := 0 to 3 do
+    ABytes[AOffset + Index] := Byte((AValue shr (8 * Index)) and $FF);
+  Inc(AOffset, 4);
+end;
+
+procedure PutStr(var ABytes: TWasmBytes; var AOffset: Integer;
+  const AValue: string);
+begin
+  PutU32(ABytes, AOffset, UInt32(Length(AValue)));
+  if Length(AValue) > 0 then
+    Move(AValue[1], ABytes[AOffset], Length(AValue));
+  Inc(AOffset, Length(AValue));
+end;
+
+function EncodeCompiledCapabilities(
+  const ACaps: TWasmCompiledCapabilities): TWasmBytes;
+var
+  Size, Offset, Index: Integer;
+  Entry: TWasmCompiledPreopen;
+begin
+  Result := nil;
+  if (ACaps = nil) or ((ACaps.PreopenCount = 0) and (ACaps.EnvCount = 0)) then
+    Exit;
+  Size := WASM_CAPABILITY_SET_HEADER_SIZE;
+  for Index := 0 to ACaps.PreopenCount - 1 do
+  begin
+    Entry := ACaps.PreopenAt(Index);
+    Inc(Size, 8 + Length(Entry.GuestPath) + Length(Entry.HostPath));
+  end;
+  for Index := 0 to ACaps.EnvCount - 1 do
+    Inc(Size, 4 + Length(ACaps.EnvAt(Index)));
+
+  SetLength(Result, Size);
+  Offset := 0;
+  PutU16(Result, Offset, WASM_CAPABILITY_SET_FORMAT_VERSION);
+  PutU16(Result, Offset, 0);
+  PutU32(Result, Offset, UInt32(ACaps.PreopenCount));
+  PutU32(Result, Offset, UInt32(ACaps.EnvCount));
+  for Index := 0 to ACaps.PreopenCount - 1 do
+  begin
+    Entry := ACaps.PreopenAt(Index);
+    PutStr(Result, Offset, Entry.GuestPath);
+    PutStr(Result, Offset, Entry.HostPath);
+  end;
+  for Index := 0 to ACaps.EnvCount - 1 do
+    PutStr(Result, Offset, ACaps.EnvAt(Index));
+end;
+
+function TakeU16(const ABytes: TWasmBytes; var AOffset: Integer;
+  out AValue: UInt16): Boolean;
+begin
+  AValue := 0;
+  Result := Int64(AOffset) + 2 <= Length(ABytes);
+  if not Result then
+    Exit;
+  AValue := UInt16(ABytes[AOffset]) or UInt16(UInt16(ABytes[AOffset + 1]) shl 8);
+  Inc(AOffset, 2);
+end;
+
+function TakeU32(const ABytes: TWasmBytes; var AOffset: Integer;
+  out AValue: UInt32): Boolean;
+var
+  Index: Integer;
+begin
+  AValue := 0;
+  Result := Int64(AOffset) + 4 <= Length(ABytes);
+  if not Result then
+    Exit;
+  for Index := 0 to 3 do
+    AValue := AValue or (UInt32(ABytes[AOffset + Index]) shl (8 * Index));
+  Inc(AOffset, 4);
+end;
+
+function TakeStr(const ABytes: TWasmBytes; var AOffset: Integer;
+  out AValue: string): Boolean;
+var
+  Len: UInt32;
+begin
+  AValue := '';
+  if not TakeU32(ABytes, AOffset, Len) then
+    Exit(False);
+  { Bound the declared length by the bytes that remain before allocating. }
+  if Int64(Len) > Int64(Length(ABytes)) - AOffset then
+    Exit(False);
+  SetLength(AValue, Len);
+  if Len > 0 then
+    Move(ABytes[AOffset], AValue[1], Len);
+  Inc(AOffset, Integer(Len));
+  Result := True;
+end;
+
+function TryDecodeCompiledCapabilities(const ABytes: TWasmBytes;
+  out ACaps: TWasmCompiledCapabilities; out AError: string): Boolean;
+var
+  Caps: TWasmCompiledCapabilities;
+  Offset: Integer;
+  Version, Flags: UInt16;
+  DirCount, EnvCount, Index: UInt32;
+  Guest, Host, KeyValue: string;
+begin
+  ACaps := nil;
+  AError := '';
+  Result := False;
+  Caps := TWasmCompiledCapabilities.Create;
+  try
+    if Length(ABytes) > 0 then
+    begin
+      Offset := 0;
+      if not (TakeU16(ABytes, Offset, Version) and
+        TakeU16(ABytes, Offset, Flags) and
+        TakeU32(ABytes, Offset, DirCount) and
+        TakeU32(ABytes, Offset, EnvCount)) then
+      begin
+        AError := 'truncated capability set header';
+        Exit;
+      end;
+      if Version <> WASM_CAPABILITY_SET_FORMAT_VERSION then
+      begin
+        AError := 'unsupported capability set version ' + IntToStr(Version);
+        Exit;
+      end;
+      if Flags <> 0 then
+      begin
+        AError := 'reserved capability set flags are set';
+        Exit;
+      end;
+      if (DirCount = 0) and (EnvCount = 0) then
+      begin
+        AError := 'an empty capability set must be encoded as no bytes';
+        Exit;
+      end;
+      { Counts are never preallocated: every entry consumes at least four
+        bytes, so a forged count fails on the bytes that are really there. }
+      Index := 0;
+      while Index < DirCount do
+      begin
+        if not (TakeStr(ABytes, Offset, Guest) and
+          TakeStr(ABytes, Offset, Host)) then
+        begin
+          AError := 'truncated capability set directory entry';
+          Exit;
+        end;
+        if not Caps.TryAddDir(Guest, Host, AError) then
+          Exit;
+        Inc(Index);
+      end;
+      Index := 0;
+      while Index < EnvCount do
+      begin
+        if not TakeStr(ABytes, Offset, KeyValue) then
+        begin
+          AError := 'truncated capability set environment entry';
+          Exit;
+        end;
+        if not Caps.TryAddEnvSpec(KeyValue, AError) then
+          Exit;
+        Inc(Index);
+      end;
+      if Offset <> Length(ABytes) then
+      begin
+        AError := 'trailing bytes after the capability set';
+        Exit;
+      end;
+    end;
+    Caps.Freeze;
+    ACaps := Caps;
+    Caps := nil;
+    Result := True;
+  finally
+    Caps.Free;
+  end;
 end;
 
 constructor TWasmCompiledCapabilities.Create;

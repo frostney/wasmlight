@@ -10,8 +10,11 @@
     - when a payload is embedded, every argument is guest argv.
 
   There are no Wasmlight runtime flags (`--dir`, `--env`, `--aot`). Compiled
-  `--dir`/`--env` values live in the payload; an empty capability set is
-  deny-by-default WASI (stdio + clock + random, no preopens, no environment).
+  `--dir`/`--env` values live in the payload's capability set, which
+  Wasm.Shell applies; an empty set is deny-by-default WASI (stdio + clock +
+  random, no preopens, no environment). The guest sees argv[0] = this
+  executable's basename followed by the guest arguments, the same argc
+  `wasmlight run` gives for the same arguments.
 
   The program does not use Wasm.Interp dispatch, Wasm.Jit compile, or
   Wasm.Aot compile. Startup always re-decodes and re-validates. }
@@ -50,14 +53,18 @@ var
   Res: TWasmShellResult;
   Guest: array of string;
   I, GuestStart: Integer;
-  AttachPath: string;
+  AttachPath, ExePath: string;
 begin
+  { On Darwin ParamStr(0) is argv[0], which may be relative to the startup
+    CWD; anchor it now so relative compiled preopens resolve from the
+    executable's real directory. }
+  ExePath := ExpandFileName(ParamStr(0));
   Payload := EmbeddedPayload;
   GuestStart := 1;
   AttachPath := '';
   if Length(Payload) = 0 then
     try
-      ExtractPackagedPayloadFromFile(ParamStr(0), Payload);
+      ExtractPackagedPayloadFromFile(ExePath, Payload);
     except
       on E: EWasmDecodeError do
       begin
@@ -89,11 +96,10 @@ begin
     Config.Stdin := OsIn;
     Config.Stdout := OsOut;
     Config.Stderr := OsErr;
-    Config.SetArgv(Guest);
     if AttachPath <> '' then
-      Res := RunShellFile(AttachPath, Config)
+      Res := RunShellFile(AttachPath, Config, ShellInvocation(ExePath, Guest))
     else
-      Res := RunShellBytes(Payload, Config);
+      Res := RunShellBytes(Payload, Config, ShellInvocation(ExePath, Guest));
   finally
     Config.Free;
     OsIn.Free;
