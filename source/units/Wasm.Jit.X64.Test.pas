@@ -67,6 +67,7 @@ type
     procedure TestEpochCaptureBytes;
     procedure TestEpochCheckCoreBytes;
     procedure TestNativeSelfCallBytes;
+    procedure TestNativeCoreWriteBack;
     procedure TestRuntimeCallMarshalBytes;
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
@@ -672,20 +673,138 @@ procedure TX64Tests.TestNativeSelfCallBytes;
 var
   Buf: TWasmCodeBuffer;
 begin
-  { test r12; je exhausted; r12--; push rbx; 16-byte regfile; rbx:=rsp;
-    store r8 parameter; call core; restore; r12++. Both branches are rel32
-    placeholders resolved after the complete function is emitted. }
+  { sub r12, 1; jb exhausted (the borrow is exactly the old zero test);
+    push rbx; 16-byte regfile; rbx:=rsp; call core (the r8 parameter stays
+    unstored); restore; add r12, 1. Both branches are rel32 placeholders
+    resolved after the complete function is emitted. }
   Buf := TWasmCodeBuffer.Create;
   try
     Buf.NewLabel;
     Buf.NewLabel;
     X64EmitNativeSelfCall(Buf, 2, 0, 0, 1);
-    CheckSeq(Buf, [$4D, $85, $E4, $0F, $84, $00, $00, $00, $00,
-      $B8, $01, $00, $00, $00, $49, $29, $C4, $53,
-      $48, $83, $EC, $10, $48, $89, $E3, $4C, $89, $03,
+    CheckSeq(Buf, [$49, $83, $EC, $01, $0F, $82, $00, $00, $00, $00,
+      $53, $48, $83, $EC, $10, $48, $89, $E3,
       $E8, $00, $00, $00, $00, $48, $83, $C4, $10, $5B,
-      $B8, $01, $00, $00, $00, $49, $01, $C4]);
+      $49, $83, $C4, $01]);
     Expect<Integer>(Buf.PatchCount).ToBe(2);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestNativeCoreWriteBack;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0 .. 7] of UInt32;
+  Visible: array[0 .. 7] of Boolean;
+  Start: Integer;
+
+  procedure Emit(const AOp: TWasmIrOp; const ADest, AA, AB: UInt32;
+    const AImm: Int64 = 0);
+  begin
+    { A native self core over an 8-slot frame: parameter slot 0, core label
+      0, exhaustion label 1, result source slot 5. }
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(AOp, ADest, AA, AB, AImm), Aux, 0, False, False, True,
+      True, 8, 0, 5, 0, 1, False, False, Cache, nil, nil, nil)).ToBe(True);
+  end;
+
+  procedure Setup;
+  begin
+    FillChar(UseCounts, SizeOf(UseCounts), 0);
+    FillChar(Visible, SizeOf(Visible), 0);
+    Visible[0] := True;
+    Buf := TWasmCodeBuffer.Create;
+    Buf.NewLabel;
+    Buf.NewLabel;
+    Buf.NewLabel;
+    X64SeedNativeCoreCache(Cache, 1, 0, 0, True);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+  end;
+
+  procedure CheckFrom(const AExpected: array of Byte);
+  var
+    I: Integer;
+  begin
+    Expect<Integer>(Buf.Size - Start).ToBe(Length(AExpected));
+    for I := 0 to High(AExpected) do
+      if Start + I < Buf.Size then
+        Expect<Byte>(Buf.ByteAt(Start + I)).ToBe(AExpected[I]);
+  end;
+
+begin
+  { Aux block 0 = the call's argument (slot 2), block 2 = its result
+    (slot 3). }
+  SetLength(Aux, 4);
+  Aux[0] := 1;
+  Aux[1] := 2;
+  Aux[2] := 1;
+  Aux[3] := 3;
+
+  { The parameter arrives unstored in r8. Writing it stays in r8 (dirty); a
+    dead temporary is never stored; the self call stores exactly the
+    parameter (a local its frame reads after the call), passes the argument
+    in r8, and adopts the r8 result into a dynamic host:
+      add r8d, r8d ; mov eax, 1 ; mov r10, rax ;
+      mov r11, r8 ; sub r11d, r10d ;               (argument, slot 2)
+      mov [rbx], r8 ; mov r8, r11 ;                (write-back, argument)
+      sub r12, 1 ; jb exh ; push rbx ; sub rsp, 64 ; mov rbx, rsp ;
+      call core ; add rsp, 64 ; pop rbx ; add r12, 1 ;
+      mov r10, r8                                  (result, slot 3) }
+  Setup;
+  try
+    UseCounts[0] := 2;
+    UseCounts[1] := 1;
+    UseCounts[2] := 1;
+    UseCounts[3] := 1;
+    Start := Buf.Size;
+    Emit(iroI32Add, 0, 0, 0);
+    Emit(iroI32Const, 1, 0, 0, 1);
+    Emit(iroI32Sub, 2, 0, 1);
+    Emit(iroCall, 0, 0, 2);
+    CheckFrom([$45, $01, $C0, $B8, $01, $00, $00, $00, $49, $89, $C2,
+      $4D, $89, $C3, $45, $29, $D3,
+      $4C, $89, $03, $4D, $89, $D8,
+      $49, $83, $EC, $01, $0F, $82, $00, $00, $00, $00,
+      $53, $48, $83, $EC, $40, $48, $89, $E3,
+      $E8, $00, $00, $00, $00, $48, $83, $C4, $40, $5B,
+      $49, $83, $C4, $01, $4D, $89, $C2]);
+    { r8 now holds the callee's result: the parameter host is
+      non-resident until a read or a canonical point reloads it. }
+    Expect<Boolean>(Cache.Entries[0].Valid).ToBe(False);
+    Expect<Boolean>(Cache.Entries[2].Valid and (Cache.Entries[2].Slot = 3) and
+      Cache.Entries[2].Dirty).ToBe(True);
+
+    { A later read reloads the parameter into its own host from the slot
+      the call left canonical: mov r8, [rbx] ; add r10d, r8d. }
+    Start := Buf.Size;
+    Emit(iroI32Add, 3, 3, 0);
+    CheckFrom([$4C, $8B, $03, $45, $01, $C2]);
+    Expect<Boolean>(Cache.Entries[0].Valid and not Cache.Entries[0].Dirty)
+      .ToBe(True);
+  finally
+    Buf.Free;
+  end;
+
+  { A branch right after the call is a canonical point: the dirty live
+    result is stored and the parameter host reloaded before the jump, so
+    every join sees it resident:
+      test r10d, r10d ; mov [rbx+24], r10 ; mov r8, [rbx] ; jne rel32. }
+  Setup;
+  try
+    UseCounts[0] := 1;
+    UseCounts[2] := 1;
+    UseCounts[3] := 2;
+    Emit(iroMove, 2, 0, 0);
+    Emit(iroCall, 0, 0, 2);
+    Start := Buf.Size;
+    Emit(iroBranchIf, 0, 3, 2);
+    CheckFrom([$45, $85, $D2, $4C, $89, $53, $18, $4C, $8B, $03,
+      $0F, $85, $00, $00, $00, $00]);
+    Expect<Boolean>(Cache.Entries[0].Valid and Cache.Entries[0].Dirty)
+      .ToBe(True);
   finally
     Buf.Free;
   end;
@@ -1408,14 +1527,16 @@ begin
     Buf.Free;
   end;
 
-  { A fixed write-through static entry (native leaf parameter) is stored
-    after an in-place op: add r8d, r8d ; mov [rbx], r8. }
+  { A native-core parameter host defers its store like a dynamic entry: an
+    in-place op leaves it dirty with no store: add r8d, r8d. }
   Buf := TWasmCodeBuffer.Create;
   try
     X64SeedNativeCoreCache(Cache, 1, 0, 0, True);
     Start := Buf.Size;
     Emit(iroI32Add, 0, 0, 0);
-    CheckFrom([$45, $01, $C0, $4C, $89, $03]);
+    CheckFrom([$45, $01, $C0]);
+    Expect<Boolean>(Cache.Entries[0].Valid and Cache.Entries[0].Dirty)
+      .ToBe(True);
   finally
     Buf.Free;
   end;
@@ -1958,6 +2079,8 @@ begin
     TestEpochCheckCoreBytes);
   Test('the native self-call frame emits the asserted bytes',
     TestNativeSelfCallBytes);
+  Test('the native core defers parameter and temporary stores',
+    TestNativeCoreWriteBack);
   Test('the runtime/vec helper-call marshaling emits the asserted bytes',
     TestRuntimeCallMarshalBytes);
   Test('helper calls and the IR pointer are position-independent',

@@ -523,6 +523,177 @@ begin
   ]);
 end;
 
+{ The x64 native scalar core under deferred write-back: seven
+  self-recursive shapes (a parameter written before a self call and read
+  after it, a call result stored into the parameter, a loop over the
+  parameter after a call, i64, select over two calls, and a join whose arms
+  leave the parameter stored on one path and dirty on the other), three
+  two-parameter leaves (register pressure that spills live temporaries, an
+  overwritten i64 parameter under rotl, compare + select), and a loop whose
+  loop-carried accumulator is a leaf argument. `check` holds every result
+  to a constant computed independently (a Python model of each function):
+  a mismatch traps `unreachable`, so the interpreter run proves the
+  constants and the compiled run is held to them. }
+function NativeCoreWriteBackModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText(
+    '(module ' +
+    '(func $fib (export "fib") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '  (then (local.get $n)) ' +
+    '  (else (i32.add (call $fib (i32.sub (local.get $n) (i32.const 1))) ' +
+    '   (call $fib (i32.sub (local.get $n) (i32.const 2))))))) ' +
+    '(func $f2 (export "f2") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '  (then (local.get $n)) ' +
+    '  (else ' +
+    '   (local.set $n (i32.add (local.get $n) (i32.const 3))) ' +
+    '   (local.set $n (i32.sub (local.get $n) (i32.const 3))) ' +
+    '   (i32.add (call $f2 (i32.sub (local.get $n) (i32.const 1))) (local.get $n))))) ' +
+    '(func $f3 (export "f3") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.eqz (local.get $n)) ' +
+    '  (then (i32.const 7)) ' +
+    '  (else ' +
+    '   (local.set $n (call $f3 (i32.sub (local.get $n) (i32.const 1)))) ' +
+    '   (i32.add (i32.mul (local.get $n) (i32.const 2)) (i32.const 1))))) ' +
+    '(func $f4 (export "f4") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.lt_s (local.get $n) (i32.const 1)) ' +
+    '  (then (i32.const 0)) ' +
+    '  (else ' +
+    '   (i32.add (call $f4 (i32.sub (local.get $n) (i32.const 1))) ' +
+    '    (block (result i32) ' +
+    '     (loop $l ' +
+    '      (if (i32.gt_s (local.get $n) (i32.const 5)) ' +
+    '       (then (local.set $n (i32.sub (local.get $n) (i32.const 1))) (br $l)))) ' +
+    '     (local.get $n)))))) ' +
+    '(func $f5 (export "f5") (param $n i64) (result i64) ' +
+    ' (if (result i64) (i64.lt_u (local.get $n) (i64.const 3)) ' +
+    '  (then (local.get $n)) ' +
+    '  (else ' +
+    '   (i64.xor ' +
+    '    (i64.xor (call $f5 (i64.sub (local.get $n) (i64.const 1))) ' +
+    '     (i64.shl (call $f5 (i64.sub (local.get $n) (i64.const 2))) (i64.const 1))) ' +
+    '    (local.get $n))))) ' +
+    '(func $f6 (export "f6") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.eqz (local.get $n)) ' +
+    '  (then (i32.const 1)) ' +
+    '  (else ' +
+    '   (select ' +
+    '    (i32.add (call $f6 (i32.sub (local.get $n) (i32.const 1))) (local.get $n)) ' +
+    '    (i32.mul (call $f6 (i32.sub (local.get $n) (i32.const 1))) (i32.const 3)) ' +
+    '    (i32.and (local.get $n) (i32.const 1)))))) ' +
+    '(func $g (export "g") (param $n i32) (result i32) ' +
+    ' (if (i32.lt_u (local.get $n) (i32.const 2)) (then (return (local.get $n)))) ' +
+    ' (if (i32.and (local.get $n) (i32.const 1)) ' +
+    '  (then (local.set $n (i32.add (local.get $n) (i32.const 1)))) ' +
+    '  (else (drop (call $g (i32.const 1))))) ' +
+    ' (i32.add (call $g (i32.sub (local.get $n) (i32.const 2))) (local.get $n))) ' +
+    '(func $leaf1 (export "leaf1") (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.add ' +
+    '  (i32.add ' +
+    '   (i32.mul (i32.add (local.get $a) (local.get $b)) ' +
+    '    (i32.sub (local.get $a) (local.get $b))) ' +
+    '   (i32.xor (local.get $a) (local.get $b))) ' +
+    '  (i32.add (i32.shl (local.get $a) (i32.const 3)) ' +
+    '   (i32.shr_u (local.get $b) (i32.const 2))))) ' +
+    '(func $leaf2 (export "leaf2") (param $a i64) (param $b i64) (result i64) ' +
+    ' (local.set $a (i64.mul (local.get $a) (local.get $b))) ' +
+    ' (i64.rotl (i64.sub (local.get $a) (local.get $b)) (i64.const 13))) ' +
+    '(func $leaf3 (export "leaf3") (param $a i32) (param $b i32) (result i32) ' +
+    ' (select (local.get $a) (i32.xor (local.get $b) (i32.const 0x5a5a5a5a)) ' +
+    '  (i32.lt_s (local.get $a) (local.get $b)))) ' +
+    '(func $run (export "run") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 123456789)) ' +
+    ' (block $done ' +
+    '  (loop $loop ' +
+    '   (br_if $done (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '   (local.set $acc (call $leaf1 (local.get $acc) (local.get $i))) ' +
+    '   (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '   (br $loop))) ' +
+    ' (local.get $acc)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $fib (i32.const 1)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $fib (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $fib (i32.const 11)) (i32.const 89)) (then unreachable)) ' +
+    ' (if (i32.ne (call $fib (i32.const 20)) (i32.const 6765)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f2 (i32.const 1)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f2 (i32.const 17)) (i32.const 153)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f2 (i32.const 60)) (i32.const 1830)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f3 (i32.const 1)) (i32.const 15)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f3 (i32.const 30)) (i32.const -1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f4 (i32.const 4)) (i32.const 10)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f4 (i32.const 9)) (i32.const 35)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f4 (i32.const 40)) (i32.const 190)) (then unreachable)) ' +
+    ' (if (i64.ne (call $f5 (i64.const 2)) (i64.const 2)) (then unreachable)) ' +
+    ' (if (i64.ne (call $f5 (i64.const 10)) (i64.const 28)) (then unreachable)) ' +
+    ' (if (i64.ne (call $f5 (i64.const 18)) (i64.const 468)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f6 (i32.const 1)) (i32.const 2)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f6 (i32.const 7)) (i32.const 103)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f6 (i32.const 12)) (i32.const 2895)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 1)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 2)) (i32.const 2)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 3)) (i32.const 6)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 9)) (i32.const 30)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 14)) (i32.const 56)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const 1) (i32.const 2)) (i32.const 8)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const 1) (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const -1) (i32.const 1)) (i32.const -10)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const -1) (i32.const 1)) (i32.const -1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const 2147483647) (i32.const -2147483648)) (i32.const 536870904)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const 2147483647) (i32.const -2147483648)) (i32.const -631612838)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const 123456) (i32.const 654321)) (i32.const -576044596)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const 123456) (i32.const 654321)) (i32.const 123456)) (then unreachable)) ' +
+    ' (if (i64.ne (call $leaf2 (i64.const 3) (i64.const 5)) (i64.const 81920)) (then unreachable)) ' +
+    ' (if (i64.ne (call $leaf2 (i64.const -1) (i64.const 2)) (i64.const -24577)) (then unreachable)) ' +
+    ' (if (i64.ne (call $leaf2 (i64.const 4886718345) (i64.const 40926266145)) (i64.const -5871452744273814801)) (then unreachable)) ' +
+    ' (if (i32.ne (call $run (i32.const 0)) (i32.const 123456789)) (then unreachable)) ' +
+    ' (if (i32.ne (call $run (i32.const 1)) (i32.const -646784650)) (then unreachable)) ' +
+    ' (if (i32.ne (call $run (i32.const 1000)) (i32.const 738141401)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
+{ $sq(n) = n*n + $sq(n-1), with the square computed BEFORE the self call so
+  a dirty temporary must survive it; $deep never terminates, with the same
+  live temporary, so it exhausts. sq(40) = 22140 (sum of squares). }
+function NativeCoreDepthModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(func $sq (export "sq") (param $n i32) (result i32) ' +
+    '(if (result i32) (i32.eqz (local.get $n)) (then (i32.const 0)) ' +
+    '(else (i32.add (i32.mul (local.get $n) (local.get $n)) ' +
+    '(call $sq (i32.sub (local.get $n) (i32.const 1))))))) ' +
+    '(func $deep (export "deep") (param $n i32) (result i32) ' +
+    '(i32.add (i32.mul (local.get $n) (i32.const 3)) ' +
+    '(call $deep (i32.add (local.get $n) (i32.const 1))))) ' +
+    '(func (export "check") (result i32) ' +
+    '(if (i32.ne (call $sq (i32.const 40)) (i32.const 22140)) ' +
+    '(then unreachable)) (i32.const 1)))');
+end;
+
+{ An epoch bump before a self-recursive core with a loop: $rl(n) =
+  rl(n-1) + n*n, then x -= 3 while x > 100 (signed), returning x. The
+  first back-edge taken (the frame n = 7: 74 + 49 - 3 > 100) polls the
+  bumped epoch, so run(8) traps `interrupt` in both tiers at the same
+  point. Without the bump, rl(10) = 98 (independent Python model). }
+function NativeCoreEpochModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(import "e" "bump" (func $bump)) ' +
+    '(func $rl (export "rl") (param $n i32) (result i32) ' +
+    '(if (i32.eqz (local.get $n)) (then (return (i32.const 1)))) ' +
+    '(local.set $n (i32.add (call $rl (i32.sub (local.get $n) ' +
+    '(i32.const 1))) (i32.mul (local.get $n) (local.get $n)))) ' +
+    '(loop $l (br_if $l (i32.gt_s (local.tee $n (i32.sub (local.get $n) ' +
+    '(i32.const 3))) (i32.const 100)))) ' +
+    '(local.get $n)) ' +
+    '(func (export "run") (param i32) (result i32) ' +
+    '(call $bump) (call $rl (local.get 0))) ' +
+    '(func (export "check") (result i32) ' +
+    '(if (i32.ne (call $rl (i32.const 10)) (i32.const 98)) ' +
+    '(then unreachable)) (i32.const 1)))');
+end;
+
 { Deep NON-tail recursion, which must exhaust at the same LOGICAL depth under
   both tiers (jit-spec §13 item 2):
 
@@ -2129,6 +2300,9 @@ type
     procedure TestNativeReturnTailNearExhaustion;
     procedure TestNativeLeafResultSource;
     procedure TestNativeScalarLeafProofAndExhaustion;
+    procedure TestNativeCoreWriteBack;
+    procedure TestNativeCoreDepthAndEpoch;
+    procedure TestX64NativeCoreShape;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestInlineCallCacheAcrossBranches;
@@ -5584,6 +5758,178 @@ begin
   end;
 end;
 
+procedure TJitTests.TestNativeCoreWriteBack;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  I: Integer;
+begin
+  Bytes := NativeCoreWriteBackModuleBytes;
+  { Every shape must actually take the native core: seven self-recursive
+    functions, then the three leaves. }
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    for I := 0 to 6 do
+      Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[I], UInt32(I)))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    for I := 7 to 9 do
+      Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[I]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  CompileExports(['fib', 'f2', 'f3', 'f4', 'f5', 'f6', 'g', 'leaf1', 'leaf2',
+    'leaf3', 'run', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  { The external entries directly (the wrapper publishes the core's r8). }
+  Expect<Boolean>(DiffModule(Bytes, 'g', [MakeValueI32(14)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'f4', [MakeValueI32(40)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'leaf1', [MakeValueI32(-7),
+    MakeValueI32(123456)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestNativeCoreDepthAndEpoch;
+var
+  Bytes: TWasmBytes;
+  N: Integer;
+begin
+  { A dirty temporary is live across every self call; the exhaustion
+    boundary must still be the interpreter's, to the frame. }
+  Bytes := NativeCoreDepthModuleBytes;
+  WasmInterpMaxDepth := 64;
+  try
+    for N := 58 to 70 do
+    begin
+      CompileExports(['sq']);
+      Expect<Boolean>(DiffModule(Bytes, 'sq', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+  { Unbounded recursion traps `call stack exhausted` mid-computation, and
+    the same store then runs the checked function normally. }
+  CompileExports(['deep', 'sq', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'deep', [MakeValueI32(1)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TwoCallOutcome(Bytes, True, 'deep', [MakeValueI32(1)],
+    'check')).ToBe('call stack exhausted|');
+  Expect<string>(TwoCallOutcome(Bytes, False, 'deep', [MakeValueI32(1)],
+    'check')).ToBe('call stack exhausted|');
+
+  { The epoch poll on the core's back-edge fires at the same frame after a
+    host bump; without the bump the loop runs to the checked value. }
+  Bytes := NativeCoreEpochModuleBytes;
+  FDiffHost := @JitBumpEpochCallback;
+  try
+    CompileExports(['rl']);
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(8)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(8)]))
+      .ToBe('interrupt');
+    CompileExports(['rl', 'check']);
+    Expect<Boolean>(DiffModule(Bytes, 'check', []))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    FDiffHost := nil;
+  end;
+end;
+
+procedure TJitTests.TestX64NativeCoreShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Code: TWasmBytes;
+
+  { Stage function AIndex of the call and fib benchmark shapes. }
+  function Stage(const AWat: string; const AIndex: Integer): TWasmBytes;
+  var
+    Bytes: TWasmBytes;
+    Module: TWasmModule;
+    Ir: TWasmIrModule;
+    EntryOffset: NativeUInt;
+    RegisterCount: UInt32;
+  begin
+    Bytes := AssembleWatText(AWat);
+    Module := TWasmModule.Create;
+    Ir := nil;
+    try
+      DecodeModule(Bytes, Module);
+      Ir := ValidateModule(Module, Bytes);
+      Result := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[AIndex],
+        Ir.FuncImportCount + UInt32(AIndex), EntryOffset, RegisterCount);
+    finally
+      Ir.Free;
+      Module.Free;
+    end;
+  end;
+
+  { REX.W mov [rbx + disp], r64 (89 /r with a ModRM whose base is rbx and
+    no SIB): a register-file slot store. }
+  function SlotStores(const ACode: TWasmBytes): Integer;
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := 0 to Length(ACode) - 3 do
+      if (ACode[I] in [$48, $4C]) and (ACode[I + 1] = $89) and
+        ((ACode[I + 2] and 7) = 3) and ((ACode[I + 2] shr 6) <> 3) then
+        Inc(Result);
+  end;
+
+  function Count(const ACode: TWasmBytes;
+    const ASeq: array of Byte): Integer;
+  var
+    I, J: Integer;
+  begin
+    Result := 0;
+    for I := 0 to Length(ACode) - Length(ASeq) do
+    begin
+      J := 0;
+      while (J <= High(ASeq)) and (ACode[I + J] = ASeq[J]) do
+        Inc(J);
+      if J > High(ASeq) then
+        Inc(Result);
+    end;
+  end;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_X64}
+  { The call benchmark's leaf: four ALU ops and two constants, every one a
+    dead-after-use temporary. The only slot store left is the external
+    wrapper publishing the result (write-through stored 7, and the
+    lightweight entry stored both parameters). }
+  Code := Stage('(module (func $mix (param $acc i32) (param $i i32) ' +
+    '(result i32) (i32.add (i32.mul (i32.xor (local.get $acc) ' +
+    '(local.get $i)) (i32.const 1664525)) (i32.const 1013904223))))', 0);
+  Expect<Integer>(SlotStores(Code)).ToBe(1);
+
+  { fib: the parameter is stored once before the first self call, the first
+    call's result once before the second, and the wrapper publishes the
+    result; the base case stores nothing. One more store is the dead
+    fall-through flush after the base case's return (never executed). Each
+    self call is `sub r12, 1 ; jb` with no parameter store in the callee
+    frame, and `add r12, 1` after it. }
+  Code := Stage('(module (func $fib (param $n i32) (result i32) ' +
+    '(if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '(then (local.get $n)) ' +
+    '(else (i32.add (call $fib (i32.sub (local.get $n) (i32.const 1))) ' +
+    '(call $fib (i32.sub (local.get $n) (i32.const 2))))))))', 0);
+  Expect<Integer>(SlotStores(Code)).ToBe(4);
+  Expect<Integer>(Count(Code, [$49, $83, $EC, $01, $0F, $82])).ToBe(2);
+  Expect<Integer>(Count(Code, [$48, $89, $E3, $E8])).ToBe(2);
+  Expect<Integer>(Count(Code, [$5B, $49, $83, $C4, $01])).ToBe(2);
+  {$ELSE}
+  Expect<Boolean>(JIT_BACKEND_AVAILABLE or True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
@@ -7997,6 +8343,12 @@ begin
     TestNativeLeafResultSource);
   Test('native scalar leaf calls preserve proof and exhaustion boundaries',
     TestNativeScalarLeafProofAndExhaustion);
+  Test('native scalar cores keep results under deferred write-back',
+    TestNativeCoreWriteBack);
+  Test('native self cores exhaust and poll the epoch like the interpreter',
+    TestNativeCoreDepthAndEpoch);
+  Test('x64 native cores store only what a later read observes',
+    TestX64NativeCoreShape);
   Test('inlined scalar body survives relocation without a compiled target',
     TestInlineScalarBodyRelocation);
   Test('inlined scalar calls preserve epoch and caller memory behavior',
