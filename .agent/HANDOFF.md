@@ -1,5 +1,30 @@
 # Handoff
 
+## x64 wave 5 — in progress, 2026-09-27
+
+- Delivery branch `codex/optimize-x64-wave5` from exact main `b9d8085` (push CI
+  run 36281908754 green on all six targets). Evidence root:
+  `~/.local/share/wasmlight-evidence/x64-wave5-b9d8085` (`PLAN.md`,
+  `LANE-BRIEF.md`, baseline binary + `SHA256SUMS`, schedules, profiles).
+- Baseline, as wasmlight/Wasmtime: 3-arg 4.90, memory-store 2.26, memory-load
+  2.22, call 2.03, memory 1.77, fib 1.18, loop 1.00. Already in or below the
+  target range: gc 0.64, simd 0.61, startup 0.64, host-call 0.51, memory-grow
+  0.82.
+- Profiles show three x64 costs, one lane each:
+  - Lane K (`lane/x64-w5-imm`, worktree `w5-laneK`): no immediate-operand
+    forms, so every constant costs `mov $imm,%eax; mov %rax,%rN`, and a
+    constant shift goes through `%cl`.
+  - Lane L (`lane/x64-w5-hosts`, worktree `w5-laneL`): only two fixed static
+    hosts, so `acc` and `address` go through their slots every iteration, and
+    the load result bounces through rax.
+  - Lane M (`lane/x64-w5-calls`, worktree `w5-laneM`): the native scalar core
+    writes every temp through (ARM64 defers these writes), the self-call
+    sequence is heavy, and a call-bearing caller writes every temp through.
+- Next: integrate the accepted lanes one at a time and re-measure, then run a
+  Fable 5.1 review, the PR, and CI. `loop` is bound by its dependency chain
+  (xor → imul → add, as in Wasmtime), so parity may be its floor without
+  algebraic changes.
+
 ## x64 wave 4 — retained outcome, 2026-09-26
 
 - Delivery branch `codex/optimize-x64-wave4` from exact main `36c9394` (push CI

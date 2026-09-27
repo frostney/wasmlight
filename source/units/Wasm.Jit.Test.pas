@@ -1451,6 +1451,130 @@ begin
     Inc(I);
   until not (I < AN);
 end;
+
+{ Models for the x64 four-host static-cache tests (TestStaticHosts*). }
+function OracleFillSum(const AN: UInt32): UInt64;
+var
+  Mem: array[0 .. 63] of UInt32;
+  I, Acc: UInt32;
+begin
+  for I := 0 to 63 do
+    Mem[I] := (I * 17) xor 12345;
+  Acc := 0;
+  I := 0;
+  repeat
+    Acc := Acc + Mem[I and 63];
+    Inc(I);
+  until not (I < AN);
+  Result := Acc;
+end;
+
+function OracleNestedLocals(const AN, ASeed: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, J, Acc, Addr, X, Y: UInt32;
+begin
+  Mem := NewMemImage(2048);
+  X := ASeed;
+  Y := 0;
+  Acc := 0;
+  I := 0;
+  repeat
+    J := 0;
+    repeat
+      Addr := ((I + J) and 255) shl 2;
+      ImgStore(Mem, Addr, 4, X + J);
+      if (J and 1) <> 0 then
+        Y := Y xor UInt32(ImgLoad(Mem, Addr, 4))
+      else
+        Acc := Acc + UInt32(ImgLoad(Mem, Addr xor 4, 4));
+      X := X * 5 + 3;
+      Inc(J);
+    until not (J < 7);
+    Inc(I);
+  until not (I < AN);
+  Result := UInt32(Acc + Y * 31 + X);
+end;
+
+function OracleWideLocals(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, Addr: UInt32;
+  W, V: UInt64;
+begin
+  Mem := NewMemImage(2048);
+  W := $123456789;
+  V := 0;
+  I := 0;
+  repeat
+    Addr := (I shl 3) and $3F8;
+    ImgStore(Mem, Addr, 8, W);
+    W := W * $100000001 + 7;
+    V := V xor ImgLoad(Mem, Addr xor 8, 8);
+    ImgStore(Mem, Addr + 4, 1, I);
+    V := V + ImgLoad(Mem, Addr, 4);
+    Inc(I);
+  until not (I < AN);
+  Result := V xor W;
+end;
+
+function OracleLoadAlu(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, A, S1, S2, S3, S4, S5: UInt32;
+begin
+  Mem := NewMemImage(2048);
+  for I := 0 to 63 do
+    ImgStore(Mem, I shl 2, 4, I * $9E3779B1 + 12345);
+  S1 := 0;
+  S2 := 1;
+  S3 := $FFFFFFFF;
+  S4 := 0;
+  S5 := 0;
+  I := 0;
+  repeat
+    A := (I and 63) shl 2;
+    S1 := S1 - UInt32(ImgLoad(Mem, A, 4));
+    S2 := UInt32(ImgLoad(Mem, A xor 4, 4)) * S2;
+    S3 := S3 and UInt32(ImgLoad(Mem, A, 4));
+    S4 := UInt32(ImgLoad(Mem, A xor 8, 4)) or S4;
+    S5 := S5 xor UInt32(ImgLoad(Mem, A, 4));
+    ImgStore(Mem, A + 256, 4, I + UInt32(ImgLoad(Mem, A, 4)));
+    Inc(I);
+  until not (I < AN);
+  Result := UInt32(S1 + S2 + (S3 + S4) + (S5 + UInt32(ImgLoad(Mem, 300, 4))));
+end;
+
+{ The walk loop's x sequence: x0 = 77, x := x * 13 + i. }
+function OracleTrapWalkSum(const AStored: UInt32): UInt32;
+var
+  I, X: UInt32;
+begin
+  X := 77;
+  Result := 0;
+  for I := 0 to AStored - 1 do
+  begin
+    X := X * 13 + I;
+    Result := Result + (I + 1) * X;
+  end;
+end;
+
+function OracleTrapWalkAcc(const AN: UInt32): UInt64;
+var
+  I, X, Y, Acc: UInt32;
+begin
+  X := 77;
+  Y := 0;
+  Acc := 0;
+  I := 0;
+  repeat
+    X := X * 13 + I;
+    Y := Y xor X;
+    Acc := Acc + Y;
+    Inc(I);
+  until not (I < AN);
+  Result := Acc;
+end;
 {$POP}
 
 { Narrow signed/unsigned loads of both result widths at unaligned, varying
@@ -2456,6 +2580,12 @@ type
     procedure TestPinnedMemoryOobTraps;
     procedure TestPinnedMemoryTrapKeepsPriorStores;
     procedure TestPinnedMemoryStoreThenLoad;
+    procedure TestStaticHostsMemoryLoopShape;
+    procedure TestStaticHostsManyLocalsNestedLoops;
+    procedure TestStaticHostsI64AndI32Addresses;
+    procedure TestStaticHostsAddressAcrossJoin;
+    procedure TestStaticHostsTrapMidLoop;
+    procedure TestStaticHostsLoadAluOperands;
     procedure TestMemory64LoopExplicitChecks;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
@@ -5390,6 +5520,401 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
+{ --- x64 static cache: four fixed hosts (r8, r9, rdi, rdx) --------------
+  Expected values come from Pascal models of each module, independent of
+  both tiers; DiffFresh adds tier identity (result bits, trap, message). }
+
+{ The benchmark memory-load and memory-store loop bodies: every local
+  (bound, counter, accumulator, address) has a fixed host, so the loop body
+  has no register-file access; the address produced by i32.and/i32.shl
+  indexes [rsi + host] with no 32-bit copy into ecx; and the load is the
+  accumulating add's memory operand (03 /r), so no value passes through
+  rax. }
+procedure TJitTests.TestStaticHostsMemoryLoopShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  F, I, J, Head, Bodies, SlotAccesses, EcxCopies, RaxLoads, Loads,
+    FusedAdds, Stores: Integer;
+  Rel: Int32;
+  ModRM: Byte;
+{$ENDIF}
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "load") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (local $address i32) ' +
+    '(loop $fill ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) ' +
+    '(i32.xor (i32.mul (local.get $i) (i32.const 17)) (i32.const 12345))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (i32.const 64)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 63)) (i32.const 2))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (local.get $address)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "store") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $address i32) (local $k i32) ' +
+    '(local.set $k (i32.const 3)) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 63)) (i32.const 2))) ' +
+    '(i32.store (local.get $address) (local.get $i)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $address) (i32.load (i32.const 8))) ' +
+    '(i32.mul (local.get $k) (local.get $k)))))');
+  { load(200): the fill writes (k*17) xor 12345 at word k < 64; the sum
+    loop reads word i mod 64. store(130): word 2 last holds 130 - 64 = 66,
+    address is 4 * (129 mod 64) = 4, and k * k = 9. }
+  Expect<Boolean>(DiffFresh(FBytes, 'load', [MakeValueI32(200)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleFillSum(200));
+  Expect<Boolean>(DiffFresh(FBytes, 'store', [MakeValueI32(130)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(4 + 66 + 9);
+  {$IFDEF WASM_JIT_X64}
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Bodies := 0;
+  for F := 0 to 1 do
+  begin
+    Code := JitStageFunctionBytes(FStore, @FIr.Functions[F], EntryOffset,
+      RegisterCount);
+    { The last back-edge is the hot loop's epoch-fused je (0F 84 rel32)
+      to its head. Everything from the head to that je is the body. }
+    Head := -1;
+    J := -1;
+    for I := 0 to Length(Code) - 6 do
+      if (Code[I] = $0F) and (Code[I + 1] = $84) then
+      begin
+        Move(Code[I + 2], Rel, SizeOf(Rel));
+        if Rel < 0 then
+        begin
+          Head := I + 6 + Rel;
+          J := I;
+        end;
+      end;
+    Expect<Boolean>(Head >= 0).ToBe(True);
+    if Head < 0 then
+      Continue;
+    Inc(Bodies);
+    SlotAccesses := 0;
+    EcxCopies := 0;
+    RaxLoads := 0;
+    Loads := 0;
+    FusedAdds := 0;
+    Stores := 0;
+    for I := Head to J - 3 do
+    begin
+      ModRM := Code[I + 1];
+      { mov r/m <-> r (89/8B) addressing [rbx], [rbx+disp8/32]: a
+        register-file slot. }
+      if (Code[I] in [$89, $8B]) and
+        ((ModRM and $C7) in [$03, $43, $83]) then
+        Inc(SlotAccesses);
+      { mov ecx, r32 (89 /r, mod=11 rm=rcx) without REX.W: the address
+        zero-extension copy. }
+      if (Code[I] = $89) and ((ModRM and $C7) = $C1) and
+        ((I = Head) or not (Code[I - 1] in [$48 .. $4F])) then
+        Inc(EcxCopies);
+      { mov r32, [rsi + index] (8B), add r32, [rsi + index] (03), and
+        mov [rsi + index], r32 (89): mod=00 rm=100, SIB base rsi. A load's
+        reg field is rax only without REX.R. }
+      if (Code[I] in [$8B, $03, $89]) and ((ModRM and $C7) = $04) and
+        ((Code[I + 2] and 7) = 6) then
+      begin
+        case Code[I] of
+          $8B: Inc(Loads);
+          $03: Inc(FusedAdds);
+        else
+          Inc(Stores);
+        end;
+        if (Code[I] <> $89) and ((ModRM shr 3) and 7 = 0) and
+          ((I = Head) or ((Code[I - 1] and $44) <> $44)) then
+          Inc(RaxLoads);
+      end;
+    end;
+    Expect<Integer>(SlotAccesses).ToBe(0);
+    Expect<Integer>(EcxCopies).ToBe(0);
+    Expect<Integer>(RaxLoads).ToBe(0);
+    Expect<Integer>(Loads).ToBe(0);
+    Expect<Integer>(FusedAdds).ToBe(1 - F);
+    Expect<Integer>(Stores).ToBe(F);
+    { store's $k is never read in a loop, so it gets no fixed host: with
+      three loop locals, rdx stays unused (no mov rdx, [rbx+disp8] 48 8B 53
+      at entry). }
+    if F = 1 then
+    begin
+      J := 0;
+      for I := 0 to Length(Code) - 3 do
+        if (Code[I] = $48) and (Code[I + 1] = $8B) and (Code[I + 2] = $53) then
+          Inc(J);
+      Expect<Integer>(J).ToBe(0);
+    end;
+  end;
+  Expect<Integer>(Bodies).ToBe(2);
+  {$ENDIF}
+end;
+
+{ Seven locals live in two nested loops with an if/else join per inner
+  iteration: two take r8/r9, the two best loop-scored take rdi/rdx, and the
+  rest stay dynamic, so fixed and dynamic values cross every branch, join,
+  and back-edge together. The model below is the same computation in
+  Pascal. }
+procedure TJitTests.TestStaticHostsManyLocalsNestedLoops;
+const
+  Inputs: array[0 .. 3] of Integer = (1, 2, 5, 40);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (param $seed i32) (result i32) ' +
+    '(local $i i32) (local $j i32) (local $acc i32) (local $addr i32) ' +
+    '(local $x i32) (local $y i32) ' +
+    '(local.set $x (local.get $seed)) ' +
+    '(loop $outer ' +
+    '(local.set $j (i32.const 0)) ' +
+    '(loop $inner ' +
+    '(local.set $addr (i32.shl (i32.and (i32.add (local.get $i) ' +
+    '(local.get $j)) (i32.const 255)) (i32.const 2))) ' +
+    '(i32.store (local.get $addr) (i32.add (local.get $x) (local.get $j))) ' +
+    '(if (i32.and (local.get $j) (i32.const 1)) ' +
+    '(then (local.set $y (i32.xor (local.get $y) ' +
+    '(i32.load (local.get $addr))))) ' +
+    '(else (local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (i32.xor (local.get $addr) (i32.const 4))))))) ' +
+    '(local.set $x (i32.add (i32.mul (local.get $x) (i32.const 5)) ' +
+    '(i32.const 3))) ' +
+    '(local.set $j (i32.add (local.get $j) (i32.const 1))) ' +
+    '(br_if $inner (i32.lt_u (local.get $j) (i32.const 7)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $outer (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $acc) ' +
+    '(i32.mul (local.get $y) (i32.const 31))) (local.get $x))))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Integer($1234567))]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits)
+      .ToBe(OracleNestedLocals(Inputs[I], $1234567));
+  end;
+end;
+
+{ i64 locals whose high halves are live share the dynamic hosts with i32
+  addresses in one pinned loop: every i64 write leaves a host whose high
+  half is set, and every i32 address must still index by its low half. }
+procedure TJitTests.TestStaticHostsI64AndI32Addresses;
+const
+  Inputs: array[0 .. 2] of Integer = (1, 9, 100);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $addr i32) (local $w i64) (local $v i64) ' +
+    '(local.set $w (i64.const 0x123456789)) ' +
+    '(loop $l ' +
+    '(local.set $addr (i32.and (i32.shl (local.get $i) (i32.const 3)) ' +
+    '(i32.const 0x3F8))) ' +
+    '(i64.store (local.get $addr) (local.get $w)) ' +
+    '(local.set $w (i64.add (i64.mul (local.get $w) ' +
+    '(i64.const 0x100000001)) (i64.const 7))) ' +
+    '(local.set $v (i64.xor (local.get $v) ' +
+    '(i64.load (i32.xor (local.get $addr) (i32.const 8))))) ' +
+    '(i32.store8 (i32.add (local.get $addr) (i32.const 4)) (local.get $i)) ' +
+    '(local.set $v (i64.add (local.get $v) ' +
+    '(i64.load32_u (local.get $addr)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.xor (local.get $v) (local.get $w))))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run', [MakeValueI32(Inputs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleWideLocals(Inputs[I]));
+  end;
+end;
+
+{ The address local is a copy of a parameter on one path and an i32.or
+  result on the other, so the join merges a host written by a 64-bit copy
+  of an entry-loaded slot with one written by a 32-bit op; the access after
+  it, the parameter's own accesses before and after the loop, and the loop
+  back-edge all index the same words in both tiers. (Every writer keeps an
+  i32 slot zero-extended — the interpreter reads indexes as u64 and asserts
+  it — so the emitter's zero-extension facts are pinned byte for byte in
+  Wasm.Jit.X64.Test instead.) }
+procedure TJitTests.TestStaticHostsAddressAcrossJoin;
+var
+  P: TWasmValue;
+  C: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $p i32) (param $c i32) (param $n i32) ' +
+    '(result i32) (local $i i32) (local $a i32) (local $acc i32) ' +
+    '(i32.store (local.get $p) (i32.const 1234567)) ' +
+    '(i32.store (i32.const 0x30) (i32.const 1000)) ' +
+    '(loop $l ' +
+    '(local.set $a (local.get $p)) ' +
+    '(if (local.get $c) (then (local.set $a (i32.or (local.get $p) ' +
+    '(i32.const 0x20))))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (local.get $acc) (i32.load (local.get $p)))))');
+  P := MakeValueI32($10);
+  for C := 0 to 1 do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run',
+      [P, MakeValueI32(C), MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
+    { c = 0: six loads of 1234567 at 0x10; c = 1: five of 1000 at 0x30
+      (0x10 or 0x20) plus the final load at 0x10. }
+    if C = 0 then
+      Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64(6 * 1234567))
+    else
+      Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64(5 * 1000 + 1234567));
+  end;
+end;
+
+{ A trap in a pinned static-cache loop after hosted locals changed: stores
+  before the trap stay, the frame is discarded, and a later call observes
+  exactly the memory the model predicts. mode 0 faults on a guard-page load,
+  mode 1 reaches unreachable, mode 2 divides by zero (not a static-cache
+  op, so that export runs the write-through path as a control). }
+procedure TJitTests.TestStaticHostsTrapMidLoop;
+const
+  Messages: array[0 .. 2] of string = ('out of bounds memory access',
+    'unreachable', 'integer divide by zero');
+var
+  M: Integer;
+  Sum: UInt32;
+  Src, Want, InterpOut, JitOut: string;
+begin
+  Sum := OracleTrapWalkSum(9);
+  for M := 0 to 2 do
+  begin
+    Src := '(module (memory 1) ' +
+      '(func (export "walk") (param $n i32) (param $stop i32) (result i32) ' +
+      '(local $i i32) (local $acc i32) (local $addr i32) (local $x i32) ' +
+      '(local $y i32) ' +
+      '(local.set $x (i32.const 77)) ' +
+      '(loop $l ' +
+      '(local.set $addr (i32.shl (local.get $i) (i32.const 2))) ' +
+      '(local.set $x (i32.add (i32.mul (local.get $x) (i32.const 13)) ' +
+      '(local.get $i))) ' +
+      '(local.set $y (i32.xor (local.get $y) (local.get $x))) ' +
+      '(i32.store (local.get $addr) (local.get $x)) ' +
+      '(if (i32.eq (local.get $i) (local.get $stop)) (then ';
+    case M of
+      0: Src := Src + '(local.set $acc (i32.add (local.get $acc) ' +
+        '(i32.load (i32.const 65534))))';
+      1: Src := Src + 'unreachable';
+    else
+      Src := Src + '(local.set $acc (i32.div_u (local.get $acc) ' +
+        '(i32.const 0)))';
+    end;
+    Src := Src + ')) ' +
+      '(local.set $acc (i32.add (local.get $acc) (local.get $y))) ' +
+      '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+      '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+      '(local.get $acc)) ' +
+      '(func (export "verify") (local $k i32) (local $s i32) ' +
+      '(loop $v ' +
+      '(local.set $s (i32.add (local.get $s) (i32.mul (i32.add ' +
+      '(local.get $k) (i32.const 1)) (i32.load (i32.shl (local.get $k) ' +
+      '(i32.const 2)))))) ' +
+      '(local.set $k (i32.add (local.get $k) (i32.const 1))) ' +
+      '(br_if $v (i32.lt_u (local.get $k) (i32.const 32)))) ' +
+      '(if (i32.ne (local.get $s) (i32.const ' + IntToStr(Int32(Sum)) +
+      ')) (then unreachable))))';
+    FBytes := AssembleWatText(Src);
+    { Stopping at i = 8 of 20 leaves words 0..8 stored. }
+    Want := Messages[M] + '|';
+    CompileExports(['walk']);
+    InterpOut := TwoCallOutcome(FBytes, False, 'walk',
+      [MakeValueI32(20), MakeValueI32(8)], 'verify');
+    JitOut := TwoCallOutcome(FBytes, True, 'walk',
+      [MakeValueI32(20), MakeValueI32(8)], 'verify');
+    Expect<string>(InterpOut).ToBe(Want);
+    Expect<string>(JitOut).ToBe(InterpOut);
+    { A stop past the end returns the model's accumulator. }
+    Expect<Boolean>(DiffFresh(FBytes, 'walk',
+      [MakeValueI32(6), MakeValueI32(99)])).ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleTrapWalkAcc(6));
+  end;
+end;
+
+{ Every fusable operator reads a load as its memory operand, with fixed
+  and dynamic destinations, a temporary result feeding a store, and an
+  address that is dead after the access. The last export faults on the
+  fused access itself (65534 + 4 bytes crosses the end), which must trap
+  like the unfused load in the interpreter. }
+procedure TJitTests.TestStaticHostsLoadAluOperands;
+const
+  Inputs: array[0 .. 2] of Integer = (1, 7, 300);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $s1 i32) (local $s2 i32) ' +
+    '(local $s3 i32) (local $s4 i32) (local $s5 i32) ' +
+    '(loop $fill ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) ' +
+    '(i32.add (i32.mul (local.get $i) (i32.const 0x9E3779B1)) ' +
+    '(i32.const 12345))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (i32.const 64)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(local.set $s2 (i32.const 1)) ' +
+    '(local.set $s3 (i32.const -1)) ' +
+    '(loop $l ' +
+    '(local.set $a (i32.shl (i32.and (local.get $i) (i32.const 63)) ' +
+    '(i32.const 2))) ' +
+    '(local.set $s1 (i32.sub (local.get $s1) (i32.load (local.get $a)))) ' +
+    '(local.set $s2 (i32.mul (i32.load (i32.xor (local.get $a) ' +
+    '(i32.const 4))) (local.get $s2))) ' +
+    '(local.set $s3 (i32.and (local.get $s3) (i32.load (local.get $a)))) ' +
+    '(local.set $s4 (i32.or (i32.load (i32.xor (local.get $a) ' +
+    '(i32.const 8))) (local.get $s4))) ' +
+    '(local.set $s5 (i32.xor (local.get $s5) (i32.load (local.get $a)))) ' +
+    '(i32.store (i32.add (local.get $a) (i32.const 256)) ' +
+    '(i32.add (local.get $i) (i32.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (i32.add (local.get $s1) (local.get $s2)) ' +
+    '(i32.add (local.get $s3) (local.get $s4))) ' +
+    '(i32.add (local.get $s5) (i32.load (i32.const 300))))) ' +
+    '(func (export "fault") (param $p i32) (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $p)))) ' +
+    '(local.set $p (i32.add (local.get $p) (i32.const 2))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run', [MakeValueI32(Inputs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleLoadAlu(Inputs[I]));
+  end;
+  { 65530 and 65532 are in bounds; the third access at 65534 is not. }
+  Expect<Boolean>(DiffFresh(FBytes, 'fault',
+    [MakeValueI32(65530), MakeValueI32(2)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(0);
+  DiffFresh(FBytes, 'fault', [MakeValueI32(65530), MakeValueI32(3)]);
+  Expect<Boolean>(FDiffJitOut.Trapped).ToBe(True);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+end;
+
 procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
 var
   Bytes: TWasmBytes;
@@ -6091,9 +6616,10 @@ begin
     {$IFDEF WASM_JIT_X64}
     { $ra's call is the static-cache form: `xor ecx, ecx ; call rdx`, and
       the result is adopted from r8 into a host (mov r10, r8) rather than
-      stored to its slot. Its only slot stores are the two statics before
-      the call, the cold fallback's argument and result stores, and the
-      exit's write-back of the statics and the result. }
+      stored to its slot. Its only slot stores are the three fixed hosts
+      before the call (r8/r9 and rdi holding the bound $n), the cold
+      fallback's argument and result stores, and the exit's write-back of
+      the three fixed hosts and the result. }
     Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[4],
       Ir.FuncImportCount + 4, EntryOffset, StagedCount);
     Calls := 0;
@@ -6109,7 +6635,7 @@ begin
         Inc(Stores);
     end;
     Expect<Integer>(Calls).ToBe(1);
-    Expect<Integer>(Stores).ToBe(8);
+    Expect<Integer>(Stores).ToBe(10);
     { $ra calls one leaf, so the activation caches its entry: the prologue
       clears [rsp+16] (mov qword [rsp+16], 0) and the call site reads it
       (mov rdx, [rsp+16] ; test rdx, rdx ; je resolve). }
@@ -8672,6 +9198,18 @@ begin
     TestPinnedMemoryTrapKeepsPriorStores);
   Test('a base-pinned store then load of one address',
     TestPinnedMemoryStoreThenLoad);
+  Test('memory loops keep every local in a host with no slot traffic',
+    TestStaticHostsMemoryLoopShape);
+  Test('six loop locals across joins and nested loops match a model',
+    TestStaticHostsManyLocalsNestedLoops);
+  Test('i64 locals beside i32 addresses in one pinned loop match a model',
+    TestStaticHostsI64AndI32Addresses);
+  Test('an address local rewritten on one path reaches the join intact',
+    TestStaticHostsAddressAcrossJoin);
+  Test('traps mid-loop keep prior stores with hosted locals modified',
+    TestStaticHostsTrapMidLoop);
+  Test('loads fused into add/sub/and/or/xor/mul match a model and trap alike',
+    TestStaticHostsLoadAluOperands);
   Test('memory64 loops keep explicit checks',
     TestMemory64LoopExplicitChecks);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);
