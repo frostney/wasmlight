@@ -154,11 +154,17 @@ const
   { The same shapes from a compiled `_start`: bytes 1..4 summed (10), a
     handle counter (5 + 3 = 8), a retained callback through the table (6
     doubled + 1 = 13), a scoped one (3 doubled twice = 12), a void callback
-    (7), and a queued notification of 50 read back from the global. Exit
-    code 10 + 8 + 13 + 12 + 7 + 50 = 100. }
+    (7), and a queued notification of 50 read back from the global — 100.
+    Then copy-out (Fill writes 7, 8, 9 at 200), inout (Reverse4 turns 1..4
+    at 300 into 4..1), and a scoped borrow (ScaleInPlace doubles 1, 2, 3 at
+    400 and returns 12) are read back from guest memory: 9 - 8 + 4 - 1 + 12
+    - 6 = 10. Exit code 110. }
   NATIVE_SHAPES_WAT =
     '(module' + sLineBreak +
     '  (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))' + sLineBreak +
+    '  (import "Conn" "Fill" (func $fill (param i32 i32 i32)))' + sLineBreak +
+    '  (import "Conn" "Reverse4" (func $rev (param i32)))' + sLineBreak +
+    '  (import "Conn" "ScaleInPlace" (func $scale (param i32 i32 i32) (result i32)))' + sLineBreak +
     '  (import "Conn" "SumBytes" (func $sum (param i32 i32) (result i32)))' + sLineBreak +
     '  (import "Conn" "CounterNew" (func $cnew (param i32) (result i32)))' + sLineBreak +
     '  (import "Conn" "CounterAdd" (func $cadd (param i32 i32) (result i32)))' + sLineBreak +
@@ -168,6 +174,9 @@ const
     '  (import "Conn" "Post" (func $post (param i32 i32)))' + sLineBreak +
     '  (memory (export "memory") 1)' + sLineBreak +
     '  (data (i32.const 100) "\01\02\03\04")' + sLineBreak +
+    '  (data (i32.const 300) "\01\00\00\00\02\00\00\00' +
+    '\03\00\00\00\04\00\00\00")' + sLineBreak +
+    '  (data (i32.const 400) "\01\00\02\00\03\00")' + sLineBreak +
     '  (global $seen (mut i32) (i32.const 0))' + sLineBreak +
     '  (table 4 funcref)' + sLineBreak +
     '  (elem (i32.const 1) func $double $tick $note)' + sLineBreak +
@@ -183,7 +192,17 @@ const
     '    (local.set $acc (i32.add (local.get $acc) (call $twice (i32.const 1) (i32.const 3))))' + sLineBreak +
     '    (local.set $acc (i32.add (local.get $acc) (call $cvoid (i32.const 2))))' + sLineBreak +
     '    (call $post (i32.const 3) (i32.const 50))' + sLineBreak +
-    '    (call $exit (i32.add (local.get $acc) (global.get $seen)))))';
+    '    (local.set $acc (i32.add (local.get $acc) (global.get $seen)))' + sLineBreak +
+    '    (call $fill (i32.const 200) (i32.const 3) (i32.const 7))' + sLineBreak +
+    '    (call $rev (i32.const 300))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc)' + sLineBreak +
+    '      (call $scale (i32.const 400) (i32.const 3) (i32.const 2))))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc) (i32.sub' + sLineBreak +
+    '      (i32.load8_u (i32.const 202)) (i32.load8_u (i32.const 201)))))' + sLineBreak +
+    '    (local.set $acc (i32.add (local.get $acc) (i32.sub' + sLineBreak +
+    '      (i32.load (i32.const 300)) (i32.load (i32.const 312)))))' + sLineBreak +
+    '    (local.set $acc (i32.sub (local.get $acc) (i32.load16_s (i32.const 404))))' + sLineBreak +
+    '    (call $exit (local.get $acc))))';
 
   { A callback that traps inside a native connector call. }
   NATIVE_CALLBACK_TRAP_WAT =
@@ -270,6 +289,7 @@ type
     procedure TestCompiledExecutableCallsTheLibrary;
     procedure TestCompiledExecutableRunsEveryShape;
     procedure TestCompiledCallbackTrapUnwinds;
+    procedure TestCompiledMissingSymbolFailsAtStartup;
     procedure TestCompiledExecutableLoadsBesideItself;
     procedure TestCompiledMissingLibraryFailsAtStartup;
     procedure TestCompiledTamperedPlanFails;
@@ -458,6 +478,7 @@ begin
     '  public delegate void Cb(int x);' + sLineBreak +
     '  public delegate long Wide(long x);' + sLineBreak +
     '  public delegate int Two(int a, int b);' + sLineBreak +
+    '  [Queued] public delegate int QGet();' + sLineBreak +
     '  [DllImport("libc")] static extern int f(' + AParamDecl + ');' +
     sLineBreak + '}',
     '(module (import "C" "f" (func (param ' + AWatParams +
@@ -532,6 +553,7 @@ begin
   { D13: only void(), void(i32), i32(), and i32(i32) delegates. }
   ExpectUnsupported(LowerError('Wide w'), 'delegate Wide');
   ExpectUnsupported(LowerError('Two t'), 'delegate Two');
+  ExpectUnsupported(LowerError('QGet q'), '[Queued] delegate QGet');
 end;
 
 procedure TConnectorHostTests.TestArrayLowering;
@@ -1021,7 +1043,7 @@ begin
   Instantiate(ShapesWlc(FLibPath), SHAPES_WAT);
   Msg := CallError('apply', [MakeValueI32(0), MakeValueI32(1)], Cls);
   Expect<string>(Cls).ToBe('EWasmTrap');
-  Expect<string>(Msg).ToBe(MSG_TRAP_UNINITIALIZED_ELEMENT);
+  Expect<string>(Msg).ToBe(MSG_TRAP_UNINITIALIZED_ELEMENT + ' 0');
   Msg := CallError('apply', [MakeValueI32(8), MakeValueI32(1)], Cls);
   Expect<string>(Msg).ToBe(MSG_TRAP_UNDEFINED_ELEMENT);
   Msg := CallError('apply', [MakeValueI32(6), MakeValueI32(1)], Cls);
@@ -1297,7 +1319,24 @@ begin
   Expect<string>(Res.Diagnostic).ToBe('');
   Run := RunPayload(Payload);
   Expect<string>(Run.Diagnostic).ToBe('');
-  Expect<Integer>(Run.ExitCode).ToBe(100);
+  Expect<Integer>(Run.ExitCode).ToBe(110);
+end;
+
+procedure TConnectorHostTests.TestCompiledMissingSymbolFailsAtStartup;
+var
+  Payload: TWasmBytes;
+  Res: TWasmCompileResult;
+  Run: TWasmShellResult;
+begin
+  if not CanRunNative then
+    Exit;
+  Res := CompileCommand(COMMAND_WAT, StringReplace(CommandWlc(FLibPath),
+    'EntryPoint = "conn_add"', 'EntryPoint = "conn_absent"', []), Payload);
+  Expect<string>(Res.Diagnostic).ToBe('');
+  Run := RunPayload(Payload);
+  Expect<Integer>(Run.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
+  Expect<Boolean>(Pos('EWasmLinkError: ' + MSG_LINK_UNKNOWN_SYMBOL,
+    Run.Diagnostic) = 1).ToBe(True);
 end;
 
 procedure TConnectorHostTests.TestCompiledCallbackTrapUnwinds;
@@ -1550,6 +1589,8 @@ begin
     TestCompiledExecutableRunsEveryShape);
   Test('a compiled callback trap unwinds on Pascal ground',
     TestCompiledCallbackTrapUnwinds);
+  Test('a missing symbol fails the executable at startup',
+    TestCompiledMissingSymbolFailsAtStartup);
   Test('a bare library name loads beside the executable',
     TestCompiledExecutableLoadsBesideItself);
   Test('a missing library fails the executable at startup',

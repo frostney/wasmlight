@@ -41,7 +41,9 @@
   Guest failures inside a callback never unwind through the native frame:
   the hub retains them, and the host function rethrows once the native
   call has returned, before any copy-out. Queued notifications are
-  delivered after every connector call and when `_start` returns.
+  delivered after every connector call and when `_start` returns normally;
+  a guest that ends with `proc_exit`, a trap, or an uncaught exception has
+  asked to stop, so notifications still pending then are dropped.
 
   64-bit Unix only: on any other host the call plan is incompatible and
   loading fails closed with the same link class. }
@@ -150,8 +152,12 @@ type
 
     { Bind the instance whose exported `memory` buffers cross and whose
       table 0 delegates index. Call after instantiation, before the start
-      function runs. A plan with array parameters and no exported memory is
-      EWasmLinkError. }
+      function runs: the runtime shell instantiates through
+      InstantiateModule and attaches before the pending start. Through
+      Wasm.Engine.Instantiate, which runs the start function itself, a start
+      function that passes a buffer fails with EWasmConnectorError
+      (MSG_CONNECTOR_NO_MEMORY) and one that passes a delegate traps. A plan
+      with array parameters and no exported memory is EWasmLinkError. }
     procedure Attach(const AInstance: TWasmInstance);
 
     { Deliver queued callback notifications, then rethrow a retained guest
@@ -502,6 +508,14 @@ begin
   begin
     if not DelegateShape(AConnector, Delegate, Result.Shape) then
       RaiseUnsupported(AThunk, 'delegate ' + Delegate.Name);
+    { A [Queued] notification has no synchronous result: only void shapes,
+      the same rule Wasm.Connector.Callbacks enforces at Bind, applied here
+      so it fails at compile time rather than on the first call. }
+    if (Delegate.CallbackKind = wckQueued) and not (Result.Shape in
+      [Wasm.Connector.Callbacks.wcsVoid,
+       Wasm.Connector.Callbacks.wcsVoidI32]) then
+      RaiseUnsupported(AThunk, '[Queued] delegate ' + Delegate.Name +
+        ' returns a value');
     Result.Kind := wcpCallback;
     Result.Lifetime := Delegate.CallbackKind;
     Exit;
@@ -822,16 +836,31 @@ begin
   Result := False;
 end;
 
-procedure DefineConnectorSignatures(const ALinker: TWasmLinker;
-  const APlan: TWlcConnectorPlan);
+{ One linker entry per guest key; a module importing the same name twice
+  gets one definition. AData[I] is the binding for thunk I, or nil. }
+procedure DefinePlan(const ALinker: TWasmLinker;
+  const APlan: TWlcConnectorPlan; const ACallback: TWasmHostFunc;
+  const AData: array of TObject);
 var
   I: Integer;
+  Data: Pointer;
 begin
   for I := 0 to High(APlan.Thunks) do
     if not DefinedEarlier(APlan, I) then
+    begin
+      Data := nil;
+      if I <= High(AData) then
+        Data := Pointer(AData[I]);
       ALinker.DefineFunc(APlan.Thunks[I].GuestModule,
         APlan.Thunks[I].GuestName, APlan.Thunks[I].Func.Params,
-        APlan.Thunks[I].Func.Results, @SignatureOnlyCall, nil);
+        APlan.Thunks[I].Func.Results, ACallback, Data);
+    end;
+end;
+
+procedure DefineConnectorSignatures(const ALinker: TWasmLinker;
+  const APlan: TWlcConnectorPlan);
+begin
+  DefinePlan(ALinker, APlan, @SignatureOnlyCall, []);
 end;
 
 { --- TWasmConnectorHost --------------------------------------------------- }
@@ -912,15 +941,8 @@ begin
 end;
 
 procedure TWasmConnectorHost.DefineImports(const ALinker: TWasmLinker);
-var
-  I: Integer;
 begin
-  for I := 0 to High(FPlan.Thunks) do
-    if not DefinedEarlier(FPlan, I) then
-      ALinker.DefineFunc(FPlan.Thunks[I].GuestModule,
-        FPlan.Thunks[I].GuestName, FPlan.Thunks[I].Func.Params,
-        FPlan.Thunks[I].Func.Results, @ConnectorHostCall,
-        Pointer(FBindings[I]));
+  DefinePlan(ALinker, FPlan, @ConnectorHostCall, FBindings);
 end;
 
 procedure TWasmConnectorHost.Attach(const AInstance: TWasmInstance);
@@ -935,7 +957,8 @@ end;
 function TWasmConnectorHost.Memory: TWasmMemoryRef;
 begin
   if not FHasMemory then
-    raise EWasmConnectorError.Create(MSG_CONNECTOR_NO_MEMORY);
+    raise Wasm.Connector.Memory.EWasmConnectorError.Create(
+      MSG_CONNECTOR_NO_MEMORY);
   Result := FMemory;
 end;
 
@@ -963,7 +986,9 @@ begin
     raise EWasmTrap.Create(MSG_TRAP_UNDEFINED_ELEMENT);
   R := FStore.Tables[TableAddr].Elems[AIndex];
   if RefIsNull(R) then
-    raise EWasmTrap.Create(MSG_TRAP_UNINITIALIZED_ELEMENT);
+    { The indexed spelling call_indirect traps with (Wasm.Runtime.Traps). }
+    raise EWasmTrap.Create(MSG_TRAP_UNINITIALIZED_ELEMENT + ' ' +
+      IntToStr(AIndex));
   if RefIsI31(R) or (GcRefKind(R) <> wokFuncRef) then
     raise EWasmTrap.Create(MSG_TRAP_INDIRECT_CALL_TYPE_MISMATCH);
 

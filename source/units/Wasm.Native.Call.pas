@@ -6,6 +6,11 @@
   per-signature compiler. The gate's meta-ABI is cdecl; the callee sees
   the planned AAPCS64 or SysV register/stack placement.
 
+  A single-piece integer argument in a register is passed with all the
+  bytes the caller supplied (up to eight), not just its C width: Apple
+  AArch64 and SysV callers extend narrow integers, so a caller passes a
+  narrow value already sign- or zero-extended (AbiValueI64 / AbiValueU64).
+
   An incompatible plan, a missing function pointer, or a host/target
   mismatch is EWasmLinkError. Guest memory is not touched here — that is
   issue #44. }
