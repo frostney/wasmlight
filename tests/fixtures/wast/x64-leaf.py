@@ -153,6 +153,22 @@ class Machine:
                 break
         return s
 
+    def teeleaf(self, a, b, c):
+        old = a
+        a = w32(b + c)
+        return w32(w32(old - a) * 7 + w32(a ^ c))
+
+    def teeloop(self, n):
+        x, s, i = 11, 0, 0
+        while True:
+            old = x
+            x = w32(x * 3 + i)
+            s = w32(s + w32(old ^ self.teeleaf(i, x, s)))
+            i = w32(i + 1)
+            if not i < w32(n):
+                break
+        return w32(s + x)
+
     def ident(self, a, b, c):
         return c
 
@@ -372,6 +388,14 @@ WAT = r'''
     (select (i32.add (local.get $a) (local.get $b))
             (i32.sub (local.get $a) (local.get $b))
             (local.get $c)))
+  ;; A copy of a parameter taken before the parameter is redefined.
+  (func $teeleaf (export "teeleaf") (param $a i32) (param $b i32)
+    (param $c i32) (result i32)
+    (i32.add
+      (i32.mul (i32.sub (local.get $a)
+                        (local.tee $a (i32.add (local.get $b) (local.get $c))))
+               (i32.const 7))
+      (i32.xor (local.get $a) (local.get $c))))
   (func $ident (export "ident") (param i32 i32 i32) (result i32)
     (local.get 2))
   (func $mrw (export "mrw") (param $id i32) (param $d i64) (param $p i32)
@@ -643,6 +667,22 @@ WAT = r'''
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (local.get $s))
 
+  ;; A copy of a local taken before a leaf call and a redefinition, read
+  ;; after both.
+  (func (export "teeloop") (param $n i32) (result i32)
+    (local $x i32) (local $s i32) (local $i i32)
+    (local.set $x (i32.const 11))
+    (loop $l
+      (local.set $s (i32.add (local.get $s)
+        (i32.xor (local.get $x)
+          (block (result i32)
+            (local.set $x (i32.add (i32.mul (local.get $x) (i32.const 3))
+              (local.get $i)))
+            (call $teeleaf (local.get $i) (local.get $x) (local.get $s))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (i32.add (local.get $s) (local.get $x)))
+
   ;; memory.grow between leaf calls: the leaf must see the new Base/size.
   (func (export "growloop") (param $n i32) (result i32)
     (local $s i32) (local $i i32) (local $top i32)
@@ -729,6 +769,9 @@ COMMANDS = [
     ('sel3', 'iii', (10, 3, 0x80000000)),
     ('sel4', 'iiii', (5, 6, 7, 7)),
     ('ident', 'iii', (1, 2, 3)),
+    ('teeleaf', 'iii', (100, 7, 5)),
+    ('teeloop', 'i', (1,)),
+    ('teeloop', 'i', (13,)),
     ('loop3', 'i', (1,)),
     ('loop3', 'i', (2,)),
     ('loop3', 'i', (37,)),
