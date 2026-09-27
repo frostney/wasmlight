@@ -475,9 +475,12 @@ procedure X64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
   core's emission with them). }
 procedure X64ResetSlotTouched;
 function X64SlotTouched: Boolean;
+{ ASelfRegisterCount > 0 (the self-recursive core): the core runs on a
+  native frame just above its return address, like every recursive level
+  (X64EmitNativeSelfCall), so rbx = rsp + 8 holds throughout each core. }
 procedure X64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
   const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
-  const ACoreLabel: TWasmJitLabel);
+  const ACoreLabel: TWasmJitLabel; const ASelfRegisterCount: UInt32 = 0);
 procedure X64EmitNativeSelfBudget(const ABuf: TWasmCodeBuffer;
   const ARegisterCount: UInt32);
 procedure X64EmitNativeSelfCall(const ABuf: TWasmCodeBuffer;
@@ -3758,14 +3761,36 @@ begin
   X64EmitRet(ABuf);
 end;
 
+function X64NativeSelfFrameBytes(const ARegisterCount: UInt32): UInt32;
+begin
+  { The register file plus 8 bytes, so each call keeps the core's entry
+    alignment (rsp = 8 mod 16) without the push of the old sequence. }
+  Result := ((ARegisterCount * X64_SLOT_SIZE + 15) and not UInt32(15)) + 8;
+end;
+
 procedure X64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
   const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
-  const ACoreLabel: TWasmJitLabel);
+  const ACoreLabel: TWasmJitLabel; const ASelfRegisterCount: UInt32);
+var
+  FrameBytes: UInt32;
 begin
   X64EmitLoadSlot64(ABuf, X64_R8, AParam0Reg);
   if AParamCount = 2 then
     X64EmitLoadSlot64(ABuf, X64_R9, AParam1Reg);
-  X64EmitCallTo(ABuf, ACoreLabel);
+  if ASelfRegisterCount = 0 then
+    X64EmitCallTo(ABuf, ACoreLabel)
+  else
+  begin
+    { The prologue left rsp 0 mod 16; the push and the odd-8 frame keep the
+      core's entry at 8 mod 16, exactly as the direct call did. }
+    FrameBytes := X64NativeSelfFrameBytes(ASelfRegisterCount);
+    X64EmitPushReg(ABuf, X64_RBX);
+    X64EmitSubRsp(ABuf, Int32(FrameBytes));
+    X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RSP);
+    X64EmitCallTo(ABuf, ACoreLabel);
+    X64EmitAddRsp(ABuf, Int32(FrameBytes));
+    X64EmitPopReg(ABuf, X64_RBX);
+  end;
   X64EmitStoreSlot64(ABuf, X64_R8, AResultReg);
 end;
 
@@ -3810,14 +3835,18 @@ begin
   X64EmitJccTo(ABuf, X64_CC_B, UInt32(AExhaustedLabel));
 
   { The callee core receives its parameter in r8 as a dirty fixed host and
-    stores it only if a read of its slot follows (AParamReg is unused). }
-  FrameBytes := (ARegisterCount * X64_SLOT_SIZE + 15) and not UInt32(15);
-  X64EmitPushReg(ABuf, X64_RBX);
+    stores it only if a read of its slot follows (AParamReg is unused).
+    Every core, the wrapper-called one included, runs on the native frame
+    directly above its return address and pushes nothing else, so its own
+    rbx is always rsp + 8: after the callee's frame is released, one lea
+    restores it instead of a push/pop pair. A trap from any depth unwinds
+    to the trampoline, which restores rbx and rsp itself. }
+  FrameBytes := X64NativeSelfFrameBytes(ARegisterCount);
   X64EmitSubRsp(ABuf, Int32(FrameBytes));
   X64EmitMovRegReg(ABuf, X64_REG_REGFILE, X64_RSP);
   X64EmitCallTo(ABuf, ACoreLabel);
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
-  X64EmitPopReg(ABuf, X64_RBX);
+  X64EmitLea(ABuf, X64_REG_REGFILE, X64_RSP, 8);
 
   X64EmitAluRegImm8(ABuf, 0, True, X64_R12, 1);            { add r12, 1 }
 end;

@@ -675,18 +675,19 @@ var
   Buf: TWasmCodeBuffer;
 begin
   { sub r12, 1; jb exhausted (the borrow is exactly the old zero test);
-    push rbx; 16-byte regfile; rbx:=rsp; call core (the r8 parameter stays
-    unstored); restore; add r12, 1. Both branches are rel32 placeholders
-    resolved after the complete function is emitted. }
+    a 16-byte regfile + 8 frame; rbx:=rsp; call core (the r8 parameter
+    stays unstored); release; lea rbx, [rsp+8] (no push/pop); add r12, 1.
+    Both branches are rel32 placeholders resolved after the complete
+    function is emitted. }
   Buf := TWasmCodeBuffer.Create;
   try
     Buf.NewLabel;
     Buf.NewLabel;
     X64EmitNativeSelfCall(Buf, 2, 0, 0, 1);
     CheckSeq(Buf, [$49, $83, $EC, $01, $0F, $82, $00, $00, $00, $00,
-      $53, $48, $83, $EC, $10, $48, $89, $E3,
-      $E8, $00, $00, $00, $00, $48, $83, $C4, $10, $5B,
-      $49, $83, $C4, $01]);
+      $48, $83, $EC, $18, $48, $89, $E3,
+      $E8, $00, $00, $00, $00, $48, $83, $C4, $18,
+      $48, $8D, $5C, $24, $08, $49, $83, $C4, $01]);
     Expect<Integer>(Buf.PatchCount).ToBe(2);
   finally
     Buf.Free;
@@ -751,8 +752,8 @@ begin
       add r8d, r8d ; mov eax, 1 ; mov r10, rax ;
       mov r11, r8 ; sub r11d, r10d ;               (argument, slot 2)
       mov [rbx], r8 ; mov r8, r11 ;                (write-back, argument)
-      sub r12, 1 ; jb exh ; push rbx ; sub rsp, 64 ; mov rbx, rsp ;
-      call core ; add rsp, 64 ; pop rbx ; add r12, 1 ;
+      sub r12, 1 ; jb exh ; sub rsp, 72 ; mov rbx, rsp ;
+      call core ; add rsp, 72 ; lea rbx, [rsp+8] ; add r12, 1 ;
       mov r10, r8                                  (result, slot 3) }
   Setup;
   try
@@ -769,9 +770,9 @@ begin
       $4D, $89, $C3, $45, $29, $D3,
       $4C, $89, $03, $4D, $89, $D8,
       $49, $83, $EC, $01, $0F, $82, $00, $00, $00, $00,
-      $53, $48, $83, $EC, $40, $48, $89, $E3,
-      $E8, $00, $00, $00, $00, $48, $83, $C4, $40, $5B,
-      $49, $83, $C4, $01, $4D, $89, $C2]);
+      $48, $83, $EC, $48, $48, $89, $E3,
+      $E8, $00, $00, $00, $00, $48, $83, $C4, $48,
+      $48, $8D, $5C, $24, $08, $49, $83, $C4, $01, $4D, $89, $C2]);
     { r8 now holds the callee's result: the parameter host is
       non-resident until a read or a canonical point reloads it. }
     Expect<Boolean>(Cache.Entries[0].Valid).ToBe(False);

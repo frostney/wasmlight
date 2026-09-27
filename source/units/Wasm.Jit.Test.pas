@@ -6033,7 +6033,8 @@ begin
     result; the base case stores nothing. One more store is the dead
     fall-through flush after the base case's return (never executed). Each
     self call is `sub r12, 1 ; jb` with no parameter store in the callee
-    frame, and `add r12, 1` after it. }
+    frame, and `lea rbx, [rsp+8] ; add r12, 1` after it (no push/pop); the
+    wrapper runs the outermost core on the same kind of frame. }
   Code := Stage('(module (func $fib (param $n i32) (result i32) ' +
     '(if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
     '(then (local.get $n)) ' +
@@ -6041,8 +6042,10 @@ begin
     '(call $fib (i32.sub (local.get $n) (i32.const 2))))))))', 0);
   Expect<Integer>(SlotStores(Code)).ToBe(4);
   Expect<Integer>(Count(Code, [$49, $83, $EC, $01, $0F, $82])).ToBe(2);
-  Expect<Integer>(Count(Code, [$48, $89, $E3, $E8])).ToBe(2);
-  Expect<Integer>(Count(Code, [$5B, $49, $83, $C4, $01])).ToBe(2);
+  Expect<Integer>(Count(Code, [$48, $89, $E3, $E8])).ToBe(3);
+  Expect<Integer>(Count(Code, [$48, $8D, $5C, $24, $08, $49, $83, $C4, $01]))
+    .ToBe(2);
+  Expect<Integer>(Count(Code, [$5B, $49, $83, $C4, $01])).ToBe(0);
   {$ELSE}
   Expect<Boolean>(JIT_BACKEND_AVAILABLE or True).ToBe(True);
   {$ENDIF}

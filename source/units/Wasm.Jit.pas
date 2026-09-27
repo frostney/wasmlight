@@ -3028,8 +3028,13 @@ begin
     end;
     if UseNativeScalarCore and not X64LeafFallThrough then
     begin
-      X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
-        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+      if UseNativeScalarSelf then
+        X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+          NativeParam1Reg, NativeResultReg, NativeCoreLabel,
+          AFn^.RegisterCount)
+      else
+        X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+          NativeParam1Reg, NativeResultReg, NativeCoreLabel);
       X64EmitEpilogue(Buf, UseX64ExtendedFrame);
     end;
     if UseNativeScalarCore then
