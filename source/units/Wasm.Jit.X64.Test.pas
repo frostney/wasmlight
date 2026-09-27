@@ -77,7 +77,6 @@ type
     procedure TestSlotOffset;
     procedure TestPredicateCoversWaves;
     procedure TestPredicateEmitsEh;
-    procedure TestCallArityFence;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheDefersDynamicStores;
     procedure TestStaticCachePinnedMemoryBytes;
@@ -2786,40 +2785,6 @@ begin
   Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(True);
 end;
 
-procedure TX64Tests.TestCallArityFence;
-var
-  Ins: TWasmIrInstr;
-  Aux: TWasmIrAuxU32;
-  I: Integer;
-begin
-  { Direct-call arity is not a decline. An empty aux and an argument block
-    one past the historical short-form cap both compile. return_call* past
-    the shared tail-channel cap declines. }
-  Ins.Op := iroCall;
-  Ins.Dest := 0;
-  Ins.A := 0;
-  Ins.B := 0;
-  Ins.Imm := 0;
-  Aux := nil;
-  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
-
-  SetLength(Aux, X64_MAX_CALL_SLOTS + 2);
-  Aux[0] := X64_MAX_CALL_SLOTS + 1;
-  for I := 1 to X64_MAX_CALL_SLOTS + 1 do
-    Aux[I] := 0;
-  Ins.Op := iroReturnCall;
-  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
-
-  SetLength(Aux, WASM_TIER_TAIL_CAP + 2);
-  Aux[0] := WASM_TIER_TAIL_CAP + 1;
-  for I := 1 to WASM_TIER_TAIL_CAP + 1 do
-    Aux[I] := 0;
-  Ins.Op := iroReturnCall;
-  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(False);
-  Ins.Op := iroCall;
-  Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
-end;
-
 { v128 xmm cache encodings, SDM Vol. 2: MOVDQA xmm1, xmm2/m128 = 66 0F 6F /r;
   PXOR = 66 0F EF /r; PCMPEQD = 66 0F 76 /r; MOVQ xmm, r/m64 = 66 REX.W 0F
   6E /r; PUNPCKLQDQ = 66 0F 6C /r; REX.R extends ModRM.reg, REX.B ModRM.rm. }
@@ -3160,8 +3125,6 @@ begin
   Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWaves);
   Test('predicate emits exception-handling ops', TestPredicateEmitsEh);
-  Test('the call-site arity predicate admits wide calls and fences huge tails',
-    TestCallArityFence);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
   Test('static allocation defers dynamic stores and evicts dead values first',

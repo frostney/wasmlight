@@ -219,6 +219,7 @@ type
     procedure TestHostCallRoundTrip;
     procedure TestHostCallTrapPropagates;
     procedure TestHostCallReentrancy;
+    procedure TestWideHostCallsMarshal;
     procedure TestM7ExternConvertCrossHierarchy;
     { SIMD / v128 (Track G). }
     procedure TestSimdSplatAddExtract;
@@ -302,6 +303,21 @@ begin
     trampoline. The nested activation region sits above the outer frames. }
   Inner[0] := AParams[0];
   InterpInvoke(GReenterStore, GReenterDouble, @Inner[0], @AResults[0]);
+end;
+
+const
+  { One past the interpreter's 1024-slot inline marshal buffers. }
+  WIDE_HOST_ARITY = 1025;
+
+procedure HostWideReverseCallback(const AStore: TWasmStore;
+  const AData: Pointer; const AParams: PWasmValue; const AResults: PWasmValue);
+var
+  K: Integer;
+begin
+  { (i32 x 1025) -> (i32 x 1025): result k is parameter 1024-k plus one, so a
+    marshal that drops, truncates, or overlaps a block changes the fold. }
+  for K := 0 to WIDE_HOST_ARITY - 1 do
+    AResults[K] := MakeValueI32(AParams[WIDE_HOST_ARITY - 1 - K].I32 + 1);
 end;
 
 { --- fixture ------------------------------------------------------------- }
@@ -1674,6 +1690,77 @@ begin
   Expect<Int32>(Call1('cr', [MakeValueI32(21)]).I32).ToBe(42);
 end;
 
+{ A host import whose parameter AND result blocks are one past the inline
+  marshal buffers, reached by `call` (HostCall) and by `return_call`
+  (ReturnHostCall) — valid wasm, so neither may raise an internal cap. The
+  callee returns params reversed plus one; the guest folds all 1025 results
+  order-sensitively and the model below recomputes the fold. }
+procedure TInterpTests.TestWideHostCallsMarshal;
+var
+  Canon, TypeIdx: TWasmEngineTypeIds;
+  TypeWide, TypeWideOut, Args, Fold: TWasmBytes;
+  K: Integer;
+  Expected: UInt32;
+
+  function I32Const(const AValue: Integer): TWasmBytes;
+  begin
+    if AValue < 64 then
+      Result := BLit([$41, Byte(AValue)])
+    else
+      Result := BLit([$41, Byte((AValue and $7F) or $80), Byte(AValue shr 7)]);
+  end;
+
+  function Repeated(const AItem: TWasmBytes; const ACount: Integer): TWasmBytes;
+  var
+    I: Integer;
+  begin
+    Result := nil;
+    for I := 1 to ACount do
+      Result := Cat([Result, AItem]);
+  end;
+
+begin
+  TypeWide := Cat([BLit([$60]), ULeb(WIDE_HOST_ARITY),
+    Repeated(BLit([$7F]), WIDE_HOST_ARITY), ULeb(WIDE_HOST_ARITY),
+    Repeated(BLit([$7F]), WIDE_HOST_ARITY)]);
+  TypeWideOut := Cat([BLit([$60, $00]), ULeb(WIDE_HOST_ARITY),
+    Repeated(BLit([$7F]), WIDE_HOST_ARITY)]);
+  Args := nil;
+  for K := 0 to WIDE_HOST_ARITY - 1 do
+    Args := Cat([Args, I32Const(K)]);
+  { acc := r1024; for k = 1023 downto 0: acc := rotl(r_k xor acc, 1) }
+  Fold := Repeated(BLit([$73, $41, $01, $77]), WIDE_HOST_ARITY - 1);
+  { import "h"."w" (type 0)
+    $wc  () -> i32        args; call 0; fold
+    $wt  () -> i32 x 1025 args; return_call 0
+    $wtc () -> i32        call 2; fold }
+  DecodeValidate(Cat([
+    BLit(WASM_HEADER),
+    Sect(1, VecOf([TypeWide, BLit([$60, $00, $01, $7F]), TypeWideOut])),
+    Sect(2, VecOf([BLit([$01, $68, $01, $77, $00, $00])])),
+    Sect(3, VecOf([BLit([$01]), BLit([$02]), BLit([$01])])),
+    Sect(7, VecOf([
+      BLit([$02, $77, $63, $00, $01]),
+      BLit([$03, $77, $74, $63, $00, $03])])),
+    Sect(10, VecOf([
+      CodeEntry(Cat([BLit([$00]), Args, BLit([$10, $00]), Fold, BLit([$0B])])),
+      CodeEntry(Cat([BLit([$00]), Args, BLit([$12, $00, $0B])])),
+      CodeEntry(Cat([BLit([$00, $10, $02]), Fold, BLit([$0B])]))]))
+  ]));
+  FEngine.InternModule(FIr, Canon, TypeIdx);
+  SetLength(FImports.Funcs, 1);
+  FImports.Funcs[0] := FStore.AddHostFunc(TypeIdx[0],
+    @HostWideReverseCallback, nil);
+  DoInstantiate;
+
+  { r_k = (1024 - k) + 1 }
+  Expected := 1;   { r1024 }
+  for K := WIDE_HOST_ARITY - 2 downto 0 do
+    Expected := RolDWord(UInt32(WIDE_HOST_ARITY - K) xor Expected, 1);
+  Expect<Int32>(Call1('wc', []).I32).ToBe(Int32(Expected));
+  Expect<Int32>(Call1('wtc', []).I32).ToBe(Int32(Expected));
+end;
+
 { --- M7: extern/any conversion crosses the hierarchy (interp-spec §3.9 O-4) -
   extern.convert_any / any.convert_extern move a value between the `any` and
   `extern` hierarchies through Wasm.Runtime.Gc's wrapper pair, so a ref.test
@@ -2660,6 +2747,8 @@ begin
   Test('a host call round-trips params and results', TestHostCallRoundTrip);
   Test('a host callback trap propagates', TestHostCallTrapPropagates);
   Test('a host callback re-enters guest code', TestHostCallReentrancy);
+  Test('host call and return_call marshal blocks past the inline buffers',
+    TestWideHostCallsMarshal);
   Test('M7: extern.convert_any moves a struct into the extern hierarchy, so '
     + 'ref.test flips across the boundary', TestM7ExternConvertCrossHierarchy);
   Test('v128 splat/add/extract_lane computes end to end',

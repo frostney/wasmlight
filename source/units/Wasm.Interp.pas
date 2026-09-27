@@ -124,6 +124,16 @@ type
 
   PWasmInterpContext = ^TWasmInterpContext;
 
+  { A heap block of flat value slots for a call whose argument or result
+    block is wider than the inline stack buffers. Plain GetMem memory owned
+    by the interpreter context, so a trap's longjmp can abandon one without
+    leaking managed state (TRAP-1); a block never moves once allocated. }
+  PWasmWideBlock = ^TWasmWideBlock;
+  TWasmWideBlock = record
+    Prev: PWasmWideBlock;            { next-older block in its chain }
+    Slots: NativeUInt;               { value slots after the header }
+  end;
+
   { The per-store, per-thread interpreter context (interp-spec §1.1). Two
     FIXED, non-reallocating reservations plus a depth cursor. }
   TWasmInterpContext = record
@@ -143,6 +153,16 @@ type
     Depth: NativeUInt;               { number of live activations }
     FuncsSlot: PWasmFuncInsts;       { stable address of Store.Funcs }
     GcFrameSlot: PPWasmGcFrame;      { stable address of Heap.FFrames }
+    { Appended after every field generated code addresses, so the JIT's
+      fixed context offsets are unchanged. WideScratch is the LIFO chain of
+      wide marshal buffers held by in-flight interpreter call sites; a site
+      releases its own block (and any a trap abandoned above it), and a
+      genuine top-level entry drops the rest. TailWide is the pending-tail
+      channel's wide argument buffer, newest first; a grown buffer keeps
+      its predecessors until the context is freed, so a published
+      argument pointer is never freed while a tail target may read it. }
+    WideScratch: PWasmWideBlock;
+    TailWide: PWasmWideBlock;
   end;
 
   { O-J5: the register-file / frame offsets the JIT's generated code reads
@@ -240,9 +260,10 @@ procedure ResetInterpContext(const AStore: TWasmStore);
 function InterpContextFor(const AStore: TWasmStore): PWasmInterpContext;
 
 const
-  { Cap on a cross-tier pending tail's argument slots — the same marshal cap the
-    interpreter's own call paths use. }
-  WASM_TIER_TAIL_CAP = 1024;
+  { Argument slots a pending tail carries inline in the per-thread channel.
+    Not an arity limit: a wider tail publishes through the store's
+    interpreter context (TWasmInterpContext.TailWide) instead. }
+  WASM_TIER_TAIL_INLINE = 1024;
 
 type
   { The cross-tier pending-tail channel (Fix A, Finding 1). One per thread (a
@@ -250,14 +271,16 @@ type
     return_call* helper AND the interpreter's Run when an ENTRY-level tail
     crosses tiers; read by the backend trampoline loop, which re-dispatches the
     target with ZERO native-stack growth so an alternating compiled<->interp
-    tail chain stays O(1). }
+    tail chain stays O(1). Args points at InlineArgs, or at the context's
+    wide buffer when ArgCount exceeds WASM_TIER_TAIL_INLINE. }
   PWasmTierTail = ^TWasmTierTail;
 
   TWasmTierTail = record
     Pending: Boolean;
     Addr: TWasmFuncAddr;
     ArgCount: UInt32;
-    Args: array[0 .. WASM_TIER_TAIL_CAP - 1] of TWasmValue;
+    Args: PWasmValue;
+    InlineArgs: array[0 .. WASM_TIER_TAIL_INLINE - 1] of TWasmValue;
   end;
 
 { @GTierTail (the per-thread pending-tail slot) so the backend loops and the
@@ -266,9 +289,9 @@ function TierTailSlot: PWasmTierTail;
 
 { Record a resolved cross-tier tail target + its collected argument slots into
   the shared channel. Args are COPIED because the frame they came from is about
-  to be torn down. Raises on an over-cap arity. }
-procedure SetTierPendingTail(const AAddr: TWasmFuncAddr;
-  const AArgs: PWasmValue; const ACount: UInt32);
+  to be torn down. Any arity: a wide block goes to AStore's context buffer. }
+procedure SetTierPendingTail(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AArgs: PWasmValue; const ACount: UInt32);
 
 { The seam-reentry flag (Fix A). A tier-seam launcher (interp->compiled,
   compiled->interp, compiled->compiled) calls MarkJitSeamReentry immediately
@@ -432,13 +455,11 @@ uses
   Wasm.Runtime.Traps;
 
 const
-  { A fixed ceiling on the parameter/result count a single call marshals
-    through a stack-local scratch buffer (interp-spec §1.4 TRAP-1: the
-    scratch must be plain stack data, not a managed dynamic array a TrapNow
-    could skip). Comfortably above the spec's function-arity implementation
-    limits; a module exceeding it raises a loud internal error rather than
-    misbehaving. }
-  WASM_INTERP_MAX_MARSHAL = 1024;
+  { The parameter/result count a single call marshals through its
+    stack-local scratch buffers (interp-spec §1.4 TRAP-1: the scratch must be
+    plain data, not a managed dynamic array a TrapNow could skip). Not an
+    arity limit: a wider call marshals through a context-owned wide block. }
+  WASM_INTERP_INLINE_MARSHAL = 1024;
 
 threadvar
   { Fix A. See the interface comments. All default cleared per thread, so with
@@ -459,20 +480,111 @@ begin
   Result := @GTierTail;
 end;
 
-procedure SetTierPendingTail(const AAddr: TWasmFuncAddr;
-  const AArgs: PWasmValue; const ACount: UInt32);
+{ --- wide marshal blocks ---------------------------------------------------
+
+  The value slots follow the header, rounded up to 16 bytes so a slot pair
+  keeps the value stack's alignment. }
+
+const
+  WIDE_BLOCK_HEADER = (SizeOf(TWasmWideBlock) + 15) and not 15;
+
+function WideBlockData(const ABlock: PWasmWideBlock): PWasmValue; inline;
+begin
+  Result := PWasmValue(PByte(ABlock) + WIDE_BLOCK_HEADER);
+end;
+
+function NewWideBlock(const ASlots: NativeUInt;
+  const APrev: PWasmWideBlock): PWasmWideBlock;
+begin
+  Result := GetMem(WIDE_BLOCK_HEADER + ASlots * SizeOf(TWasmValue));
+  Result^.Prev := APrev;
+  Result^.Slots := ASlots;
+end;
+
+procedure FreeWideChain(var AHead: PWasmWideBlock);
 var
+  Prev: PWasmWideBlock;
+begin
+  while AHead <> nil do
+  begin
+    Prev := AHead^.Prev;
+    FreeMem(AHead);
+    AHead := Prev;
+  end;
+end;
+
+{ Point AParams/AResults at the inline stack buffers when both blocks fit,
+  else at one fresh block pushed on the context's WideScratch chain. Returns
+  that block (nil when inline) for ReleaseMarshal. }
+function AcquireMarshal(const ACtx: PWasmInterpContext;
+  const AArgN, AResN: UInt32; const AInlineParams, AInlineResults: PWasmValue;
+  out AParams, AResults: PWasmValue): PWasmWideBlock;
+begin
+  if (AArgN <= WASM_INTERP_INLINE_MARSHAL) and
+    (AResN <= WASM_INTERP_INLINE_MARSHAL) then
+  begin
+    AParams := AInlineParams;
+    AResults := AInlineResults;
+    Exit(nil);
+  end;
+  Result := NewWideBlock(NativeUInt(AArgN) + AResN, ACtx^.WideScratch);
+  ACtx^.WideScratch := Result;
+  AParams := WideBlockData(Result);
+  AResults := AParams;
+  Inc(AResults, AArgN);
+end;
+
+{ Free ABlock and any block a trap or unwind abandoned above it. A nil
+  block (the inline case) is a no-op. }
+procedure ReleaseMarshal(const ACtx: PWasmInterpContext;
+  const ABlock: PWasmWideBlock);
+var
+  Top: PWasmWideBlock;
+begin
+  if ABlock = nil then
+    Exit;
+  repeat
+    Top := ACtx^.WideScratch;
+    ACtx^.WideScratch := Top^.Prev;
+    FreeMem(Top);
+  until Top = ABlock;
+end;
+
+{ The pending-tail argument buffer for a tail wider than the inline array:
+  the context's newest wide buffer, grown by pushing a larger one. Older
+  buffers stay allocated (see TWasmInterpContext). }
+function TierTailWideBuffer(const ACtx: PWasmInterpContext;
+  const ACount: UInt32): PWasmValue;
+var
+  Slots: NativeUInt;
+begin
+  if (ACtx^.TailWide = nil) or (ACtx^.TailWide^.Slots < ACount) then
+  begin
+    Slots := ACount;
+    if (ACtx^.TailWide <> nil) and (ACtx^.TailWide^.Slots * 2 > Slots) then
+      Slots := ACtx^.TailWide^.Slots * 2;
+    ACtx^.TailWide := NewWideBlock(Slots, ACtx^.TailWide);
+  end;
+  Result := WideBlockData(ACtx^.TailWide);
+end;
+
+procedure SetTierPendingTail(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AArgs: PWasmValue; const ACount: UInt32);
+var
+  Dest: PWasmValue;
   I: UInt32;
 begin
-  if ACount > WASM_TIER_TAIL_CAP then
-    raise EWasmInternal.Create(
-      'internal: cross-tier tail-call arity exceeds the marshal cap');
+  if ACount <= WASM_TIER_TAIL_INLINE then
+    Dest := @GTierTail.InlineArgs[0]
+  else
+    Dest := TierTailWideBuffer(InterpContextFor(AStore), ACount);
   I := 0;
   while I < ACount do
   begin
-    GTierTail.Args[I] := AArgs[I];
+    Dest[I] := AArgs[I];
     Inc(I);
   end;
+  GTierTail.Args := Dest;
   GTierTail.Addr := AAddr;
   GTierTail.ArgCount := ACount;
   GTierTail.Pending := True;
@@ -508,6 +620,9 @@ end;
 { Forward decls — the seam catches in CompiledCall / ReturnCompiledCall use
   these unwind leaves, which are defined later beside Run (Fix A). }
 procedure RaiseUncaught(const AExn: TWasmRef; const ATagAddr: UInt32); forward;
+{ Sizes a tail callee's flat result block for ReturnHostCall /
+  ReturnCompiledCall; defined beside the invoke boundary. }
+function ResultSlotCount(const AFn: PWasmIrFunction): UInt32; forward;
 
 { TWasmActivation, TWasmInterpContext and the IR pointer types now live in
   the interface (moved for O-J2 so the JIT can build a frame through the
@@ -763,24 +878,25 @@ procedure ReplaceWasmFrame(const ACtx: PWasmInterpContext;
 var
   CalleeInst: TWasmModuleInstance;
   CalleeFn: PWasmIrFunction;
-  TopRegs, Slots: PWasmValue;
+  TopRegs, Slots, Args, NoResults: PWasmValue;
   ArgN, I: UInt32;
-  Tmp: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+  Wide: PWasmWideBlock;
+  Tmp: array[0 .. WASM_INTERP_INLINE_MARSHAL - 1] of TWasmValue;
 begin
   CalleeInst := ACtx^.Store.Funcs[AAddr].Instance;
   CalleeFn := @CalleeInst.Ir.Functions[ACtx^.Store.Funcs[AAddr].FuncIrIndex];
 
   { 1. Collect argument VALUES first: they live in the CURRENT frame's
-       registers, which are about to be overwritten in place. Tmp is a plain
-       stack local, not managed state a TrapNow could skip. }
+       registers, which are about to be overwritten in place. Args is the
+       plain stack local Tmp, or a context-owned wide block — neither is
+       managed state a TrapNow could skip. }
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
-  if ArgN > WASM_INTERP_MAX_MARSHAL then
-    raise EWasmInternal.Create('internal: tail-call arity exceeds the marshal cap');
+  Wide := AcquireMarshal(ACtx, ArgN, 0, @Tmp[0], nil, Args, NoResults);
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
   while I < ArgN do
   begin
-    Tmp[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
+    Args[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
     Inc(I);
   end;
 
@@ -804,10 +920,11 @@ begin
 
   Slots := Frame(ACtx^.Values, ATop^.Base);
   ValueZeroSlots(Slots, CalleeFn^.RegisterCount);
-  { Tmp is the flat, dense arg block gathered from the old frame; scatter it
+  { Args is the flat, dense arg block gathered from the old frame; scatter it
     into the callee's PADDED param registers exactly as PushWasmFrame and the
     entry seam do (simd-spec §1.6). }
-  ScatterParamsFlat(CalleeFn, Slots, @Tmp[0]);
+  ScatterParamsFlat(CalleeFn, Slots, Args);
+  ReleaseMarshal(ACtx, Wide);
 
   PushGcFrame(ACtx, ATop, CalleeFn, ATop^.Base);
   { Depth UNCHANGED — the O(1) property. }
@@ -818,34 +935,36 @@ end;
 procedure HostCall(const ACtx: PWasmInterpContext; const ACaller: PWasmActivation;
   const AArgAux, ADstAux: UInt32; const AAddr: TWasmFuncAddr);
 var
-  CallerRegs: PWasmValue;
+  CallerRegs, Params, Results: PWasmValue;
   ArgN, ResN, I: UInt32;
-  ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+  Wide: PWasmWideBlock;
+  ParamBuf, ResBuf: array[0 .. WASM_INTERP_INLINE_MARSHAL - 1] of TWasmValue;
 begin
   ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
   ResN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
-  if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmInternal.Create('internal: host-call arity exceeds the marshal cap');
+  Wide := AcquireMarshal(ACtx, ArgN, ResN, @ParamBuf[0], @ResBuf[0],
+    Params, Results);
 
   CallerRegs := Frame(ACtx^.Values, ACaller^.Base);
   I := 0;
   while I < ArgN do
   begin
-    ParamBuf[I] := CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, AArgAux, I)];
+    Params[I] := CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, AArgAux, I)];
     Inc(I);
   end;
 
   ACtx^.Store.Funcs[AAddr].Callback(ACtx^.Store, ACtx^.Store.Funcs[AAddr].HostData,
-    @ParamBuf[0], @ResBuf[0]);
+    Params, Results);
 
   { The value stack is fixed, so CallerRegs is still valid even if the
     callback re-entered guest code. }
   I := 0;
   while I < ResN do
   begin
-    CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, ADstAux, I)] := ResBuf[I];
+    CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, ADstAux, I)] := Results[I];
     Inc(I);
   end;
+  ReleaseMarshal(ACtx, Wide);
   { The caller's IP was advanced past the call by the dispatch loop before it
     entered here, so a host call simply falls through. }
 end;
@@ -856,30 +975,33 @@ end;
 procedure ReturnHostCall(const ACtx: PWasmInterpContext; const ATop: PWasmActivation;
   const AArgAux: UInt32; const AAddr: TWasmFuncAddr);
 var
-  TopRegs: PWasmValue;
+  TopRegs, Params, Results: PWasmValue;
   ArgN, ResN, I: UInt32;
-  ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+  Wide: PWasmWideBlock;
+  ParamBuf, ResBuf: array[0 .. WASM_INTERP_INLINE_MARSHAL - 1] of TWasmValue;
 begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
-  ResN := ATop^.Fn^.ResultCount;   { equals the host func's result arity }
-  if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmInternal.Create('internal: host-call arity exceeds the marshal cap');
+  { The host func's result block in flat slots (a v128 takes two). }
+  ResN := ResultSlotCount(ATop^.Fn);
+  Wide := AcquireMarshal(ACtx, ArgN, ResN, @ParamBuf[0], @ResBuf[0],
+    Params, Results);
 
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
   while I < ArgN do
   begin
-    ParamBuf[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
+    Params[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
     Inc(I);
   end;
 
   ACtx^.Store.Funcs[AAddr].Callback(ACtx^.Store, ACtx^.Store.Funcs[AAddr].HostData,
-    @ParamBuf[0], @ResBuf[0]);
+    Params, Results);
 
-  { ResBuf is the flat, dense host-result block; scatter it into this frame's
+  { Results is the flat, dense host-result block; scatter it into this frame's
     PADDED result registers so DoReturn reads it back pad-aware (simd-spec
     §1.6). }
-  ScatterResultsFlat(ATop^.Fn, Frame(ACtx^.Values, ATop^.Base), @ResBuf[0]);
+  ScatterResultsFlat(ATop^.Fn, Frame(ACtx^.Values, ATop^.Base), Results);
+  ReleaseMarshal(ACtx, Wide);
   DoReturn(ACtx, ATop);
 end;
 
@@ -951,23 +1073,24 @@ procedure CompiledCall(const ACtx: PWasmInterpContext;
   const ACaller: PWasmActivation; const AArgAux, ADstAux: UInt32;
   const AAddr: TWasmFuncAddr);
 var
-  CallerRegs: PWasmValue;
+  CallerRegs, Params, Results: PWasmValue;
   ArgN, ResN, I: UInt32;
   Seam: TWasmSeamCatch;
   CallerWasNative: Boolean;
-  ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+  Wide: PWasmWideBlock;
+  ParamBuf, ResBuf: array[0 .. WASM_INTERP_INLINE_MARSHAL - 1] of TWasmValue;
 begin
   CallerWasNative := ACaller^.Native;
   ArgN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, AArgAux);
   ResN := IrAuxBlockCount(ACaller^.Fn^.AuxU32, ADstAux);
-  if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmInternal.Create('internal: compiled-call arity exceeds the marshal cap');
+  Wide := AcquireMarshal(ACtx, ArgN, ResN, @ParamBuf[0], @ResBuf[0],
+    Params, Results);
 
   CallerRegs := Frame(ACtx^.Values, ACaller^.Base);
   I := 0;
   while I < ArgN do
   begin
-    ParamBuf[I] := CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, AArgAux, I)];
+    Params[I] := CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, AArgAux, I)];
     Inc(I);
   end;
 
@@ -985,10 +1108,12 @@ begin
   Seam.Resume := False;
   CurrentSeamCatch := @Seam;
   if SetJmp(Seam.JmpBuf) = 0 then
-    ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0])
+    ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, Params, Results)
   else
   begin
     CurrentSeamCatch := Seam.Prev;
+    { The unwind skips the result scatter, so the buffers are dead. }
+    ReleaseMarshal(ACtx, Wide);
     if ACtx^.Depth = 0 then
       JitRaiseUncaught(ACtx^.Store, TWasmRef(Seam.ExnRef));
     if not Seam.Resume then
@@ -1007,9 +1132,10 @@ begin
   I := 0;
   while I < ResN do
   begin
-    CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, ADstAux, I)] := ResBuf[I];
+    CallerRegs[IrAuxBlockItem(ACaller^.Fn^.AuxU32, ADstAux, I)] := Results[I];
     Inc(I);
   end;
+  ReleaseMarshal(ACtx, Wide);
 end;
 
 { return_call to a COMPILED function (jit-spec §4.5): run the compiled callee
@@ -1020,22 +1146,24 @@ procedure ReturnCompiledCall(const ACtx: PWasmInterpContext;
   const ATop: PWasmActivation; const AArgAux: UInt32;
   const AAddr: TWasmFuncAddr);
 var
-  TopRegs: PWasmValue;
+  TopRegs, Params, Results: PWasmValue;
   ArgN, ResN, I: UInt32;
   Seam: TWasmSeamCatch;
   ExnR: TWasmRef;
-  ParamBuf, ResBuf: array[0 .. WASM_INTERP_MAX_MARSHAL - 1] of TWasmValue;
+  Wide: PWasmWideBlock;
+  ParamBuf, ResBuf: array[0 .. WASM_INTERP_INLINE_MARSHAL - 1] of TWasmValue;
 begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
-  ResN := ATop^.Fn^.ResultCount;   { equals the tail callee's result arity }
-  if (ArgN > WASM_INTERP_MAX_MARSHAL) or (ResN > WASM_INTERP_MAX_MARSHAL) then
-    raise EWasmInternal.Create('internal: compiled-call arity exceeds the marshal cap');
+  { The tail callee's result block in flat slots (a v128 takes two). }
+  ResN := ResultSlotCount(ATop^.Fn);
+  Wide := AcquireMarshal(ACtx, ArgN, ResN, @ParamBuf[0], @ResBuf[0],
+    Params, Results);
 
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
   while I < ArgN do
   begin
-    ParamBuf[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
+    Params[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
     Inc(I);
   end;
 
@@ -1051,6 +1179,7 @@ begin
   if SetJmp(Seam.JmpBuf) <> 0 then
   begin
     CurrentSeamCatch := Seam.Prev;
+    ReleaseMarshal(ACtx, Wide);
     ExnR := TWasmRef(Seam.ExnRef);
     ACtx^.Store.Heap.PopFrame;
     ACtx^.ValueTop := ATop^.Base;
@@ -1069,13 +1198,14 @@ begin
     end;
     Exit;
   end;
-  ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, @ParamBuf[0], @ResBuf[0]);
+  ACtx^.Store.JitInvokeCompiled(ACtx^.Store, AAddr, Params, Results);
   CurrentSeamCatch := Seam.Prev;
 
-  { ResBuf is the flat result block; scatter it into this frame's padded
+  { Results is the flat result block; scatter it into this frame's padded
     result registers so DoReturn reads it back pad-aware, exactly as
     ReturnHostCall does for a host tail callee. }
-  ScatterResultsFlat(ATop^.Fn, Frame(ACtx^.Values, ATop^.Base), @ResBuf[0]);
+  ScatterResultsFlat(ATop^.Fn, Frame(ACtx^.Values, ATop^.Base), Results);
+  ReleaseMarshal(ACtx, Wide);
   DoReturn(ACtx, ATop);
 end;
 
@@ -1138,20 +1268,22 @@ procedure BouncePendingTail(const ACtx: PWasmInterpContext;
   const ATop: PWasmActivation; const AArgAux: UInt32;
   const AAddr: TWasmFuncAddr);
 var
-  TopRegs: PWasmValue;
+  TopRegs, Dest: PWasmValue;
   ArgN, I: UInt32;
 begin
   ArgN := IrAuxBlockCount(ATop^.Fn^.AuxU32, AArgAux);
-  if ArgN > WASM_TIER_TAIL_CAP then
-    raise EWasmInternal.Create(
-      'internal: cross-tier tail-call arity exceeds the marshal cap');
+  if ArgN <= WASM_TIER_TAIL_INLINE then
+    Dest := @GTierTail.InlineArgs[0]
+  else
+    Dest := TierTailWideBuffer(ACtx, ArgN);
   TopRegs := Frame(ACtx^.Values, ATop^.Base);
   I := 0;
   while I < ArgN do
   begin
-    GTierTail.Args[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
+    Dest[I] := TopRegs[IrAuxBlockItem(ATop^.Fn^.AuxU32, AArgAux, I)];
     Inc(I);
   end;
+  GTierTail.Args := Dest;
   GTierTail.Addr := AAddr;
   GTierTail.ArgCount := ArgN;
   GTierTail.Pending := True;
@@ -3301,6 +3433,8 @@ begin
   Result^.Acts := GetMem(Result^.DepthCap * SizeOf(TWasmActivation));
   Result^.FuncsSlot := @AStore.Funcs;
   Result^.GcFrameSlot := AStore.Heap.FrameSlot;
+  Result^.WideScratch := nil;
+  Result^.TailWide := nil;
 end;
 
 { The store's TierContextFree hook: releases the two reservations and the
@@ -3316,6 +3450,8 @@ begin
     FreeMem(Ctx^.ValuesRaw);
   if Ctx^.Acts <> nil then
     FreeMem(Ctx^.Acts);
+  FreeWideChain(Ctx^.WideScratch);
+  FreeWideChain(Ctx^.TailWide);
   Dispose(Ctx);
 end;
 
@@ -3338,6 +3474,9 @@ begin
   Ctx := PWasmInterpContext(AStore.TierContext);
   Ctx^.Depth := 0;
   Ctx^.ValueTop := 0;
+  { No call site survives a top-level trap landing; drop the wide marshal
+    blocks the unwind abandoned. }
+  FreeWideChain(Ctx^.WideScratch);
 end;
 
 { --- host function as the entry point (interp-spec §4.5) ----------------- }
@@ -3923,6 +4062,9 @@ begin
   begin
     Ctx^.Depth := 0;
     Ctx^.ValueTop := 0;
+    { Every interpreter call site holding a wide block has its caller frame
+      on the GC chain, so an empty chain means any left are abandoned. }
+    FreeWideChain(Ctx^.WideScratch);
     AStore.EpochSnapshot := AStore.Epoch;
   end;
 

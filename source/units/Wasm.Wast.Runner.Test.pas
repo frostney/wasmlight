@@ -275,7 +275,7 @@ type
     procedure TestX64ScaledIndexFixtureAllTiers;
     procedure TestGcV128FixtureAllTiers;
     procedure TestExnV128FixtureAllTiers;
-    procedure TestAotModeMixedTiersCoexist;
+    procedure TestWideTailCallsAllTiers;
     procedure TestAotTallyIdenticalToInterp;
     procedure TestAotLoadedCountMatchesJit;
   end;
@@ -1699,52 +1699,197 @@ begin
   end;
 end;
 
-procedure TWastRunnerTests.TestAotModeMixedTiersCoexist;
-  { Handler tables and wide non-tail calls compile, so the declined fixture
-    is a return_call one past WASM_TIER_TAIL_CAP. $wide compiles; "declined"
-    stays interpreted. }
-  function MixedAotModule: string;
-  var
-    I: Integer;
-    Params, Args: string;
+{ Tail calls wider than the 1024-slot inline marshal and tail buffers
+  (exec-return_call, exec-return_call_indirect, exec-return_call_ref: no
+  arity bound, no trap). return_call / return_call_indirect / return_call_ref
+  with 1025 i32 arguments into an order-sensitive checksum, a wide self tail
+  loop, 513 v128 arguments (1026 flat slots), and a 1025-result block through
+  a tail call. The expected values come from the Pascal model below, not
+  from a tier. Every tier must pass every command, and on a backend host the
+  compiled tiers must compile every function: no wide tail is declined. }
+procedure TWastRunnerTests.TestWideTailCallsAllTiers;
+const
+  WIDE = 1025;
+  WIDE_V128 = 513;
+  SPIN_ROUNDS = 300;
+  { One module, seven assert_return. }
+  COMMANDS = 8;
+  COMPILED_FUNCTIONS = 12;
+
+  function I32Arg(const ASeed, AK: Integer): UInt32;
   begin
-    Params := '';
-    Args := '';
-    for I := 1 to WASM_TIER_TAIL_CAP + 1 do
+    Result := UInt32(ASeed * 4096 + AK);
+  end;
+
+  function I32Args(const ASeed: Integer): string;
+  var
+    K: Integer;
+  begin
+    Result := '';
+    for K := 0 to WIDE - 1 do
+      Result := Result + ' (i32.const ' + IntToStr(I32Arg(ASeed, K)) + ')';
+  end;
+
+  function Checksum32(const ASeed: Integer): UInt32;
+  var
+    K: Integer;
+  begin
+    Result := 0;
+    for K := 0 to WIDE - 1 do
+      Result := RolDWord(Result xor I32Arg(ASeed, K), 3);
+  end;
+
+  function SpinModel(const AN: Integer): UInt32;
+  var
+    P, Q: array[0 .. WIDE - 1] of UInt32;
+    K: Integer;
+  begin
+    P[0] := UInt32(AN);
+    for K := 1 to WIDE - 1 do
+      P[K] := UInt32(K - 1);
+    while P[0] <> 0 do
     begin
-      Params := Params + ' i32';
-      Args := Args + ' (i32.const 0)';
+      Q[0] := P[0] - 1;
+      Q[1] := P[1] + P[WIDE - 1];
+      for K := 2 to WIDE - 1 do
+        Q[K] := P[K - 1];
+      P := Q;
+    end;
+    Result := P[1];
+  end;
+
+  function V128Lane(const AK, ALane: Integer): UInt64;
+  begin
+    Result := UInt64(AK) * 1000 + UInt64(ALane) + 7;
+  end;
+
+  function ChecksumV128: UInt64;
+  var
+    K: Integer;
+  begin
+    Result := 0;
+    for K := 0 to WIDE_V128 - 1 do
+      Result := RolQWord(Result xor V128Lane(K, 0), 7) xor V128Lane(K, 1);
+  end;
+
+  function ManyResult(const AK: Integer): UInt32;
+  begin
+    Result := I32Arg(9, AK);
+  end;
+
+  function FoldMany: UInt32;
+  var
+    K: Integer;
+  begin
+    Result := ManyResult(WIDE - 1);
+    for K := WIDE - 2 downto 0 do
+      Result := RolDWord(ManyResult(K) xor Result, 1);
+  end;
+
+  function WideModule: string;
+  var
+    K: Integer;
+    I32s, V128s, Body, VBody, Shifted, SpinSeed, Consts, Fold, VArgs: string;
+  begin
+    I32s := '';
+    Body := '(i32.const 0)';
+    Shifted := '';
+    SpinSeed := '';
+    Consts := '';
+    Fold := '(call $tailmany)';
+    for K := 0 to WIDE - 1 do
+    begin
+      I32s := I32s + ' i32';
+      Body := Body + ' (local.get ' + IntToStr(K)
+        + ') (i32.xor) (i32.const 3) (i32.rotl)';
+      if (K >= 1) and (K <= WIDE - 2) then
+        Shifted := Shifted + ' (local.get ' + IntToStr(K) + ')';
+      if K <= WIDE - 2 then
+      begin
+        SpinSeed := SpinSeed + ' (i32.const ' + IntToStr(K) + ')';
+        Fold := Fold + ' (i32.xor) (i32.const 1) (i32.rotl)';
+      end;
+      Consts := Consts + ' (i32.const ' + IntToStr(ManyResult(K)) + ')';
+    end;
+    V128s := '';
+    VBody := '(i64.const 0)';
+    VArgs := '';
+    for K := 0 to WIDE_V128 - 1 do
+    begin
+      V128s := V128s + ' v128';
+      VBody := VBody + ' (i64x2.extract_lane 0 (local.get ' + IntToStr(K)
+        + ')) (i64.xor) (i64.const 7) (i64.rotl) (i64x2.extract_lane 1'
+        + ' (local.get ' + IntToStr(K) + ')) (i64.xor)';
+      VArgs := VArgs + ' (v128.const i64x2 ' + IntToStr(V128Lane(K, 0))
+        + ' ' + IntToStr(V128Lane(K, 1)) + ')';
     end;
     Result :=
       '(module'
-      + ' (func (export "add") (param i32 i32) (result i32)'
-      + '   (i32.add (local.get 0) (local.get 1)))'
-      + ' (func $wide (param' + Params + ') (result i32) (i32.const 7))'
-      + ' (func (export "declined") (result i32) (return_call $wide' + Args + ')))';
+      + ' (type $tw (func (param' + I32s + ') (result i32)))'
+      + ' (type $tv (func (param' + V128s + ') (result i64)))'
+      + ' (type $tm (func (result' + I32s + ')))'
+      + ' (table funcref (elem $wide))'
+      + ' (elem declare func $wide)'
+      + ' (func $wide (type $tw) ' + Body + ')'
+      + ' (func (export "call") (result i32) (call $wide' + I32Args(1) + '))'
+      + ' (func (export "tail") (result i32) (return_call $wide'
+      + I32Args(2) + '))'
+      + ' (func (export "tail_indirect") (result i32)'
+      + ' (return_call_indirect (type $tw)' + I32Args(3) + ' (i32.const 0)))'
+      + ' (func (export "tail_ref") (result i32) (return_call_ref $tw'
+      + I32Args(4) + ' (ref.func $wide)))'
+      + ' (func $spin (type $tw)'
+      + ' (if (i32.eqz (local.get 0)) (then (return (local.get 1))))'
+      + ' (return_call $spin (i32.sub (local.get 0) (i32.const 1))'
+      + ' (i32.add (local.get 1) (local.get ' + IntToStr(WIDE - 1) + '))'
+      + Shifted + '))'
+      + ' (func (export "spin") (param i32) (result i32)'
+      + ' (return_call $spin (local.get 0)' + SpinSeed + '))'
+      + ' (func $widev (type $tv) ' + VBody + ')'
+      + ' (func (export "tail_v128") (result i64) (return_call $widev'
+      + VArgs + '))'
+      + ' (func $many (type $tm)' + Consts + ')'
+      + ' (func $tailmany (type $tm) (return_call $many))'
+      + ' (func (export "many") (result i32) ' + Fold + '))';
   end;
+
+  function Expect32(const AName, AArg: string; const AValue: UInt32): string;
+  begin
+    Result := sLineBreak + '(assert_return (invoke "' + AName + '"' + AArg
+      + ') (i32.const ' + IntToStr(Int32(AValue)) + '))';
+  end;
+
 var
+  Src: string;
+  Mode: TWastTierMode;
   Run: TWastRunResult;
 begin
-  { Invoke only compiled exports. The declined return_call is past the
-    shared tail/marshal cap, so running it would raise EWasmInternal rather
-    than return 7. Coexistence is the compile-count split. }
-  Run := RunWastSource(MixedAotModule + sLineBreak
-    + '(assert_return (invoke "add" (i32.const 40) (i32.const 2)) '
-    + '(i32.const 42))' + sLineBreak
-    + '(assert_return (invoke "add" (i32.const 1) (i32.const 6)) '
-    + '(i32.const 7))', wtmAot);
-  try
-    Expect<string>(WastStatusName(Run[0].Status)).ToBe('pass');
-    Expect<string>(WastStatusName(Run[1].Status)).ToBe('pass');
-    Expect<string>(WastStatusName(Run[2].Status)).ToBe('pass');
-    {$IFDEF WASM_JIT_BACKEND}
-    { "add" and $wide AOT-loaded; "declined" stays interpreted. }
-    Expect<Integer>(Run.CompiledFuncCount).ToBe(2);
-    {$ELSE}
-    Expect<Integer>(Run.CompiledFuncCount).ToBe(0);
-    {$ENDIF}
-  finally
-    Run.Free;
+  Src := WideModule
+    + Expect32('call', '', Checksum32(1))
+    + Expect32('tail', '', Checksum32(2))
+    + Expect32('tail_indirect', '', Checksum32(3))
+    + Expect32('tail_ref', '', Checksum32(4))
+    + Expect32('spin', ' (i32.const ' + IntToStr(SPIN_ROUNDS) + ')',
+      SpinModel(SPIN_ROUNDS))
+    + sLineBreak + '(assert_return (invoke "tail_v128") (i64.const '
+    + IntToStr(Int64(ChecksumV128)) + '))'
+    + Expect32('many', '', FoldMany);
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastSource(Src, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
   end;
 end;
 
@@ -1960,8 +2105,8 @@ begin
     TestGcV128FixtureAllTiers);
   Test('the v128 exception payload fixture passes in every tier',
     TestExnV128FixtureAllTiers);
-  Test('--tier=aot lets AOT-loaded and interpreted functions coexist',
-    TestAotModeMixedTiersCoexist);
+  Test('tail calls wider than the inline buffers pass in every tier',
+    TestWideTailCallsAllTiers);
   Test('the --tier=aot tally is identical to the interpreter tally',
     TestAotTallyIdenticalToInterp);
   Test('the --tier=aot loaded count equals the --tier=jit compiled count',

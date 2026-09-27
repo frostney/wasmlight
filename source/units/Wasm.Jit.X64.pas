@@ -331,11 +331,6 @@ const
     historical comfort cap, not a compile decline. }
   X64_MAX_SLOT = 1 shl 20;
 
-  { Historical marshaling bound, mirrored from aarch64. Call sites above this
-    already use add/sub rsp, imm32; the constant remains for tests that name
-    it. }
-  X64_MAX_CALL_SLOTS = 256;
-
   { Condition-code nibbles (SDM Vol. 2 Appendix B, Jcc/SETcc). opcode is
     0F 80+cc (Jcc rel32) / 0F 90+cc (SETcc r/m8). }
   X64_CC_E = $4;    { ZF=1        (== / signed & unsigned) }
@@ -783,8 +778,6 @@ function X64ImmediateOperand(const AConst, AConsumer: TWasmIrInstr;
   the immediate forms. }
 function X64CodeHasVecCacheOp(const ACode: TWasmIrCode;
   const ASkip: array of Boolean): Boolean;
-function X64CanEmitInstr(const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32): Boolean;
 
 { The compiled-entry invocation trampoline (jit-spec §4.5, §5.2), identical in
   logic to the aarch64 backend's: builds the callee's frame through the SHARED
@@ -2860,11 +2853,11 @@ begin
   Result := AStore.FuncRefAddr(R);
 end;
 
-procedure X64SetPendingTail(const AAddr: TWasmFuncAddr;
-  const AArgs: PWasmValue; const ACount: UInt32);
+procedure X64SetPendingTail(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AArgs: PWasmValue; const ACount: UInt32);
 begin
   { Publish into the SHARED cross-tier channel (Fix A). }
-  SetTierPendingTail(AAddr, AArgs, ACount);
+  SetTierPendingTail(AStore, AAddr, AArgs, ACount);
 end;
 
 { --- the six cdecl helpers the emitted call sequences call --------------- }
@@ -2894,23 +2887,26 @@ procedure X64ReturnCallHelper(const AStore: TWasmStore;
   const AFuncIdx: PtrUInt; const AArgs: PWasmValue;
   const ACount: PtrUInt); cdecl;
 begin
-  X64SetPendingTail(X64CallerInstance(AStore).FuncAddrs[UInt32(AFuncIdx)],
-    AArgs, UInt32(ACount));
+  X64SetPendingTail(AStore,
+    X64CallerInstance(AStore).FuncAddrs[UInt32(AFuncIdx)], AArgs,
+    UInt32(ACount));
 end;
 
 procedure X64ReturnCallIndirectHelper(const AStore: TWasmStore;
   const APacked: PtrUInt; const AIndexBits: UInt64; const AArgs: PWasmValue;
   const ACount: PtrUInt); cdecl;
 begin
-  X64SetPendingTail(X64ResolveIndirect(AStore, UInt64(APacked), AIndexBits),
-    AArgs, UInt32(ACount));
+  X64SetPendingTail(AStore,
+    X64ResolveIndirect(AStore, UInt64(APacked), AIndexBits), AArgs,
+    UInt32(ACount));
 end;
 
 procedure X64ReturnCallRefHelper(const AStore: TWasmStore;
   const ARefBits: PtrUInt; const AArgs: PWasmValue;
   const ACount: PtrUInt); cdecl;
 begin
-  X64SetPendingTail(X64ResolveRef(AStore, ARefBits), AArgs, UInt32(ACount));
+  X64SetPendingTail(AStore, X64ResolveRef(AStore, ARefBits), AArgs,
+    UInt32(ACount));
 end;
 
 procedure X64InvokeCompiled(const AStore: TWasmStore;
@@ -2953,7 +2949,7 @@ begin
         Exit;
       Pend^.Pending := False;
       CurAddr := Pend^.Addr;
-      CurArgs := @Pend^.Args[0];
+      CurArgs := Pend^.Args;
       Continue;
     end;
 
@@ -3006,7 +3002,7 @@ begin
           Exit;
         Pend^.Pending := False;
         CurAddr := Pend^.Addr;
-        CurArgs := @Pend^.Args[0];
+        CurArgs := Pend^.Args;
         Continue;
       end;
       if CurrentSeamCatch <> nil then
@@ -3022,7 +3018,7 @@ begin
       Exit;
     Pend^.Pending := False;
     CurAddr := Pend^.Addr;
-    CurArgs := @Pend^.Args[0];
+    CurArgs := Pend^.Args;
   end;
 end;
 
@@ -6526,18 +6522,6 @@ begin
     or X64RuntimeOp(AOp) or X64BranchRefOp(AOp)
     or X64VecOp(AOp)
     or (AOp in [iroThrow, iroThrowRef]);
-end;
-
-function X64CanEmitInstr(const AIns: TWasmIrInstr;
-  const AAux: TWasmIrAuxU32): Boolean;
-begin
-  { Direct/indirect/ref calls marshal on the native stack. return_call*
-    publishes arguments through GTierTail, which is bounded. }
-  Result := True;
-  case AIns.Op of
-    iroReturnCall, iroReturnCallIndirect, iroReturnCallRef:
-      Result := IrAuxBlockCount(AAux, AIns.A) <= WASM_TIER_TAIL_CAP;
-  end;
 end;
 
 function X64EmitOp(const ABuf: TWasmCodeBuffer;
