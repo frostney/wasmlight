@@ -1,5 +1,34 @@
 # Handoff
 
+## Release layout fix (ORDERFIELDS), 2026-09-27
+
+- Branch `fix/release-layout-orderfields` from exact main `b9d8085`. Wave-5
+  lane M noticed the release disassembly used different store offsets from
+  dev (0x98 vs 0xa0).
+- Cause: `lwpt build --mode release` compiles with `-O4`, which turns on
+  FPC's ORDERFIELDS and reorders class fields. A probe with `-dPRODUCTION -O4`
+  showed:
+  - store `JitHelperTable` 152 (published 160) and `Epoch` 120 (128);
+  - heap `BytesLive` 232 (272), `Threshold` 280 (320) and `FFree0` 32 (48).
+  `-dPRODUCTION` alone and `-O3` matched, which is why #136's CR-2 probe
+  missed it.
+- Impact: host artifacts are stamped with the published fingerprint, so the
+  release `b9d8085` runtime loaded dev-built `.waot` files for gc, memory
+  and call, then faulted with an access violation. Native executables had
+  the same exposure.
+- Fix:
+  - `{$optimization noorderfields}` in `Shared.inc`. Dev and release `.waot`
+    files are now byte-identical, and each build runs the other's.
+  - `WasmLiveTargetAbi` fills the host descriptor from live offsets.
+  - Load side: a drifted build answers with its live fingerprint, so
+    `run --aot` falls back to the interpreter and the shell rejects the
+    payload.
+  - Stamp side: `aot` and `compile` for the host raise `EWasmInternal`, which
+    now reports cleanly instead of escaping unhandled.
+- Mutation evidence: removing the directive and building release makes
+  `aot` exit 1 with the internal message, and `run --aot` of a dev artifact
+  falls back to the interpreter with exit 0.
+
 ## x64 wave 4 — retained outcome, 2026-09-26
 
 - Delivery branch `codex/optimize-x64-wave4` from exact main `36c9394` (push CI

@@ -278,7 +278,16 @@ function AotFingerprintFor(const AStore: TWasmStore;
   const ATarget: TWasmTarget): UInt64;
 begin
   if WasmTargetSupported(ATarget) then
-    Result := WasmTargetAbiFingerprint(WasmTargetAbi(ATarget))
+  begin
+    Result := WasmTargetAbiFingerprint(WasmTargetAbi(ATarget));
+    { Host code bakes this build's live offsets under the published stamp,
+      so a build whose layout drifted from Wasm.Target would stamp code no
+      conforming runtime can run. }
+    if WasmTargetEqual(ATarget, WasmTargetHost) and
+      (WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore)) <> Result) then
+      raise EWasmInternal.Create('internal: this build''s runtime layout ' +
+        'differs from the published target layout (Wasm.Target)');
+  end
   else
     Result := WasmAotAbiFingerprint(AStore);
 end;

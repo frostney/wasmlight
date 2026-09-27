@@ -412,6 +412,13 @@ const
   live-layout fold is retained so Windows/32-bit cache stamping is unchanged. }
 function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
 
+{ The host descriptor with every published layout field replaced by the
+  offset this build actually has (WasmJitOffsets, WasmJitFrameOffsets,
+  WasmJitGcHeapOffsets) and the IR/value/helper/revision constants of this
+  build. On a supported host it must fingerprint exactly as the published
+  descriptor; WasmAotAbiFingerprint and Wasm.Aot's stamping enforce that. }
+function WasmLiveTargetAbi(const AStore: TWasmStore): TWasmTargetAbi;
+
 implementation
 
 uses
@@ -3769,10 +3776,99 @@ begin
 end;
 {$pop}
 
+function WasmLiveTargetAbi(const AStore: TWasmStore): TWasmTargetAbi;
+var
+  JO: TWasmJitOffsets;
+  FO: TWasmJitFrameOffsets;
+  GO: TWasmJitGcOffsets;
+begin
+  Result := WasmTargetAbi(WasmTargetHost);
+  JO := WasmJitOffsets(AStore);
+  FO := WasmJitFrameOffsets;
+  GO := WasmJitGcHeapOffsets;
+  Result.Layout.StoreEpoch := JO.StoreEpoch;
+  Result.Layout.StoreEpochSnapshot := JO.StoreEpochSnapshot;
+  Result.Layout.StoreJitHelperTable := JO.StoreJitHelperTable;
+  Result.Layout.FuncInstStride := JO.FuncInstStride;
+  Result.Layout.FuncKind := JO.FuncKind;
+  Result.Layout.FuncCompiledEntry := JO.FuncCompiledEntry;
+  Result.Layout.FuncCompiledDirectEntry := JO.FuncCompiledDirectEntry;
+  Result.Layout.FuncCompiledNativeScalarEntry := JO.FuncCompiledNativeScalarEntry;
+  Result.Layout.FuncDirectMeta := JO.FuncDirectMeta;
+  Result.Layout.DirectMetaFn := JO.DirectMetaFn;
+  Result.Layout.DirectMetaIrBase := JO.DirectMetaIrBase;
+  Result.Layout.DirectMetaFuncAddrs := JO.DirectMetaFuncAddrs;
+  Result.Layout.DirectMetaEntryZeroRegs := JO.DirectMetaEntryZeroRegs;
+  Result.Layout.DirectMetaRefRegBits := JO.DirectMetaRefRegBits;
+  Result.Layout.DirectMetaRegisterCount := JO.DirectMetaRegisterCount;
+  Result.Layout.DirectMetaEntryZeroCount := JO.DirectMetaEntryZeroCount;
+  Result.Layout.DirectMetaParam0Reg := JO.DirectMetaParam0Reg;
+  Result.Layout.DirectMetaParam1Reg := JO.DirectMetaParam1Reg;
+  Result.Layout.DirectMetaResult0Reg := JO.DirectMetaResult0Reg;
+  Result.Layout.FuncCallCount := JO.FuncCallCount;
+  Result.Layout.FuncInstance := JO.FuncInstance;
+  Result.Layout.MemInstStride := JO.MemInstStride;
+  Result.Layout.MemBase := JO.MemBase;
+  Result.Layout.MemByteSize := JO.MemByteSize;
+  Result.Layout.StoreFHeap := JO.StoreFHeap;
+  Result.Layout.StoreTierContext := JO.StoreTierContext;
+  Result.Layout.InstEngineTypeIds := JO.InstEngineTypeIds;
+  Result.Layout.StoreMemories := JO.StoreMemories;
+  Result.Layout.InstMemAddrs := JO.InstMemAddrs;
+  Result.Layout.HeapFFree0 := GO.HeapFFree0;
+  Result.Layout.HeapMarkState := GO.HeapMarkState;
+  Result.Layout.HeapBytesLive := GO.HeapBytesLive;
+  Result.Layout.HeapBytesAllocated := GO.HeapBytesAllocated;
+  Result.Layout.HeapObjectCount := GO.HeapObjectCount;
+  Result.Layout.HeapThreshold := GO.HeapThreshold;
+  Result.Layout.BlockBase := GO.BlockBase;
+  Result.Layout.BlockAllocated := GO.BlockAllocated;
+  Result.Layout.CtxValues := FO.CtxValues;
+  Result.Layout.CtxValueTop := FO.CtxValueTop;
+  Result.Layout.CtxValueCap := FO.CtxValueCap;
+  Result.Layout.CtxActs := FO.CtxActs;
+  Result.Layout.CtxDepthCap := FO.CtxDepthCap;
+  Result.Layout.CtxDepth := FO.CtxDepth;
+  Result.Layout.CtxFuncsSlot := FO.CtxFuncsSlot;
+  Result.Layout.CtxGcFrameSlot := FO.CtxGcFrameSlot;
+  Result.Layout.ActStride := FO.ActStride;
+  Result.Layout.ActBase := FO.ActBase;
+  Result.Layout.ActFn := FO.ActFn;
+  Result.Layout.ActInstance := FO.ActInstance;
+  Result.Layout.ActFuncAddrs := FO.ActFuncAddrs;
+  Result.Layout.ActIP := FO.ActIP;
+  Result.Layout.ActGcFrame := FO.ActGcFrame;
+  Result.Layout.ActRetKind := FO.ActRetKind;
+  Result.Layout.ActRetDest := FO.ActRetDest;
+  Result.Layout.ActRetCount := FO.ActRetCount;
+  Result.Layout.ActRetBase := FO.ActRetBase;
+  Result.Layout.ActEntryResults := FO.ActEntryResults;
+  Result.Layout.ActNative := FO.ActNative;
+  Result.Layout.GcFramePrev := FO.GcFramePrev;
+  Result.Layout.GcFrameSlots := FO.GcFrameSlots;
+  Result.Layout.GcFrameRefRegBits := FO.GcFrameRefRegBits;
+  Result.Layout.GcFrameRegisterCount := FO.GcFrameRegisterCount;
+  Result.Layout.GcFrameInstance := FO.GcFrameInstance;
+  Result.IrInstrSize := SizeOf(TWasmIrInstr);
+  Result.ValueSlotSize := SizeOf(TWasmValue);
+  Result.HelperCount := AOT_HELPER_COUNT;
+  Result.AbiRevision := AOT_ABI_REVISION;
+end;
+
 function WasmAotAbiFingerprint(const AStore: TWasmStore): UInt64;
 begin
   if WasmTargetSupported(WasmTargetHost) then
-    Result := WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost))
+  begin
+    Result := WasmTargetAbiFingerprint(WasmTargetAbi(WasmTargetHost));
+    { Artifacts are stamped with the published descriptor, but a build
+      whose layout drifted from it (-O4 ORDERFIELDS once reordered class
+      fields in release only) does not have those offsets. Answer with the
+      live fingerprint then, so every published-layout artifact or payload
+      is rejected instead of wired onto the wrong offsets. Stamping from such
+      a build is refused in Wasm.Aot. }
+    if WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore)) <> Result then
+      Result := WasmTargetAbiFingerprint(WasmLiveTargetAbi(AStore));
+  end
   else
     Result := WasmAotAbiFingerprintFromLiveRuntime(AStore);
 end;
