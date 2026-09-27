@@ -1,0 +1,336 @@
+name: Release assets
+
+# Builds, packs, and verifies the four 64-bit Unix compiler-host archives
+# and their checksums file for one release version. Manual only: there is
+# no tag or push trigger, so this is never a second publisher. The release
+# itself (changelog, tag, GitHub release) belongs to /create-release; this
+# workflow produces the assets and attaches them only when asked to, and
+# only to a release that already exists for the same commit.
+#
+#   resolve  pin `ref` to one commit and check `version` is its manifest's
+#   build    per native runner: release-mode compiler + runtime shell
+#   pack     per native runner: pack the host archive from live shells —
+#            the host's own shell plus the same-architecture shell built on
+#            the other OS's runner — and verify it with --require-compile
+#            (native compile + execution for the host target, structural
+#            emission for the other OS; four legs, not a 16-cell matrix)
+#   gather   merge the checksums file, verify the complete set, upload
+#   attach   optional: upload the verified set to the existing release
+#
+# Cross-architecture emission is #148 (0.3.0), so each archive carries its
+# host architecture for Linux and macOS only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (the release tag, or a branch for a dry run)"
+        required: true
+        type: string
+      version:
+        description: "Release version; must equal [package].version at ref (unprefixed SemVer)"
+        required: true
+        type: string
+      attach:
+        description: "Attach the verified assets to the existing GitHub release named <version>"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-assets-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  LWPT_VERSION: "0.7.0"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Pin the commit and check the manifest version
+        id: pin
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::version '$VERSION' is not unprefixed SemVer"; exit 1
+          fi
+          MANIFEST_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("lwpt.toml", "rb"))["package"]["version"])')
+          if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
+            echo "::error::version $VERSION does not match [package].version $MANIFEST_VERSION at this ref"; exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: x86_64-linux
+            runner: ubuntu-latest
+            lwpt-asset: linux-x64
+            fpc-install: apt
+          - triple: aarch64-linux
+            runner: ubuntu-24.04-arm
+            lwpt-asset: linux-arm64
+            fpc-install: apt
+          - triple: aarch64-darwin
+            runner: macos-latest
+            lwpt-asset: macos-arm64
+            fpc-install: brew
+          - triple: x86_64-darwin
+            runner: macos-15-intel
+            lwpt-asset: macos-x64
+            fpc-install: brew
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ inputs.version }}
+      WASMLIGHT_VERSION_OVERRIDE: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install FPC (apt)
+        if: matrix.fpc-install == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install FPC (brew)
+        if: matrix.fpc-install == 'brew'
+        run: |
+          brew install fpc
+          fpc -iV
+
+      - name: Install lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ASSET="lwpt-${LWPT_VERSION}-${{ matrix.lwpt-asset }}"
+          BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
+          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          else
+            sha256sum -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          fi
+          tar xzf "${ASSET}.tar.gz"
+          echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
+
+      - name: lwpt install --frozen
+        run: lwpt install --frozen
+
+      # The stamp hook is staleness-gated on lwpt.toml, so restamp explicitly
+      # under the override before the release build.
+      - name: Build the release compiler and runtime shell
+        run: |
+          set -euo pipefail
+          instantfpc scripts/stamp-version.pas
+          lwpt build --mode release wasmlight wasmlight-shell
+          test "$(./build/wasmlight --version)" = "wasmlight $VERSION"
+
+      # Upload-artifact drops the executable bit, so the pair travels as a
+      # tarball.
+      - name: Bundle the build
+        run: tar -C build -czf "$RUNNER_TEMP/build-${{ matrix.triple }}.tar.gz" wasmlight wasmlight-shell
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.triple }}
+          path: ${{ runner.temp }}/build-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  pack:
+    needs: [resolve, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-linux
+            other-os: x86_64-darwin
+            runner: ubuntu-latest
+            fpc-install: apt
+          - triple: aarch64-linux
+            other-os: aarch64-darwin
+            runner: ubuntu-24.04-arm
+            fpc-install: apt
+          - triple: aarch64-darwin
+            other-os: aarch64-linux
+            runner: macos-latest
+            fpc-install: brew
+          - triple: x86_64-darwin
+            other-os: x86_64-linux
+            runner: macos-15-intel
+            fpc-install: brew
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install FPC (apt)
+        if: matrix.fpc-install == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install FPC (brew)
+        if: matrix.fpc-install == 'brew'
+        run: |
+          brew install fpc
+          fpc -iV
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-${{ matrix.triple }}
+          path: ${{ runner.temp }}/artifacts
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-${{ matrix.other-os }}
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Pack the archive from live shells
+        run: |
+          set -euo pipefail
+          for T in "${{ matrix.triple }}" "${{ matrix.other-os }}"; do
+            mkdir -p "$RUNNER_TEMP/builds/$T"
+            tar -C "$RUNNER_TEMP/builds/$T" -xzf "$RUNNER_TEMP/artifacts/build-$T.tar.gz"
+          done
+          instantfpc -Fusource/units -Fisource/units scripts/pack-release.pas \
+            --compiler "$RUNNER_TEMP/builds/${{ matrix.triple }}/wasmlight" \
+            --version "$VERSION" \
+            --out "$RUNNER_TEMP/dist" \
+            --shell "${{ matrix.triple }}=$RUNNER_TEMP/builds/${{ matrix.triple }}/wasmlight-shell" \
+            --shell "${{ matrix.other-os }}=$RUNNER_TEMP/builds/${{ matrix.other-os }}/wasmlight-shell"
+
+      - name: Verify the archive on its own host
+        run: |
+          set -euo pipefail
+          ARCHIVE="$(ls "$RUNNER_TEMP/dist/wasmlight-$VERSION"-*.tar.gz)"
+          instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
+            --archive "$ARCHIVE" \
+            --checksums "$RUNNER_TEMP/dist/wasmlight-$VERSION-checksums.txt" \
+            --version "$VERSION" \
+            --require-compile
+
+      - name: Stage the archive and its checksum line
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/dist/wasmlight-$VERSION"-*.tar.gz "$RUNNER_TEMP/out/"
+          cp "$RUNNER_TEMP/dist/wasmlight-$VERSION-checksums.txt" \
+            "$RUNNER_TEMP/out/checksum-${{ matrix.triple }}.txt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.triple }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  gather:
+    needs: [resolve, pack]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install FPC (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: archive-*
+          path: ${{ runner.temp }}/in
+          merge-multiple: true
+
+      - name: Merge the checksums file
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$RUNNER_TEMP/in/wasmlight-$VERSION"-*.tar.gz "$RUNNER_TEMP/release/"
+          cat "$RUNNER_TEMP/in"/checksum-*.txt | LC_ALL=C sort -k2 \
+            > "$RUNNER_TEMP/release/wasmlight-$VERSION-checksums.txt"
+          cat "$RUNNER_TEMP/release/wasmlight-$VERSION-checksums.txt"
+          (cd "$RUNNER_TEMP/release" && sha256sum -c "wasmlight-$VERSION-checksums.txt")
+
+      # Every archive against the merged file: the complete four-host set,
+      # structure, and MANIFEST hashes. Execution already ran per host.
+      - name: Verify the complete release set
+        run: |
+          set -euo pipefail
+          for ARCHIVE in "$RUNNER_TEMP/release/wasmlight-$VERSION"-*.tar.gz; do
+            instantfpc -Fusource/units -Fisource/units scripts/verify-archive.pas \
+              --archive "$ARCHIVE" \
+              --checksums "$RUNNER_TEMP/release/wasmlight-$VERSION-checksums.txt" \
+              --version "$VERSION" \
+              --complete-set
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wasmlight-${{ inputs.version }}-release
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+
+  attach:
+    if: inputs.attach
+    needs: [resolve, gather]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasmlight-${{ inputs.version }}-release
+          path: ${{ runner.temp }}/release
+
+      # /create-release owns the tag and the release. This job only adds
+      # assets, never replaces one, and only when the release's tag names
+      # the commit these assets were built from.
+      - name: Attach to the existing release
+        run: |
+          set -euo pipefail
+          if ! gh release view "$VERSION" >/dev/null; then
+            echo "::error::release $VERSION does not exist; create it through /create-release first"; exit 1
+          fi
+          TAG_SHA=$(gh api "repos/$GH_REPO/commits/$VERSION" --jq .sha)
+          if [ "$TAG_SHA" != "$SHA" ]; then
+            echo "::error::tag $VERSION is $TAG_SHA but the assets were built from $SHA"; exit 1
+          fi
+          gh release upload "$VERSION" "$RUNNER_TEMP/release"/*
