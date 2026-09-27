@@ -79,6 +79,8 @@ type
     procedure TestDirectOperandEncodings;
     procedure TestDirectOperandCachedOps;
     procedure TestDirectOperandBookkeeping;
+    procedure TestImmediateEncodings;
+    procedure TestImmediateCachedOps;
     procedure TestGcFieldAccessBytes;
     procedure TestGcArrayAccessBytes;
     procedure TestVecCacheEncodings;
@@ -1201,12 +1203,11 @@ var
   end;
 
 begin
-  { After the two static loads (7 bytes) the constants reach r10 and r11:
-    mov eax, 7 ; mov r10, rax ; mov eax, 9 ; mov r11, rax. }
+  { After the two static loads (7 bytes) the constants go straight to r10
+    and r11: mov r10d, 7 ; mov r11d, 9. }
   Setup(1, 1);
   Start := 7;
-  CheckAdded([$B8, $07, $00, $00, $00, $49, $89, $C2,
-    $B8, $09, $00, $00, $00, $49, $89, $C3]);
+  CheckAdded([$41, $BA, $07, $00, $00, $00, $41, $BB, $09, $00, $00, $00]);
 
   { Result slot is the left operand's: one in-place add r10d, r11d. }
   Setup(1, 1);
@@ -1419,6 +1420,267 @@ begin
   finally
     Buf.Free;
   end;
+end;
+
+{ --- immediate operands (SDM Vol. 2: 83/81 group 1, 6B/69 IMUL, C1 group 2,
+  8D LEA, 89 MOV, C7 /0 MOV imm32, B8+rd) ---------------------------------- }
+
+procedure TX64Tests.TestImmediateEncodings;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  { imm8 vs imm32 at both sign boundaries, REX.B for r8-r15, and REX.W:
+    add r10d,127 ; add r10d,128 ; add r10d,-128 ; add r10d,-129 ;
+    sub eax,1 ; and ecx,0x3fff ; or r15,-1 ; xor r11,0x7fffffff ;
+    cmp r8d,1000000000 ; cmp r9,-2^31 ; xor r11d,0x9e3779b9. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitAluRegImm(Buf, 0, False, X64_R10, 127);
+    X64EmitAluRegImm(Buf, 0, False, X64_R10, 128);
+    X64EmitAluRegImm(Buf, 0, False, X64_R10, -128);
+    X64EmitAluRegImm(Buf, 0, False, X64_R10, -129);
+    X64EmitAluRegImm(Buf, 5, False, X64_RAX, 1);
+    X64EmitAluRegImm(Buf, 4, False, X64_RCX, $3FFF);
+    X64EmitAluRegImm(Buf, 1, True, X64_R15, -1);
+    X64EmitAluRegImm(Buf, 6, True, X64_R11, $7FFFFFFF);
+    X64EmitAluRegImm(Buf, 7, False, X64_R8, 1000000000);
+    X64EmitAluRegImm(Buf, 7, True, X64_R9, Low(Int32));
+    X64EmitAluRegImm(Buf, 6, False, X64_R11, Int32($9E3779B9));
+    CheckSeq(Buf, [$41, $83, $C2, $7F, $41, $81, $C2, $80, $00, $00, $00,
+      $41, $83, $C2, $80, $41, $81, $C2, $7F, $FF, $FF, $FF,
+      $83, $E8, $01, $81, $E1, $FF, $3F, $00, $00,
+      $49, $83, $CF, $FF, $49, $81, $F3, $FF, $FF, $FF, $7F,
+      $41, $81, $F8, $00, $CA, $9A, $3B, $49, $81, $F9, $00, $00, $00, $80,
+      $41, $81, $F3, $B9, $79, $37, $9E]);
+  finally
+    Buf.Free;
+  end;
+
+  { imul r11d,r8d,17 ; imul r10,r9,-129 ; imul eax,ecx,127 ;
+    imul r12,r15,128 ; shl r9d,2 ; shr r10,63 ; sar eax,31 ; rol r11d,5 ;
+    ror r8,1 (the C1 form). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitImulRegImm(Buf, False, X64_R11, X64_R8, 17);
+    X64EmitImulRegImm(Buf, True, X64_R10, X64_R9, -129);
+    X64EmitImulRegImm(Buf, False, X64_RAX, X64_RCX, 127);
+    X64EmitImulRegImm(Buf, True, X64_R12, X64_R15, 128);
+    X64EmitShiftImm(Buf, 4, False, X64_R9, 2);
+    X64EmitShiftImm(Buf, 5, True, X64_R10, 63);
+    X64EmitShiftImm(Buf, 7, False, X64_RAX, 31);
+    X64EmitShiftImm(Buf, 0, False, X64_R11, 5);
+    X64EmitShiftImm(Buf, 1, True, X64_R8, 1);
+    CheckSeq(Buf, [$45, $6B, $D8, $11, $4D, $69, $D1, $7F, $FF, $FF, $FF,
+      $6B, $C1, $7F, $4D, $69, $E7, $80, $00, $00, $00,
+      $41, $C1, $E1, $02, $49, $C1, $EA, $3F, $C1, $F8, $1F,
+      $41, $C1, $C3, $05, $49, $C1, $C8, $01]);
+  finally
+    Buf.Free;
+  end;
+
+  { lea r10d,[r8+1] ; lea r11,[r9-129] ; lea eax,[rcx+0x7fffffff] ;
+    lea r9d,[r13+0] (rbp/r13 force a disp8) ; lea r9d,[r12+4] (SIB) ;
+    mov r10d,r8d ; mov eax,r11d ; mov r8d,eax. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitLeaRegDisp(Buf, False, X64_R10, X64_R8, 1);
+    X64EmitLeaRegDisp(Buf, True, X64_R11, X64_R9, -129);
+    X64EmitLeaRegDisp(Buf, False, X64_RAX, X64_RCX, $7FFFFFFF);
+    X64EmitLeaRegDisp(Buf, False, X64_R9, X64_R13, 0);
+    X64EmitLeaRegDisp(Buf, False, X64_R9, X64_R12, 4);
+    X64EmitMovRegReg32(Buf, X64_R10, X64_R8);
+    X64EmitMovRegReg32(Buf, X64_RAX, X64_R11);
+    X64EmitMovRegReg32(Buf, X64_R8, X64_RAX);
+    CheckSeq(Buf, [$45, $8D, $50, $01, $4D, $8D, $99, $7F, $FF, $FF, $FF,
+      $8D, $81, $FF, $FF, $FF, $7F, $45, $8D, $4D, $00,
+      $45, $8D, $4C, $24, $04,
+      $45, $89, $C2, $44, $89, $D8, $41, $89, $C0]);
+  finally
+    Buf.Free;
+  end;
+
+  { Constants in their shortest exact form: xor r10d,r10d ;
+    mov r10d,1 ; mov r11d,0xffffffff (zero-extends) ; mov rax,-1 ;
+    mov r9,-2^31 (C7 /0 sign-extends) ; movabs r8,2^32 ;
+    movabs r11,-2^31-1 ; movabs rax,0x7fffffffffffffff. }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitMovRegConst(Buf, X64_R10, 0);
+    X64EmitMovRegConst(Buf, X64_R10, 1);
+    X64EmitMovRegConst(Buf, X64_R11, $FFFFFFFF);
+    X64EmitMovRegConst(Buf, X64_RAX, UInt64(-1));
+    X64EmitMovRegConst(Buf, X64_R9, UInt64(Int64(Low(Int32))));
+    X64EmitMovRegConst(Buf, X64_R8, UInt64($100000000));
+    X64EmitMovRegConst(Buf, X64_R11, UInt64(Int64(Low(Int32)) - 1));
+    X64EmitMovRegConst(Buf, X64_RAX, UInt64(High(Int64)));
+    CheckSeq(Buf, [$45, $31, $D2, $41, $BA, $01, $00, $00, $00,
+      $41, $BB, $FF, $FF, $FF, $FF, $48, $C7, $C0, $FF, $FF, $FF, $FF,
+      $49, $C7, $C1, $00, $00, $00, $80,
+      $49, $B8, $00, $00, $00, $00, $01, $00, $00, $00,
+      $49, $BB, $FF, $FF, $FF, $7F, $FF, $FF, $FF, $FF,
+      $48, $B8, $FF, $FF, $FF, $FF, $FF, $FF, $FF, $7F]);
+  finally
+    Buf.Free;
+  end;
+
+  { Which (op, constant) pairs have an immediate form: every i32 value;
+    an i64 value only as a sign-extended imm32, except shift counts. }
+  Expect<Boolean>(X64CanUseImmediate(iroI32Add, Int32($9E3779B9)))
+    .ToBe(True);
+  Expect<Boolean>(X64CanUseImmediate(iroI64Add, $7FFFFFFF)).ToBe(True);
+  Expect<Boolean>(X64CanUseImmediate(iroI64And, $80000000)).ToBe(False);
+  Expect<Boolean>(X64CanUseImmediate(iroI64Or, $FFFFFFFF)).ToBe(False);
+  Expect<Boolean>(X64CanUseImmediate(iroI64Xor, Low(Int32))).ToBe(True);
+  Expect<Boolean>(X64CanUseImmediate(iroI64Mul, Int64(Low(Int32)) - 1))
+    .ToBe(False);
+  Expect<Boolean>(X64CanUseImmediate(iroI64LtU, $100000000)).ToBe(False);
+  Expect<Boolean>(X64CanUseImmediate(iroI64GeS, -129)).ToBe(True);
+  Expect<Boolean>(X64CanUseImmediate(iroI64Shl, High(Int64))).ToBe(True);
+  Expect<Boolean>(X64CanUseImmediate(iroI32Rotl, -1)).ToBe(True);
+  Expect<Boolean>(X64CanUseImmediate(iroI32DivS, 3)).ToBe(False);
+  Expect<Boolean>(X64CanUseImmediate(iroI32Eqz, 0)).ToBe(False);
+end;
+
+procedure TX64Tests.TestImmediateCachedOps;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0 .. 7] of UInt32;
+  Visible: array[0 .. 7] of Boolean;
+  Start: Integer;
+
+  { Static hosts r8/r9 hold slots 0/1; slot 2 is a constant in r10 with
+    AUses planned reads left. }
+  procedure Setup(const AUses: UInt32);
+  begin
+    FillChar(UseCounts, SizeOf(UseCounts), 0);
+    FillChar(Visible, SizeOf(Visible), 0);
+    UseCounts[2] := AUses;
+    Buf := TWasmCodeBuffer.Create;
+    Buf.NewLabel;
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI32Const, 2, 0, 0,
+      7), Aux, 0, False, False, Cache)).ToBe(True);
+    Start := Buf.Size;
+  end;
+
+  procedure Emit(const AOp: TWasmIrOp; const ADest, AA: UInt32;
+    const AValue: Int64);
+  begin
+    Expect<Boolean>(X64EmitOpCachedImmediate(Buf,
+      MakeIrInstr(AOp, ADest, AA, 6, 0), AValue, Cache)).ToBe(True);
+  end;
+
+  procedure CheckAdded(const AExpected: array of Byte);
+  var
+    I: Integer;
+  begin
+    Expect<Integer>(Buf.Size - Start).ToBe(Length(AExpected));
+    for I := 0 to High(AExpected) do
+      if Start + I < Buf.Size then
+        Expect<Byte>(Buf.ByteAt(Start + I)).ToBe(AExpected[I]);
+    Buf.Free;
+  end;
+
+begin
+  { The constant goes straight to its host: mov r10d, 7 (the two static
+    loads before it are 7 bytes). }
+  Setup(1);
+  Start := 7;
+  CheckAdded([$41, $BA, $07, $00, $00, $00]);
+
+  { i64 constants beside the live r10, each previous one dead so r11 is
+    reused: xor r11d,r11d ; mov r11,-1 (sign-extended imm32) ;
+    movabs r11,2^32. }
+  Setup(1);
+  Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI64Const, 3, 0, 0, 0),
+    Aux, 0, False, False, Cache)).ToBe(True);
+  Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI64Const, 4, 0, 0,
+    -1), Aux, 0, False, False, Cache)).ToBe(True);
+  Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroI64Const, 5, 0, 0,
+    $100000000), Aux, 0, False, False, Cache)).ToBe(True);
+  CheckAdded([$45, $31, $DB, $49, $C7, $C3, $FF, $FF, $FF, $FF,
+    $49, $BB, $00, $00, $00, $00, $01, $00, $00, $00]);
+
+  { A static destination computes in place: add r8d, 1. }
+  Setup(1);
+  Emit(iroI32Add, 0, 0, 1);
+  CheckAdded([$41, $83, $C0, $01]);
+
+  { A dead dynamic operand's host takes the result in place:
+    and r10d, 0x3fff. }
+  Setup(1);
+  Emit(iroI32And, 4, 2, $3FFF);
+  CheckAdded([$41, $81, $E2, $FF, $3F, $00, $00]);
+  Expect<Boolean>(Cache.Entries[2].Valid and (Cache.Entries[2].Slot = 4) and
+    Cache.Entries[2].Dirty).ToBe(True);
+
+  { A live operand keeps its host; add and sub become one lea into the
+    other: lea r11d,[r10-129] ; lea r11d,[r10-5]. }
+  Setup(3);
+  Emit(iroI32Add, 4, 2, -129);
+  Emit(iroI32Sub, 4, 2, 5);
+  CheckAdded([$45, $8D, $9A, $7F, $FF, $FF, $FF, $45, $8D, $5A, $FB]);
+
+  { An i64 sub of -2^31 has no imm32 negation: mov r11, r10 ;
+    sub r11, -2^31. An i32 sub of INT32_MIN wraps: lea r11d,[r10-2^31]. }
+  Setup(3);
+  Emit(iroI64Sub, 4, 2, Low(Int32));
+  Emit(iroI32Sub, 4, 2, Low(Int32));
+  CheckAdded([$4D, $89, $D3, $49, $81, $EB, $00, $00, $00, $80,
+    $45, $8D, $9A, $00, $00, $00, $80]);
+
+  { Other ops copy first: mov r11, r10 ; xor r11d, 0x9e3779b9 ;
+    imul is three-operand: imul r11d, r10d, 17. }
+  Setup(3);
+  Emit(iroI32Xor, 4, 2, Int32($9E3779B9));
+  Emit(iroI32Mul, 4, 2, 17);
+  CheckAdded([$4D, $89, $D3, $41, $81, $F3, $B9, $79, $37, $9E,
+    $45, $6B, $DA, $11]);
+
+  { Counts are masked as wasm masks them: i32 shl by 33 is shl r10d,1 ;
+    i64 shr_u by -1 is shr r10,63. }
+  Setup(2);
+  Emit(iroI32Shl, 2, 2, 33);
+  Emit(iroI64ShrU, 2, 2, -1);
+  CheckAdded([$41, $C1, $E2, $01, $49, $C1, $EA, $3F]);
+
+  { A zero masked count: an i32 rotr by 32 re-zero-extends
+    (mov r10d, r10d); an i64 shl by 64 in place is nothing. }
+  Setup(2);
+  Emit(iroI32Rotr, 2, 2, 32);
+  Emit(iroI64Shl, 2, 2, 64);
+  CheckAdded([$45, $89, $D2]);
+
+  { cmp against the constant: xor r8d,r8d ; cmp r10d,1000000000 ;
+    setb r8b. }
+  Setup(1);
+  Emit(iroI32LtU, 0, 2, 1000000000);
+  CheckAdded([$45, $31, $C0, $41, $81, $FA, $00, $CA, $9A, $3B,
+    $41, $0F, $92, $C0]);
+
+  { Fused compare-branch against a constant: cmp r8, -1 ; (the dead
+    constant is not stored) ; jl rel32. }
+  Setup(0);
+  X64EmitCompareBranchCached(Buf, MakeIrInstr(iroI64LtS, 5, 0, 6, 0),
+    MakeIrInstr(iroBranchIf, 0, 5, 0, 0), Cache, True, -1);
+  CheckAdded([$49, $83, $F8, $FF, $0F, $8C, $00, $00, $00, $00]);
+
+  { An i64 value outside imm32 is declined and nothing is emitted. }
+  Setup(1);
+  Expect<Boolean>(X64EmitOpCachedImmediate(Buf,
+    MakeIrInstr(iroI64And, 4, 2, 6, 0), $FFFFFFFF, Cache)).ToBe(False);
+  CheckAdded([]);
+
+  { Write-through pair: the operand misses into r8, lea into r9, and the
+    result is stored: mov r8,[rbx+16] ; lea r9d,[r8+1] ; mov [rbx+24],r9. }
+  Buf := TWasmCodeBuffer.Create;
+  X64InitRegCache(Cache);
+  Start := 0;
+  Emit(iroI32Add, 3, 2, 1);
+  CheckAdded([$4C, $8B, $43, $10, $45, $8D, $48, $01, $4C, $89, $4B, $18]);
 end;
 
 procedure TX64Tests.TestGcFieldAccessBytes;
@@ -1980,6 +2242,10 @@ begin
     TestDirectOperandCachedOps);
   Test('direct operands keep victims, spills, and write-through stores',
     TestDirectOperandBookkeeping);
+  Test('immediate ALU, imul, shift, lea, and constant encodings',
+    TestImmediateEncodings);
+  Test('fused constants use immediate forms under every cache mode',
+    TestImmediateCachedOps);
   Test('numeric GC fields use baked native x64 loads and stores',
     TestGcFieldAccessBytes);
   Test('fixed scalar arrays use native x64 loads and stores',

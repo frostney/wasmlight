@@ -2145,6 +2145,9 @@ type
     procedure TestDirectOperandEvictsLiveOperand;
     procedure TestDirectOperandStaticI64;
     procedure TestDirectOperandWriteThrough;
+    procedure TestImmediateOperandForms;
+    procedure TestImmediateOperandTrapMidLoop;
+    procedure TestImmediateOperandCodeShape;
     procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
@@ -5094,6 +5097,292 @@ begin
   end;
 end;
 
+{ --- fused immediate operands (x64 wave 5 lane K) ------------------------ }
+
+const
+  IMM_OPS: array[0 .. 19] of string = ('add', 'sub', 'mul', 'and', 'or',
+    'xor', 'shl', 'shr_s', 'shr_u', 'rotr', 'eq', 'ne', 'lt_s', 'lt_u',
+    'gt_s', 'gt_u', 'le_s', 'le_u', 'ge_s', 'ge_u');
+  { imm8/imm32 sign boundaries, INT_MIN, all-ones, masked shift counts. }
+  IMM_C32: array[0 .. 15] of string = ('0', '1', '-1', '127', '128', '-128',
+    '-129', '0x7fffffff', '-0x80000000', '31', '32', '33', '63', '64',
+    '0x3fff', '0x9E3779B9');
+  { The same plus i64 values on both sides of the sign-extended imm32
+    range, which must fall back to a materialized constant. }
+  IMM_C64: array[0 .. 17] of string = ('0', '1', '-1', '127', '128', '-128',
+    '-129', '0x7fffffff', '-0x80000000', '0x80000000', '0xFFFFFFFF',
+    '-0x80000001', '0x100000000', '0x7fffffffffffffff',
+    '-0x8000000000000000', '63', '64', '65');
+
+{ One loop over every (op, constant) pair: acc := acc * 33 + op(x, c), then
+  every compare as a fused compare-branch, then a constant local.tee'd so it
+  has a second reader. ARotl adds rotl (not a static-cache op) and ACall a
+  call, which both force the write-through cache. i64 compares yield i32,
+  so the i64 value loop takes the ten arithmetic ops only. The model is
+  patches/laneK-imm-model.py in the wave-5 evidence root. }
+function ImmLoopFunc(const AName, AT: string;
+  const AConsts: array of string; const ARotl, ACall: Boolean): string;
+var
+  O, C, LastOp: Integer;
+  Op: string;
+begin
+  Result := '(func $' + AName + ' (export "' + AName + '") (param $x ' + AT +
+    ') (result ' + AT + ') (local $i i32) (local $acc ' + AT + ') ' +
+    '(local $c ' + AT + ') (loop $l ';
+  if AT = 'i32' then
+    LastOp := High(IMM_OPS)
+  else
+    LastOp := 9;
+  for O := 0 to LastOp + Ord(ARotl) do
+  begin
+    if O > LastOp then
+      Op := 'rotl'
+    else
+      Op := IMM_OPS[O];
+    for C := 0 to High(AConsts) do
+      Result := Result + '(local.set $acc (' + AT + '.add (' + AT +
+        '.mul (local.get $acc) (' + AT + '.const 33)) (' + AT + '.' + Op +
+        ' (local.get $x) (' + AT + '.const ' + AConsts[C] + ')))) ';
+  end;
+  for O := 10 to High(IMM_OPS) do
+    for C := 0 to High(AConsts) do
+      Result := Result + '(local.set $acc (' + AT + '.mul (local.get $acc) (' +
+        AT + '.const 33))) (if (' + AT + '.' + IMM_OPS[O] +
+        ' (local.get $x) (' + AT + '.const ' + AConsts[C] + ')) ' +
+        '(then (local.set $acc (' + AT + '.add (local.get $acc) (' + AT +
+        '.const 1))))) ';
+  Result := Result + '(local.set $acc (' + AT + '.add (local.get $acc) (' +
+    AT + '.sub (local.get $x) (local.tee $c (' + AT + '.const -129))))) ' +
+    '(local.set $acc (' + AT + '.xor (local.get $acc) (local.get $c))) ';
+  if ACall then
+    Result := Result + '(local.set $acc (' + AT + '.add (local.get $acc) ' +
+      '(call $id' + Copy(AT, 2, 2) + ' (local.get $x)))) ';
+  Result := Result + '(local.set $x (' + AT + '.add (' + AT +
+    '.mul (local.get $x) (' + AT + '.const 0x01000193)) (local.get $acc))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) ' +
+    '(local.get $acc)) ';
+end;
+
+function ImmCheckFunc(const AName, AT: string; const AArgs: Integer): string;
+var
+  K: Integer;
+  Params, Args: string;
+begin
+  Params := '';
+  Args := '';
+  for K := 0 to AArgs - 1 do
+  begin
+    if K = 0 then
+      Params := Params + ' ' + AT
+    else
+      Params := Params + ' i32';
+    Args := Args + ' (local.get ' + IntToStr(K) + ')';
+  end;
+  Result := '(func (export "check_' + AName + '") (param' + Params + ' ' + AT +
+    ') (result ' + AT + ') (local $r ' + AT + ') (local.set $r (call $' +
+    AName + Args + ')) (if (' + AT + '.ne (local.get $r) (local.get ' +
+    IntToStr(AArgs) + ')) (then unreachable)) (local.get $r)) ';
+end;
+
+procedure TJitTests.TestImmediateOperandForms;
+const
+  X32: array[0 .. 7] of Int32 = (0, 1, -1, 2147483647, Low(Int32),
+    $12345678, 127, -129);
+  S32: array[0 .. 7] of Int32 = (1810383965, -780288457, 378280729,
+    1440237318, 1401097529, -950030934, 1795948302, -396739574);
+  W32: array[0 .. 7] of Int32 = (-1729024554, -581317605, -1214220359,
+    -623438581, -1142583893, 720102354, -376787148, 1441513501);
+  L32: array[0 .. 7] of Int32 = (433277607, -1023822379, -865003413,
+    775289241, 219838788, -1561716548, -855156368, -231192963);
+  X64: array[0 .. 7] of Int64 = (0, 1, -1, High(Int64), Low(Int64),
+    $0123456789ABCDEF, $80000000, -$80000001);
+  S64: array[0 .. 7] of Int64 = (8174609595130626976, -3686491448912613370,
+    1345587086311793554, -6622255045271162838, -5024660720706839064,
+    1552713173105789090, -4070987986678753464, 2496731974621481674);
+  W64: array[0 .. 7] of Int64 = (-4662422199310828550, -164054147293146426,
+    5752929173563615710, -525369475764640264, -8598487194462611830,
+    3026572826839823822, -8281411043633708038, -7855017838354762444);
+  L64: array[0 .. 7] of Int64 = (-2295938215123960672,
+    -2297108788080395104, -2294767642167526240, -2294767642167526240,
+    -2295938215123960672, -818944875527193440, 4576484447499238560,
+    -9167190304790725472);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+
+  procedure CheckRun(const AName: string; const AArgs: array of TWasmValue);
+  begin
+    Expect<string>(TrapMessageOf(Bytes, 'check_' + AName, AArgs)).ToBe('');
+    Expect<Boolean>(DiffFresh(Bytes, 'check_' + AName, AArgs))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  end;
+
+begin
+  { Static cache (s32/s64), the write-through pair of a call-bearing
+    function (AW32/w64, ACalling a native scalar leaf), and native scalar
+    leaf cores (leaf32/leaf64, driven by a write-through caller). leaf64's
+    constants 2^32 and 0xFFFFFFFF have no imm32 form; its sub of -2^31 has
+    no lea negation; its shift count 67 masks to 3; leaf32's rotl by -27
+    masks to 5. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $id32 (export "id32") (param i32) (result i32) (local.get 0)) ' +
+    '(func $id64 (export "id64") (param i64) (result i64) (local.get 0)) ' +
+    ImmLoopFunc('s32', 'i32', IMM_C32, False, False) +
+    ImmLoopFunc('w32', 'i32', IMM_C32, True, True) +
+    ImmLoopFunc('s64', 'i64', IMM_C64, False, False) +
+    ImmLoopFunc('w64', 'i64', IMM_C64, True, True) +
+    '(func $leaf32 (export "leaf32") (param $x i32) (param $y i32) ' +
+    '(result i32) (i32.rotl (i32.xor (i32.add (i32.mul (local.get $x) ' +
+    '(i32.const 0x9E3779B1)) (i32.const -129)) (i32.or (i32.shr_u ' +
+    '(local.get $y) (i32.const 33)) (i32.lt_s (local.get $x) ' +
+    '(i32.const 128)))) (i32.const -27))) ' +
+    '(func $leaf64 (export "leaf64") (param $x i64) (param $y i64) ' +
+    '(result i64) (i64.shl (i64.mul (i64.sub (i64.xor (i64.add ' +
+    '(local.get $x) (i64.const 0x100000000)) (i64.and (local.get $y) ' +
+    '(i64.const 0xFFFFFFFF))) (i64.const -0x80000000)) (i64.const -129)) ' +
+    '(i64.const 67))) ' +
+    '(func $drive32 (export "drive32") (param $x i32) (param $n i32) ' +
+    '(result i32) (local $i i32) (loop $l (local.set $x (call $leaf32 ' +
+    '(local.get $x) (local.get $i))) (local.set $i (i32.add (local.get $i) ' +
+    '(i32.const 1))) (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $x)) ' +
+    '(func $drive64 (export "drive64") (param $x i64) (param $n i32) ' +
+    '(result i64) (local $i i32) (loop $l (local.set $x (call $leaf64 ' +
+    '(local.get $x) (i64.extend_i32_u (local.get $i)))) (local.set $i ' +
+    '(i32.add (local.get $i) (i32.const 1))) (br_if $l (i32.lt_u ' +
+    '(local.get $i) (local.get $n)))) (local.get $x)) ' +
+    ImmCheckFunc('s32', 'i32', 1) + ImmCheckFunc('w32', 'i32', 1) +
+    ImmCheckFunc('s64', 'i64', 1) + ImmCheckFunc('w64', 'i64', 1) +
+    ImmCheckFunc('drive32', 'i32', 2) + ImmCheckFunc('drive64', 'i64', 2) +
+    ')');
+  CompileExports(['id32', 'id64', 's32', 'w32', 's64', 'w64', 'leaf32',
+    'leaf64', 'drive32', 'drive64']);
+  for I := 0 to High(X32) do
+  begin
+    CheckRun('s32', [MakeValueI32(X32[I]), MakeValueI32(S32[I])]);
+    CheckRun('w32', [MakeValueI32(X32[I]), MakeValueI32(W32[I])]);
+    CheckRun('drive32', [MakeValueI32(X32[I]), MakeValueI32(5),
+      MakeValueI32(L32[I])]);
+    CheckRun('s64', [MakeValueI64(X64[I]), MakeValueI64(S64[I])]);
+    CheckRun('w64', [MakeValueI64(X64[I]), MakeValueI64(W64[I])]);
+    CheckRun('drive64', [MakeValueI64(X64[I]), MakeValueI32(5),
+      MakeValueI64(L64[I])]);
+  end;
+end;
+
+{ A base-pinned loop whose addresses, stored values, and store address are
+  fused or directly materialized constants. The 16385th iteration's store
+  faults; the stores before it, including the running sum at 0x100, must
+  be exactly the model's (patches/laneK-imm-model.py). }
+procedure TJitTests.TestImmediateOperandTrapMidLoop;
+begin
+  FBytes := AssembleWatText('(module (memory 1 1) ' +
+    '(func $fill (export "fill") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (loop $l ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) (i32.xor ' +
+    '(i32.mul (local.get $i) (i32.const 17)) (i32.const 0x9E3779B9))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (i32.shl ' +
+    '(i32.and (local.get $i) (i32.const 0x3fff)) (i32.const 2))))) ' +
+    '(i32.store (i32.const 0x100) (local.get $acc)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "peek") (param $a i32) (result i32) ' +
+    '(i32.load (local.get $a))))');
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(FBytes, 0)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(FBytes, 'fill', [MakeValueI32(100)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+    .ToBe(3450614486);
+  DiffFresh(FBytes, 'fill', [MakeValueI32(16385)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  Expect<string>(RunCompiledOnStore('fill', [MakeValueI32(16385)]))
+    .ToBe('out of bounds memory access');
+  Expect<string>(RunCompiledOnStore('peek', [MakeValueI32(0)])).ToBe('');
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], $100,
+    0, 4))^).ToBe(1981931520);
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], $FFFC,
+    0, 4))^).ToBe(2654160470);
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], 0,
+    0, 4))^).ToBe(2654435769);
+end;
+
+{ The memory-load workload's hot loop: every constant is an immediate
+  (and r, 0x3fff ; shl r, 2 ; add r, 1 ; cmp r, 100000000) and none is
+  bounced through eax or shifted by CL. Wildcards (-1) leave the host
+  registers free. }
+procedure TJitTests.TestImmediateOperandCodeShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  Bytes: TWasmBytes;
+
+  function Has(const APattern: array of Integer): Boolean;
+  var
+    I, J: Integer;
+  begin
+    for I := 0 to Length(Code) - Length(APattern) do
+    begin
+      J := 0;
+      while (J <= High(APattern)) and ((APattern[J] < 0) or
+        (Code[I + J] = APattern[J])) do
+        Inc(J);
+      if J > High(APattern) then
+        Exit(True);
+    end;
+    Result := False;
+  end;
+{$ENDIF}
+
+begin
+  {$IFDEF WASM_JIT_X64}
+  Bytes := AssembleWatText('(module (memory 1 1) ' +
+    '(func (export "run") (result i32) (local i32 i32 i32) (loop $l ' +
+    '(local.set 2 (i32.shl (i32.and (local.get 0) (i32.const 16383)) ' +
+    '(i32.const 2))) (local.set 1 (i32.add (local.get 1) (i32.load ' +
+    '(local.get 2)))) (local.set 0 (i32.add (local.get 0) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get 0) (i32.const 100000000)))) ' +
+    '(local.get 1)))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+      RegisterCount);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  Expect<Boolean>(Has([$41, $81, -1, $FF, $3F, $00, $00])).ToBe(True);
+  Expect<Boolean>(Has([$41, $C1, -1, $02])).ToBe(True);
+  Expect<Boolean>(Has([$41, $83, -1, $01])).ToBe(True);
+  Expect<Boolean>(Has([$41, $81, -1, $00, $E1, $F5, $05])).ToBe(True);
+  Expect<Boolean>(Has([$B8, $FF, $3F, $00, $00])).ToBe(False);
+  Expect<Boolean>(Has([$B8, $02, $00, $00, $00])).ToBe(False);
+  Expect<Boolean>(Has([$B8, $01, $00, $00, $00])).ToBe(False);
+  Expect<Boolean>(Has([$B8, $00, $E1, $F5, $05])).ToBe(False);
+  Expect<Boolean>(Has([$41, $D3])).ToBe(False);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(AssembleWatText('(module (memory 1 1) ' +
+    '(func (export "run") (param $n i32) (result i32) (local i32 i32 i32) ' +
+    '(loop $l (local.set 3 (i32.shl (i32.and (local.get 1) ' +
+    '(i32.const 16383)) (i32.const 2))) (local.set 2 (i32.add (local.get 2) ' +
+    '(i32.load (local.get 3)))) (local.set 1 (i32.add (local.get 1) ' +
+    '(i32.const 1))) (br_if $l (i32.lt_u (local.get 1) (local.get $n)))) ' +
+    '(local.get 2)))'), 'run', [MakeValueI32(20000)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(0);
+end;
+
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
 var
   Bytes: TWasmBytes;
@@ -7919,6 +8208,12 @@ begin
     TestDirectOperandStaticI64);
   Test('direct-operand ops match in the write-through cache',
     TestDirectOperandWriteThrough);
+  Test('fused immediate operands match an independent model in every mode',
+    TestImmediateOperandForms);
+  Test('fused immediates in a pinned loop trap mid-loop with prior stores',
+    TestImmediateOperandTrapMidLoop);
+  Test('a memory-load loop uses x64 immediate forms',
+    TestImmediateOperandCodeShape);
   Test('a tee stored in a pinned-memory loop keeps the stored value',
     TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
