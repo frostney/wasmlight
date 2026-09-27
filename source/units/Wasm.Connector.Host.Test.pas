@@ -253,6 +253,8 @@ begin
 end;
 
 procedure TConnectorHostTests.AfterEach;
+var
+  Search: TSearchRec;
 begin
   FreeAndNil(FInstance);
   FreeAndNil(FHost);
@@ -260,8 +262,16 @@ begin
   FreeAndNil(FStore);
   FreeAndNil(FEngine);
   FreeAndNil(FLoaded);
-  if FileExists(FLibPath) then
-    DeleteFile(FLibPath);
+  if FindFirst(IncludeTrailingPathDelimiter(FWork) + '*', faAnyFile,
+    Search) = 0 then
+  try
+    repeat
+      if (Search.Name <> '.') and (Search.Name <> '..') then
+        DeleteFile(IncludeTrailingPathDelimiter(FWork) + Search.Name);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
   RemoveDir(FWork);
 end;
 
@@ -484,8 +494,10 @@ procedure TConnectorHostTests.TestMissingLibraryIsALinkError;
 var
   Msg: string;
 begin
-  Msg := LinkErrorOf(LiveWlc(IncludeTrailingPathDelimiter(FWork) +
-    'libabsent.so'), ANSWER_WAT);
+  { A literal absolute path (forward slashes, so it is also a valid `.wlc`
+    string on a Windows host) that does not exist. }
+  Msg := LinkErrorOf(LiveWlc('/wasmlight-absent-dir/libabsent.so'),
+    ANSWER_WAT);
   if NativeCallSupported then
     Expect<Boolean>(Pos(MSG_LINK_UNKNOWN_LIBRARY, Msg) = 1).ToBe(True)
   else
@@ -842,14 +854,22 @@ end;
 
 procedure TConnectorHostTests.TestCompileRejectsUnsupportedShape;
 var
-  Payload: TWasmBytes;
+  Request: TWasmCompileRequest;
   Res: TWasmCompileResult;
 begin
-  Res := CompileCommand(
+  { A released target, so a Windows or 32-bit host still reaches link. }
+  WriteText(IncludeTrailingPathDelimiter(FWork) + 'conn.wlc',
+    'static class C { [DllImport("libc")] static extern void f(string s); }');
+  Request.ModulePath := '';
+  Request.OutputPath := IncludeTrailingPathDelimiter(FWork) + 'app';
+  Request.Target := WASM_COMPILE_TARGET_X64_LINUX;
+  Request.CatalogRoot := IncludeTrailingPathDelimiter(FWork) + 'no-catalog';
+  Request.Connectors := nil;
+  SetLength(Request.Connectors, 1);
+  Request.Connectors[0] := IncludeTrailingPathDelimiter(FWork) + 'conn.wlc';
+  Res := CompileModuleBytes(AssembleWatText(
     '(module (import "C" "f" (func (param i32)))' +
-    '  (memory (export "memory") 1) (func (export "_start")))',
-    'static class C { [DllImport("libc")] static extern void f(string s); }',
-    Payload);
+    '  (memory (export "memory") 1) (func (export "_start")))'), Request);
   Expect<Integer>(Res.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('EWasmLinkError: ' + MSG_WLC_UNSUPPORTED_TYPE,
     Res.Diagnostic) = 1).ToBe(True);
