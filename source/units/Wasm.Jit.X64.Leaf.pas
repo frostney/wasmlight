@@ -75,15 +75,33 @@ procedure X64RestrictMemoryLeafCalls(var ACalls: TX64LeafCallList;
 { Whether any instruction's plan is enabled. }
 function X64AnyLeafCall(const ACalls: TX64LeafCallList): Boolean;
 
-{ Forward copies inside a native leaf body (straight-line code: no branch,
-  join, call, or safepoint). A `move T <- S` whose temporary T has exactly
-  one read (AUseCounts, the canonical read counts) and is neither a
-  parameter nor the result is skipped and that read renamed to S, provided
-  nothing between them writes S or T. Runs before the liveness analyses, so
-  their counts see the renamed code. }
-procedure X64PlanLeafAliases(const AFn: TWasmIrFunction;
+{ Forward copies within a basic block: a native leaf body, or a
+  static-cache caller of native leaves. A `move T <- S` whose temporary T
+  has exactly one read (AUseCounts, the canonical read counts) and is
+  neither a local, a parameter, nor a result is skipped and that read
+  renamed to S, provided nothing between them writes S or T and no join
+  (ATargets), branch, return, safepoint, or call lies between them other
+  than a planned leaf call (ACalls), which writes only its result and
+  neither reads nor writes anything else of the caller's frame. A read by a
+  call argument is left to X64PlanLeafCallOperands. Runs before the
+  liveness analyses, so their counts see the renamed code. }
+procedure X64PlanBlockAliases(const AFn: TWasmIrFunction;
   var APlanned: TWasmIrCode; var ASkip: array of Boolean;
-  const AUseCounts: array of UInt32);
+  const AUseCounts: array of UInt32; const ATargets: array of Boolean;
+  const ACalls: TX64LeafCallList);
+
+{ Re-seat a static-cache caller's fixed hosts around its leaf calls
+  (AAllocated: the driver's r8, r9, rdi, rdx slots, High(UInt32) unused).
+  When every planned call targets one leaf (so the activation caches its
+  entry and no inline resolution clobbers rdi/rdx) and that leaf leaves rdi
+  or rdx alone, the hottest loop locals (by AScoresInLoop, then AScores,
+  then slot order) move to those hosts: a host the leaf preserves needs no
+  store before and no reload after each call. The remaining hosts keep the
+  previously chosen slots in their order. }
+procedure X64PreferLeafPreservedHosts(const AFn: TWasmIrFunction;
+  const ACalls: TX64LeafCallList;
+  const AScores, AScoresInLoop: array of UInt32;
+  var AAllocated: array of UInt32);
 
 { In a static-cache caller, after the liveness analyses: an argument
   temporary whose only definition is an adjacent-enough `move T <- S` or
@@ -334,12 +352,36 @@ begin
   Result := RenameSource(Probe, AReg, AReg);
 end;
 
-procedure X64PlanLeafAliases(const AFn: TWasmIrFunction;
+{ An instruction a forwarded operand may cross: straight-line, not a
+  safepoint, no call, and no control transfer. }
+function Crossable(const AIns: TWasmIrInstr): Boolean;
+begin
+  Result := not IrInstrIsSafepoint(AIns) and not (AIns.Op in [iroJump,
+    iroBranchIf, iroBranchIfNot, iroBrTable, iroReturn, iroUnreachable,
+    iroCall, iroCallIndirect, iroCallRef, iroReturnCall,
+    iroReturnCallIndirect, iroReturnCallRef]) and
+    (IR_OP_INFO[AIns.Op].DestKind in [ifkDestReg, ifkSrcReg, ifkUnused]);
+end;
+
+function AuxHas(const AAux: TWasmIrAuxU32; const ABlock, AReg: UInt32):
+  Boolean;
+var
+  N: Integer;
+begin
+  for N := 0 to Integer(IrAuxBlockCount(AAux, ABlock)) - 1 do
+    if IrAuxBlockItem(AAux, ABlock, UInt32(N)) = AReg then
+      Exit(True);
+  Result := False;
+end;
+
+procedure X64PlanBlockAliases(const AFn: TWasmIrFunction;
   var APlanned: TWasmIrCode; var ASkip: array of Boolean;
-  const AUseCounts: array of UInt32);
+  const AUseCounts: array of UInt32; const ATargets: array of Boolean;
+  const ACalls: TX64LeafCallList);
 var
   K, U: Integer;
   Source, Temp: UInt32;
+  Ins: TWasmIrInstr;
 begin
   for K := 0 to High(APlanned) - 1 do
   begin
@@ -352,29 +394,147 @@ begin
       Continue;
     for U := K + 1 to High(APlanned) do
     begin
+      if ATargets[U] then
+        Break;
       if ASkip[U] then
         Continue;
-      if ReadsReg(APlanned[U], Temp) then
+      Ins := APlanned[U];
+      if Ins.Op = iroCall then
+      begin
+        { Cross only a planned leaf call that neither reads the temporary
+          nor writes either register. }
+        if not ACalls[U].Enabled or AuxHas(AFn.AuxU32, Ins.A, Temp) or
+          AuxHas(AFn.AuxU32, Ins.B, Temp) or
+          AuxHas(AFn.AuxU32, Ins.B, Source) then
+          Break;
+        Continue;
+      end;
+      if ReadsReg(Ins, Temp) then
       begin
         RenameSource(APlanned[U], Temp, Source);
         ASkip[K] := True;
         Break;
       end;
-      if WritesReg(APlanned[U], Source) or WritesReg(APlanned[U], Temp) then
+      if WritesReg(Ins, Source) or WritesReg(Ins, Temp) or
+        not Crossable(Ins) then
         Break;
     end;
   end;
 end;
 
-{ An instruction a forwarded call operand may cross: straight-line, not a
-  safepoint, no call, and no control transfer. }
-function Crossable(const AIns: TWasmIrInstr): Boolean;
+procedure X64PreferLeafPreservedHosts(const AFn: TWasmIrFunction;
+  const ACalls: TX64LeafCallList;
+  const AScores, AScoresInLoop: array of UInt32;
+  var AAllocated: array of UInt32);
+var
+  K, P, Count: Integer;
+  Target: Int64;
+  Preserved: array[0..3] of Boolean;
+  Order: array of UInt32;
+  Next: array[0..3] of UInt32;
+  Slot: UInt32;
+
+  function Beats(const AA, AB: UInt32): Boolean;
+  begin
+    if AScoresInLoop[AA] <> AScoresInLoop[AB] then
+      Result := AScoresInLoop[AA] > AScoresInLoop[AB]
+    else if AScores[AA] <> AScores[AB] then
+      Result := AScores[AA] > AScores[AB]
+    else
+      Result := AA < AB;
+  end;
+
+  function Listed(const ASlot: UInt32): Boolean;
+  var
+    N: Integer;
+  begin
+    for N := 0 to Count - 1 do
+      if Order[N] = ASlot then
+        Exit(True);
+    Result := False;
+  end;
+
+  procedure Append(const ASlot: UInt32);
+  begin
+    if (ASlot = High(UInt32)) or Listed(ASlot) then
+      Exit;
+    if Count >= Length(Order) then
+      SetLength(Order, Count + 8);
+    Order[Count] := ASlot;
+    Inc(Count);
+  end;
+
+  { The best loop local not yet listed, or High(UInt32). }
+  function BestLocal: UInt32;
+  var
+    N: Integer;
+    Candidate: UInt32;
+  begin
+    Result := High(UInt32);
+    for N := 0 to High(AFn.LocalRegs) do
+    begin
+      Candidate := AFn.LocalRegs[N];
+      if (Candidate >= UInt32(Length(AScoresInLoop))) or
+        (AScoresInLoop[Candidate] = 0) or Listed(Candidate) or
+        (AFn.RegTypes[Candidate].Kind <> wvkNum) then
+        Continue;
+      if (Result = High(UInt32)) or Beats(Candidate, Result) then
+        Result := Candidate;
+    end;
+  end;
+
 begin
-  Result := not IrInstrIsSafepoint(AIns) and not (AIns.Op in [iroJump,
-    iroBranchIf, iroBranchIfNot, iroBrTable, iroReturn, iroUnreachable,
-    iroCall, iroCallIndirect, iroCallRef, iroReturnCall,
-    iroReturnCallIndirect, iroReturnCallRef]) and
-    (IR_OP_INFO[AIns.Op].DestKind in [ifkDestReg, ifkSrcReg, ifkUnused]);
+  if Length(AAllocated) <> 4 then
+    Exit;
+  Target := -1;
+  Preserved[2] := True;
+  Preserved[3] := True;
+  for K := 0 to High(ACalls) do
+    if ACalls[K].Enabled then
+    begin
+      if (Target >= 0) and (Target <> Int64(UInt32(AFn.Code[K].Imm))) then
+        Exit;
+      Target := Int64(UInt32(AFn.Code[K].Imm));
+      Preserved[2] := Preserved[2] and not ACalls[K].ClobbersRdi;
+      Preserved[3] := Preserved[3] and not ACalls[K].ClobbersRdx;
+    end;
+  if (Target < 0) or not (Preserved[2] or Preserved[3]) then
+    Exit;
+  Preserved[0] := False;
+  Preserved[1] := False;
+  { Preserved hosts first, each taking the best remaining loop local; then
+    every previously allocated slot in its order fills the rest. }
+  Order := nil;
+  Count := 0;
+  for P := 2 to 3 do
+    if Preserved[P] then
+      Append(BestLocal);
+  for P := 0 to 3 do
+    Append(AAllocated[P]);
+  K := 0;
+  for P := 2 to 3 do
+    if Preserved[P] then
+    begin
+      if K < Count then
+        Next[P] := Order[K]
+      else
+        Next[P] := High(UInt32);
+      Inc(K);
+    end;
+  for P := 0 to 3 do
+    if not Preserved[P] then
+    begin
+      if K < Count then
+        Next[P] := Order[K]
+      else
+        Next[P] := High(UInt32);
+      Inc(K);
+    end;
+  for P := 0 to 3 do
+  begin
+    Slot := Next[P];
+    AAllocated[P] := Slot;
+  end;
 end;
 
 procedure X64PlanLeafCallOperands(const AFn: TWasmIrFunction;

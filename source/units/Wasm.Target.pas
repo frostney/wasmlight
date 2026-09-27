@@ -74,7 +74,7 @@ const
   { Must stay equal to AOT_ABI_REVISION in Wasm.Interp. Identity fields
     are folded in addition to this revision, so two OS descriptors of the
     same arch do not share a fingerprint. }
-  WASM_TARGET_ABI_REVISION = UInt32(18);
+  WASM_TARGET_ABI_REVISION = UInt32(19);
 
   WASM_TARGET_POINTER_SIZE = Byte(8);
   WASM_TARGET_PAGE_SIZE_4K = UInt32(4096);

@@ -2128,6 +2128,9 @@ var
         AllocatedSlots[N] := UInt32(Ranked[N]);
     {$IFDEF WASM_JIT_X64}
     SelectX64LoopLocals;
+    if HasNativeLeafCall then
+      X64PreferLeafPreservedHosts(AFn^, X64LeafCalls, SlotScores,
+        LoopSlotScores, AllocatedSlots);
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := HasInlineCall;
@@ -2755,10 +2758,11 @@ begin
     AnalyzeLocalAliases;
     {$IFDEF WASM_JIT_X64}
     AnalyzeX64VecAliases;
-    if UseNativeScalarLeaf then
+    if UseNativeScalarLeaf or (UseStaticCache and UseNativeScalarCall) then
     begin
       RegisterUseCount(0);
-      X64PlanLeafAliases(AFn^, PlannedCode, SkipPlanned, RegUseCounts);
+      X64PlanBlockAliases(AFn^, PlannedCode, SkipPlanned, RegUseCounts,
+        Targets, X64LeafCalls);
     end;
     {$ENDIF}
     AnalyzeResultCopies;
