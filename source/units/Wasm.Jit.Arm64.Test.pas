@@ -59,7 +59,7 @@ type
     procedure TestLocalCallPatch;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWave2;
-    procedure TestCallArityFence;
+    procedure TestEveryIrOpHasTemplate;
     procedure TestSpZeroAdjustCopiesSp;
     procedure TestLargeSlotEncoding;
     procedure TestCondBranchVeneer;
@@ -674,51 +674,20 @@ begin
   Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(True);
 end;
 
-{ Direct-call arity is not a compile fence: an over-wide argument block is
-  encoded with a multi-instruction SP adjust. return_call* past the shared
-  tail-channel cap still declines so the interpreter runs it. }
-procedure TArm64Tests.TestCallArityFence;
+{ With call and return_call* arity encoded, the op template is the only
+  compile fence (JitCompileDecline), so an IR op without one would make
+  strict compilation decline a valid module (ADR-0015, issue #33). The
+  failure lists the ordinals of the ops missing a template. }
+procedure TArm64Tests.TestEveryIrOpHasTemplate;
 var
-  Aux: TWasmIrAuxU32;
-  Instr: TWasmIrInstr;
-  I: Integer;
+  Op: TWasmIrOp;
+  Missing: string;
 begin
-  { Two aux blocks, each [count, items...]: block 0 holds 2 argument
-    registers, block 3 holds 1 destination register. }
-  SetLength(Aux, 5);
-  Aux[0] := 2;
-  Aux[1] := 0;
-  Aux[2] := 1;
-  Aux[3] := 1;
-  Aux[4] := 2;
-
-  FillChar(Instr, SizeOf(Instr), 0);
-  Instr.Op := iroCall;
-  Instr.A := 0;
-  Instr.B := 3;
-  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
-
-  Instr.Op := iroI32Add;
-  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
-
-  { An argument block one past the historical short-form cap still compiles. }
-  SetLength(Aux, ARM64_MAX_CALL_SLOTS + 2);
-  Aux[0] := ARM64_MAX_CALL_SLOTS + 1;
-  for I := 1 to ARM64_MAX_CALL_SLOTS + 1 do
-    Aux[I] := 0;
-  Instr.Op := iroReturnCall;
-  Instr.A := 0;
-  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
-
-  { One past the shared GTierTail cap: return_call declines, call does not. }
-  SetLength(Aux, WASM_TIER_TAIL_CAP + 2);
-  Aux[0] := WASM_TIER_TAIL_CAP + 1;
-  for I := 1 to WASM_TIER_TAIL_CAP + 1 do
-    Aux[I] := 0;
-  Instr.Op := iroReturnCall;
-  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(False);
-  Instr.Op := iroCall;
-  Expect<Boolean>(Arm64CanEmitInstr(Instr, Aux)).ToBe(True);
+  Missing := '';
+  for Op := Low(TWasmIrOp) to High(TWasmIrOp) do
+    if not Arm64CanEmitOp(Op) then
+      Missing := Missing + ' ' + IntToStr(Ord(Op));
+  Expect<string>(Missing).ToBe('');
 end;
 
 function Arm64WordAt(const ABuf: TWasmCodeBuffer; const AOffset: Integer): UInt32;
@@ -1341,8 +1310,7 @@ begin
   Test('slot byte offset is register*8', TestSlotOffset);
   Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWave2);
-  Test('the call-site arity predicate admits wide calls and fences huge tails',
-    TestCallArityFence);
+  Test('every IR op has an aarch64 template', TestEveryIrOpHasTemplate);
   Test('a zero SP adjust copies SP rather than XZR',
     TestSpZeroAdjustCopiesSp);
   Test('a slot past the short LDR W offset uses ADD-scratch',

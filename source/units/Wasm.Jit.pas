@@ -173,7 +173,9 @@ type
   { Why JitCanCompile would refuse AFn. jdNone means the function is inside
     the current fence; every other value is the first failing check, in the
     same order JitCanCompile walks. AOT's strict path uses this so a decline
-    names the reason instead of collapsing to "not compiled". }
+    names the reason instead of collapsing to "not compiled".
+    jdFrameTooLarge, jdExceptionHandling, and jdUnsupportedInstr are retired
+    (those shapes now compile); they keep their ordinals and names. }
   TWasmJitDecline = (
     jdNone,
     jdNoBackend,
@@ -195,10 +197,9 @@ function RegisterJit(const AStore: TWasmStore): TWasmJitContext;
 function JitCompileDecline(const AFn: PWasmIrFunctionRec): TWasmJitDecline;
 
 { The compile predicate and scope fence (§10.3): True only if the active backend
-  can emit EVERY op in the function. False for EH ops / handler tables
-  (issue #32), an unsupported target, or a return_call* past WASM_TIER_TAIL_CAP
-  — the function then runs interpreted. Frame size and non-tail call arity
-  are encoded: both backends form large slots and large call-scratch frames. }
+  can emit EVERY op in the function. False off a backend host or for an op
+  with no template — the function then runs interpreted. Frame size, handler
+  tables, and call / return_call* arity are encoded, not declined. }
 function JitCanCompile(const AFn: PWasmIrFunctionRec): Boolean;
 
 { A deliberately narrow proof for the AArch64 native self-call ABI: one
@@ -353,24 +354,19 @@ begin
     UnwindException scans the same IR table the interpreter uses (tag
     store-address matching, eh-spec §2.3/§4). Native scalar fast paths still
     decline handlers — they have no helper/seam to resume a clause. }
-  { Every op must have a template, and every instruction must be one this
-    template can actually emit. Frame size and non-tail call arity are
-    encoded, not declined. The remaining fence is a `return_call*` whose
-    argument block exceeds the shared tail channel, or an op with no
+  { Every op must have a template. Frame size, call arity, and return_call*
+    arity are encoded, not declined: a wide tail publishes through the
+    context-owned wide tail buffer. The remaining fence is an op with no
     template. }
   for I := 0 to High(AFn^.Code) do
   begin
     {$IFDEF WASM_JIT_ARM64}
     if not Arm64CanEmitOp(AFn^.Code[I].Op) then
       Exit(jdUnsupportedOp);
-    if not Arm64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit(jdUnsupportedInstr);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     if not X64CanEmitOp(AFn^.Code[I].Op) then
       Exit(jdUnsupportedOp);
-    if not X64CanEmitInstr(AFn^.Code[I], AFn^.AuxU32) then
-      Exit(jdUnsupportedInstr);
     {$ENDIF}
   end;
   Result := jdNone;

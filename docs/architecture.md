@@ -456,10 +456,12 @@ different.
   publishes the callee's activation and GC frame in generated code — the
   same fields, order, and exhaustion predicates as `JitPrepareDirectCall`
   and `JitFinishDirectCall` — and falls back to those helpers whenever the
-  callee has no live direct entry. Large register files, wide non-tail calls, and out-of-range
-  conditional branches are encoded, not declined. The remaining compile
-  declines are an unsupported target (no backend) and a `return_call*`
-  whose argument block exceeds the shared cross-tier tail channel.
+  callee has no live direct entry. Large register files, wide calls and
+  `return_call*`s, and out-of-range conditional branches are encoded, not
+  declined: an argument or result block wider than the 1024-slot inline
+  buffers marshals through heap blocks the interpreter context owns, in
+  every tier. The remaining compile decline is an unsupported target (no
+  backend); every IR op has a template on both backends.
   Compiled and interpreted functions interoperate transparently across the
   seam (a throw from a compiled callee reaches an outer interpreted
   handler, and a cross-tier tail call stays O(1)).
