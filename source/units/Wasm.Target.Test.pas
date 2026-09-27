@@ -39,6 +39,7 @@ type
     procedure TestFingerprintsComeFromTheDescriptor;
     procedure TestOsIdentityChangesTheFingerprint;
     procedure TestHostLayoutMatchesLiveRecords;
+    procedure TestLiveAbiFingerprintMatchesPublished;
     procedure TestHostFingerprintMatchesDescriptor;
   end;
 
@@ -315,6 +316,56 @@ begin
   end;
 end;
 
+{ WasmAotAbiFingerprint refuses to stamp or accept an artifact when this
+  build's live layout fingerprints differently from the published one (an
+  -O4 ORDERFIELDS build once moved TWasmStore and TWasmGcHeap fields in
+  release only). The live descriptor must match here, and moving any one
+  baked offset by one word must change its fingerprint, so the guard sees
+  the kind of drift that release reordering produced. }
+procedure TTargetTests.TestLiveAbiFingerprintMatchesPublished;
+var
+  Engine: TWasmEngine;
+  Store: TWasmStore;
+  Host: TWasmTarget;
+  Live, Moved: TWasmTargetAbi;
+  Published: UInt64;
+begin
+  Host := WasmTargetHost;
+  if not WasmTargetSupported(Host) then
+  begin
+    Expect<Boolean>(WasmTargetSupported(Host)).ToBe(False);
+    Exit;
+  end;
+  Engine := TWasmEngine.Create;
+  try
+    Store := TWasmStore.Create(Engine);
+    try
+      Published := WasmTargetAbiFingerprint(WasmTargetAbi(Host));
+      Live := WasmLiveTargetAbi(Store);
+      { Every one of the published fields, not only the folded hash. }
+      Expect<Integer>(CompareByte(Live.Layout, WasmTargetAbi(Host).Layout,
+        SizeOf(TWasmTargetLayout))).ToBe(0);
+      Expect<UInt64>(WasmTargetAbiFingerprint(Live)).ToBe(Published);
+      Moved := Live;
+      Moved.Layout.StoreJitHelperTable := Live.Layout.StoreJitHelperTable - 8;
+      Expect<Boolean>(WasmTargetAbiFingerprint(Moved) <> Published).ToBe(True);
+      Moved := Live;
+      Moved.Layout.StoreEpoch := Live.Layout.StoreEpoch - 8;
+      Expect<Boolean>(WasmTargetAbiFingerprint(Moved) <> Published).ToBe(True);
+      Moved := Live;
+      Moved.Layout.HeapThreshold := Live.Layout.HeapThreshold - 8;
+      Expect<Boolean>(WasmTargetAbiFingerprint(Moved) <> Published).ToBe(True);
+      Moved := Live;
+      Moved.Layout.HeapFFree0 := Live.Layout.HeapFFree0 - 8;
+      Expect<Boolean>(WasmTargetAbiFingerprint(Moved) <> Published).ToBe(True);
+    finally
+      Store.Free;
+    end;
+  finally
+    Engine.Free;
+  end;
+end;
+
 procedure TTargetTests.TestHostFingerprintMatchesDescriptor;
 var
   Engine: TWasmEngine;
@@ -357,6 +408,8 @@ begin
     TestOsIdentityChangesTheFingerprint);
   Test('the host descriptor matches the live Pascal layout',
     TestHostLayoutMatchesLiveRecords);
+  Test('the live runtime layout fingerprints as the published one',
+    TestLiveAbiFingerprintMatchesPublished);
   Test('the host AOT fingerprint is the host descriptor fingerprint',
     TestHostFingerprintMatchesDescriptor);
 end;

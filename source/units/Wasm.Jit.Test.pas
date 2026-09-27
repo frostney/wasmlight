@@ -6040,15 +6040,11 @@ begin
   Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleEdge(5));
 
   { "\01\82\03\84\05\86\07\88" at 65528, read three times: acc*7 + x,
-    that is 57 * x in the access width. }
-  {$PUSH}
-  {$OVERFLOWCHECKS OFF}
-  {$RANGECHECKS OFF}
-  Tail32 := $88078605;
-  Tail32 := Tail32 * 57;
-  Tail64 := UInt64($8807860584038201);
-  Tail64 := Tail64 * 57;
-  {$POP}
+    that is 57 * x in the access width: $88078605 * 57 and
+    $8807860584038201 * 57, wrapped. Spelled as literals because -O4 folds
+    the products at compile time, where the wrap is an overflow error. }
+  Tail32 := $49ACD71D;
+  Tail64 := UInt64($49ACD73A64C7F239);
   Expect<Boolean>(DiffFresh(Bytes, 't32', [MakeValueI32(65532)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<UInt64>(FDiffJitOut.Bits).ToBe(Tail32);
