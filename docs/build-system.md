@@ -47,6 +47,18 @@ stack, and object checks; development turns them all on. Never repeat
 these directives per unit, and never add a second include with a
 different baseline.
 
+`Shared.inc` also sets `{$optimization noorderfields}` in every mode.
+Release builds compile with `-O4`, which otherwise reorders class fields
+to pack them. The JIT and AOT tiers bake class field offsets into machine
+code, and `Wasm.Target` publishes them for `.waot` artifacts and native
+executables. Reordering moved those offsets in release builds only, so a
+release runtime accepted a dev-built artifact and then faulted. As a second
+line of defence, a build whose live layout differs from the published one
+refuses to stamp artifacts for any target and rejects every
+published-layout artifact. `[test].flags = ["-O4"]` compiles the unit tests
+at release's optimization level, so `Wasm.Target.Test` checks the release
+layout directly; development checks stay on.
+
 ## Generated version constant
 
 ```toml

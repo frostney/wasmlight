@@ -15,6 +15,13 @@
   {$C+}
 {$ENDIF}
 {$modeswitch advancedrecords}
+{ Compiled code bakes class field offsets (TWasmStore, TWasmGcHeap,
+  TWasmModuleInstance) that Wasm.Target publishes and the AOT ABI
+  fingerprint folds. -O4 (release) turns on ORDERFIELDS, which reorders
+  class fields to pack them and so moved those offsets in release builds
+  only. Keep declaration order in every build mode so dev, release, and the
+  published layout agree. }
+{$optimization noorderfields}
 { Typed constants are read-only. Delphi mode defaults them writable, which
   would make constants like WASM_MAGIC mutable globals. }
 {$J-}

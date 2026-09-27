@@ -369,7 +369,16 @@ begin
       instantiated, and no interpreter/JIT need be registered just to stage. }
     Engine := TWasmEngine.Create;
     Store := TWasmStore.Create(Engine);
-    Artifact := AotCompileModule(Store, Loaded);
+    try
+      Artifact := AotCompileModule(Store, Loaded);
+    except
+      on E: EWasmError do
+      begin
+        WriteLn(ErrOutput, ErrPrefix('aot'), ModulePath, ': ', E.ClassName,
+          ': ', E.Message);
+        Exit(1);
+      end;
+    end;
 
     try
       WriteBytesToFile(OutPath, Artifact);
