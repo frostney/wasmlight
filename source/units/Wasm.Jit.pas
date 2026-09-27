@@ -260,6 +260,7 @@ uses
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   Wasm.Jit.X64,
+  Wasm.Jit.X64.Plan,
   {$ENDIF}
   Wasm.Runtime.Gc,
   Wasm.Runtime.Traps;
@@ -543,7 +544,7 @@ var
   GcAllocInfo: TWasmGcAllocInfo;
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
-  X64GcAllocShapes: array of TX64GcAllocShape;
+  X64GcAllocShapes: TX64GcAllocShapeList;
   {$ENDIF}
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
@@ -582,11 +583,7 @@ var
   X64CalleePtr: PX64DirectCallee;
   X64LeafFallThrough: Boolean;
   X64LeafEntryFunc: Int64;
-  UseX64VecCache: Boolean;
-  X64VecStatics: array of UInt32;
-  X64VecConsts: array of UInt32;
-  X64VecConstLo: array of UInt64;
-  X64VecConstHi: array of UInt64;
+  X64VecPlan: TX64VecCachePlan;
   X64ImmediateValues: array of Int64;
   {$ENDIF}
 
@@ -1935,152 +1932,6 @@ var
         MarkLoopCarried(Integer(PlannedCode[K].B), K);
   end;
 
-  {$IFDEF WASM_JIT_X64}
-  { The xmm plan for a static-cache function holding natively emitted v128
-    ops. Fixed hosts go first to the most-used v128 locals and parameters —
-    never a result slot, because a fixed host is not written back at an
-    exit — then to loop-invariant v128.const results: a constant defined
-    inside a loop span re-materializes every iteration, so it is seeded once
-    at entry instead. A candidate constant must be the only writer of a slot
-    no local, result, or exit can observe; a validated temporary is written
-    before every read, and a unique writer always writes the same bits, so
-    the seeded host equals the slot's value at every read. A function
-    without v128 ops keeps its exact previous code. }
-  procedure AnalyzeX64VecCache;
-  const
-    MAX_FIXED = 8;
-    MAX_STATIC = 6;
-  var
-    K, M, Best: Integer;
-    Scores: array of UInt32;
-    Slot: UInt32;
-    Ins: TWasmIrInstr;
-    HasVec, InLoop, Unique: Boolean;
-    VTmp: TWasmV128;
-
-    procedure ScoreVec(const ASlot: UInt32; const AWeight: UInt32);
-    begin
-      if ASlot < UInt32(Length(Scores)) then
-        Inc(Scores[ASlot], AWeight);
-    end;
-
-    function Chosen(const ASlot: UInt32): Boolean;
-    var
-      N: Integer;
-    begin
-      Result := True;
-      for N := 0 to High(X64VecStatics) do
-        if X64VecStatics[N] = ASlot then
-          Exit;
-      for N := 0 to High(X64VecConsts) do
-        if X64VecConsts[N] = ASlot then
-          Exit;
-      Result := False;
-    end;
-
-  begin
-    UseX64VecCache := False;
-    SetLength(X64VecStatics, 0);
-    SetLength(X64VecConsts, 0);
-    SetLength(X64VecConstLo, 0);
-    SetLength(X64VecConstHi, 0);
-    if not UseStaticCache then
-      Exit;
-    HasVec := False;
-    SetLength(Scores, AFn^.RegisterCount);
-    for K := 0 to High(PlannedCode) do
-    begin
-      Ins := PlannedCode[K];
-      if SkipPlanned[K] or not X64VecCacheOp(Ins.Op) then
-        Continue;
-      HasVec := True;
-      case Ins.Op of
-        iroMoveVec:
-          begin
-            ScoreVec(Ins.A, 2);
-            ScoreVec(Ins.Dest, 2);
-          end;
-        iroV128Const,
-        iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat:
-          ScoreVec(Ins.Dest, 1);
-        iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
-        iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
-        iroI32x4ExtractLane, iroI64x2ExtractLane:
-          ScoreVec(Ins.A, 1);
-        iroV128Not:
-          begin
-            ScoreVec(Ins.A, 1);
-            ScoreVec(Ins.Dest, 1);
-          end;
-      else
-        ScoreVec(Ins.A, 1);
-        ScoreVec(Ins.B, 1);
-        ScoreVec(Ins.Dest, 1);
-      end;
-    end;
-    if not HasVec then
-      Exit;
-    UseX64VecCache := True;
-    repeat
-      Best := -1;
-      for K := 0 to High(AFn^.LocalRegs) do
-      begin
-        Slot := AFn^.LocalRegs[K];
-        if (Slot >= UInt32(Length(AFn^.RegTypes))) or
-          (AFn^.RegTypes[Slot].Kind <> wvkVec) or (Scores[Slot] < 2) or
-          Chosen(Slot) then
-          Continue;
-        if (Best < 0) or (Scores[Slot] > Scores[AFn^.LocalRegs[Best]]) then
-          Best := K;
-      end;
-      if Best >= 0 then
-      begin
-        SetLength(X64VecStatics, Length(X64VecStatics) + 1);
-        X64VecStatics[High(X64VecStatics)] := AFn^.LocalRegs[Best];
-      end;
-    until (Best < 0) or (Length(X64VecStatics) = MAX_STATIC);
-    for K := 0 to High(PlannedCode) do
-    begin
-      if Length(X64VecStatics) + Length(X64VecConsts) >= MAX_FIXED then
-        Break;
-      Ins := PlannedCode[K];
-      if SkipPlanned[K] or (Ins.Op <> iroV128Const) or
-        IsVisibleFrameReg(Ins.Dest) or Chosen(Ins.Dest) then
-        Continue;
-      InLoop := False;
-      for M := K to High(PlannedCode) do
-        if ((PlannedCode[M].Op = iroJump) and
-          (PlannedCode[M].A <= UInt32(K))) or
-          ((PlannedCode[M].Op in [iroBranchIf, iroBranchIfNot]) and
-          (PlannedCode[M].B <= UInt32(K))) then
-        begin
-          InLoop := True;
-          Break;
-        end;
-      if not InLoop then
-        Continue;
-      { Every Dest field counts, including a store's value operand: a
-        conservative superset of the slot's writers. }
-      Unique := True;
-      for M := 0 to High(AFn^.Code) do
-        if (M <> K) and ((AFn^.Code[M].Dest = Ins.Dest) or
-          (PlannedCode[M].Dest = Ins.Dest)) then
-        begin
-          Unique := False;
-          Break;
-        end;
-      if not Unique then
-        Continue;
-      IrAuxReadV128(AFn^.AuxU32, UInt32(Ins.Imm), VTmp);
-      SetLength(X64VecConsts, Length(X64VecConsts) + 1);
-      SetLength(X64VecConstLo, Length(X64VecConsts));
-      SetLength(X64VecConstHi, Length(X64VecConsts));
-      X64VecConsts[High(X64VecConsts)] := Ins.Dest;
-      X64VecConstLo[High(X64VecConsts)] := VTmp.U64[0];
-      X64VecConstHi[High(X64VecConsts)] := VTmp.U64[1];
-    end;
-  end;
-  {$ENDIF}
 
   procedure AnalyzeStaticCache;
   var
@@ -2686,149 +2537,6 @@ var
   end;
   {$ENDIF}
 
-  {$IFDEF WASM_JIT_X64}
-  { x64 inline struct.new. For a FIXED struct type everything Allocate
-    derives except the collection decision is compile-time: layout size,
-    size class, cell size, field offsets. The backend emits the free-list
-    hit under the live collection trigger and falls back to the unchanged
-    helper for everything else. Numeric, packed, and reference fields fill
-    inline (a struct.new's stores are initializing stores, which the runtime
-    also writes without a barrier); v128 fields, large objects, and field
-    counts past the shape capacity decline. Unlike the arm64 path, any
-    class size fits: the cell index takes a shift and, for the 3*2^k
-    classes, one exact reciprocal multiply, and every qword the fills do not
-    cover is zeroed in the template. }
-  procedure AnalyzeGcInlineAllocX64;
-  var
-    K, F, C, CanonIdx, ClassIndex: Integer;
-    TypeIdx: UInt32;
-    Offset, Width, Size, CellSize, Base, Shift: UInt32;
-    Covered: UInt64;
-    ByteCount: array[0..31] of UInt32;
-    Ok: Boolean;
-    Comp: ^TWasmCompType;
-    Storage: TWasmStorageType;
-  begin
-    SetLength(X64GcAllocShapes, Length(AFn^.Code));
-    for K := 0 to High(AFn^.Code) do
-      X64GcAllocShapes[K] := Default(TX64GcAllocShape);
-    if UseNativeScalarCore then
-      Exit;
-    with WasmJitGcHeapOffsets do
-      if (HeapFFree0 + WASM_GC_CLASS_COUNT * 8 > $7FFFFFFF) or
-        (HeapMarkState > $7FFFFFFF) or (HeapBytesLive > $7FFFFFFF) or
-        (HeapBytesAllocated > $7FFFFFFF) or
-        (HeapObjectCount > $7FFFFFFF) or (HeapThreshold > $7FFFFFFF) or
-        (BlockBase > $7FFFFFFF) or (BlockAllocated > $7FFFFFFF) then
-        Exit;
-
-    for K := 0 to High(AFn^.Code) do
-    begin
-      if AFn^.Code[K].Op <> iroStructNew then
-        Continue;
-      TypeIdx := UInt32(AFn^.Code[K].Imm);
-      { EngineTypeIds[Imm] is a disp32 load in the template. }
-      if (TypeIdx >= UInt32(Length(AIr.TypeIndexToCanon))) or
-        (TypeIdx >= $1FFFFFFF) then
-        Continue;
-      CanonIdx := Integer(AIr.TypeIndexToCanon[TypeIdx]);
-      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
-        Continue;
-      Comp := @AIr.CanonTypes[CanonIdx].Comp;
-      if Comp^.Kind <> wckStruct then
-        Continue;
-      F := Length(Comp^.Struct.Fields);
-      if (F > Length(X64GcAllocShapes[K].Fields)) or
-        (UInt32(F) <> IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].A)) then
-        Continue;
-
-      { Field walk — the arithmetic of TWasmGcTypes.Define: header 8, each
-        field aligned up to its storage width, cumulative advance. }
-      Offset := 8;
-      Ok := True;
-      for C := 0 to F - 1 do
-      begin
-        Storage := Comp^.Struct.Fields[C].Storage;
-        if Storage.IsPacked then
-        begin
-          if Storage.PackedType = wpkI8 then
-            Width := 1
-          else
-            Width := 2;
-        end
-        else
-          case Storage.ValueType.Kind of
-            wvkNum:
-              if (Storage.ValueType.Num = wntI32) or
-                (Storage.ValueType.Num = wntF32) then
-                Width := 4
-              else
-                Width := 8;
-            wvkRef:
-              Width := SizeOf(TWasmRef);
-          else
-            Width := 16;
-          end;
-        if Width > 8 then
-        begin
-          Ok := False;
-          Break;
-        end;
-        Offset := (Offset + Width - 1) and not (Width - 1);
-        X64GcAllocShapes[K].Fields[C].Offset := UInt16(Offset);
-        X64GcAllocShapes[K].Fields[C].Width := Byte(Width);
-        Offset := Offset + Width;
-      end;
-      if not Ok then
-        Continue;
-
-      { Size-class math mirrors TWasmGcHeap.Allocate: align the span to 8,
-        bump to the first class, take the first class that fits. A size past
-        every class is a large object, which the helper owns. }
-      Size := (Offset + 7) and not UInt32(7);
-      if Size < WASM_GC_SIZE_CLASSES[0] then
-        Size := WASM_GC_SIZE_CLASSES[0];
-      ClassIndex := -1;
-      for C := 0 to WASM_GC_CLASS_COUNT - 1 do
-        if Size <= WASM_GC_SIZE_CLASSES[C] then
-        begin
-          ClassIndex := C;
-          Break;
-        end;
-      if ClassIndex < 0 then
-        Continue;
-      CellSize := WASM_GC_SIZE_CLASSES[ClassIndex];
-      if (CellSize mod 3) = 0 then
-        Base := CellSize div 3
-      else
-        Base := CellSize;
-      Shift := 0;
-      while (UInt32(1) shl Shift) < Base do
-        Inc(Shift);
-      if ((UInt32(1) shl Shift) <> Base) or (CellSize > 256) then
-        Continue;
-
-      { Qwords after the header the fills write in full (fields never
-        overlap, so eight covered bytes means the whole qword). }
-      FillChar(ByteCount, SizeOf(ByteCount), 0);
-      for C := 0 to F - 1 do
-        Inc(ByteCount[X64GcAllocShapes[K].Fields[C].Offset div 8],
-          X64GcAllocShapes[K].Fields[C].Width);
-      Covered := 0;
-      for C := 1 to Integer(CellSize div 8) - 1 do
-        if ByteCount[C] = 8 then
-          Covered := Covered or (UInt64(1) shl C);
-
-      X64GcAllocShapes[K].Enabled := True;
-      X64GcAllocShapes[K].FieldCount := Byte(F);
-      X64GcAllocShapes[K].ClassIndex := Byte(ClassIndex);
-      X64GcAllocShapes[K].CellShift := Byte(Shift);
-      X64GcAllocShapes[K].CellTimes3 := Base <> CellSize;
-      X64GcAllocShapes[K].CellSize := UInt16(CellSize);
-      X64GcAllocShapes[K].Covered := Covered;
-    end;
-  end;
-  {$ENDIF}
 
   procedure AnalyzePinnedMemory;
   var
@@ -3024,7 +2732,7 @@ begin
     AnalyzeGcInlineAlloc;
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
-    AnalyzeGcInlineAllocX64;
+    X64PlanGcInlineAlloc(AIr, AFn^, UseNativeScalarCore, X64GcAllocShapes);
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeDynamicWriteBack;
@@ -3039,7 +2747,8 @@ begin
         MaskedShiftSource[I] := -1;
       AnalyzeDynamicWriteBack;
     end;
-    AnalyzeX64VecCache;
+    X64PlanVecCache(AFn^, PlannedCode, SkipPlanned, UseStaticCache,
+      X64VecPlan);
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -3171,9 +2880,9 @@ begin
         X64EnableLeafEntryCache(X64Cache, UInt32(X64LeafEntryFunc));
       { Admitted v128 ops are helper-free too, so their xmm hosts survive to
         the same exits; a caller-saved xmm is never live across a call. }
-      if UseX64VecCache then
-        X64EnableVecCache(Buf, X64Cache, X64VecStatics, X64VecConsts,
-          X64VecConstLo, X64VecConstHi);
+      if X64VecPlan.Enabled then
+        X64EnableVecCache(Buf, X64Cache, X64VecPlan.Statics,
+          X64VecPlan.Consts, X64VecPlan.ConstLo, X64VecPlan.ConstHi);
     end;
     if UseNativeScalarCore and not X64LeafFallThrough then
     begin
