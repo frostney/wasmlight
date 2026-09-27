@@ -51,7 +51,16 @@ loader paths** for connector libraries, which widens host capability past
 the deny-by-default boundary. **Skipping startup revalidation because the
 artifact is local**, which would turn the payload into a trust boundary.
 **Choosing the target from host CPU/OS defines**, which prevents one
-compiler binary from emitting another supported target.
+compiler binary from emitting another supported target. **WIT as the
+connector language**, which describes component interfaces, not native
+bindings: its grammar has no library or symbol attribute, no pointer type,
+no function-typed parameter, no explicit enum value, and no `out`
+parameter, and neither the Component Model nor wit-bindgen defines a
+native host ABI (probed 2026-09-27 against `WebAssembly/component-model`
+`d1daf82`, wasm-tools 1.259.0, wit-bindgen 0.62.0). Adopting it would still
+need a native-mapping sidecar, which is `.wlc` again, and would pull in the
+Canonical ABI [ADR-0014](./0014-the-component-model-is-deferred-to-post-v1.md)
+defers.
 
 Consequences:
 
@@ -64,6 +73,13 @@ Consequences:
 - The error hierarchy, memory chokepoint, store-thread rule
   ([ADR-0008](./0008-a-store-is-confined-to-one-thread.md)), and
   deny-by-default host boundary remain intact.
+- Guests built by WIT tooling cannot use connectors. Their import modules
+  are interface names such as `local:libc/libc`, which no `.wlc` class name
+  can match, and they pass lists and strings as `(ptr, len)` pairs with
+  results through a return pointer and the guest's `cabi_realloc`. If
+  connectors ever accept such guests, that marshalling is the Canonical
+  ABI's flat lowering and must be the one implementation the Component
+  Model re-entry reuses, never a separate connector marshaller.
 - `VISION.md`'s "not a WebAssembly compiler" fence still means wasmlight
   does not produce `.wasm` modules. Compiling a validated module to a native
   executable is planned product work, recorded here and sequenced in
