@@ -270,7 +270,9 @@ type
     { AOT corpus mode (Track J, aot-spec §5.1) }
     procedure TestAotModeLoadsAndPasses;
     procedure TestX64WriteBackFixtureAllTiers;
+    procedure TestX64LeafFixtureAllTiers;
     procedure TestX64V128CacheFixtureAllTiers;
+    procedure TestX64ScaledIndexFixtureAllTiers;
     procedure TestGcV128FixtureAllTiers;
     procedure TestExnV128FixtureAllTiers;
     procedure TestAotModeMixedTiersCoexist;
@@ -1495,6 +1497,48 @@ begin
   end;
 end;
 
+{ The committed adversarial net for the x64 native leaf ABI
+  (tests/fixtures/wast/x64-leaf.py runs every command against its own
+  model of the two memories): three- and four-parameter leaves with mixed
+  i32/i64 signatures and every argument order, leaves reading and writing
+  the caller's memory at every access width and sign, guard-page faults on
+  a leaf's first or second access and mid-loop with the earlier stores
+  visible afterwards, memory.grow between leaf calls, exhaustion through
+  recursive callers, a leaf on memory 1 from memory-0 and memory-1
+  callers, forwarded, constant, and cyclic arguments, and rdi/rdx-hosted
+  locals across memory-leaf calls. Each tier must pass every command, and
+  on a backend host the compiled tiers must compile every function. }
+procedure TWastRunnerTests.TestX64LeafFixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'x64-leaf.wast';
+  { One module plus 107 assertions. }
+  COMMANDS = 108;
+  COMPILED_FUNCTIONS = 41;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
 { The committed adversarial net for the x64 v128 xmm cache
   (tests/fixtures/wast/x64-v128-cache.py computes every expected lane with an
   independent model): dirty vector temporaries across joins and traps, a
@@ -1511,6 +1555,45 @@ const
   { One module plus 60 assertions. }
   COMMANDS = 61;
   COMPILED_FUNCTIONS = 14;
+var
+  Mode: TWastTierMode;
+  Run: TWastRunResult;
+begin
+  for Mode in [wtmInterp, wtmJit, wtmAot] do
+  begin
+    Run := RunWastFile(FIXTURE, Mode);
+    try
+      Expect<Integer>(Run.Tally.Pass).ToBe(COMMANDS);
+      Expect<Integer>(Run.Tally.Fail).ToBe(0);
+      Expect<Integer>(Run.Tally.Skip).ToBe(0);
+      Expect<Integer>(Run.Tally.Staged).ToBe(0);
+      {$IFDEF WASM_JIT_BACKEND}
+      if Mode = wtmInterp then
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(0)
+      else
+        Expect<Integer>(Run.CompiledFuncCount).ToBe(COMPILED_FUNCTIONS);
+      {$ENDIF}
+    finally
+      Run.Free;
+    end;
+  end;
+end;
+
+{ The committed adversarial net for the x64 scaled pinned index
+  (tests/fixtures/wast/x64-scaled-index.py computes every expected value
+  with an independent model): masks at and across the m * 2^k < 2^32
+  bound, shift counts 0..4 and >= 32, i32 shifts that must wrap, traps at
+  and far past the end of memory, every store and load width, and address
+  locals read after the loop, before their redefinition, on another path,
+  and after the access. Each tier must pass every command, and on a backend
+  host the compiled tiers must compile every function. }
+procedure TWastRunnerTests.TestX64ScaledIndexFixtureAllTiers;
+const
+  FIXTURE = 'tests' + PathDelim + 'fixtures' + PathDelim + 'wast'
+    + PathDelim + 'x64-scaled-index.wast';
+  { One module plus 112 assertions. }
+  COMMANDS = 113;
+  COMPILED_FUNCTIONS = 52;
 var
   Mode: TWastTierMode;
   Run: TWastRunResult;
@@ -1867,8 +1950,12 @@ begin
     TestAotModeLoadsAndPasses);
   Test('the x64 write-back fixture passes in every tier',
     TestX64WriteBackFixtureAllTiers);
+  Test('the committed x64 native-leaf net passes in every tier',
+    TestX64LeafFixtureAllTiers);
   Test('the x64 v128 cache fixture passes in every tier',
     TestX64V128CacheFixtureAllTiers);
+  Test('the x64 scaled-index fixture passes in every tier',
+    TestX64ScaledIndexFixtureAllTiers);
   Test('the GC v128 field fixture passes in every tier',
     TestGcV128FixtureAllTiers);
   Test('the v128 exception payload fixture passes in every tier',

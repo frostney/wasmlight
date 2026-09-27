@@ -402,7 +402,12 @@ const
   { Revision 18: the inline struct.new fast paths (ARM64 and x64) bake the
     GC heap's live collection trigger (HeapThreshold) beside the wave-11 heap
     offsets, so they collect exactly where Allocate would. }
-  AOT_ABI_REVISION = 18;
+  { Revision 19: the x64 native leaf entry admits up to four i32/i64
+    parameters (r8, r9, rdi, rdx) and zero-offset i32 memory accesses that
+    read the caller-supplied Base in rsi, so which functions carry a
+    lightweight entry, and what it expects, changed; an older artifact's
+    code would be wired under the wrong entry contract. }
+  AOT_ABI_REVISION = 19;
 
 { A deterministic 64-bit fingerprint over everything a serialized artifact's
   code bakes as a constant and the loading runtime must therefore agree on

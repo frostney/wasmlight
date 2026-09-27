@@ -260,6 +260,7 @@ uses
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   Wasm.Jit.X64,
+  Wasm.Jit.X64.Leaf,
   Wasm.Jit.X64.Plan,
   {$ENDIF}
   Wasm.Runtime.Gc,
@@ -472,6 +473,17 @@ begin
   {$ENDIF}
 end;
 
+{ The proof behind a function's lightweight native-leaf entry: x64's wider
+  leaf ABI (Wasm.Jit.X64.Leaf), else the shared scalar leaf. }
+function JitNativeLeafEntry(const AFn: PWasmIrFunctionRec): Boolean;
+begin
+  {$IFDEF WASM_JIT_X64}
+  Result := (AFn <> nil) and X64CanNativeLeaf(AFn^);
+  {$ELSE}
+  Result := JitCanNativeScalarLeaf(AFn);
+  {$ENDIF}
+end;
+
 { --- compilation --------------------------------------------------------- }
 
 {$IFDEF WASM_JIT_BACKEND}
@@ -523,6 +535,9 @@ var
   { X64LoadAluFirst[K]: PlannedCode[K] is an i32.load emitted as the memory
     operand of PlannedCode[K + 1] (AnalyzeX64LoadAluFusion). }
   X64LoadAluFirst: array of Boolean;
+  { X64IndexScales[K]: the SIB scale of a pinned access whose address
+    shift was elided (X64PlanScaledIndex). }
+  X64IndexScales: TX64IndexScaleList;
   {$ENDIF}
   SlotUseCounts: array of UInt32;
   RegUseCounts: array of UInt32;
@@ -585,6 +600,11 @@ var
   X64LeafEntryFunc: Int64;
   X64VecPlan: TX64VecCachePlan;
   X64ImmediateValues: array of Int64;
+  { Per instruction: a direct call taking the native leaf entry. }
+  X64LeafCalls: TX64LeafCallList;
+  X64WrittenSlots: TX64BoolArray;
+  NativeParam2Reg: UInt32;
+  NativeParam3Reg: UInt32;
   {$ENDIF}
 
   procedure MarkTarget(const ATarget: UInt32);
@@ -714,9 +734,11 @@ var
     direct-call fast path). The callee's validated IR is fixed by this
     module, so its register-file shape may be baked; the live function
     instance and compiled entry are still resolved per call. Declines (nil)
-    an import, a native scalar leaf (its own path), a body the JIT declines
-    or that can never receive a CompiledDirectEntry, and any shape whose
-    flat argument/result slots do not match the call site's aux blocks. }
+    an import, a body the JIT declines or that can never receive a
+    CompiledDirectEntry, and any shape whose flat argument/result slots do
+    not match the call site's aux blocks. A planned native-leaf call site
+    (X64LeafCalls) never asks; a leaf whose memory the caller does not pin
+    takes this path through its canonical entry. }
   function PlanX64DirectCallee(const AIns: TWasmIrInstr;
     out APlan: TX64DirectCallee): Boolean;
   const
@@ -747,8 +769,7 @@ var
     APlan.ZeroRegs := nil;
     if (AIr = nil) or (AIns.Op <> iroCall) or
       (UInt32(AIns.Imm) < AIr.FuncImportCount) or
-      (UInt64(UInt32(AIns.Imm)) * 4 > UInt64(High(Int32))) or
-      NativeScalarLeafTarget(UInt32(AIns.Imm)) then
+      (UInt64(UInt32(AIns.Imm)) * 4 > UInt64(High(Int32))) then
       Exit;
     DefinedIdx := UInt32(AIns.Imm) - AIr.FuncImportCount;
     if DefinedIdx >= UInt32(Length(AIr.Functions)) then
@@ -2039,13 +2060,10 @@ var
       else
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
-      { A direct call to a proven native scalar leaf clobbers only rax-rdx
-        and r8-r11 and reads only its arguments
-        (X64EmitNativeLeafCallCached). }
-      if (AFn^.Code[K].Op = iroCall) and
-        NativeScalarLeafTarget(UInt32(AFn^.Code[K].Imm)) and
-        (IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].A) in [1, 2]) and
-        (IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].B) = 1) then
+      { A planned native-leaf call clobbers only rax, rcx, r8-r11, and per
+        its plan rdi/rdx, reads only its arguments and (a memory leaf) rsi,
+        and cannot grow memory (X64EmitNativeLeafCallCached). }
+      if X64LeafCalls[K].Enabled then
         HasNativeLeafCall := True
       else
       {$ENDIF}
@@ -2075,9 +2093,11 @@ var
     if HasNativeLeafCall then
     begin
       { Every value is an i32/i64 scalar (no reference a fallback helper
-        call could need rooted, no v128 in a caller-saved xmm host), and no
-        memory is pinned across the call. }
-      Eligible := Eligible and not UsePinnedMemory and not HasHandlers;
+        call could need rooted, no v128 in a caller-saved xmm host), and a
+        pinned memory keeps its Base in rsi, which the leaf preserves and
+        the call sequence reloads wherever it is overwritten. }
+      Eligible := Eligible and (not UsePinnedMemory or UsePinnedMemoryBase)
+        and not HasHandlers;
       for K := 0 to High(AFn^.RegTypes) do
         Eligible := Eligible and (AFn^.RegTypes[K].Kind = wvkNum) and
           ((AFn^.RegTypes[K].Num = wntI32) or
@@ -2112,6 +2132,9 @@ var
         AllocatedSlots[N] := UInt32(Ranked[N]);
     {$IFDEF WASM_JIT_X64}
     SelectX64LoopLocals;
+    if HasNativeLeafCall then
+      X64PreferLeafPreservedHosts(AFn^, X64LeafCalls, SlotScores,
+        LoopSlotScores, AllocatedSlots);
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := HasInlineCall;
@@ -2568,6 +2591,14 @@ var
         else if Index <> PinnedMemoryIndex then
           Multiple := True;
       end;
+    {$IFDEF WASM_JIT_X64}
+    { A memory leaf's accesses are this caller's own for pinning: it passes
+      the leaf the pinned Base. A call whose memory cannot be pinned keeps
+      the generic path. }
+    X64FoldLeafMemory(X64LeafCalls, Found, Multiple, PinnedMemoryIndex);
+    X64RestrictMemoryLeafCalls(X64LeafCalls, Found and not Multiple,
+      PinnedMemoryIndex);
+    {$ENDIF}
     UsePinnedMemory := Found and not Multiple;
     UsePinnedMemoryBase := UsePinnedMemory;
     if UsePinnedMemoryBase then
@@ -2578,9 +2609,13 @@ var
           those functions. Base-only pinning is restricted further to the
           zero-offset i32 guard-page form, which consumes neither ByteSize nor
           an explicit address-add sequence. }
-        if AFn^.Code[K].Op in [iroCall, iroCallIndirect, iroCallRef,
+        if (AFn^.Code[K].Op in [iroCall, iroCallIndirect, iroCallRef,
           iroReturnCall, iroReturnCallIndirect, iroReturnCallRef,
-          iroMemoryGrow] then
+          iroMemoryGrow])
+          {$IFDEF WASM_JIT_X64}
+          { A native leaf cannot grow memory or re-enter the embedder. }
+          and not X64LeafCalls[K].Enabled
+          {$ENDIF} then
           UsePinnedMemoryBase := False
         else if AFn^.Code[K].Op in [
           iroI32Load, iroI64Load, iroF32Load, iroF64Load,
@@ -2604,7 +2639,7 @@ begin
   Buf := Result;
   try
     UseNativeScalarSelf := JitCanNativeScalarSelf(AFn, AFuncIdx);
-    UseNativeScalarLeaf := JitCanNativeScalarLeaf(AFn);
+    UseNativeScalarLeaf := JitNativeLeafEntry(AFn);
     UseNativeScalarCore := UseNativeScalarSelf or UseNativeScalarLeaf;
     UseNativeScalarCall := False;
     NativeParamCount := 0;
@@ -2618,10 +2653,19 @@ begin
     begin
       NativeParamCount := AFn^.ParamCount;
       NativeParamReg := AFn^.LocalRegs[0];
-      if NativeParamCount = 2 then
+      if NativeParamCount >= 2 then
         NativeParam1Reg := AFn^.LocalRegs[1];
       NativeResultReg := AFn^.ResultRegs[0];
     end;
+    {$IFDEF WASM_JIT_X64}
+    NativeParam2Reg := 0;
+    NativeParam3Reg := 0;
+    if UseNativeScalarLeaf and (NativeParamCount >= 3) then
+      NativeParam2Reg := AFn^.LocalRegs[2];
+    if UseNativeScalarLeaf and (NativeParamCount >= 4) then
+      NativeParam3Reg := AFn^.LocalRegs[3];
+    X64PlanLeafCalls(AIr, AFn^, X64LeafCalls);
+    {$ENDIF}
     { One label per IR instruction, created in order so label id = IR index
       (the invariant the branch templates rely on). }
     for I := 0 to High(AFn^.Code) do
@@ -2665,9 +2709,11 @@ begin
     SetLength(Targets, Length(AFn^.Code));
     for I := 0 to High(AFn^.Code) do
     begin
+      {$IFNDEF WASM_JIT_X64}
       if (AFn^.Code[I].Op = iroCall) and
         NativeScalarLeafTarget(UInt32(AFn^.Code[I].Imm)) then
         UseNativeScalarCall := True;
+      {$ENDIF}
       case AFn^.Code[I].Op of
         iroJump: MarkTarget(AFn^.Code[I].A);
         iroBranchIf, iroBranchIfNot,
@@ -2689,6 +2735,9 @@ begin
     {$ENDIF}
 
     AnalyzePinnedMemory;
+    {$IFDEF WASM_JIT_X64}
+    UseNativeScalarCall := X64AnyLeafCall(X64LeafCalls);
+    {$ENDIF}
     AnalyzeStaticCache;
     if HasHandlers then
       { A landing pad is reached by the EH jump table, not a fall-through.
@@ -2713,6 +2762,12 @@ begin
     AnalyzeLocalAliases;
     {$IFDEF WASM_JIT_X64}
     AnalyzeX64VecAliases;
+    if UseNativeScalarLeaf or (UseStaticCache and UseNativeScalarCall) then
+    begin
+      RegisterUseCount(0);
+      X64PlanBlockAliases(AFn^, PlannedCode, SkipPlanned, RegUseCounts,
+        Targets, X64LeafCalls);
+    end;
     {$ENDIF}
     AnalyzeResultCopies;
     AnalyzeStoreLoadForwarding;
@@ -2723,6 +2778,9 @@ begin
     AnalyzeFusion;
     {$IFDEF WASM_JIT_X64}
     AnalyzeX64LoadAluFusion;
+    X64PlanScaledIndex(AFn^, PlannedCode, SkipPlanned, Targets,
+      ImmediateFusion, X64ImmediateValues,
+      UsePinnedMemoryBase and UseStaticCache, X64IndexScales);
     {$ENDIF}
     { After fusion planning, so already-folded constants are not offered a
       host register their defining instruction would never have used. }
@@ -2746,6 +2804,12 @@ begin
       for I := 0 to High(MaskedShiftSource) do
         MaskedShiftSource[I] := -1;
       AnalyzeDynamicWriteBack;
+    end;
+    if UseStaticCache and UseNativeScalarCall then
+    begin
+      RegisterUseCount(0);
+      X64PlanLeafCallOperands(AFn^, X64LeafCalls, SkipPlanned, PlannedCode,
+        Targets, RegUseCounts);
     end;
     X64PlanVecCache(AFn^, PlannedCode, SkipPlanned, UseStaticCache,
       X64VecPlan);
@@ -2830,9 +2894,11 @@ begin
     end;
     if UseNativeScalarSelf then
       X64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
-    if UsePinnedMemory then
+    { A leaf's pin belongs to its canonical entry alone: the lightweight
+      path receives Base in rsi from its caller. }
+    if UsePinnedMemory and not X64LeafFallThrough then
       X64EmitPinMemory(Buf, PinnedMemoryIndex,
-        UsePinnedMemoryBase and UseStaticCache);
+        (UsePinnedMemoryBase and UseStaticCache) or UseNativeScalarLeaf);
     { A static caller whose native-leaf calls all target one function
       caches that leaf's entry per activation in [rsp+16]. }
     X64LeafEntryFunc := -1;
@@ -2851,7 +2917,11 @@ begin
     if UseNativeScalarCore then
     begin
       X64SeedNativeCoreCache(X64Cache, NativeParamCount, NativeParamReg,
-        NativeParam1Reg, UseNativeScalarSelf);
+        NativeParam1Reg, UseNativeScalarSelf, NativeParam2Reg,
+        NativeParam3Reg);
+      { A memory leaf's accesses read Base from rsi (see above). }
+      if UsePinnedMemory then
+        X64EnablePinnedMemoryBase(X64Cache);
       { The closed helper-free native core defers its stores like ARM64's:
         its only exits are return (the caller reads r8 alone), the
         non-returning exhaustion and epoch traps (the trampoline reads no
@@ -2864,6 +2934,12 @@ begin
     else if UseStaticCache then
     begin
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
+      if UseNativeScalarCall then
+      begin
+        { A leaf call skips storing a host whose slot nothing writes. }
+        X64PlanWrittenSlots(AFn^, X64WrittenSlots);
+        X64MarkStableFixedHosts(X64Cache, X64WrittenSlots);
+      end;
       if UsePinnedMemoryBase then
         { StaticCacheOp admitted this function's scalar accesses only under
           the base-pinned proof; the prologue loaded Base into rsi above. }
@@ -2892,7 +2968,8 @@ begin
           AFn^.RegisterCount)
       else
         X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
-          NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+          NativeParam1Reg, NativeResultReg, NativeCoreLabel, 0,
+          NativeParam2Reg, NativeParam3Reg);
       X64EmitEpilogue(Buf, UseX64ExtendedFrame);
     end;
     if UseNativeScalarCore then
@@ -2975,8 +3052,7 @@ begin
       end;
       {$ENDIF}
       {$IFDEF WASM_JIT_X64}
-      NativeScalarCall := (AFn^.Code[I].Op = iroCall) and
-        NativeScalarLeafTarget(UInt32(AFn^.Code[I].Imm));
+      NativeScalarCall := X64LeafCalls[I].Enabled;
       X64CalleePtr := nil;
       if not UseNativeScalarCore and not NativeScalarCall and
         PlanX64DirectCallee(AFn^.Code[I], X64Callee) then
@@ -2987,7 +3063,13 @@ begin
       else if (I > 0) and X64LoadAluFirst[I - 1] then
       begin
         X64EmitLoadAluCached(Buf, PlannedCode[I - 1], PlannedCode[I],
-          X64Cache);
+          X64Cache, X64IndexScales[I - 1]);
+        Emitted := True;
+      end
+      else if X64IndexScales[I] <> 0 then
+      begin
+        X64EmitScalarMemoryPinned(Buf, PlannedCode[I], False, X64Cache,
+          X64IndexScales[I]);
         Emitted := True;
       end
       else if Fusion[I] >= 0 then
@@ -3010,7 +3092,8 @@ begin
           AFn^.RegisterCount, NativeParamReg, NativeResultSource,
           NativeCoreLabel, NativeExhaustedLabel, UseX64ExtendedFrame,
           NativeScalarCall,
-          X64Cache, @GcShapes[0], X64CalleePtr, @X64GcAllocShapes[0]);
+          X64Cache, @GcShapes[0], X64CalleePtr, @X64GcAllocShapes[0],
+          @X64LeafCalls[I]);
       {$ENDIF}
       if not Emitted then
         { The predicate guaranteed every op is emittable; reaching here is an
@@ -3054,8 +3137,11 @@ begin
       X64EmitPrologue(Buf, UseX64ExtendedFrame);
       X64EmitPinHelperTable(Buf, AHelperTableOffset);
       X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+      if UsePinnedMemory then
+        X64EmitPinMemory(Buf, PinnedMemoryIndex, True);
       X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
-        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+        NativeParam1Reg, NativeResultReg, NativeCoreLabel, 0,
+        NativeParam2Reg, NativeParam3Reg);
       X64EmitEpilogue(Buf, UseX64ExtendedFrame);
     end;
     if UseNativeScalarSelf then
@@ -3096,7 +3182,7 @@ begin
   { A native scalar leaf whose core never spills needs no frame of its own:
     emit once to learn that, then again with the frameless entry (the core
     bytes are identical; only the entry differs). }
-  if JitCanNativeScalarLeaf(AFn) then
+  if JitNativeLeafEntry(AFn) then
   begin
     Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
       ASnapshotOffset, AHelperTableOffset, False, False, Touched);
@@ -3233,7 +3319,7 @@ begin
   FStore.Funcs[AAddr].CompiledEntry := FBuffers[N].EntryPoint;
   if JitCanDirectCall(Fn) then
     FStore.Funcs[AAddr].CompiledDirectEntry := FBuffers[N].EntryPoint;
-  if JitCanNativeScalarLeaf(Fn) then
+  if JitNativeLeafEntry(Fn) then
     FStore.Funcs[AAddr].CompiledNativeScalarEntry := FBuffers[N].EntryPoint;
 
   N := Length(FCompiledAddrs);
@@ -3293,7 +3379,7 @@ begin
   if JitCanDirectCall(IrFunctionFor(AAddr)) then
     FStore.Funcs[AAddr].CompiledDirectEntry :=
       FStore.Funcs[AAddr].CompiledEntry;
-  if JitCanNativeScalarLeaf(IrFunctionFor(AAddr)) then
+  if JitNativeLeafEntry(IrFunctionFor(AAddr)) then
     FStore.Funcs[AAddr].CompiledNativeScalarEntry :=
       FStore.Funcs[AAddr].CompiledEntry;
 

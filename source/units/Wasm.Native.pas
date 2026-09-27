@@ -109,6 +109,7 @@ uses
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   Wasm.Jit.X64,
+  Wasm.Jit.X64.Leaf,
   {$ENDIF}
   Wasm.Interp.Numeric;
 
@@ -249,6 +250,24 @@ begin
       [iroReturnCall, iroReturnCallIndirect, iroReturnCallRef] then
       Exit;
   Result := True;
+end;
+
+{ The direct-call entries of a loaded function, as the JIT context wires
+  them: the canonical entry doubles as the direct entry, and on x64 a
+  native leaf's code also carries the lightweight leaf entry its callers'
+  leaf-call sites use (Wasm.Jit.X64.Leaf); without it they take the helper
+  fallback. }
+procedure NativeWireEntries(const AStore: TWasmStore;
+  const AAddr: TWasmFuncAddr; const AFn: TWasmIrFunction);
+begin
+  if NativeCanDirectCall(AFn) then
+    AStore.Funcs[AAddr].CompiledDirectEntry :=
+      AStore.Funcs[AAddr].CompiledEntry;
+  {$IFDEF WASM_JIT_X64}
+  if X64CanNativeLeaf(AFn) then
+    AStore.Funcs[AAddr].CompiledNativeScalarEntry :=
+      AStore.Funcs[AAddr].CompiledEntry;
+  {$ENDIF}
 end;
 
 procedure NativeTierInvoke(const AStore: TWasmStore;
@@ -406,9 +425,7 @@ begin
         Native.Free;
         Exit;
       end;
-      if NativeCanDirectCall(Ir.Functions[Rec^.FuncIrIndex]) then
-        AStore.Funcs[Addr].CompiledDirectEntry :=
-          AStore.Funcs[Addr].CompiledEntry;
+      NativeWireEntries(AStore, Addr, Ir.Functions[Rec^.FuncIrIndex]);
       Covered[Rec^.FuncIrIndex] := True;
     end;
 
@@ -539,9 +556,7 @@ begin
         Native.Free;
         Exit;
       end;
-      if NativeCanDirectCall(Ir.Functions[Rec^.FuncIrIndex]) then
-        AStore.Funcs[Addr].CompiledDirectEntry :=
-          AStore.Funcs[Addr].CompiledEntry;
+      NativeWireEntries(AStore, Addr, Ir.Functions[Rec^.FuncIrIndex]);
       Covered[Rec^.FuncIrIndex] := True;
     end;
 
