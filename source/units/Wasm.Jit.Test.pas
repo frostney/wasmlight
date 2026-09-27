@@ -665,12 +665,12 @@ function NativeLeafCallerModuleBytes: TWasmBytes;
 begin
   Result := AssembleWatText(
     '(module ' +
-    '(func $mix (param $a i32) (param $b i32) (result i32) ' +
+    '(func $mix (export "mix") (param $a i32) (param $b i32) (result i32) ' +
     ' (i32.add (i32.mul (i32.xor (local.get $a) (local.get $b)) (i32.const 1664525)) (i32.const 1013904223))) ' +
-    '(func $sub2 (param $a i32) (param $b i32) (result i32) ' +
+    '(func $sub2 (export "sub2") (param $a i32) (param $b i32) (result i32) ' +
     ' (i32.sub (local.get $a) (i32.mul (local.get $b) (i32.const 3)))) ' +
-    '(func $inc (param $a i32) (result i32) (i32.add (local.get $a) (i32.const 1))) ' +
-    '(func $mix64 (param $a i64) (param $b i64) (result i64) ' +
+    '(func $inc (export "inc") (param $a i32) (result i32) (i32.add (local.get $a) (i32.const 1))) ' +
+    '(func $mix64 (export "mix64") (param $a i64) (param $b i64) (result i64) ' +
     ' (i64.add (i64.mul (i64.xor (local.get $a) (local.get $b)) (i64.const 0x9E3779B97F4A7C15)) ' +
     '  (i64.shl (local.get $b) (i64.const 7)))) ' +
     '(func $ra (export "ra") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
@@ -6056,7 +6056,7 @@ var
   Bytes: TWasmBytes;
   Module: TWasmModule;
   Ir: TWasmIrModule;
-  RunRegisterCount: UInt32;
+  RunRegisterCount, MixRegisterCount, Cap: UInt32;
   {$IFDEF WASM_JIT_X64}
   Code: TWasmBytes;
   EntryOffset: NativeUInt;
@@ -6087,6 +6087,7 @@ begin
     DecodeModule(Bytes, Module);
     Ir := ValidateModule(Module, Bytes);
     RunRegisterCount := Ir.Functions[4].RegisterCount;
+    MixRegisterCount := Ir.Functions[0].RegisterCount;
     {$IFDEF WASM_JIT_X64}
     { $ra's call is the static-cache form: `xor ecx, ecx ; call rdx`, and
       the result is adopted from r8 into a host (mov r10, r8) rather than
@@ -6129,7 +6130,8 @@ begin
   end;
 
   { Every leaf compiled: the lightweight path. }
-  CompileExports(['ra', 'rb', 'rc', 'rd', 're', 'rf', 'check']);
+  CompileExports(['mix', 'sub2', 'inc', 'mix64', 'ra', 'rb', 'rc', 'rd',
+    're', 'rf', 'check']);
   Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
   { Only the callers compiled: every call takes the cold fallback, which
     must store the arguments held only in dynamic hosts and rejoin with the
@@ -6143,7 +6145,7 @@ begin
     boundaries from inside a static-cache loop. }
   WasmInterpMaxDepth := 1;
   try
-    CompileExports(['ra', 'rd']);
+    CompileExports(['mix', 'sub2', 'inc', 'ra', 'rd']);
     Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
       .ToBe(JIT_BACKEND_AVAILABLE);
     Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)]))
@@ -6153,9 +6155,25 @@ begin
   end;
   WasmInterpValueSlots := RunRegisterCount;
   try
-    CompileExports(['ra']);
+    CompileExports(['mix', 'ra']);
     Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
       .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+  { Sweep the value cap across the leaf frame's exact fit: every cap must
+    trap (or not) identically in both tiers, and the largest one fits. }
+  try
+    for Cap := RunRegisterCount to RunRegisterCount + MixRegisterCount + 2 do
+    begin
+      WasmInterpValueSlots := Cap;
+      CompileExports(['mix', 'ra']);
+      Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)])).ToBe('');
   finally
     WasmInterpValueSlots := 1 shl 16;
   end;
