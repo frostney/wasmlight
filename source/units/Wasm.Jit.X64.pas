@@ -128,22 +128,6 @@ type
     Slot: UInt32;
   end;
 
-  { The cold paths of one static-caller native-leaf call (entry resolution,
-    helper fallback, exhaustion trap), deferred past the function body by
-    X64BeginColdLeafCalls / X64EmitColdLeafCalls. }
-  TX64ColdLeafCall = record
-    Ins: TWasmIrInstr;
-    InsIndex: UInt32;
-    ArgN: Integer;
-    ArgSlots: array[0..1] of UInt32;
-    ArgHosts: array[0..1] of Byte;
-    ResultSlot: UInt32;
-    UseSlot: Boolean;
-    Slow, Fast, Fallback, Exhausted, PostCall: TWasmJitLabel;
-  end;
-  TX64ColdLeafCalls = array of TX64ColdLeafCall;
-  PX64ColdLeafCalls = ^TX64ColdLeafCalls;
-
   TX64RegCache = record
     Entries: array[0..3] of TX64RegCacheEntry;
     Next: Byte;
@@ -582,14 +566,6 @@ procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
 procedure X64EnableLeafEntryCache(var ACache: TX64RegCache;
   const AFuncIdx: UInt32);
 procedure X64EmitClearLeafEntry(const ABuf: TWasmCodeBuffer);
-{ With a sink set, a static-caller native-leaf call records its cold paths
-  there instead of emitting them in line behind a jump, so the hot path
-  falls straight through; X64EmitColdLeafCalls then emits them all (after
-  the function body, where no instruction falls into them) and clears the
-  sink. ASink = nil restores in-line emission. }
-procedure X64BeginColdLeafCalls(const ASink: PX64ColdLeafCalls);
-procedure X64EmitColdLeafCalls(const ABuf: TWasmCodeBuffer;
-  const AAux: TWasmIrAuxU32);
 { Enable deferred dynamic write-back on a static allocation. AUseCounts holds
   each slot's remaining planned reads (consumed as the emitter reads them);
   AVisibleSlots marks locals, results, and loop-carried slots, which are
@@ -5283,65 +5259,10 @@ end;
        and the other static hosts are reloaded from their slots.
 
   An exhausted call traps to the trampoline, which reads no slot. }
-threadvar
-  GX64ColdLeafSink: PX64ColdLeafCalls;
-
-procedure X64BeginColdLeafCalls(const ASink: PX64ColdLeafCalls);
-begin
-  GX64ColdLeafSink := ASink;
-  if ASink <> nil then
-    SetLength(ASink^, 0);
-end;
-
-procedure EmitColdLeafCall(const ABuf: TWasmCodeBuffer;
-  const AAux: TWasmIrAuxU32; const ACold: TX64ColdLeafCall);
-var
-  I: Integer;
-begin
-  if ACold.UseSlot then
-  begin
-    { Cache only a live entry that passed both predicates; a nil entry or
-      an exhausted call takes the same exits as the uncached form. }
-    ABuf.BindLabel(ACold.Slow);
-    EmitNativeScalarLeafResolve(ABuf, UInt32(ACold.Ins.Imm), ACold.Fallback,
-      ACold.Exhausted);
-    X64EmitStoreMem64(ABuf, X64_RDX, X64_RSP, 16);
-    X64EmitJmpTo(ABuf, UInt32(ACold.Fast));
-  end;
-  { 3. r8-r11 are intact here (the resolution touches only rax-rdi). }
-  ABuf.BindLabel(ACold.Fallback);
-  for I := 0 to ACold.ArgN - 1 do
-    if (ACold.ArgHosts[I] <> $FF) and (ACold.ArgHosts[I] <> X64_R8) and
-      (ACold.ArgHosts[I] <> X64_R9) then
-      X64EmitStoreSlot64(ABuf, ACold.ArgHosts[I], ACold.ArgSlots[I]);
-  EmitCall(ABuf, ACold.Ins, AAux, ACold.InsIndex, False, nil);
-  X64EmitLoadSlot64(ABuf, X64_R8, ACold.ResultSlot);
-  X64EmitJmpTo(ABuf, UInt32(ACold.PostCall));
-
-  ABuf.BindLabel(ACold.Exhausted);
-  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
-  X64EmitCallHelper(ABuf, aohTrapKind);
-end;
-
-procedure X64EmitColdLeafCalls(const ABuf: TWasmCodeBuffer;
-  const AAux: TWasmIrAuxU32);
-var
-  I: Integer;
-begin
-  if GX64ColdLeafSink <> nil then
-  begin
-    for I := 0 to High(GX64ColdLeafSink^) do
-      EmitColdLeafCall(ABuf, AAux, GX64ColdLeafSink^[I]);
-    SetLength(GX64ColdLeafSink^, 0);
-  end;
-  GX64ColdLeafSink := nil;
-end;
-
 procedure X64EmitNativeLeafCallCached(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AInsIndex: UInt32; var ACache: TX64RegCache);
 var
-  Cold: TX64ColdLeafCall;
   ArgN, I: Integer;
   ArgSlots: array[0..1] of UInt32;
   ArgHosts: array[0..1] of Byte;
@@ -5375,8 +5296,6 @@ var
 begin
   ArgN := Integer(IrAuxBlockCount(AAux, AIns.A));
   ResultSlot := IrAuxBlockItem(AAux, AIns.B, 0);
-  ArgSlots[1] := 0;
-  ArgHosts[1] := $FF;
   for I := 0 to ArgN - 1 do
   begin
     ArgSlots[I] := IrAuxBlockItem(AAux, AIns.A, UInt32(I));
@@ -5450,33 +5369,33 @@ begin
   for I := 0 to 1 do
     if ACache.Entries[I].Valid and (I <> Index) then
       X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
-
-  Cold.Ins := AIns;
-  Cold.InsIndex := AInsIndex;
-  Cold.ArgN := ArgN;
-  for I := 0 to 1 do
-  begin
-    Cold.ArgSlots[I] := ArgSlots[I];
-    Cold.ArgHosts[I] := ArgHosts[I];
-  end;
-  Cold.ResultSlot := ResultSlot;
-  Cold.UseSlot := UseSlot;
-  Cold.Slow := Slow;
-  Cold.Fast := Fast;
-  Cold.Fallback := Fallback;
-  Cold.Exhausted := Exhausted;
-  Cold.PostCall := PostCall;
-  if GX64ColdLeafSink <> nil then
-  begin
-    { Deferred past the body: the hot path falls straight through. }
-    I := Length(GX64ColdLeafSink^);
-    SetLength(GX64ColdLeafSink^, I + 1);
-    GX64ColdLeafSink^[I] := Cold;
-    Exit;
-  end;
-  { In line: the caller's next code must not fall into the cold paths. }
+  { The cold paths go after the straight line; the caller's next code must
+    not fall into them. }
   X64EmitJmpTo(ABuf, UInt32(Done));
-  EmitColdLeafCall(ABuf, AAux, Cold);
+
+  if UseSlot then
+  begin
+    { Cache only a live entry that passed both predicates; a nil entry or
+      an exhausted call takes the same exits as the uncached form. }
+    ABuf.BindLabel(Slow);
+    EmitNativeScalarLeafResolve(ABuf, UInt32(AIns.Imm), Fallback, Exhausted);
+    X64EmitStoreMem64(ABuf, X64_RDX, X64_RSP, 16);
+    X64EmitJmpTo(ABuf, UInt32(Fast));
+  end;
+
+  { 3. }
+  ABuf.BindLabel(Fallback);
+  for I := 0 to ArgN - 1 do
+    if (ArgHosts[I] <> $FF) and (ArgHosts[I] <> X64_R8) and
+      (ArgHosts[I] <> X64_R9) then
+      X64EmitStoreSlot64(ABuf, ArgHosts[I], ArgSlots[I]);
+  EmitCall(ABuf, AIns, AAux, AInsIndex, False, nil);
+  X64EmitLoadSlot64(ABuf, X64_R8, ResultSlot);
+  X64EmitJmpTo(ABuf, UInt32(PostCall));
+
+  ABuf.BindLabel(Exhausted);
+  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
   ABuf.BindLabel(Done);
 end;
 

@@ -569,7 +569,6 @@ var
   X64CalleePtr: PX64DirectCallee;
   X64LeafFallThrough: Boolean;
   X64LeafEntryFunc: Int64;
-  X64ColdLeafCalls: TX64ColdLeafCalls;
   UseX64VecCache: Boolean;
   X64VecStatics: array of UInt32;
   X64VecConsts: array of UInt32;
@@ -3042,7 +3041,6 @@ begin
       Buf.BindLabel(NativeCoreLabel);
     { Only the core's own slot traffic decides the leaf's frame. }
     X64ResetSlotTouched;
-    X64BeginColdLeafCalls(@X64ColdLeafCalls);
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -3174,8 +3172,6 @@ begin
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     AX64LeafTouchedFrame := X64SlotTouched;
-    { After the body's last instruction, which never falls through. }
-    X64EmitColdLeafCalls(Buf, AFn^.AuxU32);
     if AX64FramelessLeaf and AX64LeafTouchedFrame then
       raise EWasmInternal.Create(
         'internal: frameless x64 native leaf touched its frame');
@@ -3212,9 +3208,6 @@ begin
     if AFinalize then
       Buf.MakeExecutable;
   except
-    {$IFDEF WASM_JIT_X64}
-    X64BeginColdLeafCalls(nil);
-    {$ENDIF}
     Result.Free;
     raise;
   end;
