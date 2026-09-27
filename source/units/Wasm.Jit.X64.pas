@@ -456,9 +456,19 @@ procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
 procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer;
   const ARetainContext: Boolean = False);
+{ AFrameless: the leaf core touches no register-file slot (the driver's
+  first emission pass proved it with X64SlotTouched), so the lightweight
+  path jumps straight into the core and its RET returns to the caller;
+  rbx then still names the caller's frame, which the core never reads. }
 procedure X64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
   const ARegisterCount, AParamCount, AParam0Reg, AParam1Reg: UInt32;
-  const ACoreLabel, AExternalLabel: TWasmJitLabel);
+  const ACoreLabel, AExternalLabel: TWasmJitLabel;
+  const AFrameless: Boolean = False);
+{ Whether any register-file slot load or store was emitted on this thread
+  since the last X64ResetSlotTouched (the driver brackets a native leaf
+  core's emission with them). }
+procedure X64ResetSlotTouched;
+function X64SlotTouched: Boolean;
 procedure X64EmitNativeCoreWrapperCall(const ABuf: TWasmCodeBuffer;
   const AParamCount, AParam0Reg, AParam1Reg, AResultReg: UInt32;
   const ACoreLabel: TWasmJitLabel);
@@ -3128,11 +3138,25 @@ begin
     Result := X64_R10;
 end;
 
+threadvar
+  GX64SlotTouched: Boolean;
+
+procedure X64ResetSlotTouched;
+begin
+  GX64SlotTouched := False;
+end;
+
+function X64SlotTouched: Boolean;
+begin
+  Result := GX64SlotTouched;
+end;
+
 procedure X64EmitSlotAddr(const ABuf: TWasmCodeBuffer; const AAddrReg: Byte;
   const ASlot: UInt32);
 var
   Off: UInt64;
 begin
+  GX64SlotTouched := True;
   Off := UInt64(ASlot) * X64_SLOT_SIZE;
   if Off <= UInt64(High(Int32)) then
     X64EmitLea(ABuf, AAddrReg, X64_REG_REGFILE, Int32(Off))
@@ -3146,6 +3170,7 @@ end;
 procedure X64EmitLoadSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 begin
+  GX64SlotTouched := True;
   if X64SlotDispFits(ASlot) then
     X64EmitLoadMem64(ABuf, AReg, X64_REG_REGFILE,
       Int32(X64SlotByteOffset(ASlot)))
@@ -3159,6 +3184,7 @@ end;
 procedure X64EmitLoadSlot32(const ABuf: TWasmCodeBuffer; const AReg: Byte;
   const ASlot: UInt32);
 begin
+  GX64SlotTouched := True;
   if X64SlotDispFits(ASlot) then
     X64EmitLoadMem32(ABuf, AReg, X64_REG_REGFILE,
       Int32(X64SlotByteOffset(ASlot)))
@@ -3174,6 +3200,7 @@ procedure X64EmitStoreSlot64(const ABuf: TWasmCodeBuffer; const AReg: Byte;
 var
   Scratch: Byte;
 begin
+  GX64SlotTouched := True;
   if X64SlotDispFits(ASlot) then
     X64EmitStoreMem64(ABuf, AReg, X64_REG_REGFILE,
       Int32(X64SlotByteOffset(ASlot)))
@@ -3190,6 +3217,7 @@ procedure X64EmitLoadVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
 var
   Base: Byte;
 begin
+  GX64SlotTouched := True;
   if X64SlotDispFits(ASlot) then
     Base := X64_REG_REGFILE
   else
@@ -3212,6 +3240,7 @@ procedure X64EmitStoreVec(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
 var
   Base: Byte;
 begin
+  GX64SlotTouched := True;
   if X64SlotDispFits(ASlot) then
     Base := X64_REG_REGFILE
   else
@@ -3676,7 +3705,8 @@ end;
 
 procedure X64EmitNativeLeafEntry(const ABuf: TWasmCodeBuffer;
   const ARegisterCount, AParamCount, AParam0Reg, AParam1Reg: UInt32;
-  const ACoreLabel, AExternalLabel: TWasmJitLabel);
+  const ACoreLabel, AExternalLabel: TWasmJitLabel;
+  const AFrameless: Boolean);
 var
   FrameBytes: UInt32;
 begin
@@ -3684,6 +3714,11 @@ begin
     caller passes nil with scalar arguments in r8/r9 and receives r8. }
   X64EmitAluRegReg(ABuf, $85, True, X64_RCX, X64_RCX);
   X64EmitJccTo(ABuf, X64_CC_NE, UInt32(AExternalLabel));
+  if AFrameless then
+  begin
+    X64EmitJmpTo(ABuf, UInt32(ACoreLabel));
+    Exit;
+  end;
   FrameBytes := (ARegisterCount * X64_SLOT_SIZE + 15) and not UInt32(15);
   X64EmitPushReg(ABuf, X64_RBX);
   X64EmitSubRsp(ABuf, Int32(FrameBytes));

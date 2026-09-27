@@ -489,7 +489,17 @@ function JitCompileToBuffer(const AIr: TWasmIrModule;
   const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32;
   const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
-  const AFinalize: Boolean = True): TWasmCodeBuffer;
+  const AFinalize: Boolean = True): TWasmCodeBuffer; forward;
+
+{ One emission pass. AX64FramelessLeaf (x64 native scalar leaf only) emits
+  the frameless lightweight entry; AX64LeafTouchedFrame reports whether the
+  leaf core emitted any register-file slot access. }
+function JitCompileToBufferPass(const AIr: TWasmIrModule;
+  const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32;
+  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
+  const AFinalize, AX64FramelessLeaf: Boolean;
+  out AX64LeafTouchedFrame: Boolean): TWasmCodeBuffer;
 var
   I, J: Integer;
   Buf: TWasmCodeBuffer;
@@ -2734,6 +2744,7 @@ var
   end;
 
 begin
+  AX64LeafTouchedFrame := False;
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
   try
@@ -2944,7 +2955,7 @@ begin
     begin
       X64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeParamCount,
         NativeParamReg, NativeParam1Reg, NativeCoreLabel,
-        NativeExternalLabel);
+        NativeExternalLabel, AX64FramelessLeaf);
       Buf.BindLabel(NativeExternalLabel);
     end;
     X64EmitPrologue(Buf, UseX64ExtendedFrame);
@@ -2997,6 +3008,8 @@ begin
       X64EmitEpilogue(Buf, UseX64ExtendedFrame);
       Buf.BindLabel(NativeCoreLabel);
     end;
+    { Only the core's own slot traffic decides the leaf's frame. }
+    X64ResetSlotTouched;
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -3127,6 +3140,10 @@ begin
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
+    AX64LeafTouchedFrame := X64SlotTouched;
+    if AX64FramelessLeaf and AX64LeafTouchedFrame then
+      raise EWasmInternal.Create(
+        'internal: frameless x64 native leaf touched its frame');
     if UseNativeScalarSelf then
     begin
       Buf.BindLabel(NativeExhaustedLabel);
@@ -3151,6 +3168,38 @@ begin
     Result.Free;
     raise;
   end;
+end;
+
+function JitCompileToBuffer(const AIr: TWasmIrModule;
+  const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32;
+  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
+  const AFinalize: Boolean): TWasmCodeBuffer;
+var
+  Touched: Boolean;
+begin
+  {$IFDEF WASM_JIT_X64}
+  { A native scalar leaf whose core never spills needs no frame of its own:
+    emit once to learn that, then again with the frameless entry (the core
+    bytes are identical; only the entry differs). }
+  if JitCanNativeScalarLeaf(AFn) then
+  begin
+    Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
+      ASnapshotOffset, AHelperTableOffset, False, False, Touched);
+    if Touched then
+    begin
+      if AFinalize then
+        Result.MakeExecutable;
+      Exit;
+    end;
+    Result.Free;
+    Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
+      ASnapshotOffset, AHelperTableOffset, AFinalize, True, Touched);
+    Exit;
+  end;
+  {$ENDIF}
+  Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
+    ASnapshotOffset, AHelperTableOffset, AFinalize, False, Touched);
 end;
 {$ENDIF}
 
