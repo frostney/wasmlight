@@ -1164,6 +1164,16 @@ var
       instruction is read by nothing else, so its slot is never needed. A
       fused compare keeps its compare-branch plan (AnalyzeFusion runs next). }
     SetLength(X64ImmediateValues, Length(AFn^.Code));
+    { A static-cache function holding cached v128 ops (AnalyzeX64VecCache's
+      predicate) keeps its previous scalar emission: on the measuring host
+      (Zen 5) shortening the scalar half of an xmm-chain-bound loop made
+      the simd workload ~20% slower, reproduced in isolated assembly where
+      ten one-byte NOPs restore the speed; a layout/scheduling effect, not
+      a cost of the immediate forms. X64CachedConst applies the same fence. }
+    if UseStaticCache then
+      for K := 0 to High(PlannedCode) do
+        if not SkipPlanned[K] and X64VecCacheOp(PlannedCode[K].Op) then
+          Exit;
     for K := 0 to High(PlannedCode) - 1 do
       if (PlannedCode[K].Op in [iroI32Const, iroI64Const]) and
         (PlannedCode[K + 1].B = PlannedCode[K].Dest) and

@@ -696,8 +696,8 @@ procedure X64CachedLoad(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
 procedure X64CachedStore(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
   const ASrc: Byte; const ASlot: UInt32); forward;
 procedure X64CachedConst(const ABuf: TWasmCodeBuffer;
-  var ACache: TX64RegCache; const AValue: UInt64;
-  const ASlot: UInt32); forward;
+  var ACache: TX64RegCache; const AValue: UInt64; const ASlot: UInt32;
+  const AWide: Boolean); forward;
 procedure X64CachedAlu(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AOpcode: Byte; const AWide, AMul: Boolean;
   var ACache: TX64RegCache); forward;
@@ -1018,9 +1018,9 @@ begin
       end;
     iroI32Const, iroF32Const:
       X64CachedConst(ABuf, ACache, UInt64(AIns.Imm) and $FFFFFFFF,
-        AIns.Dest);
+        AIns.Dest, False);
     iroI64Const, iroF64Const:
-      X64CachedConst(ABuf, ACache, UInt64(AIns.Imm), AIns.Dest);
+      X64CachedConst(ABuf, ACache, UInt64(AIns.Imm), AIns.Dest, True);
     iroBranchIf, iroBranchIfNot:
       begin
         Host := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
@@ -1667,10 +1667,22 @@ end;
   rax bounce; the commit then stores or defers it exactly as a computed
   result. }
 procedure X64CachedConst(const ABuf: TWasmCodeBuffer;
-  var ACache: TX64RegCache; const AValue: UInt64; const ASlot: UInt32);
+  var ACache: TX64RegCache; const AValue: UInt64; const ASlot: UInt32;
+  const AWide: Boolean);
 var
   Index: Integer;
 begin
+  if ACache.VecCache then
+  begin
+    { The driver keeps v128-cache functions on their previous scalar
+      emission (see its x64 AnalyzeImmediateFusion). }
+    if AWide then
+      X64EmitMovRegImm64(ABuf, X64_RAX, AValue)
+    else
+      X64EmitMovRegImm32(ABuf, X64_RAX, UInt32(AValue));
+    X64CachedStore(ABuf, ACache, X64_RAX, ASlot);
+    Exit;
+  end;
   Index := X64CachedDestBegin(ABuf, ACache, ASlot);
   X64EmitMovRegConst(ABuf, X64CacheHostReg(Index), AValue);
   X64CachedDestCommit(ABuf, ACache, Index, ASlot);

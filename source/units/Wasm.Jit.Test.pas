@@ -5373,6 +5373,28 @@ begin
   Expect<Boolean>(Has([$B8, $01, $00, $00, $00])).ToBe(False);
   Expect<Boolean>(Has([$B8, $00, $E1, $F5, $05])).ToBe(False);
   Expect<Boolean>(Has([$41, $D3])).ToBe(False);
+  { A v128-cache loop (the simd workload's) keeps the previous scalar
+    emission: mov eax, 1 and mov eax, 1000000 feed register compares. }
+  Bytes := AssembleWatText('(module (func (export "run") (result i32) ' +
+    '(local i32 v128) (loop $l (local.set 1 (v128.xor (i32x4.add ' +
+    '(local.get 1) (v128.const i32x4 1 3 5 7)) (i32x4.splat ' +
+    '(local.get 0)))) (local.set 0 (i32.add (local.get 0) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get 0) (i32.const 1000000)))) ' +
+    '(i32x4.extract_lane 1 (local.get 1))))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+      RegisterCount);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  Expect<Boolean>(Has([$B8, $01, $00, $00, $00])).ToBe(True);
+  Expect<Boolean>(Has([$B8, $40, $42, $0F, $00])).ToBe(True);
+  Expect<Boolean>(Has([$41, $83, -1, $01])).ToBe(False);
   {$ENDIF}
   { A dynamic local ($p: the static hosts go to $a and $b), dirty after
     its update at the loop head, is read through its alias by two
