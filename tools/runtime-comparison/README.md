@@ -28,6 +28,19 @@ The default suite contains eleven checked workloads:
   when `wamrc` is absent.
 - `interpreter` compares wasmlight, WasmEdge, WAMR, wazero, and wasm3. The
   installed Wasmtime and Wasmer CLIs do not expose equivalent interpreters.
+- `interruptible` is the like-for-like view. wasmlight always polls its epoch
+  at loop back-edges and function entries (ADR-0006). Here each peer also runs
+  guest code the embedder can interrupt, with its own checks compiled in:
+  - Wasmtime compiles and runs with epoch interruption
+    (`-W epoch-interruption=y`, armed with `timeout=600s`);
+  - WasmEdge runs AOT compiled with `--interruptible`, under `--time-limit`;
+  - wazero runs with `-timeout`, from a separate compiler cache, because
+    wazero keys its compiled code on the termination mode.
+
+  Each deadline is far longer than any workload, so it arms the checks
+  without firing. Wasmer, WAMR AOT, and wasm3 are not measured here: the Wasmer
+  and wasm3 CLIs expose no interruption (Wasmer's metering is an embedding-API
+  middleware), and `iwasm --timeout` does not stop `wamrc` AOT code.
 - Compilation and cache population happen before measurement.
 - Each sample measures a fresh process from spawn through the module's checked
   `proc_exit`. This is command latency, not an in-process call microbenchmark.
@@ -81,11 +94,13 @@ python3 tools/runtime-comparison/bench.py \
 
 ## Pull-request gate
 
-The `runtime-comparison` job in `.github/workflows/pr.yml` builds release
-binaries from the PR base and head, then measures both on one Linux x86-64
-runner. It runs the `best` profile against every pinned peer, uploads both raw
-JSON reports, and the `runtime-comparison-comment` job updates one marker-based
-PR comment.
+The `runtime-comparison` job in `.github/workflows/pr.yml` runs the harness's
+unit tests, builds release binaries from the PR base and head, then measures
+both on one Linux x86-64 runner. It runs the `best` profile against every
+pinned peer for both builds, and the `interruptible` profile for the PR build.
+It uploads both raw JSON reports, and the `runtime-comparison-comment` job
+updates one marker-based PR comment with the PR-vs-main table and a
+like-for-like table.
 
 Peer executables are immutable release assets, except wasm3, which is built from
 a pinned commit archive because its published x86-64 ELF traps on GitHub's

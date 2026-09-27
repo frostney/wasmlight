@@ -390,6 +390,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Runtime comparison harness tests
+        run: python3 -m unittest discover -s tools/runtime-comparison -p 'test_*.py'
+
       - name: Restore pinned runtime executables
         uses: actions/cache@v6
         with:
@@ -468,6 +471,7 @@ jobs:
           set -euo pipefail
           python3 tools/runtime-comparison/bench.py \
             --profile best \
+            --profile interruptible \
             --samples 7 \
             --wasmlight "$RUNNER_TEMP/wasmlight-binaries/pr" \
             --source-commit "${{ github.event.pull_request.head.sha }}"
