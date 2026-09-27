@@ -523,6 +523,358 @@ begin
   ]);
 end;
 
+{ The x64 native scalar core under deferred write-back: seven
+  self-recursive shapes (a parameter written before a self call and read
+  after it, a call result stored into the parameter, a loop over the
+  parameter after a call, i64, select over two calls, and a join whose arms
+  leave the parameter stored on one path and dirty on the other), three
+  two-parameter leaves (register pressure that spills live temporaries, an
+  overwritten i64 parameter under rotl, compare + select), and a loop whose
+  loop-carried accumulator is a leaf argument. `check` holds every result
+  to a constant computed independently (a Python model of each function):
+  a mismatch traps `unreachable`, so the interpreter run proves the
+  constants and the compiled run is held to them. }
+function NativeCoreWriteBackModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText(
+    '(module ' +
+    '(func $fib (export "fib") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '  (then (local.get $n)) ' +
+    '  (else (i32.add (call $fib (i32.sub (local.get $n) (i32.const 1))) ' +
+    '   (call $fib (i32.sub (local.get $n) (i32.const 2))))))) ' +
+    '(func $f2 (export "f2") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '  (then (local.get $n)) ' +
+    '  (else ' +
+    '   (local.set $n (i32.add (local.get $n) (i32.const 3))) ' +
+    '   (local.set $n (i32.sub (local.get $n) (i32.const 3))) ' +
+    '   (i32.add (call $f2 (i32.sub (local.get $n) (i32.const 1))) (local.get $n))))) ' +
+    '(func $f3 (export "f3") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.eqz (local.get $n)) ' +
+    '  (then (i32.const 7)) ' +
+    '  (else ' +
+    '   (local.set $n (call $f3 (i32.sub (local.get $n) (i32.const 1)))) ' +
+    '   (i32.add (i32.mul (local.get $n) (i32.const 2)) (i32.const 1))))) ' +
+    '(func $f4 (export "f4") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.lt_s (local.get $n) (i32.const 1)) ' +
+    '  (then (i32.const 0)) ' +
+    '  (else ' +
+    '   (i32.add (call $f4 (i32.sub (local.get $n) (i32.const 1))) ' +
+    '    (block (result i32) ' +
+    '     (loop $l ' +
+    '      (if (i32.gt_s (local.get $n) (i32.const 5)) ' +
+    '       (then (local.set $n (i32.sub (local.get $n) (i32.const 1))) (br $l)))) ' +
+    '     (local.get $n)))))) ' +
+    '(func $f5 (export "f5") (param $n i64) (result i64) ' +
+    ' (if (result i64) (i64.lt_u (local.get $n) (i64.const 3)) ' +
+    '  (then (local.get $n)) ' +
+    '  (else ' +
+    '   (i64.xor ' +
+    '    (i64.xor (call $f5 (i64.sub (local.get $n) (i64.const 1))) ' +
+    '     (i64.shl (call $f5 (i64.sub (local.get $n) (i64.const 2))) (i64.const 1))) ' +
+    '    (local.get $n))))) ' +
+    '(func $f6 (export "f6") (param $n i32) (result i32) ' +
+    ' (if (result i32) (i32.eqz (local.get $n)) ' +
+    '  (then (i32.const 1)) ' +
+    '  (else ' +
+    '   (select ' +
+    '    (i32.add (call $f6 (i32.sub (local.get $n) (i32.const 1))) (local.get $n)) ' +
+    '    (i32.mul (call $f6 (i32.sub (local.get $n) (i32.const 1))) (i32.const 3)) ' +
+    '    (i32.and (local.get $n) (i32.const 1)))))) ' +
+    '(func $g (export "g") (param $n i32) (result i32) ' +
+    ' (if (i32.lt_u (local.get $n) (i32.const 2)) (then (return (local.get $n)))) ' +
+    ' (if (i32.and (local.get $n) (i32.const 1)) ' +
+    '  (then (local.set $n (i32.add (local.get $n) (i32.const 1)))) ' +
+    '  (else (drop (call $g (i32.const 1))))) ' +
+    ' (i32.add (call $g (i32.sub (local.get $n) (i32.const 2))) (local.get $n))) ' +
+    '(func $leaf1 (export "leaf1") (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.add ' +
+    '  (i32.add ' +
+    '   (i32.mul (i32.add (local.get $a) (local.get $b)) ' +
+    '    (i32.sub (local.get $a) (local.get $b))) ' +
+    '   (i32.xor (local.get $a) (local.get $b))) ' +
+    '  (i32.add (i32.shl (local.get $a) (i32.const 3)) ' +
+    '   (i32.shr_u (local.get $b) (i32.const 2))))) ' +
+    '(func $leaf2 (export "leaf2") (param $a i64) (param $b i64) (result i64) ' +
+    ' (local.set $a (i64.mul (local.get $a) (local.get $b))) ' +
+    ' (i64.rotl (i64.sub (local.get $a) (local.get $b)) (i64.const 13))) ' +
+    '(func $leaf3 (export "leaf3") (param $a i32) (param $b i32) (result i32) ' +
+    ' (select (local.get $a) (i32.xor (local.get $b) (i32.const 0x5a5a5a5a)) ' +
+    '  (i32.lt_s (local.get $a) (local.get $b)))) ' +
+    '(func $run (export "run") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 123456789)) ' +
+    ' (block $done ' +
+    '  (loop $loop ' +
+    '   (br_if $done (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '   (local.set $acc (call $leaf1 (local.get $acc) (local.get $i))) ' +
+    '   (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '   (br $loop))) ' +
+    ' (local.get $acc)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $fib (i32.const 1)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $fib (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $fib (i32.const 11)) (i32.const 89)) (then unreachable)) ' +
+    ' (if (i32.ne (call $fib (i32.const 20)) (i32.const 6765)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f2 (i32.const 1)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f2 (i32.const 17)) (i32.const 153)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f2 (i32.const 60)) (i32.const 1830)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f3 (i32.const 1)) (i32.const 15)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f3 (i32.const 30)) (i32.const -1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f4 (i32.const 4)) (i32.const 10)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f4 (i32.const 9)) (i32.const 35)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f4 (i32.const 40)) (i32.const 190)) (then unreachable)) ' +
+    ' (if (i64.ne (call $f5 (i64.const 2)) (i64.const 2)) (then unreachable)) ' +
+    ' (if (i64.ne (call $f5 (i64.const 10)) (i64.const 28)) (then unreachable)) ' +
+    ' (if (i64.ne (call $f5 (i64.const 18)) (i64.const 468)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f6 (i32.const 1)) (i32.const 2)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f6 (i32.const 7)) (i32.const 103)) (then unreachable)) ' +
+    ' (if (i32.ne (call $f6 (i32.const 12)) (i32.const 2895)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 1)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 2)) (i32.const 2)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 3)) (i32.const 6)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 9)) (i32.const 30)) (then unreachable)) ' +
+    ' (if (i32.ne (call $g (i32.const 14)) (i32.const 56)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const 1) (i32.const 2)) (i32.const 8)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const 1) (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const -1) (i32.const 1)) (i32.const -10)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const -1) (i32.const 1)) (i32.const -1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const 2147483647) (i32.const -2147483648)) (i32.const 536870904)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const 2147483647) (i32.const -2147483648)) (i32.const -631612838)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf1 (i32.const 123456) (i32.const 654321)) (i32.const -576044596)) (then unreachable)) ' +
+    ' (if (i32.ne (call $leaf3 (i32.const 123456) (i32.const 654321)) (i32.const 123456)) (then unreachable)) ' +
+    ' (if (i64.ne (call $leaf2 (i64.const 3) (i64.const 5)) (i64.const 81920)) (then unreachable)) ' +
+    ' (if (i64.ne (call $leaf2 (i64.const -1) (i64.const 2)) (i64.const -24577)) (then unreachable)) ' +
+    ' (if (i64.ne (call $leaf2 (i64.const 4886718345) (i64.const 40926266145)) (i64.const -5871452744273814801)) (then unreachable)) ' +
+    ' (if (i32.ne (call $run (i32.const 0)) (i32.const 123456789)) (then unreachable)) ' +
+    ' (if (i32.ne (call $run (i32.const 1)) (i32.const -646784650)) (then unreachable)) ' +
+    ' (if (i32.ne (call $run (i32.const 1000)) (i32.const 738141401)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
+{ Loop callers of native scalar leaves, which x64 compiles with a static
+  allocation kept across each call: the loop-carried accumulator as a leaf
+  argument ($ra), swapped arguments ($rb), one value passed twice ($rc), a
+  call result stored straight into the loop counter while an earlier read
+  of the accumulator stays live across the next call ($rd), expression
+  arguments and two calls per iteration including a one-parameter leaf
+  ($re), and i64 ($rf). `check` holds each to constants from an
+  independent Python model and traps `unreachable` on a mismatch. }
+function NativeLeafCallerModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText(
+    '(module ' +
+    '(func $mix (export "mix") (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.add (i32.mul (i32.xor (local.get $a) (local.get $b)) (i32.const 1664525)) (i32.const 1013904223))) ' +
+    '(func $sub2 (export "sub2") (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.sub (local.get $a) (i32.mul (local.get $b) (i32.const 3)))) ' +
+    '(func $inc (export "inc") (param $a i32) (result i32) (i32.add (local.get $a) (i32.const 1))) ' +
+    '(func $mix64 (export "mix64") (param $a i64) (param $b i64) (result i64) ' +
+    ' (i64.add (i64.mul (i64.xor (local.get $a) (local.get $b)) (i64.const 0x9E3779B97F4A7C15)) ' +
+    '  (i64.shl (local.get $b) (i64.const 7)))) ' +
+    '(func $ra (export "ra") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 123456789)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (call $mix (local.get $acc) (local.get $i))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rb (export "rb") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 7)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (call $sub2 (local.get $i) (local.get $acc))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rc (export "rc") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 99)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (i32.add (call $mix (local.get $acc) (local.get $acc)) (local.get $i))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rd (export "rd") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 5)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (i32.add (local.get $acc) ' +
+    '    (block (result i32) ' +
+    '      (local.set $i (call $inc (local.get $i))) ' +
+    '      (call $sub2 (local.get $i) (local.get $acc))))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $re (export "re") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 1)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (call $mix (i32.mul (local.get $acc) (i32.const 3)) (i32.add (local.get $i) (i32.const 7)))) ' +
+    '  (local.set $acc (i32.xor (local.get $acc) (call $inc (local.get $acc)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rf (export "rf") (param $n i32) (result i64) (local $i i64) (local $acc i64) ' +
+    ' (local.set $acc (i64.const 0x0123456789ABCDEF)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i64.ge_u (local.get $i) (i64.extend_i32_u (local.get $n)))) ' +
+    '  (local.set $acc (call $mix64 (local.get $acc) (local.get $i))) ' +
+    '  (local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $ra (i32.const 0)) (i32.const 123456789)) (then unreachable)) ' +
+    ' (if (i32.ne (call $ra (i32.const 1)) (i32.const 920370032)) (then unreachable)) ' +
+    ' (if (i32.ne (call $ra (i32.const 2)) (i32.const -531661284)) (then unreachable)) ' +
+    ' (if (i32.ne (call $ra (i32.const 57)) (i32.const 1051844512)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 0)) (i32.const 7)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 1)) (i32.const -21)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 2)) (i32.const 64)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 57)) (i32.const -624708169)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 0)) (i32.const 99)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 1)) (i32.const 1013904223)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 2)) (i32.const 1013904224)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 57)) (i32.const 1013904279)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 0)) (i32.const 5)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 1)) (i32.const -9)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 2)) (i32.const 20)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 57)) (i32.const 1908874373)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 0)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 1)) (i32.const 7)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 57)) (i32.const 7)) (then unreachable)) ' +
+    ' (if (i64.ne (call $rf (i32.const 0)) (i64.const 81985529216486895)) (then unreachable)) ' +
+    ' (if (i64.ne (call $rf (i32.const 1)) (i64.const 906252357051721883)) (then unreachable)) ' +
+    ' (if (i64.ne (call $rf (i32.const 33)) (i64.const 2523068962131947067)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
+{ Loop callers of native leaves with four or more hot locals, so the x64
+  static cache also fixes rdi and rdx (lane L): locals live across each
+  call, arguments read from and results written to rdi/rdx-hosted locals
+  ($w4: three leaf calls and a one-parameter leaf per iteration; $w5; i64
+  $w64). $wm uses memory, so it keeps the generic caller; its address comes
+  from a leaf result masked to i32. `check` holds each to constants from an
+  independent Python model and traps `unreachable` on a mismatch. }
+function NativeLeafHostsModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText(
+    '(module ' +
+    '(memory 1) ' +
+    '(func $mix (export "mix") (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.add (i32.mul (i32.xor (local.get $a) (local.get $b)) (i32.const 1664525)) (i32.const 1013904223))) ' +
+    '(func $inc (export "inc") (param $a i32) (result i32) (i32.add (local.get $a) (i32.const 1))) ' +
+    '(func $mix64 (export "mix64") (param $a i64) (param $b i64) (result i64) ' +
+    ' (i64.add (i64.mul (i64.xor (local.get $a) (local.get $b)) (i64.const 0x9E3779B97F4A7C15)) ' +
+    '  (i64.shl (local.get $b) (i64.const 7)))) ' +
+    '(func $w4 (export "w4") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32) ' +
+    ' (local.set $a (i32.const 7)) (local.set $c (i32.const 11)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $mix (local.get $a) (local.get $i))) ' +
+    '  (local.set $b (i32.add (local.get $b) (i32.xor (local.get $a) (local.get $c)))) ' +
+    '  (local.set $c (i32.add (i32.add (local.get $c) (i32.const 3)) (local.get $d))) ' +
+    '  (local.set $d (call $mix (local.get $d) (local.get $b))) ' +
+    '  (local.set $e (call $mix (local.get $c) (local.get $d))) ' +
+    '  (local.set $b (i32.xor (local.get $b) (i32.shr_u (local.get $e) (i32.const 1)))) ' +
+    '  (local.set $c (call $inc (local.get $c))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.xor (i32.xor (local.get $a) (local.get $b)) (i32.xor (local.get $c) (local.get $d)))) ' +
+    '(func $w5 (export "w5") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32) ' +
+    ' (local.set $a (i32.const 5)) (local.set $d (i32.const 1)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $mix (local.get $a) (local.get $d))) ' +
+    '  (local.set $b (i32.add (local.get $b) (local.get $a))) ' +
+    '  (local.set $c (i32.xor (local.get $c) (i32.shr_u (local.get $a) (i32.const 3)))) ' +
+    '  (local.set $d (i32.add (i32.add (local.get $d) (local.get $c)) (local.get $b))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.add (local.get $a) (local.get $b)) (i32.add (local.get $c) (local.get $d)))) ' +
+    '(func $w64 (export "w64") (param $n i64) (result i64) ' +
+    ' (local $i i64) (local $a i64) (local $b i64) (local $c i64) (local $d i64) ' +
+    ' (local.set $a (i64.const 1)) (local.set $b (i64.const 2)) (local.set $c (i64.const 3)) (local.set $d (i64.const 4)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $mix64 (local.get $a) (local.get $i))) ' +
+    '  (local.set $b (i64.add (local.get $b) (i64.xor (local.get $a) (local.get $c)))) ' +
+    '  (local.set $c (i64.add (i64.add (local.get $c) (local.get $d)) (i64.const 5))) ' +
+    '  (local.set $d (call $mix64 (local.get $d) (local.get $b))) ' +
+    '  (local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '  (br_if $l (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i64.xor (i64.xor (local.get $a) (local.get $b)) (i64.xor (local.get $c) (local.get $d)))) ' +
+    '(func $wm (export "wm") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $p i32) (local $s i32) ' +
+    ' (loop $l ' +
+    '  (local.set $p (i32.and (call $mix (local.get $p) (local.get $i)) (i32.const 0xfffc))) ' +
+    '  (i32.store (local.get $p) (local.get $i)) ' +
+    '  (local.set $s (i32.add (local.get $s) (i32.load (local.get $p)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (local.get $s)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $w4 (i32.const 1)) (i32.const -1918920164)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 1)) (i32.const -978139746)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 1)) (i64.const 5658031813416700493)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 1)) (i32.const 0)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w4 (i32.const 2)) (i32.const -1712910881)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 2)) (i32.const 1790146644)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 2)) (i64.const -5807380632104104251)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w4 (i32.const 3)) (i32.const -368195979)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 3)) (i32.const -1518150501)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 3)) (i64.const 5228304227958329896)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 3)) (i32.const 3)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w4 (i32.const 40)) (i32.const -983224598)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 40)) (i32.const -413072615)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 40)) (i64.const -2418841147283987750)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 40)) (i32.const 780)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
+{ $sq(n) = n*n + $sq(n-1), with the square computed BEFORE the self call so
+  a dirty temporary must survive it; $deep never terminates, with the same
+  live temporary, so it exhausts. sq(40) = 22140 (sum of squares). }
+function NativeCoreDepthModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(func $sq (export "sq") (param $n i32) (result i32) ' +
+    '(if (result i32) (i32.eqz (local.get $n)) (then (i32.const 0)) ' +
+    '(else (i32.add (i32.mul (local.get $n) (local.get $n)) ' +
+    '(call $sq (i32.sub (local.get $n) (i32.const 1))))))) ' +
+    '(func $deep (export "deep") (param $n i32) (result i32) ' +
+    '(i32.add (i32.mul (local.get $n) (i32.const 3)) ' +
+    '(call $deep (i32.add (local.get $n) (i32.const 1))))) ' +
+    '(func (export "check") (result i32) ' +
+    '(if (i32.ne (call $sq (i32.const 40)) (i32.const 22140)) ' +
+    '(then unreachable)) (i32.const 1)))');
+end;
+
+{ An epoch bump before a self-recursive core with a loop: $rl(n) =
+  rl(n-1) + n*n, then x -= 3 while x > 100 (signed), returning x. The
+  first back-edge taken (the frame n = 7: 74 + 49 - 3 > 100) polls the
+  bumped epoch, so run(8) traps `interrupt` in both tiers at the same
+  point. Without the bump, rl(10) = 98 (independent Python model). }
+function NativeCoreEpochModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText('(module ' +
+    '(import "e" "bump" (func $bump)) ' +
+    '(func $rl (export "rl") (param $n i32) (result i32) ' +
+    '(if (i32.eqz (local.get $n)) (then (return (i32.const 1)))) ' +
+    '(local.set $n (i32.add (call $rl (i32.sub (local.get $n) ' +
+    '(i32.const 1))) (i32.mul (local.get $n) (local.get $n)))) ' +
+    '(loop $l (br_if $l (i32.gt_s (local.tee $n (i32.sub (local.get $n) ' +
+    '(i32.const 3))) (i32.const 100)))) ' +
+    '(local.get $n)) ' +
+    '(func (export "run") (param i32) (result i32) ' +
+    '(call $bump) (call $rl (local.get 0))) ' +
+    '(func (export "check") (result i32) ' +
+    '(if (i32.ne (call $rl (i32.const 10)) (i32.const 98)) ' +
+    '(then unreachable)) (i32.const 1)))');
+end;
+
 { Deep NON-tail recursion, which must exhaust at the same LOGICAL depth under
   both tiers (jit-spec §13 item 2):
 
@@ -1181,6 +1533,130 @@ begin
     Result := Result + SignExtend(ImgLoad(Mem, 65535, 1), 8);
     Inc(I);
   until not (I < AN);
+end;
+
+{ Models for the x64 four-host static-cache tests (TestStaticHosts*). }
+function OracleFillSum(const AN: UInt32): UInt64;
+var
+  Mem: array[0 .. 63] of UInt32;
+  I, Acc: UInt32;
+begin
+  for I := 0 to 63 do
+    Mem[I] := (I * 17) xor 12345;
+  Acc := 0;
+  I := 0;
+  repeat
+    Acc := Acc + Mem[I and 63];
+    Inc(I);
+  until not (I < AN);
+  Result := Acc;
+end;
+
+function OracleNestedLocals(const AN, ASeed: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, J, Acc, Addr, X, Y: UInt32;
+begin
+  Mem := NewMemImage(2048);
+  X := ASeed;
+  Y := 0;
+  Acc := 0;
+  I := 0;
+  repeat
+    J := 0;
+    repeat
+      Addr := ((I + J) and 255) shl 2;
+      ImgStore(Mem, Addr, 4, X + J);
+      if (J and 1) <> 0 then
+        Y := Y xor UInt32(ImgLoad(Mem, Addr, 4))
+      else
+        Acc := Acc + UInt32(ImgLoad(Mem, Addr xor 4, 4));
+      X := X * 5 + 3;
+      Inc(J);
+    until not (J < 7);
+    Inc(I);
+  until not (I < AN);
+  Result := UInt32(Acc + Y * 31 + X);
+end;
+
+function OracleWideLocals(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, Addr: UInt32;
+  W, V: UInt64;
+begin
+  Mem := NewMemImage(2048);
+  W := $123456789;
+  V := 0;
+  I := 0;
+  repeat
+    Addr := (I shl 3) and $3F8;
+    ImgStore(Mem, Addr, 8, W);
+    W := W * $100000001 + 7;
+    V := V xor ImgLoad(Mem, Addr xor 8, 8);
+    ImgStore(Mem, Addr + 4, 1, I);
+    V := V + ImgLoad(Mem, Addr, 4);
+    Inc(I);
+  until not (I < AN);
+  Result := V xor W;
+end;
+
+function OracleLoadAlu(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, A, S1, S2, S3, S4, S5: UInt32;
+begin
+  Mem := NewMemImage(2048);
+  for I := 0 to 63 do
+    ImgStore(Mem, I shl 2, 4, I * $9E3779B1 + 12345);
+  S1 := 0;
+  S2 := 1;
+  S3 := $FFFFFFFF;
+  S4 := 0;
+  S5 := 0;
+  I := 0;
+  repeat
+    A := (I and 63) shl 2;
+    S1 := S1 - UInt32(ImgLoad(Mem, A, 4));
+    S2 := UInt32(ImgLoad(Mem, A xor 4, 4)) * S2;
+    S3 := S3 and UInt32(ImgLoad(Mem, A, 4));
+    S4 := UInt32(ImgLoad(Mem, A xor 8, 4)) or S4;
+    S5 := S5 xor UInt32(ImgLoad(Mem, A, 4));
+    ImgStore(Mem, A + 256, 4, I + UInt32(ImgLoad(Mem, A, 4)));
+    Inc(I);
+  until not (I < AN);
+  Result := UInt32(S1 + S2 + (S3 + S4) + (S5 + UInt32(ImgLoad(Mem, 300, 4))));
+end;
+
+{ The walk loop's x sequence: x0 = 77, x := x * 13 + i. }
+function OracleTrapWalkSum(const AStored: UInt32): UInt32;
+var
+  I, X: UInt32;
+begin
+  X := 77;
+  Result := 0;
+  for I := 0 to AStored - 1 do
+  begin
+    X := X * 13 + I;
+    Result := Result + (I + 1) * X;
+  end;
+end;
+
+function OracleTrapWalkAcc(const AN: UInt32): UInt64;
+var
+  I, X, Y, Acc: UInt32;
+begin
+  X := 77;
+  Y := 0;
+  Acc := 0;
+  I := 0;
+  repeat
+    X := X * 13 + I;
+    Y := Y xor X;
+    Acc := Acc + Y;
+    Inc(I);
+  until not (I < AN);
+  Result := Acc;
 end;
 {$POP}
 
@@ -2129,6 +2605,11 @@ type
     procedure TestNativeReturnTailNearExhaustion;
     procedure TestNativeLeafResultSource;
     procedure TestNativeScalarLeafProofAndExhaustion;
+    procedure TestNativeCoreWriteBack;
+    procedure TestNativeCoreDepthAndEpoch;
+    procedure TestX64NativeCoreShape;
+    procedure TestNativeLeafStaticCaller;
+    procedure TestNativeLeafStaticCallerHosts;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestInlineCallCacheAcrossBranches;
@@ -2145,6 +2626,10 @@ type
     procedure TestDirectOperandEvictsLiveOperand;
     procedure TestDirectOperandStaticI64;
     procedure TestDirectOperandWriteThrough;
+    procedure TestImmediateOperandForms;
+    procedure TestImmediateOperandTrapMidLoop;
+    procedure TestImmediateOperandCodeShape;
+    procedure TestImmediateOperandNativeCores;
     procedure TestTeeStoredInPinnedMemoryLoop;
     procedure TestNativeResultAcrossDroppedComputations;
     procedure TestDeepRecursionExhausts;
@@ -2183,6 +2668,12 @@ type
     procedure TestPinnedMemoryOobTraps;
     procedure TestPinnedMemoryTrapKeepsPriorStores;
     procedure TestPinnedMemoryStoreThenLoad;
+    procedure TestStaticHostsMemoryLoopShape;
+    procedure TestStaticHostsManyLocalsNestedLoops;
+    procedure TestStaticHostsI64AndI32Addresses;
+    procedure TestStaticHostsAddressAcrossJoin;
+    procedure TestStaticHostsTrapMidLoop;
+    procedure TestStaticHostsLoadAluOperands;
     procedure TestMemory64LoopExplicitChecks;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
@@ -5094,6 +5585,440 @@ begin
   end;
 end;
 
+{ --- fused immediate operands (x64 wave 5 lane K) ------------------------ }
+
+const
+  IMM_OPS: array[0 .. 19] of string = ('add', 'sub', 'mul', 'and', 'or',
+    'xor', 'shl', 'shr_s', 'shr_u', 'rotr', 'eq', 'ne', 'lt_s', 'lt_u',
+    'gt_s', 'gt_u', 'le_s', 'le_u', 'ge_s', 'ge_u');
+  { imm8/imm32 sign boundaries, INT_MIN, all-ones, masked shift counts. }
+  IMM_C32: array[0 .. 15] of string = ('0', '1', '-1', '127', '128', '-128',
+    '-129', '0x7fffffff', '-0x80000000', '31', '32', '33', '63', '64',
+    '0x3fff', '0x9E3779B9');
+  { The same plus i64 values on both sides of the sign-extended imm32
+    range, which must fall back to a materialized constant. }
+  IMM_C64: array[0 .. 17] of string = ('0', '1', '-1', '127', '128', '-128',
+    '-129', '0x7fffffff', '-0x80000000', '0x80000000', '0xFFFFFFFF',
+    '-0x80000001', '0x100000000', '0x7fffffffffffffff',
+    '-0x8000000000000000', '63', '64', '65');
+
+{ One loop over every (op, constant) pair: acc := acc * 33 + op(x, c), then
+  every compare as a fused compare-branch, then a constant local.tee'd so it
+  has a second reader. ARotl adds rotl (not a static-cache op) and ACall a
+  call, which both force the write-through cache. i64 compares yield i32,
+  so the i64 value loop takes the ten arithmetic ops only. The model is
+  patches/laneK-imm-model.py in the wave-5 evidence root. }
+function ImmLoopFunc(const AName, AT: string;
+  const AConsts: array of string; const ARotl, ACall: Boolean): string;
+var
+  O, C, LastOp: Integer;
+  Op: string;
+begin
+  Result := '(func $' + AName + ' (export "' + AName + '") (param $x ' + AT +
+    ') (result ' + AT + ') (local $i i32) (local $acc ' + AT + ') ' +
+    '(local $c ' + AT + ') (loop $l ';
+  if AT = 'i32' then
+    LastOp := High(IMM_OPS)
+  else
+    LastOp := 9;
+  for O := 0 to LastOp + Ord(ARotl) do
+  begin
+    if O > LastOp then
+      Op := 'rotl'
+    else
+      Op := IMM_OPS[O];
+    for C := 0 to High(AConsts) do
+      Result := Result + '(local.set $acc (' + AT + '.add (' + AT +
+        '.mul (local.get $acc) (' + AT + '.const 33)) (' + AT + '.' + Op +
+        ' (local.get $x) (' + AT + '.const ' + AConsts[C] + ')))) ';
+  end;
+  for O := 10 to High(IMM_OPS) do
+    for C := 0 to High(AConsts) do
+      Result := Result + '(local.set $acc (' + AT + '.mul (local.get $acc) (' +
+        AT + '.const 33))) (if (' + AT + '.' + IMM_OPS[O] +
+        ' (local.get $x) (' + AT + '.const ' + AConsts[C] + ')) ' +
+        '(then (local.set $acc (' + AT + '.add (local.get $acc) (' + AT +
+        '.const 1))))) ';
+  Result := Result + '(local.set $acc (' + AT + '.add (local.get $acc) (' +
+    AT + '.sub (local.get $x) (local.tee $c (' + AT + '.const -129))))) ' +
+    '(local.set $acc (' + AT + '.xor (local.get $acc) (local.get $c))) ';
+  if ACall then
+    Result := Result + '(local.set $acc (' + AT + '.add (local.get $acc) ' +
+      '(call $id' + Copy(AT, 2, 2) + ' (local.get $x)))) ';
+  Result := Result + '(local.set $x (' + AT + '.add (' + AT +
+    '.mul (local.get $x) (' + AT + '.const 0x01000193)) (local.get $acc))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (i32.const 3)))) ' +
+    '(local.get $acc)) ';
+end;
+
+function ImmCheckFunc(const AName, AT: string; const AArgs: Integer): string;
+var
+  K: Integer;
+  Params, Args: string;
+begin
+  Params := '';
+  Args := '';
+  for K := 0 to AArgs - 1 do
+  begin
+    if K = 0 then
+      Params := Params + ' ' + AT
+    else
+      Params := Params + ' i32';
+    Args := Args + ' (local.get ' + IntToStr(K) + ')';
+  end;
+  Result := '(func (export "check_' + AName + '") (param' + Params + ' ' + AT +
+    ') (result ' + AT + ') (local $r ' + AT + ') (local.set $r (call $' +
+    AName + Args + ')) (if (' + AT + '.ne (local.get $r) (local.get ' +
+    IntToStr(AArgs) + ')) (then unreachable)) (local.get $r)) ';
+end;
+
+procedure TJitTests.TestImmediateOperandForms;
+const
+  X32: array[0 .. 7] of Int32 = (0, 1, -1, 2147483647, Low(Int32),
+    $12345678, 127, -129);
+  S32: array[0 .. 7] of Int32 = (1810383965, -780288457, 378280729,
+    1440237318, 1401097529, -950030934, 1795948302, -396739574);
+  W32: array[0 .. 7] of Int32 = (-1729024554, -581317605, -1214220359,
+    -623438581, -1142583893, 720102354, -376787148, 1441513501);
+  L32: array[0 .. 7] of Int32 = (433277607, -1023822379, -865003413,
+    775289241, 219838788, -1561716548, -855156368, -231192963);
+  X64: array[0 .. 7] of Int64 = (0, 1, -1, High(Int64), Low(Int64),
+    $0123456789ABCDEF, $80000000, -$80000001);
+  S64: array[0 .. 7] of Int64 = (8174609595130626976, -3686491448912613370,
+    1345587086311793554, -6622255045271162838, -5024660720706839064,
+    1552713173105789090, -4070987986678753464, 2496731974621481674);
+  W64: array[0 .. 7] of Int64 = (-4662422199310828550, -164054147293146426,
+    5752929173563615710, -525369475764640264, -8598487194462611830,
+    3026572826839823822, -8281411043633708038, -7855017838354762444);
+  L64: array[0 .. 7] of Int64 = (-2295938215123960672,
+    -2297108788080395104, -2294767642167526240, -2294767642167526240,
+    -2295938215123960672, -818944875527193440, 4576484447499238560,
+    -9167190304790725472);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+
+  { check_* traps unless the result is the model's, so a clean compiled
+    run proves the value and DiffFresh proves the interpreter agrees. }
+  procedure CheckRun(const AName: string; const AArgs: array of TWasmValue);
+  begin
+    Expect<Boolean>(DiffFresh(Bytes, 'check_' + AName, AArgs))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(FDiffJitOut.Trapped).ToBe(False);
+  end;
+
+begin
+  { Static cache (s32/s64), the write-through pair of a call-bearing
+    function (AW32/w64, ACalling a native scalar leaf), and native scalar
+    leaf cores (leaf32/leaf64, driven by a write-through caller). leaf64's
+    constants 2^32 and 0xFFFFFFFF have no imm32 form; its sub of -2^31 has
+    no lea negation; its shift count 67 masks to 3; leaf32's rotl by -27
+    masks to 5. }
+  Bytes := AssembleWatText('(module ' +
+    '(func $id32 (export "id32") (param i32) (result i32) (local.get 0)) ' +
+    '(func $id64 (export "id64") (param i64) (result i64) (local.get 0)) ' +
+    ImmLoopFunc('s32', 'i32', IMM_C32, False, False) +
+    ImmLoopFunc('w32', 'i32', IMM_C32, True, True) +
+    ImmLoopFunc('s64', 'i64', IMM_C64, False, False) +
+    ImmLoopFunc('w64', 'i64', IMM_C64, True, True) +
+    '(func $leaf32 (export "leaf32") (param $x i32) (param $y i32) ' +
+    '(result i32) (i32.rotl (i32.xor (i32.add (i32.mul (local.get $x) ' +
+    '(i32.const 0x9E3779B1)) (i32.const -129)) (i32.or (i32.shr_u ' +
+    '(local.get $y) (i32.const 33)) (i32.lt_s (local.get $x) ' +
+    '(i32.const 128)))) (i32.const -27))) ' +
+    '(func $leaf64 (export "leaf64") (param $x i64) (param $y i64) ' +
+    '(result i64) (i64.shl (i64.mul (i64.sub (i64.xor (i64.add ' +
+    '(local.get $x) (i64.const 0x100000000)) (i64.and (local.get $y) ' +
+    '(i64.const 0xFFFFFFFF))) (i64.const -0x80000000)) (i64.const -129)) ' +
+    '(i64.const 67))) ' +
+    '(func $drive32 (export "drive32") (param $x i32) (param $n i32) ' +
+    '(result i32) (local $i i32) (loop $l (local.set $x (call $leaf32 ' +
+    '(local.get $x) (local.get $i))) (local.set $i (i32.add (local.get $i) ' +
+    '(i32.const 1))) (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $x)) ' +
+    '(func $drive64 (export "drive64") (param $x i64) (param $n i32) ' +
+    '(result i64) (local $i i32) (loop $l (local.set $x (call $leaf64 ' +
+    '(local.get $x) (i64.extend_i32_u (local.get $i)))) (local.set $i ' +
+    '(i32.add (local.get $i) (i32.const 1))) (br_if $l (i32.lt_u ' +
+    '(local.get $i) (local.get $n)))) (local.get $x)) ' +
+    ImmCheckFunc('s32', 'i32', 1) + ImmCheckFunc('w32', 'i32', 1) +
+    ImmCheckFunc('s64', 'i64', 1) + ImmCheckFunc('w64', 'i64', 1) +
+    ImmCheckFunc('drive32', 'i32', 2) + ImmCheckFunc('drive64', 'i64', 2) +
+    ')');
+  CompileExports(['id32', 'id64', 's32', 'w32', 's64', 'w64', 'leaf32',
+    'leaf64', 'drive32', 'drive64']);
+  for I := 0 to High(X32) do
+  begin
+    CheckRun('s32', [MakeValueI32(X32[I]), MakeValueI32(S32[I])]);
+    CheckRun('w32', [MakeValueI32(X32[I]), MakeValueI32(W32[I])]);
+    CheckRun('drive32', [MakeValueI32(X32[I]), MakeValueI32(5),
+      MakeValueI32(L32[I])]);
+    CheckRun('s64', [MakeValueI64(X64[I]), MakeValueI64(S64[I])]);
+    CheckRun('w64', [MakeValueI64(X64[I]), MakeValueI64(W64[I])]);
+    CheckRun('drive64', [MakeValueI64(X64[I]), MakeValueI32(5),
+      MakeValueI64(L64[I])]);
+  end;
+end;
+
+{ A base-pinned loop whose addresses, stored values, and store address are
+  fused or directly materialized constants. The 16385th iteration's store
+  faults; the stores before it, including the running sum at 0x100, must
+  be exactly the model's (patches/laneK-imm-model.py). }
+procedure TJitTests.TestImmediateOperandTrapMidLoop;
+begin
+  FBytes := AssembleWatText('(module (memory 1 1) ' +
+    '(func $fill (export "fill") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (loop $l ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) (i32.xor ' +
+    '(i32.mul (local.get $i) (i32.const 17)) (i32.const 0x9E3779B9))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (i32.shl ' +
+    '(i32.and (local.get $i) (i32.const 0x3fff)) (i32.const 2))))) ' +
+    '(i32.store (i32.const 0x100) (local.get $acc)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "peek") (param $a i32) (result i32) ' +
+    '(i32.load (local.get $a))))');
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(FBytes, 0)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(FBytes, 'fill', [MakeValueI32(100)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+    .ToBe(3450614486);
+  DiffFresh(FBytes, 'fill', [MakeValueI32(16385)]);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
+  Expect<string>(RunCompiledOnStore('fill', [MakeValueI32(16385)]))
+    .ToBe('out of bounds memory access');
+  Expect<string>(RunCompiledOnStore('peek', [MakeValueI32(0)])).ToBe('');
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], $100,
+    0, 4))^).ToBe(1981931520);
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], $FFFC,
+    0, 4))^).ToBe(2654160470);
+  Expect<UInt32>(PUInt32(FStore.MemAddressAt(FInstance.MemAddrs[0], 0,
+    0, 4))^).ToBe(2654435769);
+end;
+
+{ The memory-load workload's hot loop: every constant is an immediate
+  (and r, 0x3fff ; shl r, 2 ; add r, 1 ; cmp r, 100000000) and none is
+  bounced through eax or shifted by CL. Wildcards (-1) leave the host
+  registers free. }
+procedure TJitTests.TestImmediateOperandCodeShape;
+var
+  Bytes: TWasmBytes;
+{$IFDEF WASM_JIT_X64}
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+
+  function Has(const APattern: array of Integer): Boolean;
+  var
+    I, J: Integer;
+  begin
+    for I := 0 to Length(Code) - Length(APattern) do
+    begin
+      J := 0;
+      while (J <= High(APattern)) and ((APattern[J] < 0) or
+        (Code[I + J] = APattern[J])) do
+        Inc(J);
+      if J > High(APattern) then
+        Exit(True);
+    end;
+    Result := False;
+  end;
+{$ENDIF}
+
+begin
+  {$IFDEF WASM_JIT_X64}
+  Bytes := AssembleWatText('(module (memory 1 1) ' +
+    '(func (export "run") (result i32) (local i32 i32 i32) (loop $l ' +
+    '(local.set 2 (i32.shl (i32.and (local.get 0) (i32.const 16383)) ' +
+    '(i32.const 2))) (local.set 1 (i32.add (local.get 1) (i32.load ' +
+    '(local.get 2)))) (local.set 0 (i32.add (local.get 0) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get 0) (i32.const 100000000)))) ' +
+    '(local.get 1)))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+      RegisterCount);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  Expect<Boolean>(Has([$41, $81, -1, $FF, $3F, $00, $00])).ToBe(True);
+  { shl by 2 (C1 /4 ib) writes a 32-bit result into $2's host (rdi), so
+    the fused load-add indexes [rsi + rdi] with no mov ecx, edi copy:
+    add r9d, [rsi + rdi] (44 03 0C 3E). }
+  Expect<Boolean>(Has([$C1, -1, $02])).ToBe(True);
+  Expect<Boolean>(Has([$03, $0C, $3E])).ToBe(True);
+  Expect<Boolean>(Has([$41, $83, -1, $01])).ToBe(True);
+  Expect<Boolean>(Has([$41, $81, -1, $00, $E1, $F5, $05])).ToBe(True);
+  Expect<Boolean>(Has([$B8, $FF, $3F, $00, $00])).ToBe(False);
+  Expect<Boolean>(Has([$B8, $02, $00, $00, $00])).ToBe(False);
+  Expect<Boolean>(Has([$B8, $01, $00, $00, $00])).ToBe(False);
+  Expect<Boolean>(Has([$B8, $00, $E1, $F5, $05])).ToBe(False);
+  Expect<Boolean>(Has([$41, $D3])).ToBe(False);
+  { A constant store address goes straight into a host as a zero-extended
+    32-bit value (lane L's Zx32 fact), so the pinned store indexes that host
+    with no mov ecx copy: mov r32, 0x100 ; mov [rsi + r], r32 (REX.X). }
+  Bytes := AssembleWatText('(module (memory 1 1) ' +
+    '(func (export "run") (param $n i32) (result i32) (local $i i32) ' +
+    '(local $acc i32) (loop $l (local.set $acc (i32.add (local.get $acc) ' +
+    '(local.get $i))) (i32.store (i32.const 0x100) (local.get $acc)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+      RegisterCount);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  Expect<Boolean>(Has([$00, $01, $00, $00, $46, $89, -1, -1])).ToBe(True);
+  { A v128-cache loop (the simd workload's) keeps the previous scalar
+    emission: mov eax, 1 and mov eax, 1000000 feed register compares. }
+  Bytes := AssembleWatText('(module (func (export "run") (result i32) ' +
+    '(local i32 v128) (loop $l (local.set 1 (v128.xor (i32x4.add ' +
+    '(local.get 1) (v128.const i32x4 1 3 5 7)) (i32x4.splat ' +
+    '(local.get 0)))) (local.set 0 (i32.add (local.get 0) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get 0) (i32.const 1000000)))) ' +
+    '(i32x4.extract_lane 1 (local.get 1))))');
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, @Ir.Functions[0], EntryOffset,
+      RegisterCount);
+  finally
+    FreeAndNil(Ir);
+    FreeAndNil(Module);
+  end;
+  Expect<Boolean>(Has([$B8, $01, $00, $00, $00])).ToBe(True);
+  Expect<Boolean>(Has([$B8, $40, $42, $0F, $00])).ToBe(True);
+  Expect<Boolean>(Has([$41, $83, -1, $01])).ToBe(False);
+  {$ENDIF}
+  { A dynamic local ($p: the four static hosts go to hotter locals),
+    dirty after its update at the loop head, is read through its alias by
+    two immediate ops: an op may take a dead operand's host in place, never
+    a live one's (which would drop the dirty value). The expected sums come
+    from the lane K model. }
+  Bytes := AssembleWatText('(module (memory 1 1) (data (i32.const 0) ' +
+    '"\05\00\00\00\09\00\00\00\11\00\00\00\21\00\00\00") ' +
+    '(func (export "run") (param $n i32) (result i32) (local $i i32) ' +
+    '(local $a i32) (local $b i32) (local $p i32) (local $c i32) ' +
+    '(local $d i32) (loop $l ' +
+    '(local.set $p (i32.add (local.get $p) (i32.const 4))) ' +
+    '(local.set $a (i32.add (local.get $a) (i32.load (i32.and ' +
+    '(local.get $p) (i32.const 12))))) ' +
+    '(local.set $b (i32.xor (local.get $b) (i32.shl (local.get $p) ' +
+    '(i32.const 3)))) ' +
+    '(local.set $a (i32.add (local.get $a) (local.get $b))) ' +
+    '(local.set $b (i32.add (local.get $b) (local.get $a))) ' +
+    '(local.set $c (i32.add (local.get $c) (i32.xor (local.get $a) ' +
+    '(local.get $c)))) ' +
+    '(local.set $d (i32.sub (local.get $d) (i32.add (local.get $c) ' +
+    '(local.get $d)))) ' +
+    '(local.set $c (i32.add (local.get $c) (i32.mul (local.get $d) ' +
+    '(local.get $c)))) ' +
+    '(local.set $d (i32.xor (local.get $d) (i32.add (local.get $c) ' +
+    '(local.get $d)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $a) (local.get $b)) (i32.add ' +
+    '(local.get $c) (local.get $d)))))');
+  {$IFDEF WASM_JIT_X64}
+  Expect<Boolean>(X64PinnedBaseShape(Bytes, 0)).ToBe(True);
+  {$ENDIF}
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(10)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1276431346);
+  Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(37)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF).ToBe(1963718274);
+end;
+
+{ Immediates inside lane M's deferred-write-back native self cores (a
+  compare-branch against 2, subs of 1 and 2 feeding the self-call argument,
+  imul by 0x9E3779B1 / -2^31, rotr and shr_u by masked counts, an add of 2^32
+  that has no imm32 form) and in a static caller that keeps its four fixed
+  hosts (r8, r9, rdi, rdx) across native leaf calls. Expected values come
+  from the lane K model (patches/laneK-imm-model.py). }
+procedure TJitTests.TestImmediateOperandNativeCores;
+const
+  N32: array[0 .. 4] of Int32 = (0, 1, 2, 7, 15);
+  R32: array[0 .. 4] of Int32 = (-129, -130, -1479265315, 1869713821,
+    33384351);
+  R64: array[0 .. 4] of Int64 = (4294967296, 4294967297,
+    9223372032559808512, 2305843009750564864, 144115188109410304);
+  NC: array[0 .. 2] of Int32 = (1, 5, 100);
+  RC: array[0 .. 2] of Int32 = (536868476, 1624373064, 347210642);
+var
+  Bytes: TWasmBytes;
+  I: Integer;
+begin
+  Bytes := AssembleWatText('(module ' +
+    '(func $rec32 (export "rec32") (param $n i32) (result i32) ' +
+    '(if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '(then (i32.xor (local.get $n) (i32.const -129))) ' +
+    '(else (i32.add (i32.mul (call $rec32 (i32.sub (local.get $n) ' +
+    '(i32.const 1))) (i32.const 0x9E3779B1)) (i32.rotr (call $rec32 ' +
+    '(i32.sub (local.get $n) (i32.const 2))) (i32.const 33)))))) ' +
+    '(func $rec64 (export "rec64") (param $n i64) (result i64) ' +
+    '(if (result i64) (i64.lt_s (local.get $n) (i64.const 2)) ' +
+    '(then (i64.add (local.get $n) (i64.const 0x100000000))) ' +
+    '(else (i64.xor (i64.mul (call $rec64 (i64.sub (local.get $n) ' +
+    '(i64.const 1))) (i64.const -0x80000000)) (i64.shr_u (call $rec64 ' +
+    '(i64.sub (local.get $n) (i64.const 2))) (i64.const 65)))))) ' +
+    '(func $leafk (export "leafk") (param $x i32) (param $y i32) ' +
+    '(result i32) (i32.xor (i32.mul (local.get $x) (i32.const 17)) ' +
+    '(i32.add (local.get $y) (i32.const -128)))) ' +
+    '(func $caller (export "caller") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $b i32) (local $c i32) (loop $l ' +
+    '(local.set $a (i32.add (local.get $a) (i32.const 127))) ' +
+    '(local.set $b (i32.xor (local.get $b) (i32.shl (local.get $i) ' +
+    '(i32.const 3)))) ' +
+    '(local.set $c (call $leafk (local.get $a) (local.get $b))) ' +
+    '(local.set $a (i32.sub (local.get $a) (i32.and (local.get $c) ' +
+    '(i32.const 0xff)))) ' +
+    '(local.set $b (i32.add (local.get $b) (i32.shr_u (local.get $c) ' +
+    '(i32.const 35)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $a) (local.get $b)) (local.get $c))))');
+  CompileExports(['rec32', 'rec64', 'leafk', 'caller']);
+  for I := 0 to High(N32) do
+  begin
+    Expect<Boolean>(DiffFresh(Bytes, 'rec32', [MakeValueI32(N32[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+      .ToBe(UInt64(UInt32(R32[I])));
+    Expect<Boolean>(DiffFresh(Bytes, 'rec64', [MakeValueI64(N32[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64(R64[I]));
+  end;
+  for I := 0 to High(NC) do
+  begin
+    Expect<Boolean>(DiffFresh(Bytes, 'caller', [MakeValueI32(NC[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits and $FFFFFFFF)
+      .ToBe(UInt64(UInt32(RC[I])));
+  end;
+end;
+
 procedure TJitTests.TestTeeStoredInPinnedMemoryLoop;
 var
   Bytes: TWasmBytes;
@@ -5115,6 +6040,401 @@ begin
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<Boolean>(DiffFresh(Bytes, 'run', [MakeValueI32(7)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+{ --- x64 static cache: four fixed hosts (r8, r9, rdi, rdx) --------------
+  Expected values come from Pascal models of each module, independent of
+  both tiers; DiffFresh adds tier identity (result bits, trap, message). }
+
+{ The benchmark memory-load and memory-store loop bodies: every local
+  (bound, counter, accumulator, address) has a fixed host, so the loop body
+  has no register-file access; the address produced by i32.and/i32.shl
+  indexes [rsi + host] with no 32-bit copy into ecx; and the load is the
+  accumulating add's memory operand (03 /r), so no value passes through
+  rax. }
+procedure TJitTests.TestStaticHostsMemoryLoopShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  RegisterCount: UInt32;
+  F, I, J, Head, Bodies, SlotAccesses, EcxCopies, RaxLoads, Loads,
+    FusedAdds, Stores: Integer;
+  Rel: Int32;
+  ModRM: Byte;
+{$ENDIF}
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "load") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) (local $address i32) ' +
+    '(loop $fill ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) ' +
+    '(i32.xor (i32.mul (local.get $i) (i32.const 17)) (i32.const 12345))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (i32.const 64)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 63)) (i32.const 2))) ' +
+    '(local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (local.get $address)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)) ' +
+    '(func (export "store") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $address i32) (local $k i32) ' +
+    '(local.set $k (i32.const 3)) ' +
+    '(loop $l ' +
+    '(local.set $address (i32.shl (i32.and (local.get $i) ' +
+    '(i32.const 63)) (i32.const 2))) ' +
+    '(i32.store (local.get $address) (local.get $i)) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $address) (i32.load (i32.const 8))) ' +
+    '(i32.mul (local.get $k) (local.get $k)))))');
+  { load(200): the fill writes (k*17) xor 12345 at word k < 64; the sum
+    loop reads word i mod 64. store(130): word 2 last holds 130 - 64 = 66,
+    address is 4 * (129 mod 64) = 4, and k * k = 9. }
+  Expect<Boolean>(DiffFresh(FBytes, 'load', [MakeValueI32(200)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleFillSum(200));
+  Expect<Boolean>(DiffFresh(FBytes, 'store', [MakeValueI32(130)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(4 + 66 + 9);
+  {$IFDEF WASM_JIT_X64}
+  DecodeModule(FBytes, FModule);
+  FIr := ValidateModule(FModule, FBytes);
+  Bodies := 0;
+  for F := 0 to 1 do
+  begin
+    Code := JitStageFunctionBytes(FStore, @FIr.Functions[F], EntryOffset,
+      RegisterCount);
+    { The last back-edge is the hot loop's epoch-fused je (0F 84 rel32)
+      to its head. Everything from the head to that je is the body. }
+    Head := -1;
+    J := -1;
+    for I := 0 to Length(Code) - 6 do
+      if (Code[I] = $0F) and (Code[I + 1] = $84) then
+      begin
+        Move(Code[I + 2], Rel, SizeOf(Rel));
+        if Rel < 0 then
+        begin
+          Head := I + 6 + Rel;
+          J := I;
+        end;
+      end;
+    Expect<Boolean>(Head >= 0).ToBe(True);
+    if Head < 0 then
+      Continue;
+    Inc(Bodies);
+    SlotAccesses := 0;
+    EcxCopies := 0;
+    RaxLoads := 0;
+    Loads := 0;
+    FusedAdds := 0;
+    Stores := 0;
+    for I := Head to J - 3 do
+    begin
+      ModRM := Code[I + 1];
+      { mov r/m <-> r (89/8B) addressing [rbx], [rbx+disp8/32]: a
+        register-file slot. }
+      if (Code[I] in [$89, $8B]) and
+        ((ModRM and $C7) in [$03, $43, $83]) then
+        Inc(SlotAccesses);
+      { mov ecx, r32 (89 /r, mod=11 rm=rcx) without REX.W: the address
+        zero-extension copy. }
+      if (Code[I] = $89) and ((ModRM and $C7) = $C1) and
+        ((I = Head) or not (Code[I - 1] in [$48 .. $4F])) then
+        Inc(EcxCopies);
+      { mov r32, [rsi + index] (8B), add r32, [rsi + index] (03), and
+        mov [rsi + index], r32 (89): mod=00 rm=100, SIB base rsi. A load's
+        reg field is rax only without REX.R. }
+      if (Code[I] in [$8B, $03, $89]) and ((ModRM and $C7) = $04) and
+        ((Code[I + 2] and 7) = 6) then
+      begin
+        case Code[I] of
+          $8B: Inc(Loads);
+          $03: Inc(FusedAdds);
+        else
+          Inc(Stores);
+        end;
+        if (Code[I] <> $89) and ((ModRM shr 3) and 7 = 0) and
+          ((I = Head) or ((Code[I - 1] and $44) <> $44)) then
+          Inc(RaxLoads);
+      end;
+    end;
+    Expect<Integer>(SlotAccesses).ToBe(0);
+    Expect<Integer>(EcxCopies).ToBe(0);
+    Expect<Integer>(RaxLoads).ToBe(0);
+    Expect<Integer>(Loads).ToBe(0);
+    Expect<Integer>(FusedAdds).ToBe(1 - F);
+    Expect<Integer>(Stores).ToBe(F);
+    { store's $k is never read in a loop, so it gets no fixed host: with
+      three loop locals, rdx stays unused (no mov rdx, [rbx+disp8] 48 8B 53
+      at entry). }
+    if F = 1 then
+    begin
+      J := 0;
+      for I := 0 to Length(Code) - 3 do
+        if (Code[I] = $48) and (Code[I + 1] = $8B) and (Code[I + 2] = $53) then
+          Inc(J);
+      Expect<Integer>(J).ToBe(0);
+    end;
+  end;
+  Expect<Integer>(Bodies).ToBe(2);
+  {$ENDIF}
+end;
+
+{ Seven locals live in two nested loops with an if/else join per inner
+  iteration: two take r8/r9, the two best loop-scored take rdi/rdx, and the
+  rest stay dynamic, so fixed and dynamic values cross every branch, join,
+  and back-edge together. The model below is the same computation in
+  Pascal. }
+procedure TJitTests.TestStaticHostsManyLocalsNestedLoops;
+const
+  Inputs: array[0 .. 3] of Integer = (1, 2, 5, 40);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (param $seed i32) (result i32) ' +
+    '(local $i i32) (local $j i32) (local $acc i32) (local $addr i32) ' +
+    '(local $x i32) (local $y i32) ' +
+    '(local.set $x (local.get $seed)) ' +
+    '(loop $outer ' +
+    '(local.set $j (i32.const 0)) ' +
+    '(loop $inner ' +
+    '(local.set $addr (i32.shl (i32.and (i32.add (local.get $i) ' +
+    '(local.get $j)) (i32.const 255)) (i32.const 2))) ' +
+    '(i32.store (local.get $addr) (i32.add (local.get $x) (local.get $j))) ' +
+    '(if (i32.and (local.get $j) (i32.const 1)) ' +
+    '(then (local.set $y (i32.xor (local.get $y) ' +
+    '(i32.load (local.get $addr))))) ' +
+    '(else (local.set $acc (i32.add (local.get $acc) ' +
+    '(i32.load (i32.xor (local.get $addr) (i32.const 4))))))) ' +
+    '(local.set $x (i32.add (i32.mul (local.get $x) (i32.const 5)) ' +
+    '(i32.const 3))) ' +
+    '(local.set $j (i32.add (local.get $j) (i32.const 1))) ' +
+    '(br_if $inner (i32.lt_u (local.get $j) (i32.const 7)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $outer (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (local.get $acc) ' +
+    '(i32.mul (local.get $y) (i32.const 31))) (local.get $x))))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run',
+      [MakeValueI32(Inputs[I]), MakeValueI32(Integer($1234567))]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits)
+      .ToBe(OracleNestedLocals(Inputs[I], $1234567));
+  end;
+end;
+
+{ i64 locals whose high halves are live share the dynamic hosts with i32
+  addresses in one pinned loop: every i64 write leaves a host whose high
+  half is set, and every i32 address must still index by its low half. }
+procedure TJitTests.TestStaticHostsI64AndI32Addresses;
+const
+  Inputs: array[0 .. 2] of Integer = (1, 9, 100);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (result i64) ' +
+    '(local $i i32) (local $addr i32) (local $w i64) (local $v i64) ' +
+    '(local.set $w (i64.const 0x123456789)) ' +
+    '(loop $l ' +
+    '(local.set $addr (i32.and (i32.shl (local.get $i) (i32.const 3)) ' +
+    '(i32.const 0x3F8))) ' +
+    '(i64.store (local.get $addr) (local.get $w)) ' +
+    '(local.set $w (i64.add (i64.mul (local.get $w) ' +
+    '(i64.const 0x100000001)) (i64.const 7))) ' +
+    '(local.set $v (i64.xor (local.get $v) ' +
+    '(i64.load (i32.xor (local.get $addr) (i32.const 8))))) ' +
+    '(i32.store8 (i32.add (local.get $addr) (i32.const 4)) (local.get $i)) ' +
+    '(local.set $v (i64.add (local.get $v) ' +
+    '(i64.load32_u (local.get $addr)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i64.xor (local.get $v) (local.get $w))))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run', [MakeValueI32(Inputs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleWideLocals(Inputs[I]));
+  end;
+end;
+
+{ The address local is a copy of a parameter on one path and an i32.or
+  result on the other, so the join merges a host written by a 64-bit copy
+  of an entry-loaded slot with one written by a 32-bit op; the access after
+  it, the parameter's own accesses before and after the loop, and the loop
+  back-edge all index the same words in both tiers. (Every writer keeps an
+  i32 slot zero-extended — the interpreter reads indexes as u64 and asserts
+  it — so the emitter's zero-extension facts are pinned byte for byte in
+  Wasm.Jit.X64.Test instead.) }
+procedure TJitTests.TestStaticHostsAddressAcrossJoin;
+var
+  P: TWasmValue;
+  C: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $p i32) (param $c i32) (param $n i32) ' +
+    '(result i32) (local $i i32) (local $a i32) (local $acc i32) ' +
+    '(i32.store (local.get $p) (i32.const 1234567)) ' +
+    '(i32.store (i32.const 0x30) (i32.const 1000)) ' +
+    '(loop $l ' +
+    '(local.set $a (local.get $p)) ' +
+    '(if (local.get $c) (then (local.set $a (i32.or (local.get $p) ' +
+    '(i32.const 0x20))))) ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (local.get $acc) (i32.load (local.get $p)))))');
+  P := MakeValueI32($10);
+  for C := 0 to 1 do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run',
+      [P, MakeValueI32(C), MakeValueI32(5)])).ToBe(JIT_BACKEND_AVAILABLE);
+    { c = 0: six loads of 1234567 at 0x10; c = 1: five of 1000 at 0x30
+      (0x10 or 0x20) plus the final load at 0x10. }
+    if C = 0 then
+      Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64(6 * 1234567))
+    else
+      Expect<UInt64>(FDiffJitOut.Bits).ToBe(UInt64(5 * 1000 + 1234567));
+  end;
+end;
+
+{ A trap in a pinned static-cache loop after hosted locals changed: stores
+  before the trap stay, the frame is discarded, and a later call observes
+  exactly the memory the model predicts. mode 0 faults on a guard-page load,
+  mode 1 reaches unreachable, mode 2 divides by zero (not a static-cache
+  op, so that export runs the write-through path as a control). }
+procedure TJitTests.TestStaticHostsTrapMidLoop;
+const
+  Messages: array[0 .. 2] of string = ('out of bounds memory access',
+    'unreachable', 'integer divide by zero');
+var
+  M: Integer;
+  Sum: UInt32;
+  Src, Want, InterpOut, JitOut: string;
+begin
+  Sum := OracleTrapWalkSum(9);
+  for M := 0 to 2 do
+  begin
+    Src := '(module (memory 1) ' +
+      '(func (export "walk") (param $n i32) (param $stop i32) (result i32) ' +
+      '(local $i i32) (local $acc i32) (local $addr i32) (local $x i32) ' +
+      '(local $y i32) ' +
+      '(local.set $x (i32.const 77)) ' +
+      '(loop $l ' +
+      '(local.set $addr (i32.shl (local.get $i) (i32.const 2))) ' +
+      '(local.set $x (i32.add (i32.mul (local.get $x) (i32.const 13)) ' +
+      '(local.get $i))) ' +
+      '(local.set $y (i32.xor (local.get $y) (local.get $x))) ' +
+      '(i32.store (local.get $addr) (local.get $x)) ' +
+      '(if (i32.eq (local.get $i) (local.get $stop)) (then ';
+    case M of
+      0: Src := Src + '(local.set $acc (i32.add (local.get $acc) ' +
+        '(i32.load (i32.const 65534))))';
+      1: Src := Src + 'unreachable';
+    else
+      Src := Src + '(local.set $acc (i32.div_u (local.get $acc) ' +
+        '(i32.const 0)))';
+    end;
+    Src := Src + ')) ' +
+      '(local.set $acc (i32.add (local.get $acc) (local.get $y))) ' +
+      '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+      '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+      '(local.get $acc)) ' +
+      '(func (export "verify") (local $k i32) (local $s i32) ' +
+      '(loop $v ' +
+      '(local.set $s (i32.add (local.get $s) (i32.mul (i32.add ' +
+      '(local.get $k) (i32.const 1)) (i32.load (i32.shl (local.get $k) ' +
+      '(i32.const 2)))))) ' +
+      '(local.set $k (i32.add (local.get $k) (i32.const 1))) ' +
+      '(br_if $v (i32.lt_u (local.get $k) (i32.const 32)))) ' +
+      '(if (i32.ne (local.get $s) (i32.const ' + IntToStr(Int32(Sum)) +
+      ')) (then unreachable))))';
+    FBytes := AssembleWatText(Src);
+    { Stopping at i = 8 of 20 leaves words 0..8 stored. }
+    Want := Messages[M] + '|';
+    CompileExports(['walk']);
+    InterpOut := TwoCallOutcome(FBytes, False, 'walk',
+      [MakeValueI32(20), MakeValueI32(8)], 'verify');
+    JitOut := TwoCallOutcome(FBytes, True, 'walk',
+      [MakeValueI32(20), MakeValueI32(8)], 'verify');
+    Expect<string>(InterpOut).ToBe(Want);
+    Expect<string>(JitOut).ToBe(InterpOut);
+    { A stop past the end returns the model's accumulator. }
+    Expect<Boolean>(DiffFresh(FBytes, 'walk',
+      [MakeValueI32(6), MakeValueI32(99)])).ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleTrapWalkAcc(6));
+  end;
+end;
+
+{ Every fusable operator reads a load as its memory operand, with fixed
+  and dynamic destinations, a temporary result feeding a store, and an
+  address that is dead after the access. The last export faults on the
+  fused access itself (65534 + 4 bytes crosses the end), which must trap
+  like the unfused load in the interpreter. }
+procedure TJitTests.TestStaticHostsLoadAluOperands;
+const
+  Inputs: array[0 .. 2] of Integer = (1, 7, 300);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $s1 i32) (local $s2 i32) ' +
+    '(local $s3 i32) (local $s4 i32) (local $s5 i32) ' +
+    '(loop $fill ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) ' +
+    '(i32.add (i32.mul (local.get $i) (i32.const 0x9E3779B1)) ' +
+    '(i32.const 12345))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (i32.const 64)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(local.set $s2 (i32.const 1)) ' +
+    '(local.set $s3 (i32.const -1)) ' +
+    '(loop $l ' +
+    '(local.set $a (i32.shl (i32.and (local.get $i) (i32.const 63)) ' +
+    '(i32.const 2))) ' +
+    '(local.set $s1 (i32.sub (local.get $s1) (i32.load (local.get $a)))) ' +
+    '(local.set $s2 (i32.mul (i32.load (i32.xor (local.get $a) ' +
+    '(i32.const 4))) (local.get $s2))) ' +
+    '(local.set $s3 (i32.and (local.get $s3) (i32.load (local.get $a)))) ' +
+    '(local.set $s4 (i32.or (i32.load (i32.xor (local.get $a) ' +
+    '(i32.const 8))) (local.get $s4))) ' +
+    '(local.set $s5 (i32.xor (local.get $s5) (i32.load (local.get $a)))) ' +
+    '(i32.store (i32.add (local.get $a) (i32.const 256)) ' +
+    '(i32.add (local.get $i) (i32.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (i32.add (local.get $s1) (local.get $s2)) ' +
+    '(i32.add (local.get $s3) (local.get $s4))) ' +
+    '(i32.add (local.get $s5) (i32.load (i32.const 300))))) ' +
+    '(func (export "fault") (param $p i32) (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $p)))) ' +
+    '(local.set $p (i32.add (local.get $p) (i32.const 2))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run', [MakeValueI32(Inputs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleLoadAlu(Inputs[I]));
+  end;
+  { 65530 and 65532 are in bounds; the third access at 65534 is not. }
+  Expect<Boolean>(DiffFresh(FBytes, 'fault',
+    [MakeValueI32(65530), MakeValueI32(2)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(0);
+  DiffFresh(FBytes, 'fault', [MakeValueI32(65530), MakeValueI32(3)]);
+  Expect<Boolean>(FDiffJitOut.Trapped).ToBe(True);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
 end;
 
 procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
@@ -5582,6 +6902,385 @@ begin
   finally
     WasmInterpValueSlots := 1 shl 16;
   end;
+end;
+
+procedure TJitTests.TestNativeCoreWriteBack;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  I: Integer;
+begin
+  Bytes := NativeCoreWriteBackModuleBytes;
+  { Every shape must actually take the native core: seven self-recursive
+    functions, then the three leaves. }
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    for I := 0 to 6 do
+      Expect<Boolean>(JitCanNativeScalarSelf(@Ir.Functions[I], UInt32(I)))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    for I := 7 to 9 do
+      Expect<Boolean>(JitCanNativeScalarLeaf(@Ir.Functions[I]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  CompileExports(['fib', 'f2', 'f3', 'f4', 'f5', 'f6', 'g', 'leaf1', 'leaf2',
+    'leaf3', 'run', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  { The external entries directly (the wrapper publishes the core's r8). }
+  Expect<Boolean>(DiffModule(Bytes, 'g', [MakeValueI32(14)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'f4', [MakeValueI32(40)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'leaf1', [MakeValueI32(-7),
+    MakeValueI32(123456)])).ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
+procedure TJitTests.TestNativeCoreDepthAndEpoch;
+var
+  Bytes: TWasmBytes;
+  N: Integer;
+begin
+  { A dirty temporary is live across every self call; the exhaustion
+    boundary must still be the interpreter's, to the frame. }
+  Bytes := NativeCoreDepthModuleBytes;
+  WasmInterpMaxDepth := 64;
+  try
+    for N := 58 to 70 do
+    begin
+      CompileExports(['sq']);
+      Expect<Boolean>(DiffModule(Bytes, 'sq', [MakeValueI32(N)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+  { Unbounded recursion traps `call stack exhausted` mid-computation, and
+    the same store then runs the checked function normally. }
+  CompileExports(['deep', 'sq', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'deep', [MakeValueI32(1)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<string>(TwoCallOutcome(Bytes, True, 'deep', [MakeValueI32(1)],
+    'check')).ToBe('call stack exhausted|');
+  Expect<string>(TwoCallOutcome(Bytes, False, 'deep', [MakeValueI32(1)],
+    'check')).ToBe('call stack exhausted|');
+
+  { The epoch poll on the core's back-edge fires at the same frame after a
+    host bump; without the bump the loop runs to the checked value. }
+  Bytes := NativeCoreEpochModuleBytes;
+  FDiffHost := @JitBumpEpochCallback;
+  try
+    CompileExports(['rl']);
+    Expect<Boolean>(DiffModule(Bytes, 'run', [MakeValueI32(8)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'run', [MakeValueI32(8)]))
+      .ToBe('interrupt');
+    CompileExports(['rl', 'check']);
+    Expect<Boolean>(DiffModule(Bytes, 'check', []))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    FDiffHost := nil;
+  end;
+end;
+
+procedure TJitTests.TestX64NativeCoreShape;
+{$IFDEF WASM_JIT_X64}
+var
+  Code: TWasmBytes;
+
+  { Stage function AIndex of the call and fib benchmark shapes. }
+  function Stage(const AWat: string; const AIndex: Integer): TWasmBytes;
+  var
+    Bytes: TWasmBytes;
+    Module: TWasmModule;
+    Ir: TWasmIrModule;
+    EntryOffset: NativeUInt;
+    RegisterCount: UInt32;
+  begin
+    Bytes := AssembleWatText(AWat);
+    Module := TWasmModule.Create;
+    Ir := nil;
+    try
+      DecodeModule(Bytes, Module);
+      Ir := ValidateModule(Module, Bytes);
+      Result := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[AIndex],
+        Ir.FuncImportCount + UInt32(AIndex), EntryOffset, RegisterCount);
+    finally
+      Ir.Free;
+      Module.Free;
+    end;
+  end;
+
+  { REX.W mov [rbx + disp], r64 (89 /r with a ModRM whose base is rbx and
+    no SIB): a register-file slot store. }
+  function SlotStores(const ACode: TWasmBytes): Integer;
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := 0 to Length(ACode) - 3 do
+      if (ACode[I] in [$48, $4C]) and (ACode[I + 1] = $89) and
+        ((ACode[I + 2] and 7) = 3) and ((ACode[I + 2] shr 6) <> 3) then
+        Inc(Result);
+  end;
+
+  function Count(const ACode: TWasmBytes;
+    const ASeq: array of Byte): Integer;
+  var
+    I, J: Integer;
+  begin
+    Result := 0;
+    for I := 0 to Length(ACode) - Length(ASeq) do
+    begin
+      J := 0;
+      while (J <= High(ASeq)) and (ACode[I + J] = ASeq[J]) do
+        Inc(J);
+      if J > High(ASeq) then
+        Inc(Result);
+    end;
+  end;
+{$ENDIF}
+begin
+  {$IFDEF WASM_JIT_X64}
+  { The call benchmark's leaf: four ALU ops and two constants, every one a
+    dead-after-use temporary. The only slot store left is the external
+    wrapper publishing the result (write-through stored 7, and the
+    lightweight entry stored both parameters). }
+  Code := Stage('(module (func $mix (param $acc i32) (param $i i32) ' +
+    '(result i32) (i32.add (i32.mul (i32.xor (local.get $acc) ' +
+    '(local.get $i)) (i32.const 1664525)) (i32.const 1013904223))))', 0);
+  Expect<Integer>(SlotStores(Code)).ToBe(1);
+  { Its core never spills, so the lightweight entry is frameless:
+    test rcx, rcx ; jne external, then the core itself (neither push rbx
+    nor a jump). }
+  Expect<Byte>(Code[0]).ToBe($48);
+  Expect<Byte>(Code[1]).ToBe($85);
+  Expect<Byte>(Code[2]).ToBe($C9);
+  Expect<Byte>(Code[3]).ToBe($0F);
+  Expect<Byte>(Code[4]).ToBe($85);
+  Expect<Boolean>(Code[9] in [$53, $E9]).ToBe(False);
+
+  { Live temporaries outnumber the dynamic pair here, so the
+    core spills and the entry keeps its frame: push rbx after the jne. }
+  Code := Stage('(module (func $p (param $a i32) (param $b i32) ' +
+    '(result i32) (i32.add (i32.add (i32.mul (i32.add (local.get $a) ' +
+    '(local.get $b)) (i32.sub (local.get $a) (local.get $b))) ' +
+    '(i32.xor (local.get $a) (local.get $b))) (i32.add (i32.shl ' +
+    '(local.get $a) (i32.const 3)) (i32.shr_u (local.get $b) ' +
+    '(i32.const 2))))))', 0);
+  Expect<Byte>(Code[9]).ToBe($53);
+
+  { fib: the parameter is stored once before the first self call, the first
+    call's result once before the second, and the wrapper publishes the
+    result; the base case stores nothing. One more store is the dead
+    fall-through flush after the base case's return (never executed). Each
+    self call is `sub r12, 1 ; jb` with no parameter store in the callee
+    frame, and `lea rbx, [rsp+8] ; add r12, 1` after it (no push/pop); the
+    wrapper runs the outermost core on the same kind of frame. }
+  Code := Stage('(module (func $fib (param $n i32) (result i32) ' +
+    '(if (result i32) (i32.lt_u (local.get $n) (i32.const 2)) ' +
+    '(then (local.get $n)) ' +
+    '(else (i32.add (call $fib (i32.sub (local.get $n) (i32.const 1))) ' +
+    '(call $fib (i32.sub (local.get $n) (i32.const 2))))))))', 0);
+  Expect<Integer>(SlotStores(Code)).ToBe(4);
+  Expect<Integer>(Count(Code, [$49, $83, $EC, $01, $0F, $82])).ToBe(2);
+  Expect<Integer>(Count(Code, [$48, $89, $E3, $E8])).ToBe(3);
+  Expect<Integer>(Count(Code, [$48, $8D, $5C, $24, $08, $49, $83, $C4, $01]))
+    .ToBe(2);
+  Expect<Integer>(Count(Code, [$5B, $49, $83, $C4, $01])).ToBe(0);
+  {$ELSE}
+  Expect<Boolean>(JIT_BACKEND_AVAILABLE or True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TJitTests.TestNativeLeafStaticCaller;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RunRegisterCount, MixRegisterCount, Cap: UInt32;
+  {$IFDEF WASM_JIT_X64}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  StagedCount: UInt32;
+  I, Calls, Stores: Integer;
+
+  function CountSeq(const ACode: TWasmBytes;
+    const ASeq: array of Byte): Integer;
+  var
+    N, J: Integer;
+  begin
+    Result := 0;
+    for N := 0 to Length(ACode) - Length(ASeq) do
+    begin
+      J := 0;
+      while (J <= High(ASeq)) and (ACode[N + J] = ASeq[J]) do
+        Inc(J);
+      if J > High(ASeq) then
+        Inc(Result);
+    end;
+  end;
+  {$ENDIF}
+begin
+  Bytes := NativeLeafCallerModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    RunRegisterCount := Ir.Functions[4].RegisterCount;
+    MixRegisterCount := Ir.Functions[0].RegisterCount;
+    {$IFDEF WASM_JIT_X64}
+    { $ra's call is the static-cache form: `xor ecx, ecx ; call rdx`, and
+      the result is adopted from r8 into a host (mov r10, r8) rather than
+      stored to its slot. Its only slot stores are the three fixed hosts
+      before the call (r8/r9 and rdi holding the bound $n), the cold
+      fallback's argument and result stores, and the exit's write-back of
+      the three fixed hosts and the result. }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[4],
+      Ir.FuncImportCount + 4, EntryOffset, StagedCount);
+    Calls := 0;
+    Stores := 0;
+    for I := 0 to Length(Code) - 7 do
+    begin
+      if (Code[I] = $31) and (Code[I + 1] = $C9) and (Code[I + 2] = $FF) and
+        (Code[I + 3] = $D2) and (Code[I + 4] = $4D) and
+        (Code[I + 5] = $89) and (Code[I + 6] = $C2) then
+        Inc(Calls);
+      if (Code[I] in [$48, $4C]) and (Code[I + 1] = $89) and
+        ((Code[I + 2] and 7) = 3) and ((Code[I + 2] shr 6) <> 3) then
+        Inc(Stores);
+    end;
+    Expect<Integer>(Calls).ToBe(1);
+    Expect<Integer>(Stores).ToBe(10);
+    { $ra calls one leaf, so the activation caches its entry: the prologue
+      clears [rsp+16] (mov qword [rsp+16], 0) and the call site reads it
+      (mov rdx, [rsp+16] ; test rdx, rdx ; je resolve). }
+    Expect<Integer>(CountSeq(Code, [$48, $C7, $44, $24, $10, 0, 0, 0, 0]))
+      .ToBe(1);
+    Expect<Integer>(CountSeq(Code, [$48, $8B, $54, $24, $10, $48, $85, $D2,
+      $0F, $84])).ToBe(1);
+    { $re calls two different leaves: no cached entry, both sites resolve. }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[8],
+      Ir.FuncImportCount + 8, EntryOffset, StagedCount);
+    Expect<Integer>(CountSeq(Code, [$48, $8B, $54, $24, $10, $48, $85, $D2]))
+      .ToBe(0);
+    Expect<Integer>(CountSeq(Code, [$31, $C9, $FF, $D2])).ToBe(2);
+    {$ENDIF}
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  { Every leaf compiled: the lightweight path. }
+  CompileExports(['mix', 'sub2', 'inc', 'mix64', 'ra', 'rb', 'rc', 'rd',
+    're', 'rf', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  { Only the callers compiled: every call takes the cold fallback, which
+    must store the arguments held only in dynamic hosts and rejoin with the
+    result. }
+  CompileExports(['ra', 'rb', 'rc', 'rd', 're', 'rf']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'rd', [MakeValueI32(57)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+
+  { The lightweight call keeps the interpreter's depth and value-slot
+    boundaries from inside a static-cache loop. }
+  WasmInterpMaxDepth := 1;
+  try
+    CompileExports(['mix', 'sub2', 'inc', 'ra', 'rd']);
+    Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+  WasmInterpValueSlots := RunRegisterCount;
+  try
+    CompileExports(['mix', 'ra']);
+    Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+  { Sweep the value cap across the leaf frame's exact fit: every cap must
+    trap (or not) identically in both tiers, and the largest one fits. }
+  try
+    for Cap := RunRegisterCount to RunRegisterCount + MixRegisterCount + 2 do
+    begin
+      WasmInterpValueSlots := Cap;
+      CompileExports(['mix', 'ra']);
+      Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
+        .ToBe(JIT_BACKEND_AVAILABLE);
+    end;
+    Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)])).ToBe('');
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+end;
+
+procedure TJitTests.TestNativeLeafStaticCallerHosts;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_X64}
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  StagedCount: UInt32;
+
+  { REX.W mov [rbx+disp8], AReg / mov AReg, [rbx+disp8] with AReg one of
+    rdi (7) or rdx (2): a fixed-host slot store or load. }
+  function HostSlotOps(const ACode: TWasmBytes; const AReg, AOpcode: Byte):
+    Integer;
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := 0 to Length(ACode) - 3 do
+      if (ACode[I] = $48) and (ACode[I + 1] = AOpcode) and
+        (ACode[I + 2] = ($43 or (AReg shl 3))) then
+        Inc(Result);
+  end;
+  {$ENDIF}
+begin
+  Bytes := NativeLeafHostsModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  { $w4 is a static caller whose rdi and rdx each host a local: both are
+    stored before each of its four leaf calls and reloaded after it (plus
+    the entry load and the exit store). }
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[3],
+      Ir.FuncImportCount + 3, EntryOffset, StagedCount);
+    Expect<Integer>(HostSlotOps(Code, 7, $89)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 2, $89)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 7, $8B)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 2, $8B)).ToBe(5);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  {$ENDIF}
+  CompileExports(['mix', 'inc', 'mix64', 'w4', 'w5', 'w64', 'wm', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  { Callers only: every call takes the helper fallback, which must see the
+    rdi/rdx locals stored and restore them afterwards. }
+  CompileExports(['w4', 'w5', 'w64', 'wm']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'w4', [MakeValueI32(40)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
 end;
 
 procedure TJitTests.TestDeepRecursionExhausts;
@@ -7915,6 +9614,14 @@ begin
     TestDirectOperandStaticI64);
   Test('direct-operand ops match in the write-through cache',
     TestDirectOperandWriteThrough);
+  Test('fused immediate operands match an independent model in every mode',
+    TestImmediateOperandForms);
+  Test('fused immediates in a pinned loop trap mid-loop with prior stores',
+    TestImmediateOperandTrapMidLoop);
+  Test('a memory-load loop uses x64 immediate forms',
+    TestImmediateOperandCodeShape);
+  Test('fused immediates match in native self cores and leaf-calling loops',
+    TestImmediateOperandNativeCores);
   Test('a tee stored in a pinned-memory loop keeps the stored value',
     TestTeeStoredInPinnedMemoryLoop);
   Test('native return retains a value across dropped computations',
@@ -7993,6 +9700,16 @@ begin
     TestNativeLeafResultSource);
   Test('native scalar leaf calls preserve proof and exhaustion boundaries',
     TestNativeScalarLeafProofAndExhaustion);
+  Test('native scalar cores keep results under deferred write-back',
+    TestNativeCoreWriteBack);
+  Test('native self cores exhaust and poll the epoch like the interpreter',
+    TestNativeCoreDepthAndEpoch);
+  Test('x64 native cores store only what a later read observes',
+    TestX64NativeCoreShape);
+  Test('loop callers keep a static cache across native leaf calls',
+    TestNativeLeafStaticCaller);
+  Test('rdi/rdx static hosts survive native leaf calls',
+    TestNativeLeafStaticCallerHosts);
   Test('inlined scalar body survives relocation without a compiled target',
     TestInlineScalarBodyRelocation);
   Test('inlined scalar calls preserve epoch and caller memory behavior',
@@ -8065,6 +9782,18 @@ begin
     TestPinnedMemoryTrapKeepsPriorStores);
   Test('a base-pinned store then load of one address',
     TestPinnedMemoryStoreThenLoad);
+  Test('memory loops keep every local in a host with no slot traffic',
+    TestStaticHostsMemoryLoopShape);
+  Test('six loop locals across joins and nested loops match a model',
+    TestStaticHostsManyLocalsNestedLoops);
+  Test('i64 locals beside i32 addresses in one pinned loop match a model',
+    TestStaticHostsI64AndI32Addresses);
+  Test('an address local rewritten on one path reaches the join intact',
+    TestStaticHostsAddressAcrossJoin);
+  Test('traps mid-loop keep prior stores with hosted locals modified',
+    TestStaticHostsTrapMidLoop);
+  Test('loads fused into add/sub/and/or/xor/mul match a model and trap alike',
+    TestStaticHostsLoadAluOperands);
   Test('memory64 loops keep explicit checks',
     TestMemory64LoopExplicitChecks);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);

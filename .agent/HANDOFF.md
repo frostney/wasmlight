@@ -1,5 +1,97 @@
 # Handoff
 
+## x64 wave 5 — retained outcome, 2026-09-27
+
+- Delivery branch `codex/optimize-x64-wave5` from exact main `b9d8085` (push CI
+  run 36281908754 green on all six targets), with main `dec195f` (#140)
+  merged. Evidence root: `~/.local/share/wasmlight-evidence/x64-wave5-b9d8085`
+  (`PLAN.md`, `LANE-BRIEF.md`, binaries + `SHA256SUMS`, schedules, gates,
+  patches, profiles). Method as before: native Ryzen AI MAX+ 395, release, AOT
+  precompiled, CPU 7, shared lock, `waitquiet.py`, 1 warm-up + 7 alternating
+  samples. Lanes held the lock for builds too.
+- Profiles (gdb on `-long` variants): the memory-load inner loop was 25
+  instructions:
+  - every constant cost `mov $imm,%eax; mov %rax,%rN`, and a constant shift
+    went through `%cl`;
+  - `acc` and `address` lived in slots, because only r8 and r9 were fixed
+    hosts;
+  - the load result bounced through rax, and the address was zero-extended
+    again.
+  The native scalar core (fib, call's `$mix`) wrote every temp through, and
+  the call-bearing caller had no static cache.
+- Accepted, integrated in the order L, M, K:
+  - **Lane L** (`lane/x64-w5-hosts`):
+    - rdi and rdx are fixed hosts for the declared locals and parameters the
+      loops use most;
+    - loads go straight into their destination host;
+    - a per-entry "upper 32 bits zero" flag (`Zx32`) removes the redundant
+      address zero-extension;
+    - an i32 load read only by the next i32 ALU op becomes its memory
+      operand.
+    Alone: memory-load 0.78, memory 0.91, memory-store 0.93.
+  - **Lane M** (`lane/x64-w5-calls`):
+    - the native scalar core defers write-back using the shared liveness
+      plan;
+    - the self-call sequence is shorter (`sub r12,1; jb`, `lea rbx,[rsp+8]`);
+    - static-cache callers keep their cache across calls to native leaves,
+      saving and reloading r8/r9/rdi/rdx, with the leaf entry cached per
+      activation;
+    - a leaf that never spills gets no frame.
+    Alone: call 0.42, fib 0.67. Layout effects matter here: moving the rare
+    paths cold made call 1.31x slower, so that was rejected.
+  - **Lane K** (`lane/x64-w5-imm`):
+    - an adjacent single-use i32/i64 constant is fused into its consumer's
+      imm8/imm32 form: ALU ops, cmp and compare-branch, masked shifts and
+      rotates, `imul r,r,imm`, and `lea` for add/sub into a new register;
+    - unfused constants go straight to their host;
+    - functions that use the v128 cache are fenced out. On Zen 5, shortening
+      the scalar tail of an xmm-bound loop made simd 2.11 → 2.54 ms, which
+      NOPs restore.
+    On top of L+M: memory 0.86, memory-load 0.87, memory-store 0.87.
+  - **Refactor** `0f6b643`: the x64 vec-cache and GC inline-allocation
+    planners moved into `Wasm.Jit.X64.Plan`. `Wasm.Jit.pas` cognitive went
+    from 1079 to 956 against the 1050 ratchet. Output is byte-identical over
+    32 modules and 2,512 compiled corpus modules.
+- Final, release `cc960fd` vs main `dec195f` (`schedules/final-{fwd,rev}.txt`,
+  ms; wave5/base forward, base/wave5 reverse):
+  - call 147.59 → 61.18 (0.415; 2.391x)
+  - fib 43.04 → 28.93 (0.672; 1.499x)
+  - memory-load 61.28 → 41.59 (0.679; 1.474x)
+  - memory 28.49 → 21.83 (0.766; 1.292x)
+  - memory-store 51.47 → 41.69 (0.810; 1.221x)
+  - loop, startup, memory-grow, simd, gc: flat
+  - host-call 0.953 / 1.042
+  - 3-arg 0.864 / 1.027 (wide spread)
+- vs Wasmtime 47.0.3, wasmlight/wasmtime:
+  - in or below the 0.6–0.8 range: fib 0.80, startup 0.60, simd 0.65, gc
+    0.66, host-call 0.50, memory-grow 0.79;
+  - close: call 0.85, loop 1.00;
+  - still out of range: memory 1.38, memory-load 1.51, memory-store 1.82,
+    3-arg 4.74.
+- Correctness:
+  - each lane's differential, code-shape and byte tests are killed by
+    mutations (`gates/lane{K,L,M}-mutations*`);
+  - the surviving mutants are equivalent under current lowering and are
+    documented in the lane reports;
+  - integration tests cover rdi/rdx hosts across leaf calls, and immediates
+    inside native cores and static callers.
+  Gates at `cc960fd`:
+  - frozen install, format, agents, dev and release builds;
+  - `lwpt test` (all suites, at `-O4` since #140), health, duplication,
+    markdownlint and the ARM64 type-check;
+  - the four fixtures in every tier;
+  - pinned core 65,188 in interp/jit/aot (compiled 0/8763/8763) on dev and
+    release, non-core identical.
+- Next profiled levers:
+  - memory-store and memory: the remaining loop moves (`mov %r8,%r10` before
+    `and`, and the store address still copied into ecx when it comes from a
+    shift of a dynamic);
+  - `AnalyzeLocalAliases` runs only for pinned-memory functions on x64;
+  - a fixed host whose slot is never written (a loop bound) could skip its
+    store before a leaf call;
+  - 3-arg host dispatch;
+  - loop is bound by its dependency chain (xor → imul → add), as in Wasmtime.
+
 ## Release layout fix (ORDERFIELDS), 2026-09-27
 
 - Branch `fix/release-layout-orderfields` from exact main `b9d8085`. Wave-5

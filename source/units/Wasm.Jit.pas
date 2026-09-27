@@ -260,6 +260,7 @@ uses
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
   Wasm.Jit.X64,
+  Wasm.Jit.X64.Plan,
   {$ENDIF}
   Wasm.Runtime.Gc,
   Wasm.Runtime.Traps;
@@ -489,7 +490,17 @@ function JitCompileToBuffer(const AIr: TWasmIrModule;
   const AFn: PWasmIrFunctionRec;
   const AFuncIdx: UInt32;
   const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
-  const AFinalize: Boolean = True): TWasmCodeBuffer;
+  const AFinalize: Boolean = True): TWasmCodeBuffer; forward;
+
+{ One emission pass. AX64FramelessLeaf (x64 native scalar leaf only) emits
+  the frameless lightweight entry; AX64LeafTouchedFrame reports whether the
+  leaf core emitted any register-file slot access. }
+function JitCompileToBufferPass(const AIr: TWasmIrModule;
+  const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32;
+  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
+  const AFinalize, AX64FramelessLeaf: Boolean;
+  out AX64LeafTouchedFrame: Boolean): TWasmCodeBuffer;
 var
   I, J: Integer;
   Buf: TWasmCodeBuffer;
@@ -499,9 +510,22 @@ var
   {$IFDEF WASM_JIT_X64}
   LoopHeads: array of Boolean;
   {$ENDIF}
-  AllocatedSlots: array[0..2] of UInt32;
+  { The static cache's fixed-host slots, High(UInt32) when unused: three on
+    ARM64 (x24/x25 and the extended frame's third), four on x64
+    (r8/r9/rdi/rdx). }
+  AllocatedSlots: array[0..{$IFDEF WASM_JIT_X64}3{$ELSE}2{$ENDIF}] of UInt32;
   SlotScores: array of UInt32;
+  {$IFDEF WASM_JIT_X64}
+  { SlotScores restricted to instructions inside a loop span; ranks the x64
+    static cache's rdi/rdx hosts (AnalyzeStaticCache). }
+  LoopSlotScores: array of UInt32;
+  ScoringInLoop: Boolean;
+  { X64LoadAluFirst[K]: PlannedCode[K] is an i32.load emitted as the memory
+    operand of PlannedCode[K + 1] (AnalyzeX64LoadAluFusion). }
+  X64LoadAluFirst: array of Boolean;
+  {$ENDIF}
   SlotUseCounts: array of UInt32;
+  RegUseCounts: array of UInt32;
   VisibleSlots: array of Boolean;
   Fusion: array of Integer;
   PlannedCode: TWasmIrCode;
@@ -520,7 +544,7 @@ var
   GcAllocInfo: TWasmGcAllocInfo;
   {$ENDIF}
   {$IFDEF WASM_JIT_X64}
-  X64GcAllocShapes: array of TX64GcAllocShape;
+  X64GcAllocShapes: TX64GcAllocShapeList;
   {$ENDIF}
   UsePinnedMemory: Boolean;
   UsePinnedMemoryBase: Boolean;
@@ -557,11 +581,10 @@ var
   X64Cache: TX64RegCache;
   X64Callee: TX64DirectCallee;
   X64CalleePtr: PX64DirectCallee;
-  UseX64VecCache: Boolean;
-  X64VecStatics: array of UInt32;
-  X64VecConsts: array of UInt32;
-  X64VecConstLo: array of UInt64;
-  X64VecConstHi: array of UInt64;
+  X64LeafFallThrough: Boolean;
+  X64LeafEntryFunc: Int64;
+  X64VecPlan: TX64VecCachePlan;
+  X64ImmediateValues: array of Int64;
   {$ENDIF}
 
   procedure MarkTarget(const ATarget: UInt32);
@@ -623,40 +646,52 @@ var
   { Every read of AReg in the function: source-register operands, A-side aux
     source lists (call arguments), store values in Dest, and register Imm
     operands. The single use-count for fold and forwarding decisions; an
-    incomplete counter once let a local.tee'd call argument be folded away. }
-  function RegisterUseCount(const AReg: UInt32): UInt32;
+    incomplete counter once let a local.tee'd call argument be folded away.
+    The canonical code never changes during a compile, so every register's
+    count is taken in one pass on first use (validated operands all lie
+    below RegisterCount); per-query scans made fusion planning quadratic. }
+  procedure CountRegisterReads;
   var
     Info: TWasmIrOpInfo;
     K, N: Integer;
 
-    procedure CountIfSame(const ASource: UInt32);
+    procedure CountRead(const ASource: UInt32);
     begin
-      if ASource = AReg then
-        Inc(Result);
+      if ASource < UInt32(Length(RegUseCounts)) then
+        Inc(RegUseCounts[ASource]);
     end;
 
   begin
-    Result := 0;
+    SetLength(RegUseCounts, AFn^.RegisterCount + 1);
     for K := 0 to High(AFn^.Code) do
     begin
       Info := IR_OP_INFO[AFn^.Code[K].Op];
       if Info.DestKind = ifkSrcReg then
-        CountIfSame(AFn^.Code[K].Dest);
+        CountRead(AFn^.Code[K].Dest);
       if Info.AKind = ifkSrcReg then
-        CountIfSame(AFn^.Code[K].A)
+        CountRead(AFn^.Code[K].A)
       else if Info.AKind = ifkAuxIndex then
         { Every A aux block is a source-register list. B aux blocks carry
           call results or control targets; Imm aux blocks carry literals,
           masks, or memory arguments. }
         for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
           AFn^.Code[K].A)) - 1 do
-          CountIfSame(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
+          CountRead(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
             UInt32(N)));
       if Info.BKind = ifkSrcReg then
-        CountIfSame(AFn^.Code[K].B);
+        CountRead(AFn^.Code[K].B);
       if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
-        CountIfSame(UInt32(AFn^.Code[K].Imm));
+        CountRead(UInt32(AFn^.Code[K].Imm));
     end;
+  end;
+
+  function RegisterUseCount(const AReg: UInt32): UInt32;
+  begin
+    if Length(RegUseCounts) = 0 then
+      CountRegisterReads;
+    Result := 0;
+    if AReg < UInt32(Length(RegUseCounts)) then
+      Result := RegUseCounts[AReg];
   end;
 
   function IsVisibleFrameReg(const AReg: UInt32): Boolean; forward;
@@ -1111,10 +1146,38 @@ var
       end;
   end;
 
+  {$IFDEF WASM_JIT_X64}
+  { In the helper-free base-pinned loop shape, an i32.load whose value only
+    the next i32 ALU op reads becomes that op's memory operand. Every
+    analysis still sees two instructions (the load's address read and the
+    temporary's definition and read keep their use counts and liveness);
+    only emission changes, so the access traps at the same point with the
+    same kind. The value is never visible and the ALU op carries no label,
+    so nothing can observe the temporary's absence. }
+  procedure AnalyzeX64LoadAluFusion;
+  var
+    K: Integer;
+  begin
+    SetLength(X64LoadAluFirst, Length(PlannedCode));
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K + 1] and (Fusion[K] = -1) and (Fusion[K + 1] = -1) and
+        X64CanFuseLoadAlu(PlannedCode[K], PlannedCode[K + 1]) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) then
+        X64LoadAluFirst[K] := True;
+  end;
+  {$ENDIF}
+
   procedure AnalyzeImmediateFusion;
   var
     K: Integer;
     Value: UInt32;
+    {$IFDEF WASM_JIT_X64}
+    Value64: Int64;
+    {$ENDIF}
   begin
     SetLength(ImmediateFusion, Length(AFn^.Code));
     SetLength(ImmediateValues, Length(AFn^.Code));
@@ -1139,6 +1202,30 @@ var
           ImmediateFusion[K + 1] := True;
           ImmediateValues[K + 1] := Value;
         end;
+      end;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    { Every x64 cache mode reads a fused constant from the consumer's
+      immediate field, and an immediate form is never costlier than the
+      register form it replaces. The same proof as ARM64's: an adjacent,
+      single-read, non-visible constant temporary with no join on either
+      instruction is read by nothing else, so its slot is never needed. A
+      fused compare keeps its compare-branch plan (AnalyzeFusion runs next). }
+    SetLength(X64ImmediateValues, Length(AFn^.Code));
+    { A static-cache function holding cached v128 ops keeps its previous
+      scalar emission (X64CodeHasVecCacheOp explains why). }
+    if UseStaticCache and X64CodeHasVecCacheOp(PlannedCode, SkipPlanned) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K] and not Targets[K + 1] and
+        X64ImmediateOperand(PlannedCode[K], PlannedCode[K + 1], Value64) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) then
+      begin
+        SkipPlanned[K] := True;
+        ImmediateFusion[K + 1] := True;
+        X64ImmediateValues[K + 1] := Value64;
       end;
     {$ENDIF}
   end;
@@ -1206,18 +1293,22 @@ var
   end;
   {$ENDIF}
 
+  { True when ASlot has a fixed static-cache host. }
+  function IsAllocatedSlot(const ASlot: UInt32): Boolean;
+  var
+    N: Integer;
+  begin
+    for N := 0 to High(AllocatedSlots) do
+      if (AllocatedSlots[N] <> High(UInt32)) and
+        (AllocatedSlots[N] = ASlot) then
+        Exit(True);
+    Result := False;
+  end;
+
   procedure AnalyzeMemoryMoves;
   var
     K, P, First: Integer;
     Source, Temp: UInt32;
-
-    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
-    begin
-      Result := (ASlot = AllocatedSlots[0]) or
-        (ASlot = AllocatedSlots[1]) or
-        ((AllocatedSlots[2] <> High(UInt32)) and
-          (ASlot = AllocatedSlots[2]));
-    end;
 
     function ScalarMemoryOp(const AOp: TWasmIrOp): Boolean;
     begin
@@ -1272,14 +1363,6 @@ var
   var
     K, L, Last, Arg: Integer;
     Source, Alias_: UInt32;
-
-    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
-    begin
-      Result := (ASlot = AllocatedSlots[0]) or
-        (ASlot = AllocatedSlots[1]) or
-        ((AllocatedSlots[2] <> High(UInt32)) and
-          (ASlot = AllocatedSlots[2]));
-    end;
 
     function RewriteUse(var AIns: TWasmIrInstr; const AOld,
       ANew: UInt32): Boolean;
@@ -1444,14 +1527,6 @@ var
     K, L, Last: Integer;
     StoreIns, LoadIns: TWasmIrInstr;
 
-    function IsAllocatedSlot(const ASlot: UInt32): Boolean;
-    begin
-      Result := (ASlot = AllocatedSlots[0]) or
-        (ASlot = AllocatedSlots[1]) or
-        ((AllocatedSlots[2] <> High(UInt32)) and
-          (ASlot = AllocatedSlots[2]));
-    end;
-
   begin
     {$IFDEF WASM_JIT_BACKEND}
     { This is deliberately not general memory value numbering. In the
@@ -1572,7 +1647,13 @@ var
   procedure ScoreSlot(const ASlot: UInt32; const AWeight: UInt32 = 1);
   begin
     if ASlot < UInt32(Length(SlotScores)) then
+    begin
       Inc(SlotScores[ASlot], AWeight);
+      {$IFDEF WASM_JIT_X64}
+      if ScoringInLoop then
+        Inc(LoopSlotScores[ASlot], AWeight);
+      {$ENDIF}
+    end;
   end;
 
   procedure ScoreInstruction(const AIns: TWasmIrInstr);
@@ -1851,173 +1932,103 @@ var
         MarkLoopCarried(Integer(PlannedCode[K].B), K);
   end;
 
-  {$IFDEF WASM_JIT_X64}
-  { The xmm plan for a static-cache function holding natively emitted v128
-    ops. Fixed hosts go first to the most-used v128 locals and parameters —
-    never a result slot, because a fixed host is not written back at an
-    exit — then to loop-invariant v128.const results: a constant defined
-    inside a loop span re-materializes every iteration, so it is seeded once
-    at entry instead. A candidate constant must be the only writer of a slot
-    no local, result, or exit can observe; a validated temporary is written
-    before every read, and a unique writer always writes the same bits, so
-    the seeded host equals the slot's value at every read. A function
-    without v128 ops keeps its exact previous code. }
-  procedure AnalyzeX64VecCache;
-  const
-    MAX_FIXED = 8;
-    MAX_STATIC = 6;
-  var
-    K, M, Best: Integer;
-    Scores: array of UInt32;
-    Slot: UInt32;
-    Ins: TWasmIrInstr;
-    HasVec, InLoop, Unique: Boolean;
-    VTmp: TWasmV128;
-
-    procedure ScoreVec(const ASlot: UInt32; const AWeight: UInt32);
-    begin
-      if ASlot < UInt32(Length(Scores)) then
-        Inc(Scores[ASlot], AWeight);
-    end;
-
-    function Chosen(const ASlot: UInt32): Boolean;
-    var
-      N: Integer;
-    begin
-      Result := True;
-      for N := 0 to High(X64VecStatics) do
-        if X64VecStatics[N] = ASlot then
-          Exit;
-      for N := 0 to High(X64VecConsts) do
-        if X64VecConsts[N] = ASlot then
-          Exit;
-      Result := False;
-    end;
-
-  begin
-    UseX64VecCache := False;
-    SetLength(X64VecStatics, 0);
-    SetLength(X64VecConsts, 0);
-    SetLength(X64VecConstLo, 0);
-    SetLength(X64VecConstHi, 0);
-    if not UseStaticCache then
-      Exit;
-    HasVec := False;
-    SetLength(Scores, AFn^.RegisterCount);
-    for K := 0 to High(PlannedCode) do
-    begin
-      Ins := PlannedCode[K];
-      if SkipPlanned[K] or not X64VecCacheOp(Ins.Op) then
-        Continue;
-      HasVec := True;
-      case Ins.Op of
-        iroMoveVec:
-          begin
-            ScoreVec(Ins.A, 2);
-            ScoreVec(Ins.Dest, 2);
-          end;
-        iroV128Const,
-        iroI8x16Splat, iroI16x8Splat, iroI32x4Splat, iroI64x2Splat:
-          ScoreVec(Ins.Dest, 1);
-        iroI8x16ExtractLaneS, iroI8x16ExtractLaneU,
-        iroI16x8ExtractLaneS, iroI16x8ExtractLaneU,
-        iroI32x4ExtractLane, iroI64x2ExtractLane:
-          ScoreVec(Ins.A, 1);
-        iroV128Not:
-          begin
-            ScoreVec(Ins.A, 1);
-            ScoreVec(Ins.Dest, 1);
-          end;
-      else
-        ScoreVec(Ins.A, 1);
-        ScoreVec(Ins.B, 1);
-        ScoreVec(Ins.Dest, 1);
-      end;
-    end;
-    if not HasVec then
-      Exit;
-    UseX64VecCache := True;
-    repeat
-      Best := -1;
-      for K := 0 to High(AFn^.LocalRegs) do
-      begin
-        Slot := AFn^.LocalRegs[K];
-        if (Slot >= UInt32(Length(AFn^.RegTypes))) or
-          (AFn^.RegTypes[Slot].Kind <> wvkVec) or (Scores[Slot] < 2) or
-          Chosen(Slot) then
-          Continue;
-        if (Best < 0) or (Scores[Slot] > Scores[AFn^.LocalRegs[Best]]) then
-          Best := K;
-      end;
-      if Best >= 0 then
-      begin
-        SetLength(X64VecStatics, Length(X64VecStatics) + 1);
-        X64VecStatics[High(X64VecStatics)] := AFn^.LocalRegs[Best];
-      end;
-    until (Best < 0) or (Length(X64VecStatics) = MAX_STATIC);
-    for K := 0 to High(PlannedCode) do
-    begin
-      if Length(X64VecStatics) + Length(X64VecConsts) >= MAX_FIXED then
-        Break;
-      Ins := PlannedCode[K];
-      if SkipPlanned[K] or (Ins.Op <> iroV128Const) or
-        IsVisibleFrameReg(Ins.Dest) or Chosen(Ins.Dest) then
-        Continue;
-      InLoop := False;
-      for M := K to High(PlannedCode) do
-        if ((PlannedCode[M].Op = iroJump) and
-          (PlannedCode[M].A <= UInt32(K))) or
-          ((PlannedCode[M].Op in [iroBranchIf, iroBranchIfNot]) and
-          (PlannedCode[M].B <= UInt32(K))) then
-        begin
-          InLoop := True;
-          Break;
-        end;
-      if not InLoop then
-        Continue;
-      { Every Dest field counts, including a store's value operand: a
-        conservative superset of the slot's writers. }
-      Unique := True;
-      for M := 0 to High(AFn^.Code) do
-        if (M <> K) and ((AFn^.Code[M].Dest = Ins.Dest) or
-          (PlannedCode[M].Dest = Ins.Dest)) then
-        begin
-          Unique := False;
-          Break;
-        end;
-      if not Unique then
-        Continue;
-      IrAuxReadV128(AFn^.AuxU32, UInt32(Ins.Imm), VTmp);
-      SetLength(X64VecConsts, Length(X64VecConsts) + 1);
-      SetLength(X64VecConstLo, Length(X64VecConsts));
-      SetLength(X64VecConstHi, Length(X64VecConsts));
-      X64VecConsts[High(X64VecConsts)] := Ins.Dest;
-      X64VecConstLo[High(X64VecConsts)] := VTmp.U64[0];
-      X64VecConstHi[High(X64VecConsts)] := VTmp.U64[1];
-    end;
-  end;
-  {$ENDIF}
 
   procedure AnalyzeStaticCache;
   var
-    K, Best, Second, Third: Integer;
+    K, N, M: Integer;
+    Ranked: array[0..High(AllocatedSlots)] of Integer;
     HasBackEdge, Eligible: Boolean;
     {$IFDEF WASM_JIT_ARM64}
     HasInlineCall: Boolean;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    HasNativeLeafCall: Boolean;
+    InLoop: array of Boolean;
+
+    { rdi and rdx serve the declared locals and parameters the loops use
+      most, instead of ARM64's next-best slot overall. A fixed host removes
+      a local's per-iteration slot traffic: as a dynamic entry a local is
+      visible, so it is written back at every back-edge and reloaded after
+      every join, and a loop-invariant one (a bound) is reloaded on every
+      use. A short-lived temporary already lives well in r10/r11, and one
+      outside a loop only pays an entry load and an exit store. Candidates
+      are numeric (a v128 local stays in the xmm cache), rank by in-loop
+      score, then total score, then slot order. }
+    procedure SelectX64LoopLocals;
+    var
+      L, P, Q: Integer;
+      Slot: UInt32;
+      Taken: Boolean;
+      Picked: array[2..3] of Integer;
+
+      function Beats(const AA, AB: Integer): Boolean;
+      begin
+        if LoopSlotScores[AA] <> LoopSlotScores[AB] then
+          Result := LoopSlotScores[AA] > LoopSlotScores[AB]
+        else if SlotScores[AA] <> SlotScores[AB] then
+          Result := SlotScores[AA] > SlotScores[AB]
+        else
+          Result := AA < AB;
+      end;
+
+    begin
+      Picked[2] := -1;
+      Picked[3] := -1;
+      for L := 0 to High(AFn^.LocalRegs) do
+      begin
+        Slot := AFn^.LocalRegs[L];
+        if (Slot >= UInt32(Length(SlotScores))) or
+          (LoopSlotScores[Slot] = 0) or
+          (Slot = AllocatedSlots[0]) or (Slot = AllocatedSlots[1]) or
+          (Slot >= UInt32(Length(AFn^.RegTypes))) or
+          (AFn^.RegTypes[Slot].Kind <> wvkNum) then
+          Continue;
+        Taken := False;
+        for P := 2 to 3 do
+          Taken := Taken or (Picked[P] = Integer(Slot));
+        if Taken then
+          Continue;
+        for P := 2 to 3 do
+          if (Picked[P] < 0) or Beats(Integer(Slot), Picked[P]) then
+          begin
+            for Q := 3 downto P + 1 do
+              Picked[Q] := Picked[Q - 1];
+            Picked[P] := Integer(Slot);
+            Break;
+          end;
+      end;
+      for P := 2 to 3 do
+        if Picked[P] >= 0 then
+          AllocatedSlots[P] := UInt32(Picked[P])
+        else
+          AllocatedSlots[P] := High(UInt32);
+    end;
     {$ENDIF}
   begin
     UseStaticCache := False;
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := False;
     {$ENDIF}
-    AllocatedSlots[2] := High(UInt32);
+    for N := 2 to High(AllocatedSlots) do
+      AllocatedSlots[N] := High(UInt32);
     if AFn^.RegisterCount = 0 then
       Exit;
     SetLength(SlotScores, AFn^.RegisterCount);
+    {$IFDEF WASM_JIT_X64}
+    SetLength(LoopSlotScores, AFn^.RegisterCount);
+    SetLength(InLoop, Length(AFn^.Code));
+    for K := 0 to High(AFn^.Code) do
+      if (AFn^.Code[K].Op = iroJump) and (AFn^.Code[K].A <= UInt32(K)) then
+        for N := Integer(AFn^.Code[K].A) to K do
+          InLoop[N] := True;
+    {$ENDIF}
     HasBackEdge := False;
     Eligible := True;
     {$IFDEF WASM_JIT_ARM64}
     HasInlineCall := False;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    HasNativeLeafCall := False;
     {$ENDIF}
     for K := 0 to High(AFn^.Code) do
     begin
@@ -2027,12 +2038,29 @@ var
         HasInlineCall := True
       else
       {$ENDIF}
+      {$IFDEF WASM_JIT_X64}
+      { A direct call to a proven native scalar leaf clobbers only rax-rdx
+        and r8-r11 and reads only its arguments
+        (X64EmitNativeLeafCallCached). }
+      if (AFn^.Code[K].Op = iroCall) and
+        NativeScalarLeafTarget(UInt32(AFn^.Code[K].Imm)) and
+        (IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].A) in [1, 2]) and
+        (IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].B) = 1) then
+        HasNativeLeafCall := True
+      else
+      {$ENDIF}
         Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
       if (AFn^.Code[K].Op = iroJump) and
         (AFn^.Code[K].A <= UInt32(K)) then
         HasBackEdge := True;
+      {$IFDEF WASM_JIT_X64}
+      ScoringInLoop := InLoop[K];
+      {$ENDIF}
       ScoreInstruction(AFn^.Code[K]);
     end;
+    {$IFDEF WASM_JIT_X64}
+    ScoringInLoop := False;
+    {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     if HasInlineCall then
     begin
@@ -2043,38 +2071,48 @@ var
           (AFn^.RegTypes[K].Num = wntI64));
     end;
     {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    if HasNativeLeafCall then
+    begin
+      { Every value is an i32/i64 scalar (no reference a fallback helper
+        call could need rooted, no v128 in a caller-saved xmm host), and no
+        memory is pinned across the call. }
+      Eligible := Eligible and not UsePinnedMemory and not HasHandlers;
+      for K := 0 to High(AFn^.RegTypes) do
+        Eligible := Eligible and (AFn^.RegTypes[K].Kind = wvkNum) and
+          ((AFn^.RegTypes[K].Num = wntI32) or
+          (AFn^.RegTypes[K].Num = wntI64));
+    end;
+    {$ENDIF}
     if not Eligible or not HasBackEdge then
       Exit;
 
-    Best := -1;
-    Second := -1;
-    Third := -1;
+    { The highest scores in descending order; an earlier slot wins a tie. }
+    for N := 0 to High(Ranked) do
+      Ranked[N] := -1;
     for K := 0 to High(SlotScores) do
-      if (Best < 0) or (SlotScores[K] > SlotScores[Best]) then
-      begin
-        Third := Second;
-        Second := Best;
-        Best := K;
-      end
-      else if (Second < 0) or (SlotScores[K] > SlotScores[Second]) then
-      begin
-        Third := Second;
-        Second := K;
-      end
-      else if (Third < 0) or (SlotScores[K] > SlotScores[Third]) then
-        Third := K;
+      for N := 0 to High(Ranked) do
+        if (Ranked[N] < 0) or (SlotScores[K] > SlotScores[Ranked[N]]) then
+        begin
+          for M := High(Ranked) downto N + 1 do
+            Ranked[M] := Ranked[M - 1];
+          Ranked[N] := K;
+          Break;
+        end;
     { Loading and preserving a one-use expression register costs more than the
       old write-through cache. Require both physical registers to serve slots
       that occur repeatedly in the loop-shaped function. }
-    if (Best < 0) or (Second < 0) or
-      (SlotScores[Best] < 3) or (SlotScores[Second] < 3) then
+    if (Ranked[0] < 0) or (Ranked[1] < 0) or
+      (SlotScores[Ranked[0]] < 3) or (SlotScores[Ranked[1]] < 3) then
       Exit;
-    AllocatedSlots[0] := UInt32(Best);
-    AllocatedSlots[1] := UInt32(Second);
-    if (Third >= 0) and (SlotScores[Third] >= 3) then
-      AllocatedSlots[2] := UInt32(Third)
-    else
-      AllocatedSlots[2] := High(UInt32);
+    { ARM64's third host takes the next slot by the same measure; x64 then
+      re-picks its rdi and rdx hosts from the loop locals. }
+    for N := 0 to High(Ranked) do
+      if (Ranked[N] >= 0) and (SlotScores[Ranked[N]] >= 3) then
+        AllocatedSlots[N] := UInt32(Ranked[N]);
+    {$IFDEF WASM_JIT_X64}
+    SelectX64LoopLocals;
+    {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     UsePreservedInlineCache := HasInlineCall;
     if UsePreservedInlineCache then
@@ -2499,149 +2537,6 @@ var
   end;
   {$ENDIF}
 
-  {$IFDEF WASM_JIT_X64}
-  { x64 inline struct.new. For a FIXED struct type everything Allocate
-    derives except the collection decision is compile-time: layout size,
-    size class, cell size, field offsets. The backend emits the free-list
-    hit under the live collection trigger and falls back to the unchanged
-    helper for everything else. Numeric, packed, and reference fields fill
-    inline (a struct.new's stores are initializing stores, which the runtime
-    also writes without a barrier); v128 fields, large objects, and field
-    counts past the shape capacity decline. Unlike the arm64 path, any
-    class size fits: the cell index takes a shift and, for the 3*2^k
-    classes, one exact reciprocal multiply, and every qword the fills do not
-    cover is zeroed in the template. }
-  procedure AnalyzeGcInlineAllocX64;
-  var
-    K, F, C, CanonIdx, ClassIndex: Integer;
-    TypeIdx: UInt32;
-    Offset, Width, Size, CellSize, Base, Shift: UInt32;
-    Covered: UInt64;
-    ByteCount: array[0..31] of UInt32;
-    Ok: Boolean;
-    Comp: ^TWasmCompType;
-    Storage: TWasmStorageType;
-  begin
-    SetLength(X64GcAllocShapes, Length(AFn^.Code));
-    for K := 0 to High(AFn^.Code) do
-      X64GcAllocShapes[K] := Default(TX64GcAllocShape);
-    if UseNativeScalarCore then
-      Exit;
-    with WasmJitGcHeapOffsets do
-      if (HeapFFree0 + WASM_GC_CLASS_COUNT * 8 > $7FFFFFFF) or
-        (HeapMarkState > $7FFFFFFF) or (HeapBytesLive > $7FFFFFFF) or
-        (HeapBytesAllocated > $7FFFFFFF) or
-        (HeapObjectCount > $7FFFFFFF) or (HeapThreshold > $7FFFFFFF) or
-        (BlockBase > $7FFFFFFF) or (BlockAllocated > $7FFFFFFF) then
-        Exit;
-
-    for K := 0 to High(AFn^.Code) do
-    begin
-      if AFn^.Code[K].Op <> iroStructNew then
-        Continue;
-      TypeIdx := UInt32(AFn^.Code[K].Imm);
-      { EngineTypeIds[Imm] is a disp32 load in the template. }
-      if (TypeIdx >= UInt32(Length(AIr.TypeIndexToCanon))) or
-        (TypeIdx >= $1FFFFFFF) then
-        Continue;
-      CanonIdx := Integer(AIr.TypeIndexToCanon[TypeIdx]);
-      if (CanonIdx < 0) or (CanonIdx >= Length(AIr.CanonTypes)) then
-        Continue;
-      Comp := @AIr.CanonTypes[CanonIdx].Comp;
-      if Comp^.Kind <> wckStruct then
-        Continue;
-      F := Length(Comp^.Struct.Fields);
-      if (F > Length(X64GcAllocShapes[K].Fields)) or
-        (UInt32(F) <> IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].A)) then
-        Continue;
-
-      { Field walk — the arithmetic of TWasmGcTypes.Define: header 8, each
-        field aligned up to its storage width, cumulative advance. }
-      Offset := 8;
-      Ok := True;
-      for C := 0 to F - 1 do
-      begin
-        Storage := Comp^.Struct.Fields[C].Storage;
-        if Storage.IsPacked then
-        begin
-          if Storage.PackedType = wpkI8 then
-            Width := 1
-          else
-            Width := 2;
-        end
-        else
-          case Storage.ValueType.Kind of
-            wvkNum:
-              if (Storage.ValueType.Num = wntI32) or
-                (Storage.ValueType.Num = wntF32) then
-                Width := 4
-              else
-                Width := 8;
-            wvkRef:
-              Width := SizeOf(TWasmRef);
-          else
-            Width := 16;
-          end;
-        if Width > 8 then
-        begin
-          Ok := False;
-          Break;
-        end;
-        Offset := (Offset + Width - 1) and not (Width - 1);
-        X64GcAllocShapes[K].Fields[C].Offset := UInt16(Offset);
-        X64GcAllocShapes[K].Fields[C].Width := Byte(Width);
-        Offset := Offset + Width;
-      end;
-      if not Ok then
-        Continue;
-
-      { Size-class math mirrors TWasmGcHeap.Allocate: align the span to 8,
-        bump to the first class, take the first class that fits. A size past
-        every class is a large object, which the helper owns. }
-      Size := (Offset + 7) and not UInt32(7);
-      if Size < WASM_GC_SIZE_CLASSES[0] then
-        Size := WASM_GC_SIZE_CLASSES[0];
-      ClassIndex := -1;
-      for C := 0 to WASM_GC_CLASS_COUNT - 1 do
-        if Size <= WASM_GC_SIZE_CLASSES[C] then
-        begin
-          ClassIndex := C;
-          Break;
-        end;
-      if ClassIndex < 0 then
-        Continue;
-      CellSize := WASM_GC_SIZE_CLASSES[ClassIndex];
-      if (CellSize mod 3) = 0 then
-        Base := CellSize div 3
-      else
-        Base := CellSize;
-      Shift := 0;
-      while (UInt32(1) shl Shift) < Base do
-        Inc(Shift);
-      if ((UInt32(1) shl Shift) <> Base) or (CellSize > 256) then
-        Continue;
-
-      { Qwords after the header the fills write in full (fields never
-        overlap, so eight covered bytes means the whole qword). }
-      FillChar(ByteCount, SizeOf(ByteCount), 0);
-      for C := 0 to F - 1 do
-        Inc(ByteCount[X64GcAllocShapes[K].Fields[C].Offset div 8],
-          X64GcAllocShapes[K].Fields[C].Width);
-      Covered := 0;
-      for C := 1 to Integer(CellSize div 8) - 1 do
-        if ByteCount[C] = 8 then
-          Covered := Covered or (UInt64(1) shl C);
-
-      X64GcAllocShapes[K].Enabled := True;
-      X64GcAllocShapes[K].FieldCount := Byte(F);
-      X64GcAllocShapes[K].ClassIndex := Byte(ClassIndex);
-      X64GcAllocShapes[K].CellShift := Byte(Shift);
-      X64GcAllocShapes[K].CellTimes3 := Base <> CellSize;
-      X64GcAllocShapes[K].CellSize := UInt16(CellSize);
-      X64GcAllocShapes[K].Covered := Covered;
-    end;
-  end;
-  {$ENDIF}
 
   procedure AnalyzePinnedMemory;
   var
@@ -2704,6 +2599,7 @@ var
   end;
 
 begin
+  AX64LeafTouchedFrame := False;
   Result := TWasmCodeBuffer.Create;
   Buf := Result;
   try
@@ -2804,7 +2700,8 @@ begin
       { x26 is unavailable to the shared native core cache: recursion pins its
         additional-frame budget there, while a leaf uses the wider x14-x17
         dynamic set and does not need a third static entry. }
-      AllocatedSlots[2] := High(UInt32);
+      for I := 2 to High(AllocatedSlots) do
+        AllocatedSlots[I] := High(UInt32);
       { The native core seeds x12/x13 before any canonical register-file load;
         use its bounded write-back cache rather than the ordinary entry loads. }
       UseStaticCache := False;
@@ -2824,6 +2721,9 @@ begin
     {$ENDIF}
     AnalyzeImmediateFusion;
     AnalyzeFusion;
+    {$IFDEF WASM_JIT_X64}
+    AnalyzeX64LoadAluFusion;
+    {$ENDIF}
     { After fusion planning, so already-folded constants are not offered a
       host register their defining instruction would never have used. }
     AnalyzeConstSlots;
@@ -2832,13 +2732,13 @@ begin
     AnalyzeGcInlineAlloc;
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
-    AnalyzeGcInlineAllocX64;
+    X64PlanGcInlineAlloc(AIr, AFn^, UseNativeScalarCore, X64GcAllocShapes);
     {$ENDIF}
     {$IFDEF WASM_JIT_ARM64}
     AnalyzeDynamicWriteBack;
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
-    if UseStaticCache then
+    if UseStaticCache or UseNativeScalarCore then
     begin
       { Masked-shift fusion is ARM64-only; the shared liveness walk reads its
         plan, so give x64 the empty one. }
@@ -2847,7 +2747,8 @@ begin
         MaskedShiftSource[I] := -1;
       AnalyzeDynamicWriteBack;
     end;
-    AnalyzeX64VecCache;
+    X64PlanVecCache(AFn^, PlannedCode, SkipPlanned, UseStaticCache,
+      X64VecPlan);
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -2910,25 +2811,56 @@ begin
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     UseX64ExtendedFrame := UseNativeScalarCall or UseNativeScalarSelf;
+    { A frameless leaf's lightweight entry falls straight into its core; the
+      canonical external entry is emitted after the core instead. }
+    X64LeafFallThrough := UseNativeScalarLeaf and AX64FramelessLeaf;
     if UseNativeScalarLeaf then
     begin
       X64EmitNativeLeafEntry(Buf, AFn^.RegisterCount, NativeParamCount,
         NativeParamReg, NativeParam1Reg, NativeCoreLabel,
-        NativeExternalLabel);
-      Buf.BindLabel(NativeExternalLabel);
+        NativeExternalLabel, AX64FramelessLeaf);
+      if not X64LeafFallThrough then
+        Buf.BindLabel(NativeExternalLabel);
     end;
-    X64EmitPrologue(Buf, UseX64ExtendedFrame);
-    X64EmitPinHelperTable(Buf, AHelperTableOffset);
-    X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    if not X64LeafFallThrough then
+    begin
+      X64EmitPrologue(Buf, UseX64ExtendedFrame);
+      X64EmitPinHelperTable(Buf, AHelperTableOffset);
+      X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+    end;
     if UseNativeScalarSelf then
       X64EmitNativeSelfBudget(Buf, AFn^.RegisterCount);
     if UsePinnedMemory then
       X64EmitPinMemory(Buf, PinnedMemoryIndex,
         UsePinnedMemoryBase and UseStaticCache);
+    { A static caller whose native-leaf calls all target one function
+      caches that leaf's entry per activation in [rsp+16]. }
+    X64LeafEntryFunc := -1;
+    if UseStaticCache and UseNativeScalarCall then
+      for I := 0 to High(AFn^.Code) do
+        if AFn^.Code[I].Op = iroCall then
+        begin
+          if X64LeafEntryFunc = -1 then
+            X64LeafEntryFunc := Int64(UInt32(AFn^.Code[I].Imm))
+          else if X64LeafEntryFunc <> Int64(UInt32(AFn^.Code[I].Imm)) then
+            X64LeafEntryFunc := -2;
+        end;
+    if X64LeafEntryFunc >= 0 then
+      X64EmitClearLeafEntry(Buf);
     X64InitRegCache(X64Cache);
     if UseNativeScalarCore then
+    begin
       X64SeedNativeCoreCache(X64Cache, NativeParamCount, NativeParamReg,
-        NativeParam1Reg, UseNativeScalarLeaf)
+        NativeParam1Reg, UseNativeScalarSelf);
+      { The closed helper-free native core defers its stores like ARM64's:
+        its only exits are return (the caller reads r8 alone), the
+        non-returning exhaustion and epoch traps (the trampoline reads no
+        slot), and the native self call, which writes back just the values
+        this frame reads after it. Branches, joins and back-edges write back
+        what a later read, local, result, or loop-carried use can observe. }
+      X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
+        @VisibleSlots[0], AFn^.RegisterCount);
+    end
     else if UseStaticCache then
     begin
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
@@ -2944,19 +2876,29 @@ begin
         fault unwinds to the trampoline, which reads no slot. }
       X64EnableDynamicWriteBack(X64Cache, @SlotUseCounts[0],
         @VisibleSlots[0], AFn^.RegisterCount);
+      if X64LeafEntryFunc >= 0 then
+        X64EnableLeafEntryCache(X64Cache, UInt32(X64LeafEntryFunc));
       { Admitted v128 ops are helper-free too, so their xmm hosts survive to
         the same exits; a caller-saved xmm is never live across a call. }
-      if UseX64VecCache then
-        X64EnableVecCache(Buf, X64Cache, X64VecStatics, X64VecConsts,
-          X64VecConstLo, X64VecConstHi);
+      if X64VecPlan.Enabled then
+        X64EnableVecCache(Buf, X64Cache, X64VecPlan.Statics,
+          X64VecPlan.Consts, X64VecPlan.ConstLo, X64VecPlan.ConstHi);
+    end;
+    if UseNativeScalarCore and not X64LeafFallThrough then
+    begin
+      if UseNativeScalarSelf then
+        X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+          NativeParam1Reg, NativeResultReg, NativeCoreLabel,
+          AFn^.RegisterCount)
+      else
+        X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+          NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
     end;
     if UseNativeScalarCore then
-    begin
-      X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
-        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
-      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
       Buf.BindLabel(NativeCoreLabel);
-    end;
+    { Only the core's own slot traffic decides the leaf's frame. }
+    X64ResetSlotTouched;
     {$ENDIF}
 
     {$IFDEF WASM_JIT_ARM64}
@@ -3039,12 +2981,25 @@ begin
       if not UseNativeScalarCore and not NativeScalarCall and
         PlanX64DirectCallee(AFn^.Code[I], X64Callee) then
         X64CalleePtr := @X64Callee;
-      if Fusion[I] >= 0 then
+      if X64LoadAluFirst[I] then
+        { The next instruction emits this access as its memory operand. }
+        Emitted := True
+      else if (I > 0) and X64LoadAluFirst[I - 1] then
       begin
-        X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
-          PlannedCode[I], X64Cache);
+        X64EmitLoadAluCached(Buf, PlannedCode[I - 1], PlannedCode[I],
+          X64Cache);
         Emitted := True;
       end
+      else if Fusion[I] >= 0 then
+      begin
+        X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
+          PlannedCode[I], X64Cache, ImmediateFusion[Fusion[I]],
+          X64ImmediateValues[Fusion[I]]);
+        Emitted := True;
+      end
+      else if ImmediateFusion[I] then
+        Emitted := X64EmitOpCachedImmediate(Buf, PlannedCode[I],
+          X64ImmediateValues[I], X64Cache)
       else
         Emitted := X64EmitOpCached(Buf, PlannedCode[I], AFn^.AuxU32,
           UInt32(I),
@@ -3087,6 +3042,22 @@ begin
     Arm64ResolvePatches(Buf);
     {$ENDIF}
     {$IFDEF WASM_JIT_X64}
+    AX64LeafTouchedFrame := X64SlotTouched;
+    if AX64FramelessLeaf and AX64LeafTouchedFrame then
+      raise EWasmInternal.Create(
+        'internal: frameless x64 native leaf touched its frame');
+    if X64LeafFallThrough then
+    begin
+      { The canonical entry, after the core's final RET: the same prologue,
+        epoch capture, and register-file bridge as the framed layout. }
+      Buf.BindLabel(NativeExternalLabel);
+      X64EmitPrologue(Buf, UseX64ExtendedFrame);
+      X64EmitPinHelperTable(Buf, AHelperTableOffset);
+      X64EmitEpochCapture(Buf, AEpochOffset, ASnapshotOffset);
+      X64EmitNativeCoreWrapperCall(Buf, NativeParamCount, NativeParamReg,
+        NativeParam1Reg, NativeResultReg, NativeCoreLabel);
+      X64EmitEpilogue(Buf, UseX64ExtendedFrame);
+    end;
     if UseNativeScalarSelf then
     begin
       Buf.BindLabel(NativeExhaustedLabel);
@@ -3111,6 +3082,38 @@ begin
     Result.Free;
     raise;
   end;
+end;
+
+function JitCompileToBuffer(const AIr: TWasmIrModule;
+  const AFn: PWasmIrFunctionRec;
+  const AFuncIdx: UInt32;
+  const AEpochOffset, ASnapshotOffset, AHelperTableOffset: NativeUInt;
+  const AFinalize: Boolean): TWasmCodeBuffer;
+var
+  Touched: Boolean;
+begin
+  {$IFDEF WASM_JIT_X64}
+  { A native scalar leaf whose core never spills needs no frame of its own:
+    emit once to learn that, then again with the frameless entry (the core
+    bytes are identical; only the entry differs). }
+  if JitCanNativeScalarLeaf(AFn) then
+  begin
+    Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
+      ASnapshotOffset, AHelperTableOffset, False, False, Touched);
+    if Touched then
+    begin
+      if AFinalize then
+        Result.MakeExecutable;
+      Exit;
+    end;
+    Result.Free;
+    Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
+      ASnapshotOffset, AHelperTableOffset, AFinalize, True, Touched);
+    Exit;
+  end;
+  {$ENDIF}
+  Result := JitCompileToBufferPass(AIr, AFn, AFuncIdx, AEpochOffset,
+    ASnapshotOffset, AHelperTableOffset, AFinalize, False, Touched);
 end;
 {$ENDIF}
 
