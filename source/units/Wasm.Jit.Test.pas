@@ -6008,6 +6008,24 @@ begin
     '(result i32) (i32.add (i32.mul (i32.xor (local.get $acc) ' +
     '(local.get $i)) (i32.const 1664525)) (i32.const 1013904223))))', 0);
   Expect<Integer>(SlotStores(Code)).ToBe(1);
+  { Its core never spills, so the lightweight entry is frameless:
+    test rcx, rcx ; jne external ; jmp core (no push rbx / frame). }
+  Expect<Byte>(Code[0]).ToBe($48);
+  Expect<Byte>(Code[1]).ToBe($85);
+  Expect<Byte>(Code[2]).ToBe($C9);
+  Expect<Byte>(Code[3]).ToBe($0F);
+  Expect<Byte>(Code[4]).ToBe($85);
+  Expect<Byte>(Code[9]).ToBe($E9);
+
+  { Live temporaries outnumber the dynamic pair here, so the
+    core spills and the entry keeps its frame: push rbx after the jne. }
+  Code := Stage('(module (func $p (param $a i32) (param $b i32) ' +
+    '(result i32) (i32.add (i32.add (i32.mul (i32.add (local.get $a) ' +
+    '(local.get $b)) (i32.sub (local.get $a) (local.get $b))) ' +
+    '(i32.xor (local.get $a) (local.get $b))) (i32.add (i32.shl ' +
+    '(local.get $a) (i32.const 3)) (i32.shr_u (local.get $b) ' +
+    '(i32.const 2))))))', 0);
+  Expect<Byte>(Code[9]).ToBe($53);
 
   { fib: the parameter is stored once before the first self call, the first
     call's result once before the second, and the wrapper publishes the
