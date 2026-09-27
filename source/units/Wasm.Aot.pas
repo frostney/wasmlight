@@ -182,9 +182,13 @@ function AotCompileModuleIrStrict(const AStore: TWasmStore;
 procedure AotPublishArtifact(const APath: string; const ABytes: TWasmBytes);
 
 { Compile strictly, then publish atomically. A decline raises EWasmAotError
-  before any bytes are written; APath is left absent or unchanged. }
+  before any bytes are written; APath is left absent or unchanged. The
+  no-target overload compiles for the compiler host. }
 procedure AotCompileModuleStrictToFile(const AStore: TWasmStore;
-  const ALoaded: TWasmLoadedModule; const APath: string);
+  const ALoaded: TWasmLoadedModule; const APath: string); overload;
+procedure AotCompileModuleStrictToFile(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule; const ATarget: TWasmTarget;
+  const APath: string); overload;
 
 { Load AArtifact against the freshly-validated ALoaded + its live AInstance in
   AStore, applying every guard (§2.3), and — only if all pass — map each compiled
@@ -473,10 +477,17 @@ end;
 
 procedure AotCompileModuleStrictToFile(const AStore: TWasmStore;
   const ALoaded: TWasmLoadedModule; const APath: string);
+begin
+  AotCompileModuleStrictToFile(AStore, ALoaded, WasmTargetHost, APath);
+end;
+
+procedure AotCompileModuleStrictToFile(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule; const ATarget: TWasmTarget;
+  const APath: string);
 var
   Artifact: TWasmBytes;
 begin
-  Artifact := AotCompileModuleStrict(AStore, ALoaded);
+  Artifact := AotCompileModuleStrict(AStore, ALoaded, ATarget);
   AotPublishArtifact(APath, Artifact);
 end;
 

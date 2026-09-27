@@ -456,10 +456,12 @@ different.
   publishes the callee's activation and GC frame in generated code — the
   same fields, order, and exhaustion predicates as `JitPrepareDirectCall`
   and `JitFinishDirectCall` — and falls back to those helpers whenever the
-  callee has no live direct entry. Large register files, wide non-tail calls, and out-of-range
-  conditional branches are encoded, not declined. The remaining compile
-  declines are an unsupported target (no backend) and a `return_call*`
-  whose argument block exceeds the shared cross-tier tail channel.
+  callee has no live direct entry. Large register files, wide calls and
+  `return_call*`s, and out-of-range conditional branches are encoded, not
+  declined: an argument or result block wider than the 1024-slot inline
+  buffers marshals through heap blocks the interpreter context owns, in
+  every tier. The remaining compile decline is an unsupported target (no
+  backend); every IR op has a template on both backends.
   Compiled and interpreted functions interoperate transparently across the
   seam (a throw from a compiled callee reaches an outer interpreted
   handler, and a cross-tier tail call stays O(1)).
@@ -497,9 +499,10 @@ payload and packages it onto a catalog or host-sibling runtime shell.
 The **runtime shell** (`Wasm.Shell`, `Wasm.Shell.Payload`, `Wasm.Native`,
 program `wasmlight-shell`) is the interpreter-free template
 `wasmlight compile` populates. Startup always re-decodes and
-re-validates the embedded module, then wires only a complete native
-image; an incomplete or incompatible image is `EWasmLinkError` and is
-never interpreted. `.waot` remains the fallback-capable cache for
+re-validates the embedded module, strictly decodes and applies the
+embedded capability set, then wires only a complete native image; an
+incomplete or incompatible image is `EWasmLinkError` and is never
+interpreted. `.waot` remains the fallback-capable cache for
 `run --aot`. Packaged ELF/Mach-O images carry the product payload;
 the attach-seam `.wshl` envelope remains for template tests.
 
@@ -608,7 +611,10 @@ boundary is drawn.
   runtime shell. WASI preview1 is a built-in; other imports fail at link
   unless a selected connector uniquely binds them with a fixed lowering the
   target C ABI can call, and the resolved plan is embedded for the shell.
-  There is no `.waot`, JIT, or interpreter fallback. A missing catalog or unusable shell is `EWasmPackagingError`.
+  `--dir GUEST=HOST` and `--env KEY=VALUE` build the compiled capability set,
+  which the payload embeds; a malformed spec is a usage error before decode.
+  There is no `.waot`, JIT, or interpreter fallback. A missing catalog or
+  unusable shell is `EWasmPackagingError`.
 - **`Wasm.Connector` / `Wasm.Connector.Resolve`** are compile-time linking,
   not a runtime host. `ParseConnector` turns `.wlc` into declaration
   records. `ResolveConnectorPlan` matches each non-built-in import exactly
@@ -636,7 +642,13 @@ boundary is drawn.
   the guest. Embedded environment values are visible in the executable and
   are not a secret mechanism. The set cannot grow after it is frozen, and
   apply refuses a config that already has preopens or env. Containment
-  stays in `Wasm.Wasi`.
+  stays in `Wasm.Wasi`. The unit also owns the capability-set section
+  encoding: versioned, fixed-width little-endian, order-preserving, with
+  the empty set as no bytes so every set has one encoding, and a strict
+  decoder that rejects anything the compile path could not have written.
+  `CompiledGuestArgv` is the one argv builder: `wasmlight run` passes the
+  module path and a compiled executable passes its own path, so the guest
+  sees the same argc for the same arguments.
 
 ### Target-shell discovery
 

@@ -18,6 +18,7 @@ uses
   CLI.Options,
   TestingPascalLibrary,
   Wasm.Compile,
+  Wasm.Compile.Capabilities,
   Wasm.Compile.Catalog,
   Wasm.Connector,
   Wasm.Core,
@@ -108,6 +109,10 @@ type
     procedure TestPackageWithoutCatalogIsPackagingError;
     procedure TestHostTargetEmitsNativeExecutable;
     procedure TestWrongMachOTemplateFails;
+    procedure TestHelpDocumentsCapabilityOptions;
+    procedure TestCapabilityOptionsMapVerbatim;
+    procedure TestMalformedCapabilityIsUsageError;
+    procedure TestHostTargetEmbedsCapabilitySet;
   end;
 
 function TCompileTests.NewRequest(const ATarget: string): TWasmCompileRequest;
@@ -119,6 +124,8 @@ begin
   { A missing catalog root, not empty: empty would consult the compiler
     catalog and, for the host target, a sibling `wasmlight-shell`. }
   Result.CatalogRoot := IncludeTrailingPathDelimiter(FTempDir) + 'no-catalog';
+  Result.Dirs := nil;
+  Result.Envs := nil;
 end;
 
 function TCompileTests.CompileWat(const AWat: string): TWasmCompileResult;
@@ -800,6 +807,8 @@ begin
     .ToBe(True);
   Expect<Integer>(Ord(ParseNativePayload(Extracted, Parsed))).ToBe(Ord(nprOk));
   Expect<Boolean>(Length(Parsed.Funcs) > 0).ToBe(True);
+  { No --dir/--env: the empty, deny-by-default set is no bytes. }
+  Expect<Integer>(Length(Parsed.CapabilitySet)).ToBe(0);
 end;
 
 procedure TCompileTests.TestWrongMachOTemplateFails;
@@ -842,6 +851,133 @@ begin
   Expect<Boolean>(Pos('EWasmLinkError', Res.Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(Pos('must have type () -> ()', Res.Diagnostic) > 0).ToBe(True);
   Expect<string>(ReadUtf8File(FOutputPath)).ToBe('existing executable');
+end;
+
+procedure TCompileTests.TestHelpDocumentsCapabilityOptions;
+begin
+  BeginOptions;
+  try
+    Expect<Integer>(Length(FOptions)).ToBe(5);
+    Expect<string>(FOptions[3].LongName).ToBe('dir');
+    Expect<string>(FOptions[3].FormatForHelp).ToBe('--dir <value>');
+    Expect<Boolean>(Pos('GUEST=HOST', FOptions[3].HelpText) > 0).ToBe(True);
+    Expect<Boolean>(Pos('executable''s directory', FOptions[3].HelpText) > 0)
+      .ToBe(True);
+    Expect<string>(FOptions[4].LongName).ToBe('env');
+    Expect<string>(FOptions[4].FormatForHelp).ToBe('--env <value>');
+    Expect<Boolean>(Pos('KEY=VALUE', FOptions[4].HelpText) > 0).ToBe(True);
+    Expect<Boolean>(Pos('not a secret', FOptions[4].HelpText) > 0).ToBe(True);
+  finally
+    EndOptions;
+  end;
+end;
+
+procedure TCompileTests.TestCapabilityOptionsMapVerbatim;
+var
+  Request: TWasmCompileRequest;
+  Err: string;
+begin
+  BeginOptions;
+  try
+    FPositionals.Add(FModulePath);
+    FOutputOpt.Apply(FOutputPath);
+    TRepeatableOption(FOptions[3]).Apply('/data=--data');
+    TRepeatableOption(FOptions[3]).Apply('/abs=/srv/a=b');
+    TRepeatableOption(FOptions[4]).Apply('--K=--v');
+    TRepeatableOption(FOptions[4]).Apply('EMPTY=');
+    Expect<Boolean>(CompileRequestFromOptions(FPositionals, FOptions,
+      Request, Err)).ToBe(True);
+    Expect<string>(Err).ToBe('');
+    Expect<Integer>(Length(Request.Dirs)).ToBe(2);
+    Expect<string>(Request.Dirs[0]).ToBe('/data=--data');
+    Expect<string>(Request.Dirs[1]).ToBe('/abs=/srv/a=b');
+    Expect<Integer>(Length(Request.Envs)).ToBe(2);
+    Expect<string>(Request.Envs[0]).ToBe('--K=--v');
+    Expect<string>(Request.Envs[1]).ToBe('EMPTY=');
+  finally
+    EndOptions;
+  end;
+end;
+
+procedure TCompileTests.TestMalformedCapabilityIsUsageError;
+var
+  Request: TWasmCompileRequest;
+  Res: TWasmCompileResult;
+  Err: string;
+begin
+  { The module path does not exist: a usage error must come first. }
+  BeginOptions;
+  try
+    FPositionals.Add(FModulePath);
+    FOutputOpt.Apply(FOutputPath);
+    TRepeatableOption(FOptions[3]).Apply('no-separator');
+    Expect<Boolean>(CompileRequestFromOptions(FPositionals, FOptions,
+      Request, Err)).ToBe(False);
+    Expect<string>(Err).ToBe('invalid --dir "no-separator": expected GUEST=HOST');
+  finally
+    EndOptions;
+  end;
+  BeginOptions;
+  try
+    FPositionals.Add(FModulePath);
+    FOutputOpt.Apply(FOutputPath);
+    TRepeatableOption(FOptions[4]).Apply('=value');
+    Res := CompileFromOptions(FPositionals, FOptions);
+    Expect<Integer>(Res.ExitCode).ToBe(1);
+    Expect<string>(Res.Diagnostic).ToBe('invalid --env "=value": expected KEY=VALUE');
+  finally
+    EndOptions;
+  end;
+  { A programmatic request is checked before any stage writes output. }
+  Request := NewRequest(WASM_COMPILE_TARGET_AARCH64_DARWIN);
+  SetLength(Request.Dirs, 1);
+  Request.Dirs[0] := '/data=';
+  Res := CompileModuleBytes(AssembleWatText(WASI_WAT), Request);
+  Expect<Integer>(Res.ExitCode).ToBe(1);
+  Expect<string>(Res.Diagnostic).ToBe('invalid --dir "/data=": HOST path is empty');
+  Expect<Boolean>(OutputExists).ToBe(False);
+end;
+
+procedure TCompileTests.TestHostTargetEmbedsCapabilitySet;
+var
+  Res: TWasmCompileResult;
+  Request: TWasmCompileRequest;
+  Extracted: TWasmBytes;
+  Parsed: TWasmNativePayload;
+  Caps: TWasmCompiledCapabilities;
+  Err: string;
+begin
+  Request := NewRequest(CompileHostTarget);
+  Request.CatalogRoot := FCatalogRoot;
+  SetLength(Request.Dirs, 2);
+  Request.Dirs[0] := '/data=data';
+  Request.Dirs[1] := '/abs=/srv/shared';
+  SetLength(Request.Envs, 1);
+  Request.Envs[0] := 'MODE=release';
+  Res := CompileModuleBytes(AssembleWatText(WASI_WAT), Request);
+  if not IsReleasedCompileTarget(CompileHostTarget) then
+  begin
+    Expect<Boolean>(Pos('EWasmPackagingError', Res.Diagnostic) > 0).ToBe(True);
+    Exit;
+  end;
+  Expect<string>(Res.Diagnostic).ToBe('');
+  Expect<Boolean>(ExtractPackagedPayloadFromFile(FOutputPath, Extracted))
+    .ToBe(True);
+  Expect<Integer>(Ord(ParseNativePayload(Extracted, Parsed))).ToBe(Ord(nprOk));
+  Caps := nil;
+  try
+    Expect<Boolean>(TryDecodeCompiledCapabilities(Parsed.CapabilitySet, Caps,
+      Err)).ToBe(True);
+    Expect<Integer>(Caps.PreopenCount).ToBe(2);
+    Expect<string>(Caps.PreopenAt(0).GuestPath).ToBe('/data');
+    { Stored unresolved: the executable resolves it at run time. }
+    Expect<string>(Caps.PreopenAt(0).HostPath).ToBe('data');
+    Expect<string>(Caps.PreopenAt(1).HostPath).ToBe('/srv/shared');
+    Expect<Integer>(Caps.EnvCount).ToBe(1);
+    Expect<string>(Caps.EnvAt(0)).ToBe('MODE=release');
+  finally
+    Caps.Free;
+  end;
 end;
 
 procedure TCompileTests.SetupTests;
@@ -898,6 +1034,14 @@ begin
     TestPackageWithoutCatalogIsPackagingError);
   Test('the host target emits a packaged native executable',
     TestHostTargetEmitsNativeExecutable);
+  Test('help documents --dir and --env and warns env is not secret',
+    TestHelpDocumentsCapabilityOptions);
+  Test('--dir and --env map onto the request verbatim and in order',
+    TestCapabilityOptionsMapVerbatim);
+  Test('a malformed --dir or --env is a usage error before decode',
+    TestMalformedCapabilityIsUsageError);
+  Test('the host target embeds the compiled capability set',
+    TestHostTargetEmbedsCapabilitySet);
 end;
 
 begin

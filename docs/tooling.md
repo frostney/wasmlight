@@ -42,7 +42,9 @@ lwpt update            # sanctioned constraint+lock bump (do not hand-edit the l
 lwpt build [target]    # binaries land under build/ (verified-result cache is default)
 lwpt test              # discovers source/units/*.Test.pas (executable cache is default)
 ./build/wasmlight inspect <module.wasm>
-./build/wasmlight compile <module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...
+./build/wasmlight compile <module.wasm> -o <executable> [--target <triple>] \
+  [--connector <file.wlc>]... [--dir GUEST=HOST]... [--env KEY=VALUE]...
+# --dir/--env embed an immutable WASI capability set; env values are not secret
 # native WASI executable onto a catalog or sibling wasmlight-shell
 # never a .waot/JIT/interpreter fallback
 ./build/wasmlight-shell [<payload.wshl> [guest-args...]]  # runtime-shell template

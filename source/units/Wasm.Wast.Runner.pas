@@ -141,8 +141,10 @@ type
     expected/actual.
 
     wtmAot is the third tier (aot-spec §5.1). It does NOT re-run the JIT and
-    rename it: per built module it AotCompileModule's every compilable function
-    to position-independent bytes, SERIALIZES them into a `.waot` byte buffer,
+    rename it: per built module it compiles every function to
+    position-independent bytes — strictly on a backend host, so a declined
+    function fails the module rather than running interpreted — SERIALIZES
+    them into a `.waot` byte buffer,
     then in the SAME per-script store AotLoadAndWire's that buffer — re-checking
     every guard (irVer/arch/abi/checksum/moduleHash), mapping the code
     executable, and wiring each CompiledEntry from the loaded bytes. So the
@@ -941,7 +943,17 @@ begin
     bytes — the full round-trip a deployed artifact takes. A guard rejection
     leaves Jit nil and the functions interpreted (still correct); the loaded
     count then drops, which is visible in the tally. }
-  Artifact := AotCompileModuleIr(FStore, AIr, BytesPtr, NativeUInt(Length(ABytes)));
+  { On a backend host every valid function must compile (ADR-0015), so the
+    corpus stages through STRICT compilation: any decline raises
+    EWasmAotError and fails the module's command instead of hiding as an
+    interpreted function. Off a backend the cache path records every
+    function declined and the load falls back to the interpreter. }
+  if JitCompileDecline(nil) = jdNoBackend then
+    Artifact := AotCompileModuleIr(FStore, AIr, BytesPtr,
+      NativeUInt(Length(ABytes)))
+  else
+    Artifact := AotCompileModuleIrStrict(FStore, AIr, BytesPtr,
+      NativeUInt(Length(ABytes)));
   Jit := AotLoadAndWireIr(FStore, AIr, BytesPtr, NativeUInt(Length(ABytes)),
     AInst, Artifact, LoadRes);
   if Jit = nil then

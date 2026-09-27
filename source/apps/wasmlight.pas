@@ -647,12 +647,12 @@ begin
       Config.Stderr := OsErr;
 
       { argv[0] = the module basename with extension (embedding-spec.md §4.4),
-        then the forwarded guest args. }
-      SetLength(Argv, 1 + GuestArgs.Count);
-      Argv[0] := ExtractFileName(ModulePath);
+        then the forwarded guest args — the same CompiledGuestArgv a compiled
+        executable uses, so both give the guest the same argc. }
+      SetLength(Argv, GuestArgs.Count);
       for I := 0 to GuestArgs.Count - 1 do
-        Argv[I + 1] := GuestArgs[I];
-      Config.SetArgv(Argv);
+        Argv[I] := GuestArgs[I];
+      Config.SetArgv(CompiledGuestArgv(ModulePath, Argv));
 
       for I := 0 to DirOpt.Values.Count - 1 do
         if not AddDirPreopen(Config, DirOpt.Values[I], ErrMsg) then
@@ -829,7 +829,8 @@ begin
       CompileConnectorOpt);
     Registry.Add(TSubcommand.Create('compile',
       'Compile a module to a native executable (strict; no interpreter fallback)',
-      '<module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]...',
+      '<module.wasm> -o <executable> [--target <triple>] [--connector <file.wlc>]... '
+      + '[--dir GUEST=HOST]... [--env KEY=VALUE]...',
       @HandleCompile, CompileOpts));
 
     { --dir and --env are repeatable and are the ONLY host capabilities `run`

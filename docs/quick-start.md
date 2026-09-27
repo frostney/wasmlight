@@ -56,7 +56,7 @@ lwpt test            # co-located unit suites
 ./build/wasmlight inspect module.wasm    # section table + entity counts
 ./build/wasmlight validate module.wasm   # decode + validate, report the IR
 ./build/wasmlight run module.wasm        # run a WASI preview1 command
-./build/wasmlight compile module.wasm -o app  # native WASI executable (needs wasmlight-shell beside the compiler, or a catalog)
+./build/wasmlight compile module.wasm -o app  # native WASI executable (needs wasmlight-shell beside the compiler, or a catalog); see below
 ./build/wasmlight --version
 ./build/wasmbench --workload loop --tier jit --samples 5
 # workloads: decode, leb128, startup, loop, fib, memory, numeric, simd
@@ -151,6 +151,32 @@ skips),
 `wasmlight-shell` is the interpreter-free runtime-shell template; it is
 built with the other programs and is not a user-facing compile command.
 See [roadmap.md](roadmap.md) for what comes next and in what order.
+
+## Compile a WASI program
+
+`wasmlight compile` turns the same command into a native executable. A
+generated executable has no Wasmlight flags, so its WASI grants are fixed at
+compile time with `--dir GUEST=HOST` and `--env KEY=VALUE`, spelled as for
+`run`, and embedded as an immutable capability set. `compile` rejects an
+`--env` value without a `KEY=` part:
+
+```bash
+./build/wasmlight compile app.wasm --dir /data=data --env LANG=C -o app
+./app arg1 arg2   # the guest sees argv [app, arg1, arg2], env LANG=C only
+```
+
+A relative `HOST` such as `data` resolves from the executable's directory
+when it runs (the real file, as the OS reports it, even when started through
+a symlink or a `PATH` lookup), so the executable can be moved together with
+its data; an
+absolute `HOST` stays literal. The executable never inherits the process
+environment and cannot widen its set at run time. Every invocation argument
+belongs to the guest, and argc matches `wasmlight run` for the same
+arguments.
+
+Embedded `--env` values are stored in plain bytes inside the executable.
+Anyone who can read the file can read them, so they are not a place for
+secrets.
 
 For the full command set (formatter, benchmarks, CI gates) see
 [tooling.md](tooling.md).
