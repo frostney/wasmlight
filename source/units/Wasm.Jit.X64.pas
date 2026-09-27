@@ -497,9 +497,13 @@ procedure X64AlignCode(const ABuf: TWasmCodeBuffer;
 procedure X64EmitLoopHeadAlign(const ABuf: TWasmCodeBuffer);
 { The loop back-edge safepoint (§6): `cmp r14,[r13]; je ATarget` then the
   epoch-interrupt trap call, which does not return. One taken branch per
-  iteration; the trap stays on the fall-through. }
+  iteration; the trap stays on the fall-through. ALoadEpoch keeps the
+  earlier `mov rax,[r13]; cmp rax,r14` form, which v128-cache loops use:
+  on the measuring host (Zen 5) the three bytes shorter back-edge made the
+  xmm-bound simd loop ~18% slower, the effect X64CodeHasVecCacheOp
+  describes. }
 procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
-  const ATarget: UInt32);
+  const ATarget: UInt32; const ALoadEpoch: Boolean = False);
 
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
 procedure X64EmitPrologue(const ABuf: TWasmCodeBuffer;
@@ -1152,8 +1156,11 @@ begin
           Deferred dynamic values are not fixed to a host across the edge,
           so the target reloads them: write back the live ones. }
         X64FlushDynamicRegCache(ABuf, ACache);
-        Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
-          AUseNativeScalarCall);
+        if ACache.VecCache and ((AIns.Imm and IR_JUMP_SAFEPOINT) <> 0) then
+          X64EmitEpochBackEdge(ABuf, AIns.A, True)
+        else
+          Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+            AUseNativeScalarCall);
       end;
     iroCall:
       if ANativeScalarSelf then
@@ -4708,13 +4715,21 @@ begin
 end;
 
 procedure X64EmitEpochBackEdge(const ABuf: TWasmCodeBuffer;
-  const ATarget: UInt32);
+  const ATarget: UInt32; const ALoadEpoch: Boolean);
 begin
-  { cmp r14, [r13] (CMP r64, r/m64 = REX.W 3B /r): the same equality test
-    as loading the epoch into rax and comparing, with no scratch write. }
-  X64EmitRex(ABuf, 1, X64_REG_EPOCH shr 3, 0, X64_REG_EPOCHADDR shr 3);
-  ABuf.EmitByte($3B);
-  EmitMemOperand(ABuf, X64_REG_EPOCH, X64_REG_EPOCHADDR, 0);
+  if ALoadEpoch then
+  begin
+    X64EmitLoadMem64(ABuf, X64_RAX, X64_REG_EPOCHADDR, 0);     { rax := *r13 }
+    X64EmitAluRegReg(ABuf, $39, True, X64_RAX, X64_REG_EPOCH); { cmp rax, r14 }
+  end
+  else
+  begin
+    { cmp r14, [r13] (CMP r64, r/m64 = REX.W 3B /r): the same equality
+      test with no scratch write. }
+    X64EmitRex(ABuf, 1, X64_REG_EPOCH shr 3, 0, X64_REG_EPOCHADDR shr 3);
+    ABuf.EmitByte($3B);
+    EmitMemOperand(ABuf, X64_REG_EPOCH, X64_REG_EPOCHADDR, 0);
+  end;
   X64EmitJccTo(ABuf, X64_CC_E, ATarget);                       { je target }
   EmitTrapCall(ABuf, wtkEpochInterrupt);                       { no return }
 end;

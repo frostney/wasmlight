@@ -4716,10 +4716,10 @@ var
   Saved, SavedJoin: TWasmIrInstr;
 
   {$IFDEF WASM_JIT_X64}
-  { `mov rax, [r13]; cmp rax, r14`: the epoch poll a flagged jump emits. }
+  { `cmp r14, [r13]; je`: the epoch poll a flagged jump emits. }
   function HasEpochPoll(const ACode: TWasmBytes): Boolean;
   const
-    POLL: array[0..6] of Byte = ($49, $8B, $45, $00, $4C, $39, $F0);
+    POLL: array[0..5] of Byte = ($4D, $3B, $75, $00, $0F, $84);
   var
     N, J: Integer;
   begin
@@ -6351,6 +6351,11 @@ begin
     Expect<Integer>(Scaled).ToBe(1);
     Expect<Integer>(Unscaled).ToBe(0);
     Expect<Integer>(Shifts).ToBe(0);
+    { The back-edge compares the epoch in memory: cmp r14, [r13] (4D 3B
+      75 00) right before the je. }
+    Expect<Boolean>((J >= 4) and (Code[J - 4] = $4D) and
+      (Code[J - 3] = $3B) and (Code[J - 2] = $75) and (Code[J - 1] = $00))
+      .ToBe(True);
   end;
   {$ENDIF}
 end;
@@ -8734,6 +8739,22 @@ begin
   Expect<Integer>(Loads).ToBe(1);
   Expect<Integer>(Stores).ToBe(0);
   Expect<Integer>(Consts).ToBe(1);
+  { The back-edge keeps the load form (mov rax,[r13]; cmp rax,r14; je),
+    never cmp r14,[r13] (4D 3B 75 00): see X64EmitEpochBackEdge. }
+  Loads := 0;
+  Stores := 0;
+  for I := 0 to Length(Code) - 9 do
+  begin
+    if (Code[I] = $49) and (Code[I + 1] = $8B) and (Code[I + 2] = $45) and
+      (Code[I + 3] = $00) and (Code[I + 4] = $4C) and (Code[I + 5] = $39) and
+      (Code[I + 6] = $F0) and (Code[I + 7] = $0F) and (Code[I + 8] = $84) then
+      Inc(Loads);
+    if (Code[I] = $4D) and (Code[I + 1] = $3B) and (Code[I + 2] = $75) and
+      (Code[I + 3] = $00) then
+      Inc(Stores);
+  end;
+  Expect<Integer>(Loads).ToBe(1);
+  Expect<Integer>(Stores).ToBe(0);
   {$ELSE}
   Expect<Boolean>(True).ToBe(True);
   {$ENDIF}

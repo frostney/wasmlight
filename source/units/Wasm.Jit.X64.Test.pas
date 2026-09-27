@@ -584,6 +584,24 @@ begin
   finally
     Buf.Free;
   end;
+  { The load form v128-cache loops keep: mov rax,[r13] (49 8B 45 00); cmp
+    rax,r14 (4C 39 F0); je head (rel32 = 0 - (8 + 6) = -14). }
+  Buf := TWasmCodeBuffer.Create;
+  try
+    Buf.NewLabel;
+    Buf.BindLabel(0);
+    Buf.EmitByte($90);
+    X64EmitEpochBackEdge(Buf, 0, True);
+    X64ResolvePatches(Buf);
+    CheckSeq(Buf, [$90,
+      $49, $8B, $45, $00,
+      $4C, $39, $F0,
+      $0F, $84, $F2, $FF, $FF, $FF,
+      $BF, Byte(Ord(wtkEpochInterrupt)), $00, $00, $00,
+      $41, $FF, $17]);
+  finally
+    Buf.Free;
+  end;
 end;
 
 { --- the Wave-2 frame (jit-spec §5.2/§5.3/§6) --------------------------- }
