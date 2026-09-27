@@ -2034,6 +2034,9 @@ var
     K, N, M: Integer;
     Ranked: array[0..High(AllocatedSlots)] of Integer;
     HasBackEdge, Eligible: Boolean;
+    {$IFDEF WASM_JIT_ARM64}
+    HasInlineCall: Boolean;
+    {$ENDIF}
     {$IFDEF WASM_JIT_X64}
     InLoop: array of Boolean;
 
@@ -2095,9 +2098,6 @@ var
         else
           AllocatedSlots[P] := High(UInt32);
     end;
-    {$ENDIF}
-    {$IFDEF WASM_JIT_ARM64}
-    HasInlineCall: Boolean;
     {$ENDIF}
   begin
     UseStaticCache := False;
