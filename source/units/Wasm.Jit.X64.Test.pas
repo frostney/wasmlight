@@ -78,6 +78,7 @@ type
     procedure TestStaticCachePinnedMemoryBytes;
     procedure TestStaticCacheFourFixedHosts;
     procedure TestStaticCacheAddressZeroExtension;
+    procedure TestStaticCacheLoadAluFusion;
     procedure TestDirectOperandEncodings;
     procedure TestDirectOperandCachedOps;
     procedure TestDirectOperandBookkeeping;
@@ -1211,15 +1212,22 @@ begin
     Op(MakeIrInstr(iroI32Load, 6, 3, 0, 0));
     CheckFrom(Start, [$89, $D1, $44, $8B, $14, $0E]);
 
-    { A move copies host to host (49 89 FA = mov r10, rdi) and carries the
-      source's fact: rdi is unknown here, so the store copies r10d. }
+    { A move (mov rax, rdi; mov r10, rax) carries the source's fact: rdi is
+      unknown after the join, so the store copies r10d; after an i32.or
+      into rdi, the next copy indexes [rsi + r10] directly. }
     X64FlushDynamicRegCache(Buf, Cache);
     X64InvalidateRegCache(Cache);
     Start := Buf.Size;
     Op(MakeIrInstr(iroMove, 6, 2, 0, 0));
     Op(MakeIrInstr(iroI32Store, 1, 6, 0, 0));
-    CheckFrom(Start, [$49, $89, $FA, $44, $89, $D1,
+    CheckFrom(Start, [$48, $89, $F8, $49, $89, $C2, $44, $89, $D1,
       $44, $89, $0C, $0E]);
+    Op(MakeIrInstr(iroI32Or, 2, 0, 1, 0));
+    Start := Buf.Size;
+    Op(MakeIrInstr(iroMove, 6, 2, 0, 0));
+    Op(MakeIrInstr(iroI32Store, 1, 6, 0, 0));
+    CheckFrom(Start, [$48, $89, $F8, $49, $89, $C2,
+      $46, $89, $0C, $16]);
 
     { A compare result is 0/1 in a zeroed host (xor edi, edi; cmp r8d, r9d;
       setb dil), so a byte store through it indexes [rsi+rdi] (44 88 0C 3E
@@ -1264,6 +1272,96 @@ begin
     Expect<Integer>(Buf.Size - Start).ToBe(7);
     Expect<Boolean>((FindSeq(Buf, [$44, $89, $D1], Start) = Start) or
       (FindSeq(Buf, [$44, $89, $D9], Start) = Start)).ToBe(True);
+  finally
+    Buf.Free;
+  end;
+end;
+
+{ `op r32, [rsi + index]` (ADD 03, SUB 2B, IMUL 0F AF /r; ModRM mod=00
+  rm=100 + SIB, SDM Vol. 2 Tables 2-2/2-3). }
+procedure TX64Tests.TestStaticCacheLoadAluFusion;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..7] of UInt32;
+  Visible: array[0..7] of Boolean;
+  Start: Integer;
+
+  procedure CheckFrom(const AFrom: Integer; const AExpected: array of Byte);
+  var
+    J: Integer;
+  begin
+    Expect<Integer>(Buf.Size - AFrom).ToBe(Length(AExpected));
+    for J := 0 to High(AExpected) do
+      Expect<Byte>(Buf.ByteAt(AFrom + J)).ToBe(AExpected[J]);
+  end;
+
+begin
+  { The predicate: a zero-offset i32.load read once by i32 add/sub/and/or/
+    xor/mul, and only as sub's right operand. }
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+    MakeIrInstr(iroI32Add, 3, 6, 3, 0))).ToBe(True);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+    MakeIrInstr(iroI32Sub, 3, 3, 6, 0))).ToBe(True);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+    MakeIrInstr(iroI32Sub, 3, 6, 3, 0))).ToBe(False);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+    MakeIrInstr(iroI32Mul, 3, 6, 6, 0))).ToBe(False);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load8U, 6, 2, 0, 0),
+    MakeIrInstr(iroI32Add, 3, 3, 6, 0))).ToBe(False);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load, 6, 2, 0, 4),
+    MakeIrInstr(iroI32Add, 3, 3, 6, 0))).ToBe(False);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI64Load, 6, 2, 0, 0),
+    MakeIrInstr(iroI64Add, 3, 3, 6, 0))).ToBe(False);
+  Expect<Boolean>(X64CanFuseLoadAlu(MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+    MakeIrInstr(iroI32Shl, 3, 3, 6, 0))).ToBe(False);
+
+  Aux := nil;
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1, 2, 3]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    X64EnablePinnedMemoryBase(Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32And, 2, 0, 1, 0), Aux, 0,
+      False, True, Cache);
+
+    { acc (rdx) += [rsi + rdi]: 03 14 3E. }
+    Start := Buf.Size;
+    X64EmitLoadAluCached(Buf, MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+      MakeIrInstr(iroI32Add, 3, 3, 6, 0), Cache);
+    CheckFrom(Start, [$03, $14, $3E]);
+    Expect<Boolean>(Cache.Entries[5].Zx32).ToBe(True);
+
+    { A dynamic result: mov r10, r8; sub r10d, [rsi + rdi] (44 2B 14 3E). }
+    Start := Buf.Size;
+    X64EmitLoadAluCached(Buf, MakeIrInstr(iroI32Load, 6, 2, 0, 0),
+      MakeIrInstr(iroI32Sub, 7, 0, 6, 0), Cache);
+    CheckFrom(Start, [$4D, $89, $C2, $44, $2B, $14, $3E]);
+    Expect<Boolean>(Cache.Entries[2].Valid and (Cache.Entries[2].Slot = 7) and
+      Cache.Entries[2].Zx32).ToBe(True);
+
+    { The result takes the dead address's host r10 (r11 is live), so the
+      index moves to ecx before r8 is copied over it: mov ecx, r10d;
+      mov r10, r8; imul r10d, [rsi + rcx] (44 0F AF 14 0E). }
+    X64FlushDynamicRegCache(Buf, Cache);
+    X64InvalidateRegCache(Cache);
+    UseCounts[5] := 1;
+    UseCounts[4] := 1;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Add, 5, 0, 1, 0), Aux, 0,
+      False, True, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32Add, 4, 0, 1, 0), Aux, 0,
+      False, True, Cache);
+    Expect<Boolean>(Cache.Entries[2].Slot = 5).ToBe(True);
+    Start := Buf.Size;
+    X64EmitLoadAluCached(Buf, MakeIrInstr(iroI32Load, 6, 5, 0, 0),
+      MakeIrInstr(iroI32Mul, 7, 6, 0, 0), Cache);
+    CheckFrom(Start, [$44, $89, $D1, $4D, $89, $C2,
+      $44, $0F, $AF, $14, $0E]);
+    Expect<Boolean>(Cache.Entries[3].Valid and
+      (Cache.Entries[3].Slot = 4)).ToBe(True);
   finally
     Buf.Free;
   end;
@@ -2218,6 +2316,8 @@ begin
     TestStaticCacheFourFixedHosts);
   Test('a pinned access skips the address copy only for a 32-bit-written host',
     TestStaticCacheAddressZeroExtension);
+  Test('an i32.load feeding an ALU op becomes its memory operand',
+    TestStaticCacheLoadAluFusion);
   Test('direct-operand ALU, compare, setcc, and movzx encodings',
     TestDirectOperandEncodings);
   Test('cached ALU and compares compute on the cache hosts',

@@ -509,6 +509,9 @@ var
     static cache's rdi/rdx hosts (AnalyzeStaticCache). }
   LoopSlotScores: array of UInt32;
   ScoringInLoop: Boolean;
+  { X64LoadAluFirst[K]: PlannedCode[K] is an i32.load emitted as the memory
+    operand of PlannedCode[K + 1] (AnalyzeX64LoadAluFusion). }
+  X64LoadAluFirst: array of Boolean;
   {$ENDIF}
   SlotUseCounts: array of UInt32;
   VisibleSlots: array of Boolean;
@@ -1119,6 +1122,31 @@ var
         Fusion[K + 1] := K;
       end;
   end;
+
+  {$IFDEF WASM_JIT_X64}
+  { In the helper-free base-pinned loop shape, an i32.load whose value only
+    the next i32 ALU op reads becomes that op's memory operand. Every
+    analysis still sees two instructions (the load's address read and the
+    temporary's definition and read keep their use counts and liveness);
+    only emission changes, so the access traps at the same point with the
+    same kind. The value is never visible and the ALU op carries no label,
+    so nothing can observe the temporary's absence. }
+  procedure AnalyzeX64LoadAluFusion;
+  var
+    K: Integer;
+  begin
+    SetLength(X64LoadAluFirst, Length(PlannedCode));
+    if not (UsePinnedMemoryBase and UseStaticCache) then
+      Exit;
+    for K := 0 to High(PlannedCode) - 1 do
+      if not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K + 1] and (Fusion[K] = -1) and (Fusion[K + 1] = -1) and
+        X64CanFuseLoadAlu(PlannedCode[K], PlannedCode[K + 1]) and
+        (RegisterUseCount(PlannedCode[K].Dest) = 1) and
+        not IsVisibleFrameReg(PlannedCode[K].Dest) then
+        X64LoadAluFirst[K] := True;
+  end;
+  {$ENDIF}
 
   procedure AnalyzeImmediateFusion;
   var
@@ -2903,6 +2931,9 @@ begin
     {$ENDIF}
     AnalyzeImmediateFusion;
     AnalyzeFusion;
+    {$IFDEF WASM_JIT_X64}
+    AnalyzeX64LoadAluFusion;
+    {$ENDIF}
     { After fusion planning, so already-folded constants are not offered a
       host register their defining instruction would never have used. }
     AnalyzeConstSlots;
@@ -3118,7 +3149,16 @@ begin
       if not UseNativeScalarCore and not NativeScalarCall and
         PlanX64DirectCallee(AFn^.Code[I], X64Callee) then
         X64CalleePtr := @X64Callee;
-      if Fusion[I] >= 0 then
+      if X64LoadAluFirst[I] then
+        { The next instruction emits this access as its memory operand. }
+        Emitted := True
+      else if (I > 0) and X64LoadAluFirst[I - 1] then
+      begin
+        X64EmitLoadAluCached(Buf, PlannedCode[I - 1], PlannedCode[I],
+          X64Cache);
+        Emitted := True;
+      end
+      else if Fusion[I] >= 0 then
       begin
         X64EmitCompareBranchCached(Buf, PlannedCode[Fusion[I]],
           PlannedCode[I], X64Cache);

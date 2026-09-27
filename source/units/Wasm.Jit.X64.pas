@@ -602,6 +602,17 @@ procedure X64EmitGcArrayAccess(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache);
 procedure X64EmitCompareBranchCached(const ABuf: TWasmCodeBuffer;
   const ACompare, ABranch: TWasmIrInstr; var ACache: TX64RegCache);
+{ True when ALoad is a zero-offset i32.load whose result AAlu (an i32 add,
+  sub, and, or, xor, or mul) reads as exactly one operand, and as the right
+  one for sub: the pair can be one `op r32, [rsi + index]`. The driver also
+  requires the loaded value to have no other reader, no visible slot, and no
+  label on AAlu, in a base-pinned static cache. }
+function X64CanFuseLoadAlu(const ALoad, AAlu: TWasmIrInstr): Boolean;
+{ Emit such a pair as the ALU op with the access as its memory operand. The
+  access, its guard-page fault, and its trap are the load's own; nothing
+  else runs between the two, so only the loaded value's register is saved. }
+procedure X64EmitLoadAluCached(const ABuf: TWasmCodeBuffer;
+  const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache);
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -657,6 +668,8 @@ procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
 function X64CachedOperand(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache; const ASlot: UInt32; const AProtect: Byte;
   out AProtectMoved: Boolean): Byte; forward;
+function X64SlotZx32(const ACache: TX64RegCache;
+  const ASlot: UInt32): Boolean; forward;
 procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
   const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
   AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache); forward;
@@ -671,8 +684,6 @@ procedure X64CachedShift(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ASubop: Byte; const AWide: Boolean;
   var ACache: TX64RegCache); forward;
 procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; var ACache: TX64RegCache); forward;
-procedure X64CachedMove(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; var ACache: TX64RegCache); forward;
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
@@ -980,12 +991,12 @@ begin
   end;
   case AIns.Op of
     iroMove:
-      if ACache.WriteBackDynamics then
-        X64CachedMove(ABuf, AIns, ACache)
-      else
       begin
         X64CachedLoad(ABuf, ACache, X64_RAX, AIns.A);
-        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+        { rax is a 64-bit copy of the source host, so a zero-extended source
+          stays zero-extended in the destination. }
+        X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest,
+          X64SlotZx32(ACache, AIns.A));
       end;
     iroI32Const, iroF32Const:
       begin
@@ -1780,27 +1791,6 @@ begin
   end;
   { 0/1 in a host zeroed by a 32-bit xor or widened by a 32-bit movzx. }
   X64CachedDestCommit(ABuf, ACache, Index, ADest, False, True);
-end;
-
-{ A move in the deferred-write-back static cache: straight from the source
-  host into the destination's, with no rax bounce. The source is resolved
-  (and its read consumed) first, so a dead source's dynamic host is the
-  preferred destination and the copy disappears. Only this mode takes the
-  path; the write-through modes keep their store-first byte sequence. }
-procedure X64CachedMove(const ABuf: TWasmCodeBuffer;
-  const AIns: TWasmIrInstr; var ACache: TX64RegCache);
-var
-  HostA, HostD: Byte;
-  Index: Integer;
-  Moved, SourceZx32: Boolean;
-begin
-  HostA := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
-  SourceZx32 := X64SlotZx32(ACache, AIns.A);
-  Index := X64CachedDestBegin(ABuf, ACache, AIns.Dest);
-  HostD := X64CacheHostReg(Index);
-  if HostD <> HostA then
-    X64EmitMovRegReg(ABuf, HostD, HostA);
-  X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False, SourceZx32);
 end;
 
 procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
@@ -3039,6 +3029,24 @@ end;
   register is read by the access itself, so the value side may still evict
   or reuse the address host (a spill only stores). A load's result goes
   straight into its destination host. }
+function X64PinnedIndexReg(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlot: UInt32): Byte;
+var
+  Host: Byte;
+begin
+  Result := X64_RCX;
+  if X64CachedHostForSlot(ACache, ASlot, Host) then
+  begin
+    if X64SlotZx32(ACache, ASlot) then
+      Result := Host
+    else
+      X64EmitAluRegReg(ABuf, $89, False, X64_RCX, Host);
+  end
+  else
+    X64EmitLoadSlot32(ABuf, X64_RCX, ASlot);
+  X64ConsumeUse(ACache, ASlot);
+end;
+
 procedure X64EmitScalarMemoryPinned(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAddr64: Boolean;
   var ACache: TX64RegCache);
@@ -3053,17 +3061,7 @@ begin
   if AAddr64 or (Offset <> 0) then
     raise EWasmInternal.Create(
       'internal: base-pinned x64 access is not a zero-offset i32 access');
-  IndexReg := X64_RCX;
-  if X64CachedHostForSlot(ACache, AIns.A, Host) then
-  begin
-    if X64SlotZx32(ACache, AIns.A) then
-      IndexReg := Host
-    else
-      X64EmitAluRegReg(ABuf, $89, False, X64_RCX, Host);
-  end
-  else
-    X64EmitLoadSlot32(ABuf, X64_RCX, AIns.A);
-  X64ConsumeUse(ACache, AIns.A);
+  IndexReg := X64PinnedIndexReg(ABuf, ACache, AIns.A);
 
   if AIns.Op in [iroI32Store, iroI64Store, iroF32Store, iroF64Store,
     iroI32Store8, iroI32Store16, iroI64Store8, iroI64Store16,
@@ -3094,6 +3092,68 @@ begin
     has a 32-bit destination (mov/movzx/movsx r32), which zero-extends. }
   X64CachedDestCommit(ABuf, ACache, Index, AIns.Dest, False,
     (Size < 8) and not (Signed and Result64));
+end;
+
+function X64CanFuseLoadAlu(const ALoad, AAlu: TWasmIrInstr): Boolean;
+begin
+  Result := (ALoad.Op = iroI32Load) and (ALoad.Imm = 0) and
+    (AAlu.Op in [iroI32Add, iroI32Sub, iroI32And, iroI32Or, iroI32Xor,
+    iroI32Mul]) and (AAlu.A <> AAlu.B) and
+    ((AAlu.B = ALoad.Dest) or
+    ((AAlu.A = ALoad.Dest) and (AAlu.Op <> iroI32Sub)));
+end;
+
+{ `op r32, r/m32` (ADD 03, SUB 2B, AND 23, OR 0B, XOR 33, IMUL 0F AF /r;
+  SDM Vol. 2) with r/m = [rsi + index]. The other operand is resolved
+  first: resolving it may reload a dynamic host, which the index must not
+  be yet. The destination may then take the index's host (the address is
+  dead after this read); the copy of the other operand into it would
+  overwrite the index, so the index moves to ecx first. The 32-bit op
+  zero-extends its destination. }
+procedure X64EmitLoadAluCached(const ABuf: TWasmCodeBuffer;
+  const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache);
+var
+  Other: UInt32;
+  HostA, HostD, IndexReg: Byte;
+  Index: Integer;
+  Moved: Boolean;
+begin
+  if not ACache.PinnedMemoryBase or not X64CanFuseLoadAlu(ALoad, AAlu) then
+    raise EWasmInternal.Create('internal: x64 load/ALU pair is not fusable');
+  if AAlu.B = ALoad.Dest then
+    Other := AAlu.A
+  else
+    Other := AAlu.B;
+  HostA := X64CachedOperand(ABuf, ACache, Other, $FF, Moved);
+  IndexReg := X64PinnedIndexReg(ABuf, ACache, ALoad.A);
+  { The loaded value's only read; it never occupies a host. }
+  X64ConsumeUse(ACache, ALoad.Dest);
+  Index := X64CachedDestBegin(ABuf, ACache, AAlu.Dest);
+  HostD := X64CacheHostReg(Index);
+  if HostD <> HostA then
+  begin
+    if HostD = IndexReg then
+    begin
+      X64EmitAluRegReg(ABuf, $89, False, X64_RCX, IndexReg);
+      IndexReg := X64_RCX;
+    end;
+    X64EmitMovRegReg(ABuf, HostD, HostA);
+  end;
+  X64EmitRex(ABuf, 0, HostD shr 3, IndexReg shr 3, X64_REG_MEMBASE shr 3);
+  case AAlu.Op of
+    iroI32Add: ABuf.EmitByte($03);
+    iroI32Sub: ABuf.EmitByte($2B);
+    iroI32And: ABuf.EmitByte($23);
+    iroI32Or: ABuf.EmitByte($0B);
+    iroI32Xor: ABuf.EmitByte($33);
+  else
+    begin
+      ABuf.EmitByte($0F);
+      ABuf.EmitByte($AF);
+    end;
+  end;
+  EmitMemOperandIndexed(ABuf, HostD, X64_REG_MEMBASE, IndexReg);
+  X64CachedDestCommit(ABuf, ACache, Index, AAlu.Dest, False, True);
 end;
 
 function X64SlotDispFits(const ASlot: UInt32): Boolean;

@@ -1249,6 +1249,33 @@ begin
   Result := V xor W;
 end;
 
+function OracleLoadAlu(const AN: UInt32): UInt64;
+var
+  Mem: TMemImage;
+  I, A, S1, S2, S3, S4, S5: UInt32;
+begin
+  Mem := NewMemImage(2048);
+  for I := 0 to 63 do
+    ImgStore(Mem, I shl 2, 4, I * $9E3779B1 + 12345);
+  S1 := 0;
+  S2 := 1;
+  S3 := $FFFFFFFF;
+  S4 := 0;
+  S5 := 0;
+  I := 0;
+  repeat
+    A := (I and 63) shl 2;
+    S1 := S1 - UInt32(ImgLoad(Mem, A, 4));
+    S2 := UInt32(ImgLoad(Mem, A xor 4, 4)) * S2;
+    S3 := S3 and UInt32(ImgLoad(Mem, A, 4));
+    S4 := UInt32(ImgLoad(Mem, A xor 8, 4)) or S4;
+    S5 := S5 xor UInt32(ImgLoad(Mem, A, 4));
+    ImgStore(Mem, A + 256, 4, I + UInt32(ImgLoad(Mem, A, 4)));
+    Inc(I);
+  until not (I < AN);
+  Result := UInt32(S1 + S2 + (S3 + S4) + (S5 + UInt32(ImgLoad(Mem, 300, 4))));
+end;
+
 { The walk loop's x sequence: x0 = 77, x := x * 13 + i. }
 function OracleTrapWalkSum(const AStored: UInt32): UInt32;
 var
@@ -2285,6 +2312,7 @@ type
     procedure TestStaticHostsI64AndI32Addresses;
     procedure TestStaticHostsAddressAcrossJoin;
     procedure TestStaticHostsTrapMidLoop;
+    procedure TestStaticHostsLoadAluOperands;
     procedure TestMemory64LoopExplicitChecks;
     procedure TestMemorySizeGrow;
     procedure TestMemoryFillCopy;
@@ -5226,15 +5254,17 @@ end;
 { The benchmark memory-load and memory-store loop bodies: every local
   (bound, counter, accumulator, address) has a fixed host, so the loop body
   has no register-file access; the address produced by i32.and/i32.shl
-  indexes [rsi + host] with no 32-bit copy into ecx; and the load writes its
-  destination host directly, not rax. }
+  indexes [rsi + host] with no 32-bit copy into ecx; and the load is the
+  accumulating add's memory operand (03 /r), so no value passes through
+  rax. }
 procedure TJitTests.TestStaticHostsMemoryLoopShape;
 {$IFDEF WASM_JIT_X64}
 var
   Code: TWasmBytes;
   EntryOffset: NativeUInt;
   RegisterCount: UInt32;
-  F, I, J, Head, Bodies, SlotAccesses, EcxCopies, RaxLoads, Loads: Integer;
+  F, I, J, Head, Bodies, SlotAccesses, EcxCopies, RaxLoads, Loads,
+    FusedAdds, Stores: Integer;
   Rel: Int32;
   ModRM: Byte;
 {$ENDIF}
@@ -5304,6 +5334,8 @@ begin
     EcxCopies := 0;
     RaxLoads := 0;
     Loads := 0;
+    FusedAdds := 0;
+    Stores := 0;
     for I := Head to J - 3 do
     begin
       ModRM := Code[I + 1];
@@ -5317,13 +5349,19 @@ begin
       if (Code[I] = $89) and ((ModRM and $C7) = $C1) and
         ((I = Head) or not (Code[I - 1] in [$48 .. $4F])) then
         Inc(EcxCopies);
-      { mov r32, [rsi + index] (8B, mod=00 rm=100, SIB base rsi): the
-        pinned load; its reg field is rax only without REX.R. }
-      if (Code[I] = $8B) and ((ModRM and $C7) = $04) and
+      { mov r32, [rsi + index] (8B), add r32, [rsi + index] (03), and
+        mov [rsi + index], r32 (89): mod=00 rm=100, SIB base rsi. A load's
+        reg field is rax only without REX.R. }
+      if (Code[I] in [$8B, $03, $89]) and ((ModRM and $C7) = $04) and
         ((Code[I + 2] and 7) = 6) then
       begin
-        Inc(Loads);
-        if ((ModRM shr 3) and 7 = 0) and
+        case Code[I] of
+          $8B: Inc(Loads);
+          $03: Inc(FusedAdds);
+        else
+          Inc(Stores);
+        end;
+        if (Code[I] <> $89) and ((ModRM shr 3) and 7 = 0) and
           ((I = Head) or ((Code[I - 1] and $44) <> $44)) then
           Inc(RaxLoads);
       end;
@@ -5331,7 +5369,9 @@ begin
     Expect<Integer>(SlotAccesses).ToBe(0);
     Expect<Integer>(EcxCopies).ToBe(0);
     Expect<Integer>(RaxLoads).ToBe(0);
-    Expect<Integer>(Loads).ToBe(1 - F);
+    Expect<Integer>(Loads).ToBe(0);
+    Expect<Integer>(FusedAdds).ToBe(1 - F);
+    Expect<Integer>(Stores).ToBe(F);
   end;
   Expect<Integer>(Bodies).ToBe(2);
   {$ENDIF}
@@ -5523,6 +5563,70 @@ begin
       [MakeValueI32(6), MakeValueI32(99)])).ToBe(JIT_BACKEND_AVAILABLE);
     Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleTrapWalkAcc(6));
   end;
+end;
+
+{ Every fusable operator reads a load as its memory operand, with fixed
+  and dynamic destinations, a temporary result feeding a store, and an
+  address that is dead after the access. The last export faults on the
+  fused access itself (65534 + 4 bytes crosses the end), which must trap
+  like the unfused load in the interpreter. }
+procedure TJitTests.TestStaticHostsLoadAluOperands;
+const
+  Inputs: array[0 .. 2] of Integer = (1, 7, 300);
+var
+  I: Integer;
+begin
+  FBytes := AssembleWatText('(module (memory 1) ' +
+    '(func (export "run") (param $n i32) (result i32) ' +
+    '(local $i i32) (local $a i32) (local $s1 i32) (local $s2 i32) ' +
+    '(local $s3 i32) (local $s4 i32) (local $s5 i32) ' +
+    '(loop $fill ' +
+    '(i32.store (i32.shl (local.get $i) (i32.const 2)) ' +
+    '(i32.add (i32.mul (local.get $i) (i32.const 0x9E3779B1)) ' +
+    '(i32.const 12345))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $fill (i32.lt_u (local.get $i) (i32.const 64)))) ' +
+    '(local.set $i (i32.const 0)) ' +
+    '(local.set $s2 (i32.const 1)) ' +
+    '(local.set $s3 (i32.const -1)) ' +
+    '(loop $l ' +
+    '(local.set $a (i32.shl (i32.and (local.get $i) (i32.const 63)) ' +
+    '(i32.const 2))) ' +
+    '(local.set $s1 (i32.sub (local.get $s1) (i32.load (local.get $a)))) ' +
+    '(local.set $s2 (i32.mul (i32.load (i32.xor (local.get $a) ' +
+    '(i32.const 4))) (local.get $s2))) ' +
+    '(local.set $s3 (i32.and (local.get $s3) (i32.load (local.get $a)))) ' +
+    '(local.set $s4 (i32.or (i32.load (i32.xor (local.get $a) ' +
+    '(i32.const 8))) (local.get $s4))) ' +
+    '(local.set $s5 (i32.xor (local.get $s5) (i32.load (local.get $a)))) ' +
+    '(i32.store (i32.add (local.get $a) (i32.const 256)) ' +
+    '(i32.add (local.get $i) (i32.load (local.get $a)))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(i32.add (i32.add (i32.add (local.get $s1) (local.get $s2)) ' +
+    '(i32.add (local.get $s3) (local.get $s4))) ' +
+    '(i32.add (local.get $s5) (i32.load (i32.const 300))))) ' +
+    '(func (export "fault") (param $p i32) (param $n i32) (result i32) ' +
+    '(local $i i32) (local $acc i32) ' +
+    '(loop $l ' +
+    '(local.set $acc (i32.add (local.get $acc) (i32.load (local.get $p)))) ' +
+    '(local.set $p (i32.add (local.get $p) (i32.const 2))) ' +
+    '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    '(local.get $acc)))');
+  for I := 0 to High(Inputs) do
+  begin
+    Expect<Boolean>(DiffFresh(FBytes, 'run', [MakeValueI32(Inputs[I])]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleLoadAlu(Inputs[I]));
+  end;
+  { 65530 and 65532 are in bounds; the third access at 65534 is not. }
+  Expect<Boolean>(DiffFresh(FBytes, 'fault',
+    [MakeValueI32(65530), MakeValueI32(2)])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(0);
+  DiffFresh(FBytes, 'fault', [MakeValueI32(65530), MakeValueI32(3)]);
+  Expect<Boolean>(FDiffJitOut.Trapped).ToBe(True);
+  Expect<string>(FDiffJitOut.Msg).ToBe('out of bounds memory access');
 end;
 
 procedure TJitTests.TestAdjacentMoveRetainsCallArgument;
@@ -8487,6 +8591,8 @@ begin
     TestStaticHostsAddressAcrossJoin);
   Test('traps mid-loop keep prior stores with hosted locals modified',
     TestStaticHostsTrapMidLoop);
+  Test('loads fused into add/sub/and/or/xor/mul match a model and trap alike',
+    TestStaticHostsLoadAluOperands);
   Test('memory64 loops keep explicit checks',
     TestMemory64LoopExplicitChecks);
   Test('memory.size/grow match the interpreter', TestMemorySizeGrow);
