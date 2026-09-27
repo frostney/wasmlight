@@ -751,6 +751,89 @@ begin
     ' (i32.const 1))) ');
 end;
 
+{ Loop callers of native leaves with four or more hot locals, so the x64
+  static cache also fixes rdi and rdx (lane L): locals live across each
+  call, arguments read from and results written to rdi/rdx-hosted locals
+  ($w4: three leaf calls and a one-parameter leaf per iteration; $w5; i64
+  $w64). $wm uses memory, so it keeps the generic caller; its address comes
+  from a leaf result masked to i32. `check` holds each to constants from an
+  independent Python model and traps `unreachable` on a mismatch. }
+function NativeLeafHostsModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText(
+    '(module ' +
+    '(memory 1) ' +
+    '(func $mix (export "mix") (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.add (i32.mul (i32.xor (local.get $a) (local.get $b)) (i32.const 1664525)) (i32.const 1013904223))) ' +
+    '(func $inc (export "inc") (param $a i32) (result i32) (i32.add (local.get $a) (i32.const 1))) ' +
+    '(func $mix64 (export "mix64") (param $a i64) (param $b i64) (result i64) ' +
+    ' (i64.add (i64.mul (i64.xor (local.get $a) (local.get $b)) (i64.const 0x9E3779B97F4A7C15)) ' +
+    '  (i64.shl (local.get $b) (i64.const 7)))) ' +
+    '(func $w4 (export "w4") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32) ' +
+    ' (local.set $a (i32.const 7)) (local.set $c (i32.const 11)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $mix (local.get $a) (local.get $i))) ' +
+    '  (local.set $b (i32.add (local.get $b) (i32.xor (local.get $a) (local.get $c)))) ' +
+    '  (local.set $c (i32.add (i32.add (local.get $c) (i32.const 3)) (local.get $d))) ' +
+    '  (local.set $d (call $mix (local.get $d) (local.get $b))) ' +
+    '  (local.set $e (call $mix (local.get $c) (local.get $d))) ' +
+    '  (local.set $b (i32.xor (local.get $b) (i32.shr_u (local.get $e) (i32.const 1)))) ' +
+    '  (local.set $c (call $inc (local.get $c))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.xor (i32.xor (local.get $a) (local.get $b)) (i32.xor (local.get $c) (local.get $d)))) ' +
+    '(func $w5 (export "w5") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32) ' +
+    ' (local.set $a (i32.const 5)) (local.set $d (i32.const 1)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $mix (local.get $a) (local.get $d))) ' +
+    '  (local.set $b (i32.add (local.get $b) (local.get $a))) ' +
+    '  (local.set $c (i32.xor (local.get $c) (i32.shr_u (local.get $a) (i32.const 3)))) ' +
+    '  (local.set $d (i32.add (i32.add (local.get $d) (local.get $c)) (local.get $b))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i32.add (i32.add (local.get $a) (local.get $b)) (i32.add (local.get $c) (local.get $d)))) ' +
+    '(func $w64 (export "w64") (param $n i64) (result i64) ' +
+    ' (local $i i64) (local $a i64) (local $b i64) (local $c i64) (local $d i64) ' +
+    ' (local.set $a (i64.const 1)) (local.set $b (i64.const 2)) (local.set $c (i64.const 3)) (local.set $d (i64.const 4)) ' +
+    ' (loop $l ' +
+    '  (local.set $a (call $mix64 (local.get $a) (local.get $i))) ' +
+    '  (local.set $b (i64.add (local.get $b) (i64.xor (local.get $a) (local.get $c)))) ' +
+    '  (local.set $c (i64.add (i64.add (local.get $c) (local.get $d)) (i64.const 5))) ' +
+    '  (local.set $d (call $mix64 (local.get $d) (local.get $b))) ' +
+    '  (local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '  (br_if $l (i64.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (i64.xor (i64.xor (local.get $a) (local.get $b)) (i64.xor (local.get $c) (local.get $d)))) ' +
+    '(func $wm (export "wm") (param $n i32) (result i32) ' +
+    ' (local $i i32) (local $p i32) (local $s i32) ' +
+    ' (loop $l ' +
+    '  (local.set $p (i32.and (call $mix (local.get $p) (local.get $i)) (i32.const 0xfffc))) ' +
+    '  (i32.store (local.get $p) (local.get $i)) ' +
+    '  (local.set $s (i32.add (local.get $s) (i32.load (local.get $p)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
+    ' (local.get $s)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $w4 (i32.const 1)) (i32.const -1918920164)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 1)) (i32.const -978139746)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 1)) (i64.const 5658031813416700493)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 1)) (i32.const 0)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w4 (i32.const 2)) (i32.const -1712910881)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 2)) (i32.const 1790146644)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 2)) (i64.const -5807380632104104251)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w4 (i32.const 3)) (i32.const -368195979)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 3)) (i32.const -1518150501)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 3)) (i64.const 5228304227958329896)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 3)) (i32.const 3)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w4 (i32.const 40)) (i32.const -983224598)) (then unreachable)) ' +
+    ' (if (i32.ne (call $w5 (i32.const 40)) (i32.const -413072615)) (then unreachable)) ' +
+    ' (if (i64.ne (call $w64 (i64.const 40)) (i64.const -2418841147283987750)) (then unreachable)) ' +
+    ' (if (i32.ne (call $wm (i32.const 40)) (i32.const 780)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
 { $sq(n) = n*n + $sq(n-1), with the square computed BEFORE the self call so
   a dirty temporary must survive it; $deep never terminates, with the same
   live temporary, so it exhausts. sq(40) = 22140 (sum of squares). }
@@ -2526,6 +2609,7 @@ type
     procedure TestNativeCoreDepthAndEpoch;
     procedure TestX64NativeCoreShape;
     procedure TestNativeLeafStaticCaller;
+    procedure TestNativeLeafStaticCallerHosts;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestInlineCallCacheAcrossBranches;
@@ -6705,6 +6789,62 @@ begin
   end;
 end;
 
+procedure TJitTests.TestNativeLeafStaticCallerHosts;
+var
+  Bytes: TWasmBytes;
+  {$IFDEF WASM_JIT_X64}
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  StagedCount: UInt32;
+
+  { REX.W mov [rbx+disp8], AReg / mov AReg, [rbx+disp8] with AReg one of
+    rdi (7) or rdx (2): a fixed-host slot store or load. }
+  function HostSlotOps(const ACode: TWasmBytes; const AReg, AOpcode: Byte):
+    Integer;
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := 0 to Length(ACode) - 3 do
+      if (ACode[I] = $48) and (ACode[I + 1] = AOpcode) and
+        (ACode[I + 2] = ($43 or (AReg shl 3))) then
+        Inc(Result);
+  end;
+  {$ENDIF}
+begin
+  Bytes := NativeLeafHostsModuleBytes;
+  {$IFDEF WASM_JIT_X64}
+  { $w4 is a static caller whose rdi and rdx each host a local: both are
+    stored before each of its four leaf calls and reloaded after it (plus
+    the entry load and the exit store). }
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[3],
+      Ir.FuncImportCount + 3, EntryOffset, StagedCount);
+    Expect<Integer>(HostSlotOps(Code, 7, $89)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 2, $89)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 7, $8B)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 2, $8B)).ToBe(5);
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+  {$ENDIF}
+  CompileExports(['mix', 'inc', 'mix64', 'w4', 'w5', 'w64', 'wm', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  { Callers only: every call takes the helper fallback, which must see the
+    rdi/rdx locals stored and restore them afterwards. }
+  CompileExports(['w4', 'w5', 'w64', 'wm']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'w4', [MakeValueI32(40)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
@@ -9126,6 +9266,8 @@ begin
     TestX64NativeCoreShape);
   Test('loop callers keep a static cache across native leaf calls',
     TestNativeLeafStaticCaller);
+  Test('rdi/rdx static hosts survive native leaf calls',
+    TestNativeLeafStaticCallerHosts);
   Test('inlined scalar body survives relocation without a compiled target',
     TestInlineScalarBodyRelocation);
   Test('inlined scalar calls preserve epoch and caller memory behavior',
