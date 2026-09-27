@@ -77,6 +77,7 @@ type
     procedure TestSlotOffset;
     procedure TestPredicateCoversWaves;
     procedure TestPredicateEmitsEh;
+    procedure TestEveryIrOpHasTemplate;
     procedure TestStaticCacheKeepsShiftResult;
     procedure TestStaticCacheDefersDynamicStores;
     procedure TestStaticCachePinnedMemoryBytes;
@@ -2785,6 +2786,22 @@ begin
   Expect<Boolean>(X64CanEmitOp(iroThrowRef)).ToBe(True);
 end;
 
+{ With call and return_call* arity encoded, the op template is the only
+  compile fence (JitCompileDecline), so an IR op without one would make
+  strict compilation decline a valid module (ADR-0015, issue #33). The
+  failure lists the ordinals of the ops missing a template. }
+procedure TX64Tests.TestEveryIrOpHasTemplate;
+var
+  Op: TWasmIrOp;
+  Missing: string;
+begin
+  Missing := '';
+  for Op := Low(TWasmIrOp) to High(TWasmIrOp) do
+    if not X64CanEmitOp(Op) then
+      Missing := Missing + ' ' + IntToStr(Ord(Op));
+  Expect<string>(Missing).ToBe('');
+end;
+
 { v128 xmm cache encodings, SDM Vol. 2: MOVDQA xmm1, xmm2/m128 = 66 0F 6F /r;
   PXOR = 66 0F EF /r; PCMPEQD = 66 0F 76 /r; MOVQ xmm, r/m64 = 66 REX.W 0F
   6E /r; PUNPCKLQDQ = 66 0F 6C /r; REX.R extends ModRM.reg, REX.B ModRM.rm. }
@@ -3125,6 +3142,7 @@ begin
   Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWaves);
   Test('predicate emits exception-handling ops', TestPredicateEmitsEh);
+  Test('every IR op has an x86-64 template', TestEveryIrOpHasTemplate);
   Test('static allocation keeps a shifted expression result',
     TestStaticCacheKeepsShiftResult);
   Test('static allocation defers dynamic stores and evicts dead values first',

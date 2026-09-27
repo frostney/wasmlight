@@ -518,7 +518,7 @@ end;
   that block (nil when inline) for ReleaseMarshal. }
 function AcquireMarshal(const ACtx: PWasmInterpContext;
   const AArgN, AResN: UInt32; const AInlineParams, AInlineResults: PWasmValue;
-  out AParams, AResults: PWasmValue): PWasmWideBlock;
+  out AParams, AResults: PWasmValue): PWasmWideBlock; inline;
 begin
   if (AArgN <= WASM_INTERP_INLINE_MARSHAL) and
     (AResN <= WASM_INTERP_INLINE_MARSHAL) then
@@ -534,20 +534,28 @@ begin
   Inc(AResults, AArgN);
 end;
 
-{ Free ABlock and any block a trap or unwind abandoned above it. A nil
-  block (the inline case) is a no-op. }
-procedure ReleaseMarshal(const ACtx: PWasmInterpContext;
+{ Free ABlock and any block a trap or unwind abandoned above it. }
+procedure ReleaseWideScratch(const ACtx: PWasmInterpContext;
   const ABlock: PWasmWideBlock);
 var
   Top: PWasmWideBlock;
 begin
-  if ABlock = nil then
-    Exit;
   repeat
     Top := ACtx^.WideScratch;
+    if Top = nil then
+      raise EWasmInternal.Create(
+        'internal: wide marshal block not on the context chain');
     ACtx^.WideScratch := Top^.Prev;
     FreeMem(Top);
   until Top = ABlock;
+end;
+
+{ Release AcquireMarshal's block; the inline case (nil) is a no-op. }
+procedure ReleaseMarshal(const ACtx: PWasmInterpContext;
+  const ABlock: PWasmWideBlock); inline;
+begin
+  if ABlock <> nil then
+    ReleaseWideScratch(ACtx, ABlock);
 end;
 
 { The pending-tail argument buffer for a tail wider than the inline array:

@@ -59,6 +59,7 @@ type
     procedure TestLocalCallPatch;
     procedure TestSlotOffset;
     procedure TestPredicateCoversWave2;
+    procedure TestEveryIrOpHasTemplate;
     procedure TestSpZeroAdjustCopiesSp;
     procedure TestLargeSlotEncoding;
     procedure TestCondBranchVeneer;
@@ -671,6 +672,22 @@ begin
   { throw / throw_ref compile; matching stays in UnwindException. }
   Expect<Boolean>(Arm64CanEmitOp(iroThrow)).ToBe(True);
   Expect<Boolean>(Arm64CanEmitOp(iroThrowRef)).ToBe(True);
+end;
+
+{ With call and return_call* arity encoded, the op template is the only
+  compile fence (JitCompileDecline), so an IR op without one would make
+  strict compilation decline a valid module (ADR-0015, issue #33). The
+  failure lists the ordinals of the ops missing a template. }
+procedure TArm64Tests.TestEveryIrOpHasTemplate;
+var
+  Op: TWasmIrOp;
+  Missing: string;
+begin
+  Missing := '';
+  for Op := Low(TWasmIrOp) to High(TWasmIrOp) do
+    if not Arm64CanEmitOp(Op) then
+      Missing := Missing + ' ' + IntToStr(Ord(Op));
+  Expect<string>(Missing).ToBe('');
 end;
 
 function Arm64WordAt(const ABuf: TWasmCodeBuffer; const AOffset: Integer): UInt32;
@@ -1293,6 +1310,7 @@ begin
   Test('slot byte offset is register*8', TestSlotOffset);
   Test('predicate covers waves 2-6 including throw and throw_ref',
     TestPredicateCoversWave2);
+  Test('every IR op has an aarch64 template', TestEveryIrOpHasTemplate);
   Test('a zero SP adjust copies SP rather than XZR',
     TestSpZeroAdjustCopiesSp);
   Test('a slot past the short LDR W offset uses ADD-scratch',
