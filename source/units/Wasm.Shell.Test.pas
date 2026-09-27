@@ -162,7 +162,7 @@ type
     procedure TestInvalidModuleIsValidationError;
     procedure TestIncompleteNativeRejected;
     procedure TestStaleNativeRejected;
-    procedure TestConnectorStubRejected;
+    procedure TestMalformedConnectorPlanRejected;
     procedure TestMalformedCapabilitySetRejected;
     procedure TestCapabilitySetCannotBeExpanded;
     procedure TestCompiledCapabilitiesReachGuest;
@@ -342,7 +342,7 @@ begin
   Expect<Boolean>(CapturedStdout = '').ToBe(True);
 end;
 
-procedure TShellTests.TestConnectorStubRejected;
+procedure TShellTests.TestMalformedConnectorPlanRejected;
 var
   Module, Plan, Payload: TWasmBytes;
   Res: TWasmShellResult;
@@ -354,7 +354,9 @@ begin
   FConfig := TWasmWasiConfig.Create;
   Res := RunShellBytes(Payload, FConfig);
   Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
-  Expect<Boolean>(Pos('connector plan', Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('EWasmLinkError: malformed connector plan',
+    Res.Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(CapturedStdout = '').ToBe(True);
 end;
 
 procedure TShellTests.TestMalformedCapabilitySetRejected;
@@ -868,8 +870,8 @@ begin
     TestIncompleteNativeRejected);
   Test('a native image for a different module is EWasmLinkError',
     TestStaleNativeRejected);
-  Test('a non-empty connector plan is rejected (stub until later issues)',
-    TestConnectorStubRejected);
+  Test('a malformed connector plan is a link error before instantiation',
+    TestMalformedConnectorPlanRejected);
   Test('a malformed capability set is rejected before instantiation',
     TestMalformedCapabilitySetRejected);
   Test('a config that already grants env or a preopen cannot expand the set',

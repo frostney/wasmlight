@@ -86,6 +86,10 @@ type
     Kind: TWlcMarshalKind;
     SizeConst: Integer;
     HasSizeConst: Boolean;
+    { Zero-based index of the parameter whose value is an array's element
+      count (issue #146). }
+    SizeParamIndex: Integer;
+    HasSizeParamIndex: Boolean;
   end;
 
   TWlcParam = record

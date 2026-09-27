@@ -3,7 +3,8 @@
 
   Native libraries such as SDL and raylib call C function pointers. This
   unit hands out those pointers and re-enters a guest function through the
-  existing InterpInvoke trampoline. It is embedding-layer machinery: it
+  existing InterpInvoke trampoline, or through the hub's Invoke hook (the
+  runtime shell's native invoke). It is embedding-layer machinery: it
   adds no spec rule, does not read a module binary, and does not sit in
   an execution tier.
 
@@ -92,6 +93,13 @@ type
   TWasmCallbackFilter = function(AUserData: Pointer;
     AEvent: Pointer): Int32; cdecl;
 
+  { How a thunk re-enters the guest. Unset means Wasm.Engine.Call (the
+    interpreter trampoline); the interpreter-free runtime shell installs a
+    native invoke instead (issue #146). }
+  TWasmCallbackInvoke = procedure(const AFunc: TWasmFunc;
+    const AArgs: array of TWasmValue;
+    var AResults: array of TWasmValue) of object;
+
   { One hub per store. Native callers must unregister a callback and finish
     any in-flight call before Unbind, EndScope, or Destroy. Released thunk
     addresses may be reused; calling an old pointer is outside the contract
@@ -104,6 +112,7 @@ type
     FExnRoot: TWasmRootHandle;
     FDead: Boolean;
     FInFlight: Integer;
+    FInvoke: TWasmCallbackInvoke;
 
     procedure Capture(E: EWasmError);
     procedure ReleaseSlot(const AIndex: Integer);
@@ -129,6 +138,8 @@ type
     procedure RethrowDeferred;
 
     property Store: TWasmStore read FStore;
+    { Set once, before any Bind. }
+    property Invoke: TWasmCallbackInvoke read FInvoke write FInvoke;
   end;
 
 implementation
@@ -403,7 +414,10 @@ begin
           SetLength(Results, 1);
         end;
     end;
-    Call(Func, Params, Results);
+    if Assigned(Hub.FInvoke) then
+      Hub.FInvoke(Func, Params, Results)
+    else
+      Call(Func, Params, Results);
     if Length(Results) > 0 then
       Result := Results[0].I32;
   except

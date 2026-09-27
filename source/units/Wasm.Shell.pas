@@ -8,15 +8,18 @@
        or, for the attach-seam tests, the temporary WSHL envelope.
     3. Re-decode and re-validate the embedded module (LoadModule). That
        fresh validation is the safety oracle, same as `run --aot`.
-    4. Reject a non-empty connector plan; connector host functions apply
-       later. Strictly decode the compiled capability set
+    4. Strictly decode the compiled capability set
        (Wasm.Compile.Capabilities) and apply exactly it to the config:
        compiled preopens (relative hosts from the executable directory),
        compiled env, and argv = executable basename + every invocation
        argument. An empty set is deny-by-default WASI (stdio + clock +
        random). The set cannot be widened: apply refuses a config that
        already carries preopens or env.
-    5. Link deny-by-default WASI, instantiate, and require exported
+    5. Link deny-by-default WASI plus the embedded connector plan: the plan
+       is decoded strictly and re-resolved against the module
+       (Wasm.Connector.Plan), its application-local libraries are loaded
+       beside the executable, and Wasm.Connector.Host turns each bound
+       import into a host function. Instantiate, and require exported
        memory + `_start`.
     6. Wire ONLY a complete native image (Wasm.Native). Incomplete or
        incompatible code is EWasmLinkError; there is no interpreter
@@ -36,6 +39,7 @@ uses
   Classes,
   SysUtils,
 
+  Wasm.Connector.Host,
   Wasm.Core,
   Wasm.Engine,
   Wasm.MachO,
@@ -139,6 +143,8 @@ implementation
 
 uses
   Wasm.Compile.Capabilities,
+  Wasm.Connector.Plan,
+  Wasm.Connector.Resolve,
   Wasm.Native.Load;
 
 type
@@ -287,6 +293,26 @@ begin
   end;
 end;
 
+{ nil for an empty connector-plan section. A malformed or inconsistent
+  plan, a missing library or symbol, or an unsupported lowering is
+  EWasmLinkError before instantiation. }
+function LoadShellConnectors(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const AConnector: TWasmBytes): TWasmConnectorHost;
+var
+  Plan: TWlcConnectorPlan;
+begin
+  Result := nil;
+  if Length(AConnector) = 0 then
+    Exit;
+  Plan := CheckConnectorPlanForModule(AConnector, ALoaded.Model,
+    [WLC_WASI_MODULE]);
+  { Callbacks re-enter through the native invoke: the shell has no
+    interpreter. }
+  Result := TWasmConnectorHost.Create(AStore, Plan, NativeExecutableDirectory,
+    @NativeInvoke);
+end;
+
 function RunLoadedShellCore(const ALoaded: TWasmLoadedModule;
   const AConnector, ACapability: TWasmBytes;
   const AConfig: TWasmWasiConfig; const AInvocation: TWasmShellInvocation;
@@ -303,6 +329,7 @@ var
   StartFn: TWasmFunc;
   Imports: TWasmImports;
   Inst: TWasmModuleInstance;
+  Connectors: TWasmConnectorHost;
   CapDiagnostic: string;
 begin
   Result.ExitCode := 0;
@@ -312,8 +339,6 @@ begin
   if (AConfig = nil) or (ALoaded = nil) then
     Exit(FailResult('shell needs a module and a WASI config'));
 
-  if Length(AConnector) > 0 then
-    Exit(FailResult('EWasmLinkError: connector plan is not yet loadable'));
   if not ApplyShellCapabilities(ACapability, AConfig, AInvocation,
     CapDiagnostic) then
     Exit(FailResult(CapDiagnostic));
@@ -324,6 +349,7 @@ begin
   Context := nil;
   Instance := nil;
   Native := nil;
+  Connectors := nil;
   try
     Engine := TWasmEngine.Create;
     Store := TWasmStore.Create(Engine);
@@ -333,10 +359,15 @@ begin
 
     try
       WasiCheckCommandEntry(ALoaded);
+      Connectors := LoadShellConnectors(Store, ALoaded, AConnector);
+      if Connectors <> nil then
+        Connectors.DefineImports(Linker);
       Imports := Linker.ResolveImports(ALoaded);
       Inst := InstantiateModule(Store, ALoaded.Ir, ALoaded.BytesPtr,
         ALoaded.BytesLength, Imports);
       Instance := TWasmInstance.Create(Store, Inst);
+      if Connectors <> nil then
+        Connectors.Attach(Instance);
     except
       on E: EWasmError do
         Exit(FailResult(E.ClassName + ': ' + E.Message));
@@ -373,6 +404,10 @@ begin
         NativeInvoke(Store, Inst.FuncAddrs[Inst.PendingStartFuncIndex], nil, nil);
       Inst.HasPendingStart := False;
       NativeInvoke(StartFn.Store, StartFn.Addr, nil, nil);
+      { Queued connector notifications still pending when `_start`
+        returns are delivered before the executable exits. }
+      if Connectors <> nil then
+        Connectors.DrainQueued;
       Result.ExitCode := 0;
     except
       on E: EWasmExit do
@@ -403,6 +438,7 @@ begin
     Native.Free;
     Context.Free;
     Linker.Free;
+    Connectors.Free;
     FreeAndNil(Store);
     Engine.Free;
   end;
