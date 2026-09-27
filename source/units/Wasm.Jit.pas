@@ -523,6 +523,9 @@ var
   { X64LoadAluFirst[K]: PlannedCode[K] is an i32.load emitted as the memory
     operand of PlannedCode[K + 1] (AnalyzeX64LoadAluFusion). }
   X64LoadAluFirst: array of Boolean;
+  { X64IndexScales[K]: the SIB scale of a pinned access whose address
+    shift was elided (X64PlanScaledIndex). }
+  X64IndexScales: TX64IndexScaleList;
   {$ENDIF}
   SlotUseCounts: array of UInt32;
   RegUseCounts: array of UInt32;
@@ -2723,6 +2726,9 @@ begin
     AnalyzeFusion;
     {$IFDEF WASM_JIT_X64}
     AnalyzeX64LoadAluFusion;
+    X64PlanScaledIndex(AFn^, PlannedCode, SkipPlanned, Targets,
+      ImmediateFusion, X64ImmediateValues,
+      UsePinnedMemoryBase and UseStaticCache, X64IndexScales);
     {$ENDIF}
     { After fusion planning, so already-folded constants are not offered a
       host register their defining instruction would never have used. }
@@ -2987,7 +2993,13 @@ begin
       else if (I > 0) and X64LoadAluFirst[I - 1] then
       begin
         X64EmitLoadAluCached(Buf, PlannedCode[I - 1], PlannedCode[I],
-          X64Cache);
+          X64Cache, X64IndexScales[I - 1]);
+        Emitted := True;
+      end
+      else if X64IndexScales[I] <> 0 then
+      begin
+        X64EmitScalarMemoryPinned(Buf, PlannedCode[I], False, X64Cache,
+          X64IndexScales[I]);
         Emitted := True;
       end
       else if Fusion[I] >= 0 then
