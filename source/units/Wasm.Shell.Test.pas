@@ -371,7 +371,7 @@ begin
   Res := RunShellBytes(Payload, FConfig);
   Expect<Integer>(Res.ExitCode).ToBe(WASM_SHELL_EXIT_ERROR);
   Expect<string>(Res.Diagnostic)
-    .ToBe('malformed capability set: truncated capability set header');
+    .ToBe('EWasmLinkError: malformed capability set: truncated capability set header');
   Expect<Boolean>(CapturedStdout = '').ToBe(True);
 end;
 

@@ -274,7 +274,7 @@ begin
   ADiagnostic := '';
   if not TryDecodeCompiledCapabilities(ACapability, Caps, Err) then
   begin
-    ADiagnostic := 'malformed capability set: ' + Err;
+    ADiagnostic := 'EWasmLinkError: malformed capability set: ' + Err;
     Exit(False);
   end;
   try
