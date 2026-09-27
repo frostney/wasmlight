@@ -32,6 +32,7 @@ uses
   Wasm.Jit.CodeBuffer,
   Wasm.Jit.X64,
   Wasm.Runtime.Gc,
+  Wasm.Runtime.Memory,
   Wasm.Runtime.Store,
   Wasm.Runtime.Traps;
 
@@ -69,6 +70,8 @@ type
     procedure TestNativeSelfCallBytes;
     procedure TestNativeCoreWriteBack;
     procedure TestNativeLeafCallStaticMoves;
+    procedure TestNativeLeafCallPlans;
+    procedure TestNativeLeafMemoryCore;
     procedure TestRuntimeCallMarshalBytes;
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
@@ -882,12 +885,12 @@ var
 var
   Pre, Post: TWasmBytes;
 begin
-  { Swapped statics: the parallel move goes through rax:
-    mov rax, r8 ; mov r8, r9 ; mov r9, rax. The result (slot 2) is adopted
-    from r8 into r10 before both statics reload: mov r10, r8 ;
+  { Swapped statics: the parallel move parks r8 in rcx (rax is free for the
+    entry): mov rcx, r8 ; mov r8, r9 ; mov r9, rcx. The result (slot 2) is
+    adopted from r8 into r10 before both statics reload: mov r10, r8 ;
     mov r8, [rbx] ; mov r9, [rbx+8]. }
   EmitCall(1, 0, 2, Pre, Post);
-  CheckBytes(Pre, [$4C, $89, $C0, $4D, $89, $C8, $49, $89, $C1], 0);
+  CheckBytes(Pre, [$4C, $89, $C1, $4D, $89, $C8, $49, $89, $C9], 0);
   CheckBytes(Post, [$4D, $89, $C2, $4C, $8B, $03, $4C, $8B, $4B, $08], 0);
 
   { r8 is the second argument's source: r9 is filled first (mov r9, r8)
@@ -904,6 +907,197 @@ begin
   EmitCall(0, 0, 0, Pre, Post);
   CheckBytes(Pre, [$4D, $89, $C1], 6);
   CheckBytes(Post, [$4C, $8B, $4B, $08], 0);
+end;
+
+procedure TX64Tests.TestNativeLeafCallPlans;
+const
+  { mov [rbx + 8k], host for the statics r8, r9, rdi, rdx. }
+  STORE_REX: array[0 .. 3] of Byte = ($4C, $4C, $48, $48);
+  STORE_MODRM: array[0 .. 3] of Byte = ($03, $4B, $7B, $53);
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  Plan: TX64LeafCall;
+  UseCounts: array[0 .. 15] of UInt32;
+  Visible: array[0 .. 15] of Boolean;
+  Layout: TWasmMemoryInst;
+  BaseOff: Byte;
+  I, Site: Integer;
+
+  procedure Setup(const AArgs: array of UInt32; const AResult: UInt32);
+  var
+    N: Integer;
+  begin
+    SetLength(Aux, Length(AArgs) + 3);
+    Aux[0] := Length(AArgs);
+    for N := 0 to High(AArgs) do
+      Aux[N + 1] := AArgs[N];
+    Aux[Length(AArgs) + 1] := 1;
+    Aux[Length(AArgs) + 2] := AResult;
+    FillChar(UseCounts, SizeOf(UseCounts), 0);
+    FillChar(Visible, SizeOf(Visible), 0);
+    for N := 0 to 3 do
+      Visible[N] := True;
+    FillChar(Plan, SizeOf(Plan), 0);
+    Plan.Enabled := True;
+    Plan.ParamCount := Length(AArgs);
+    for N := 0 to 3 do
+      Plan.ArgSlots[N] := High(UInt32);
+    Plan.ResultSlot := High(UInt32);
+    Buf := TWasmCodeBuffer.Create;
+    { Statics: slot 0 in r8, 1 in r9, 2 in rdi, 3 in rdx. The activation
+      caches the leaf's entry, so the call site loads it into rax and the
+      hot path clobbers only what the leaf itself does. }
+    X64EnableStaticRegCache(Buf, Cache, [0, 1, 2, 3]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 16);
+    X64EnableLeafEntryCache(Cache, 0);
+  end;
+
+  procedure Emit;
+  begin
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroCall, 0, 0, UInt32(Aux[0]) + 1, 0), Aux, 0, False,
+      False, False, False, 0, 0, 0, 0, 0, True, True, Cache, nil, nil, nil,
+      @Plan)).ToBe(True);
+    { The fast path's call: xor ecx, ecx ; call rax. }
+    Site := FindSeq(Buf, [$31, $C9, $FF, $D0]);
+    Expect<Boolean>(Site > 0).ToBe(True);
+  end;
+
+  procedure CheckBefore(const AExpected: array of Byte);
+  var
+    N: Integer;
+  begin
+    for N := 0 to High(AExpected) do
+      if Site - Length(AExpected) + N >= 0 then
+        Expect<Byte>(Buf.ByteAt(Site - Length(AExpected) + N))
+          .ToBe(AExpected[N]);
+  end;
+
+  procedure CheckAfter(const AExpected: array of Byte);
+  var
+    N: Integer;
+  begin
+    for N := 0 to High(AExpected) do
+      Expect<Byte>(Buf.ByteAt(Site + 4 + N)).ToBe(AExpected[N]);
+  end;
+
+begin
+  { A four-argument rotation of the statics, (r9, rdi, rdx, r8) -> (r8, r9,
+    rdi, rdx), is one cycle: rcx parks r8 (rax holds the entry):
+      mov rcx, r8 ; mov r8, r9 ; mov r9, rdi ; mov rdi, rdx ; mov rdx, rcx.
+    A four-parameter leaf writes all four hosts. Each static (a visible
+    local) was just written, so it is stored before the call, and reloads
+    after it; the result (slot 4) is adopted from r8 into r10 first:
+      mov r10, r8 ; mov r8, [rbx] ; mov r9, [rbx+8] ; mov rdi, [rbx+16] ;
+      mov rdx, [rbx+24]. }
+  Setup([1, 2, 3, 0], 4);
+  Plan.ClobbersRdi := True;
+  Plan.ClobbersRdx := True;
+  for I := 0 to 3 do
+    Expect<Boolean>(X64EmitOpCached(Buf,
+      MakeIrInstr(iroI32Const, UInt32(I), 0, 0, I + 40), Aux, 0, False,
+      False, Cache)).ToBe(True);
+  Emit;
+  CheckBefore([$4C, $89, $C1, $4D, $89, $C8, $49, $89, $F9, $48, $89, $D7,
+    $48, $89, $CA]);
+  CheckAfter([$4D, $89, $C2, $4C, $8B, $03, $4C, $8B, $4B, $08, $48, $8B,
+    $7B, $10, $48, $8B, $53, $18]);
+  for I := 0 to 3 do
+    Expect<Boolean>(FindSeq(Buf, [STORE_REX[I], $89, STORE_MODRM[I]]) >= 0)
+      .ToBe(True);
+  Buf.Free;
+
+  { A two-parameter leaf leaves rdi and rdx alone: they are neither stored
+    nor reloaded on the hot path, the arguments read them directly
+    (mov r8, rdx ; mov r9, rdi), and the result forwarded into static slot 1
+    replaces its reload (mov r9, r8 ; mov r8, [rbx]). r8's slot is current
+    (the statics were only loaded), so it is reloaded but never stored. }
+  Setup([3, 2], 5);
+  Plan.ResultSlot := 1;
+  Emit;
+  CheckBefore([$49, $89, $D0, $49, $89, $F9]);
+  CheckAfter([$4D, $89, $C1, $4C, $8B, $03, $E9]);
+  Expect<Integer>(FindSeq(Buf, [$48, $89, $7B, $10])).ToBe(
+    FindSeq(Buf, [$48, $89, $7B, $10], Site));
+  Expect<Integer>(FindSeq(Buf, [$4C, $89, $03])).ToBe(-1);
+  Buf.Free;
+
+  { Constant arguments go straight into their registers, each in its
+    shortest exact form, and a memory leaf called from a frame that does
+    not hold Base gets it from the pinned instance:
+      mov r8d, 1 ; xor r9d, r9d ; movabs rdi, 0x100000000 ;
+      mov rsi, [rsp] ; mov rsi, [rsi + Base]. }
+  Setup([8, 9, 10], 6);
+  Plan.UsesMemory := True;
+  Plan.ClobbersRdi := True;
+  Plan.ArgConst[0] := True;
+  Plan.ArgValues[0] := 1;
+  Plan.ArgConst[1] := True;
+  Plan.ArgValues[1] := 0;
+  Plan.ArgConst[2] := True;
+  Plan.ArgValues[2] := UInt64($100000000);
+  Emit;
+  BaseOff := Byte(PtrUInt(@Layout.Base) - PtrUInt(@Layout));
+  if BaseOff = 0 then
+    CheckBefore([$41, $B8, $01, 0, 0, 0, $45, $31, $C9, $48, $BF, 0, 0, 0,
+      0, 1, 0, 0, 0, $48, $8B, $34, $24, $48, $8B, $36])
+  else
+    CheckBefore([$41, $B8, $01, 0, 0, 0, $45, $31, $C9, $48, $BF, 0, 0, 0,
+      0, 1, 0, 0, 0, $48, $8B, $34, $24, $48, $8B, $76, BaseOff]);
+  Buf.Free;
+end;
+
+procedure TX64Tests.TestNativeLeafMemoryCore;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0 .. 15] of UInt32;
+  Visible: array[0 .. 15] of Boolean;
+
+  procedure Emit(const AOp: TWasmIrOp; const ADest, AA, AB: UInt32);
+  begin
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(AOp, ADest, AA, AB, 0),
+      Aux, 0, False, True, True, False, 16, 0, 9, 0, 1, False, False, Cache,
+      nil, nil, nil)).ToBe(True);
+  end;
+
+begin
+  SetLength(Aux, 0);
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  UseCounts[5] := 1;
+  UseCounts[6] := 1;
+  UseCounts[7] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    { A four-parameter leaf: slots 0-3 arrive in r8, r9, rdi, rdx; memory
+      accesses read Base from rsi. }
+    X64SeedNativeCoreCache(Cache, 4, 0, 1, False, 2, 3);
+    X64EnablePinnedMemoryBase(Cache);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 16);
+    { i64.load r5 <- [r2]: the parameter's upper half is not known zero, so
+      the index is copied by a 32-bit move: mov ecx, edi ;
+      mov r10, [rsi + rcx]. }
+    Emit(iroI64Load, 5, 2, 0);
+    { i64.extend_i32_s r6 <- r0: movsxd r11, r8d. }
+    Emit(iroI64ExtendI32S, 6, 0, 0);
+    { i32.wrap_i64 r7 <- r3 into the dead load's host: mov r10d, edx. }
+    UseCounts[5] := 0;
+    Emit(iroI32WrapI64, 7, 3, 0);
+    { i64.extend_i32_u r8 <- r1: mov r11d, r9d. }
+    UseCounts[6] := 0;
+    Emit(iroI64ExtendI32U, 8, 1, 0);
+    { i32.store [r7] <- r3: r7's host was written by a 32-bit move, so it
+      indexes directly: mov [rsi + r10], edx. }
+    Emit(iroI32Store, 3, 7, 0);
+    CheckSeq(Buf, [$89, $F9, $4C, $8B, $14, $0E, $4D, $63, $D8, $41, $89,
+      $D2, $45, $89, $CB, $42, $89, $14, $16]);
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TX64Tests.TestRuntimeCallMarshalBytes;
@@ -2778,6 +2972,10 @@ begin
     TestNativeSelfCallBytes);
   Test('the native core defers parameter and temporary stores',
     TestNativeCoreWriteBack);
+  Test('a static caller moves four leaf arguments, constants, and the Base',
+    TestNativeLeafCallPlans);
+  Test('a memory leaf core addresses rsi and converts widths in its hosts',
+    TestNativeLeafMemoryCore);
   Test('a static caller moves leaf arguments and adopts the result',
     TestNativeLeafCallStaticMoves);
   Test('the runtime/vec helper-call marshaling emits the asserted bytes',

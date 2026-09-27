@@ -7136,12 +7136,14 @@ begin
     RunRegisterCount := Ir.Functions[4].RegisterCount;
     MixRegisterCount := Ir.Functions[0].RegisterCount;
     {$IFDEF WASM_JIT_X64}
-    { $ra's call is the static-cache form: `xor ecx, ecx ; call rdx`, and
-      the result is adopted from r8 into a host (mov r10, r8) rather than
-      stored to its slot. Its only slot stores are the three fixed hosts
-      before the call (r8/r9 and rdi holding the bound $n), the cold
-      fallback's argument and result stores, and the exit's write-back of
-      the three fixed hosts and the result. }
+    { $ra's call is the static-cache form: `xor ecx, ecx ; call rax` (the
+      activation's cached entry), and the result lands straight in $acc's
+      host (mov rdx, r8), which the one-leaf caller moved with $i to rdi
+      and rdx: $mix preserves both, so the hot path stores nothing, not
+      even r8 (the bound $n, which no instruction writes). Its only slot
+      stores are the cold first resolution's rdi/rdx, the cold fallback's
+      two canonical arguments and result, and the exit's write-back of the
+      three fixed hosts and the result. }
     Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[4],
       Ir.FuncImportCount + 4, EntryOffset, StagedCount);
     Calls := 0;
@@ -7149,7 +7151,7 @@ begin
     for I := 0 to Length(Code) - 7 do
     begin
       if (Code[I] = $31) and (Code[I + 1] = $C9) and (Code[I + 2] = $FF) and
-        (Code[I + 3] = $D2) and (Code[I + 4] = $4D) and
+        (Code[I + 3] = $D0) and (Code[I + 4] = $4C) and
         (Code[I + 5] = $89) and (Code[I + 6] = $C2) then
         Inc(Calls);
       if (Code[I] in [$48, $4C]) and (Code[I + 1] = $89) and
@@ -7157,18 +7159,18 @@ begin
         Inc(Stores);
     end;
     Expect<Integer>(Calls).ToBe(1);
-    Expect<Integer>(Stores).ToBe(10);
+    Expect<Integer>(Stores).ToBe(9);
     { $ra calls one leaf, so the activation caches its entry: the prologue
       clears [rsp+16] (mov qword [rsp+16], 0) and the call site reads it
-      (mov rdx, [rsp+16] ; test rdx, rdx ; je resolve). }
+      (mov rax, [rsp+16] ; test rax, rax ; je resolve). }
     Expect<Integer>(CountSeq(Code, [$48, $C7, $44, $24, $10, 0, 0, 0, 0]))
       .ToBe(1);
-    Expect<Integer>(CountSeq(Code, [$48, $8B, $54, $24, $10, $48, $85, $D2,
+    Expect<Integer>(CountSeq(Code, [$48, $8B, $44, $24, $10, $48, $85, $C0,
       $0F, $84])).ToBe(1);
     { $re calls two different leaves: no cached entry, both sites resolve. }
     Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[8],
       Ir.FuncImportCount + 8, EntryOffset, StagedCount);
-    Expect<Integer>(CountSeq(Code, [$48, $8B, $54, $24, $10, $48, $85, $D2]))
+    Expect<Integer>(CountSeq(Code, [$48, $8B, $44, $24, $10, $48, $85, $C0]))
       .ToBe(0);
     Expect<Integer>(CountSeq(Code, [$31, $C9, $FF, $D2])).ToBe(2);
     {$ENDIF}
@@ -7254,9 +7256,15 @@ var
 begin
   Bytes := NativeLeafHostsModuleBytes;
   {$IFDEF WASM_JIT_X64}
-  { $w4 is a static caller whose rdi and rdx each host a local: both are
-    stored before each of its four leaf calls and reloaded after it (plus
-    the entry load and the exit store). }
+  { $w4 is a static caller whose rdi and rdx each host a local ($d and
+    $i), around four calls to two different leaves, so each call resolves
+    its entry inline and that resolution clobbers both hosts. A host is
+    stored only while its slot is stale: both before the iteration's first
+    call (the loop head is a join), $d again before the third call after the
+    second call's result lands in rdi, neither before the fourth; plus the
+    exit store. Each is reloaded after every call it does not receive the
+    result of (rdi takes $d's result from the second call), plus the entry
+    load. }
   Module := TWasmModule.Create;
   Ir := nil;
   try
@@ -7264,9 +7272,9 @@ begin
     Ir := ValidateModule(Module, Bytes);
     Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[3],
       Ir.FuncImportCount + 3, EntryOffset, StagedCount);
-    Expect<Integer>(HostSlotOps(Code, 7, $89)).ToBe(5);
-    Expect<Integer>(HostSlotOps(Code, 2, $89)).ToBe(5);
-    Expect<Integer>(HostSlotOps(Code, 7, $8B)).ToBe(5);
+    Expect<Integer>(HostSlotOps(Code, 7, $89)).ToBe(3);
+    Expect<Integer>(HostSlotOps(Code, 2, $89)).ToBe(2);
+    Expect<Integer>(HostSlotOps(Code, 7, $8B)).ToBe(4);
     Expect<Integer>(HostSlotOps(Code, 2, $8B)).ToBe(5);
   finally
     Ir.Free;

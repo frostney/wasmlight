@@ -37,6 +37,7 @@ type
 
   { One entry per IR instruction of the function being compiled. }
   TX64LeafCallList = array of TX64LeafCall;
+  TX64BoolArray = array of Boolean;
 
 { Whether AFn gets the x64 native leaf entry, and its shape. A superset of
   the shared JitCanNativeScalarLeaf proof: one to four numeric parameters
@@ -102,6 +103,13 @@ procedure X64PreferLeafPreservedHosts(const AFn: TWasmIrFunction;
   const ACalls: TX64LeafCallList;
   const AScores, AScoresInLoop: array of UInt32;
   var AAllocated: array of UInt32);
+
+{ AWritten[r]: some instruction of AFn writes register r — a Dest the op
+  defines (both slots of a v128) or a call's result. Planning only ever
+  renames reads or moves a write onto a register the canonical code also
+  writes, so this canonical set covers the planned code. }
+procedure X64PlanWrittenSlots(const AFn: TWasmIrFunction;
+  out AWritten: TX64BoolArray);
 
 { In a static-cache caller, after the liveness analyses: an argument
   temporary whose only definition is an adjacent-enough `move T <- S` or
@@ -534,6 +542,38 @@ begin
   begin
     Slot := Next[P];
     AAllocated[P] := Slot;
+  end;
+end;
+
+procedure X64PlanWrittenSlots(const AFn: TWasmIrFunction;
+  out AWritten: TX64BoolArray);
+
+  procedure Mark(const AReg: UInt32);
+  begin
+    if AReg < UInt32(Length(AWritten)) then
+      AWritten[AReg] := True;
+  end;
+
+var
+  K, N: Integer;
+  Ins: TWasmIrInstr;
+begin
+  AWritten := nil;
+  SetLength(AWritten, AFn.RegisterCount);
+  for K := 0 to High(AFn.Code) do
+  begin
+    Ins := AFn.Code[K];
+    if IR_OP_INFO[Ins.Op].DestKind = ifkDestReg then
+    begin
+      Mark(Ins.Dest);
+      if (Ins.Dest < UInt32(Length(AFn.RegTypes))) and
+        (AFn.RegTypes[Ins.Dest].Kind = wvkVec) then
+        Mark(Ins.Dest + 1);
+    end;
+    if (Ins.Op in [iroCall, iroCallIndirect, iroCallRef]) and
+      (IR_OP_INFO[Ins.Op].BKind = ifkAuxIndex) then
+      for N := 0 to Integer(IrAuxBlockCount(AFn.AuxU32, Ins.B)) - 1 do
+        Mark(IrAuxBlockItem(AFn.AuxU32, Ins.B, UInt32(N)));
   end;
 end;
 

@@ -123,6 +123,13 @@ type
       zero-extended i32 address needs no `mov ecx, r32` before it indexes
       the pinned memory base. }
     Zx32: Boolean;
+    { Static allocation, fixed host only (X64MarkStableFixedHosts): no
+      instruction of the function writes Slot, so the slot always holds the
+      host's value. A static fixed host's Dirty says its value may not have
+      reached the slot yet: set by every write, cleared by a store or a
+      reload, and set again at a join unless Stable. Only the native-leaf
+      call sequence reads it, to skip a store whose slot is current. }
+    Stable: Boolean;
     Slot: UInt32;
   end;
 
@@ -628,6 +635,10 @@ procedure X64EnableStaticRegCache(const ABuf: TWasmCodeBuffer;
   X64EmitPinMemory), and scalar memory ops take their address and value from
   the cache hosts instead of making the register file canonical. }
 procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
+{ Mark each static fixed host whose slot AWritten says no instruction of the
+  function writes (AA parameter only read, ASuch as a loop bound) as Stable. }
+procedure X64MarkStableFixedHosts(var ACache: TX64RegCache;
+  const AWritten: array of Boolean);
 { A static-allocation caller whose native-leaf calls all target AFuncIdx
   caches that leaf's resolved entry in [rsp+16] for the activation (the
   driver zeroes the slot after the prologue with X64EmitClearLeafEntry).
@@ -1402,6 +1413,20 @@ begin
     ACache.PinnedMemoryBase := True;
 end;
 
+procedure X64MarkStableFixedHosts(var ACache: TX64RegCache;
+  const AWritten: array of Boolean);
+var
+  I: Integer;
+begin
+  if not ACache.StaticAllocation or ACache.NativeCore then
+    Exit;
+  for I := 0 to High(ACache.Entries) do
+    if X64CacheEntryFixed(I) and ACache.Entries[I].Valid and
+      (ACache.Entries[I].Slot < UInt32(Length(AWritten))) and
+      not AWritten[ACache.Entries[I].Slot] then
+      ACache.Entries[I].Stable := True;
+end;
+
 procedure X64EnableLeafEntryCache(var ACache: TX64RegCache;
   const AFuncIdx: UInt32);
 begin
@@ -1771,10 +1796,15 @@ begin
     ACache.Entries[3].Dirty := False;
     ACache.Next := 0;
     { A native core's parameter hosts survive, but whether a predecessor
-      stored one is path-dependent: assume dirty. }
+      stored one is path-dependent: assume dirty. So for a static fixed host
+      whose slot some instruction writes. }
     if ACache.NativeCore then
       for I := 0 to ACache.NativeFixedCount - 1 do
-        ACache.Entries[I].Dirty := True;
+        ACache.Entries[I].Dirty := True
+    else
+      for I := 0 to High(ACache.Entries) do
+        if X64CacheEntryFixed(I) then
+          ACache.Entries[I].Dirty := not ACache.Entries[I].Stable;
     for I := 0 to High(ACache.VecEntries) do
       if not ACache.VecEntries[I].Fixed then
       begin
@@ -1950,10 +1980,8 @@ begin
       { A native-core parameter host holds the only current copy until a
         write-back proves a later read needs the slot. }
       if ACache.NativeCore then
-      begin
         ACache.Entries[AIndex].Valid := True;
-        ACache.Entries[AIndex].Dirty := True;
-      end;
+      ACache.Entries[AIndex].Dirty := True;
       Exit;
     end;
     if not (ACache.WriteBackDynamics or AStoreEmitted) then
@@ -5978,9 +6006,10 @@ end;
   entry resolution (EmitNativeScalarLeafResolve) writes rax, rcx, rdx, rsi,
   and rdi. So:
 
-    1. every fixed host (r8, r9, rdi, rdx) the hot path clobbers is stored
-       unless its slot is the result's (the call overwrites it) or dead (no
-       later read, not visible), and reloaded after the call; a fixed host
+    1. every fixed host (r8, r9, rdi, rdx) the hot path clobbers is
+       reloaded after the call unless its slot is the result's (the call
+       overwrites it) or dead (no later read, not visible), and stored
+       before it unless its slot is already current (Dirty); a fixed host
        the hot path does not clobber (rdi/rdx around a small leaf whose entry
        is cached) is neither stored nor reloaded. Each argument's read is
        consumed and the dynamic pair is written back by the ordinary
@@ -6174,7 +6203,8 @@ begin
     if not Cached and (I >= 4) and ArgSource(ACache.Entries[I].Slot) then
       Keep := True;
     Saved[I] := Keep;
-    if Keep then
+    { A clean host's slot is already current. }
+    if Keep and ACache.Entries[I].Dirty then
       X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
   end;
   for I := 2 to 3 do
@@ -6233,7 +6263,10 @@ begin
       (I <> Index) and Clobbered[I] then
     begin
       if Saved[I] then
+      begin
         X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+        ACache.Entries[I].Dirty := False;
+      end;
       ACache.Entries[I].Zx32 := False;
     end;
   { The cold paths go after the straight line; the caller's next code must

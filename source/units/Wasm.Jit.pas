@@ -599,6 +599,7 @@ var
   X64ImmediateValues: array of Int64;
   { Per instruction: a direct call taking the native leaf entry. }
   X64LeafCalls: TX64LeafCallList;
+  X64WrittenSlots: TX64BoolArray;
   NativeParam2Reg: UInt32;
   NativeParam3Reg: UInt32;
   {$ENDIF}
@@ -2927,6 +2928,12 @@ begin
     else if UseStaticCache then
     begin
       X64EnableStaticRegCache(Buf, X64Cache, AllocatedSlots);
+      if UseNativeScalarCall then
+      begin
+        { A leaf call skips storing a host whose slot nothing writes. }
+        X64PlanWrittenSlots(AFn^, X64WrittenSlots);
+        X64MarkStableFixedHosts(X64Cache, X64WrittenSlots);
+      end;
       if UsePinnedMemoryBase then
         { StaticCacheOp admitted this function's scalar accesses only under
           the base-pinned proof; the prologue loaded Base into rsi above. }
