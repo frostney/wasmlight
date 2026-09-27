@@ -705,6 +705,21 @@ function X64CanFuseLoadAlu(const ALoad, AAlu: TWasmIrInstr): Boolean;
   else runs between the two, so only the loaded value's register is saved. }
 procedure X64EmitLoadAluCached(const ABuf: TWasmCodeBuffer;
   const ALoad, AAlu: TWasmIrInstr; var ACache: TX64RegCache);
+{ The plan half of x64 immediate fusion: AConst is an i32/i64 constant
+  whose destination is AConsumer's right operand, and AConsumer has an
+  immediate form for it (X64CanUseImmediate); AValue is the constant as an
+  i64, an i32 one sign-extended. The driver adds the liveness proof. }
+function X64ImmediateOperand(const AConst, AConsumer: TWasmIrInstr;
+  out AValue: Int64): Boolean;
+{ Whether any non-skipped instruction of ACode is a v128 op the xmm cache
+  emits. Such a static-cache function keeps its previous scalar emission
+  (no fused immediates, constants through rax): on the measuring host
+  (Zen 5) shortening the scalar half of an xmm-chain-bound loop made the
+  simd workload ~20% slower, reproduced in isolated assembly where ten
+  one-byte NOPs restore the speed. A layout/scheduling effect, not a cost of
+  the immediate forms. }
+function X64CodeHasVecCacheOp(const ACode: TWasmIrCode;
+  const ASkip: array of Boolean): Boolean;
 function X64CanEmitInstr(const AIns: TWasmIrInstr;
   const AAux: TWasmIrAuxU32): Boolean;
 
@@ -1932,7 +1947,7 @@ begin
   if ACache.VecCache then
   begin
     { The driver keeps v128-cache functions on their previous scalar
-      emission (see its x64 AnalyzeImmediateFusion). }
+      emission (see X64CodeHasVecCacheOp). }
     if AWide then
       X64EmitMovRegImm64(ABuf, X64_RAX, AValue)
     else
@@ -2258,6 +2273,31 @@ begin
       end;
   end;
   Result := X64CachedDestBegin(ABuf, ACache, ASlot);
+end;
+
+function X64ImmediateOperand(const AConst, AConsumer: TWasmIrInstr;
+  out AValue: Int64): Boolean;
+begin
+  AValue := 0;
+  if not (AConst.Op in [iroI32Const, iroI64Const]) or
+    (AConsumer.B <> AConst.Dest) then
+    Exit(False);
+  if AConst.Op = iroI32Const then
+    AValue := Int32(UInt32(AConst.Imm and $FFFFFFFF))
+  else
+    AValue := AConst.Imm;
+  Result := X64CanUseImmediate(AConsumer.Op, AValue);
+end;
+
+function X64CodeHasVecCacheOp(const ACode: TWasmIrCode;
+  const ASkip: array of Boolean): Boolean;
+var
+  K: Integer;
+begin
+  for K := 0 to High(ACode) do
+    if not ASkip[K] and X64VecCacheOp(ACode[K].Op) then
+      Exit(True);
+  Result := False;
 end;
 
 function X64EmitOpCachedImmediate(const ABuf: TWasmCodeBuffer;

@@ -653,7 +653,7 @@ var
     The canonical code never changes during a compile, so every register's
     count is taken in one pass on first use (validated operands all lie
     below RegisterCount); per-query scans made fusion planning quadratic. }
-  function RegisterUseCount(const AReg: UInt32): UInt32;
+  procedure CountRegisterReads;
   var
     Info: TWasmIrOpInfo;
     K, N: Integer;
@@ -665,34 +665,36 @@ var
     end;
 
   begin
-    if Length(RegUseCounts) = 0 then
+    SetLength(RegUseCounts, AFn^.RegisterCount + 1);
+    for K := 0 to High(AFn^.Code) do
     begin
-      SetLength(RegUseCounts, AFn^.RegisterCount + 1);
-      for K := 0 to High(AFn^.Code) do
-      begin
-        Info := IR_OP_INFO[AFn^.Code[K].Op];
-        if Info.DestKind = ifkSrcReg then
-          CountRead(AFn^.Code[K].Dest);
-        if Info.AKind = ifkSrcReg then
-          CountRead(AFn^.Code[K].A)
-        else if Info.AKind = ifkAuxIndex then
-          { Every A aux block is a source-register list. B aux blocks carry
-            call results or control targets; Imm aux blocks carry literals,
-            masks, or memory arguments. }
-          for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
-            AFn^.Code[K].A)) - 1 do
-            CountRead(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
-              UInt32(N)));
-        if Info.BKind = ifkSrcReg then
-          CountRead(AFn^.Code[K].B);
-        if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
-          CountRead(UInt32(AFn^.Code[K].Imm));
-      end;
+      Info := IR_OP_INFO[AFn^.Code[K].Op];
+      if Info.DestKind = ifkSrcReg then
+        CountRead(AFn^.Code[K].Dest);
+      if Info.AKind = ifkSrcReg then
+        CountRead(AFn^.Code[K].A)
+      else if Info.AKind = ifkAuxIndex then
+        { Every A aux block is a source-register list. B aux blocks carry
+          call results or control targets; Imm aux blocks carry literals,
+          masks, or memory arguments. }
+        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+          AFn^.Code[K].A)) - 1 do
+          CountRead(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
+            UInt32(N)));
+      if Info.BKind = ifkSrcReg then
+        CountRead(AFn^.Code[K].B);
+      if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
+        CountRead(UInt32(AFn^.Code[K].Imm));
     end;
+  end;
+
+  function RegisterUseCount(const AReg: UInt32): UInt32;
+  begin
+    if Length(RegUseCounts) = 0 then
+      CountRegisterReads;
+    Result := 0;
     if AReg < UInt32(Length(RegUseCounts)) then
-      Result := RegUseCounts[AReg]
-    else
-      Result := 0;
+      Result := RegUseCounts[AReg];
   end;
 
   function IsVisibleFrameReg(const AReg: UInt32): Boolean; forward;
@@ -1213,34 +1215,20 @@ var
       instruction is read by nothing else, so its slot is never needed. A
       fused compare keeps its compare-branch plan (AnalyzeFusion runs next). }
     SetLength(X64ImmediateValues, Length(AFn^.Code));
-    { A static-cache function holding cached v128 ops (AnalyzeX64VecCache's
-      predicate) keeps its previous scalar emission: on the measuring host
-      (Zen 5) shortening the scalar half of an xmm-chain-bound loop made
-      the simd workload ~20% slower, reproduced in isolated assembly where
-      ten one-byte NOPs restore the speed; a layout/scheduling effect, not
-      a cost of the immediate forms. X64CachedConst applies the same fence. }
-    if UseStaticCache then
-      for K := 0 to High(PlannedCode) do
-        if not SkipPlanned[K] and X64VecCacheOp(PlannedCode[K].Op) then
-          Exit;
+    { A static-cache function holding cached v128 ops keeps its previous
+      scalar emission (X64CodeHasVecCacheOp explains why). }
+    if UseStaticCache and X64CodeHasVecCacheOp(PlannedCode, SkipPlanned) then
+      Exit;
     for K := 0 to High(PlannedCode) - 1 do
-      if (PlannedCode[K].Op in [iroI32Const, iroI64Const]) and
-        (PlannedCode[K + 1].B = PlannedCode[K].Dest) and
+      if not SkipPlanned[K] and not SkipPlanned[K + 1] and
+        not Targets[K] and not Targets[K + 1] and
+        X64ImmediateOperand(PlannedCode[K], PlannedCode[K + 1], Value64) and
         (RegisterUseCount(PlannedCode[K].Dest) = 1) and
-        not IsVisibleFrameReg(PlannedCode[K].Dest) and
-        not SkipPlanned[K] and not SkipPlanned[K + 1] and
-        not Targets[K] and not Targets[K + 1] then
+        not IsVisibleFrameReg(PlannedCode[K].Dest) then
       begin
-        if PlannedCode[K].Op = iroI32Const then
-          Value64 := Int32(UInt32(PlannedCode[K].Imm and $FFFFFFFF))
-        else
-          Value64 := PlannedCode[K].Imm;
-        if X64CanUseImmediate(PlannedCode[K + 1].Op, Value64) then
-        begin
-          SkipPlanned[K] := True;
-          ImmediateFusion[K + 1] := True;
-          X64ImmediateValues[K + 1] := Value64;
-        end;
+        SkipPlanned[K] := True;
+        ImmediateFusion[K + 1] := True;
+        X64ImmediateValues[K + 1] := Value64;
       end;
     {$ENDIF}
   end;
