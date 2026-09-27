@@ -5211,11 +5211,13 @@ var
   Bytes: TWasmBytes;
   I: Integer;
 
+  { check_* traps unless the result is the model's, so a clean compiled
+    run proves the value and DiffFresh proves the interpreter agrees. }
   procedure CheckRun(const AName: string; const AArgs: array of TWasmValue);
   begin
-    Expect<string>(TrapMessageOf(Bytes, 'check_' + AName, AArgs)).ToBe('');
     Expect<Boolean>(DiffFresh(Bytes, 'check_' + AName, AArgs))
       .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<Boolean>(FDiffJitOut.Trapped).ToBe(False);
   end;
 
 begin

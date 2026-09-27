@@ -502,6 +502,7 @@ var
   AllocatedSlots: array[0..2] of UInt32;
   SlotScores: array of UInt32;
   SlotUseCounts: array of UInt32;
+  RegUseCounts: array of UInt32;
   VisibleSlots: array of Boolean;
   Fusion: array of Integer;
   PlannedCode: TWasmIrCode;
@@ -624,40 +625,50 @@ var
   { Every read of AReg in the function: source-register operands, A-side aux
     source lists (call arguments), store values in Dest, and register Imm
     operands. The single use-count for fold and forwarding decisions; an
-    incomplete counter once let a local.tee'd call argument be folded away. }
+    incomplete counter once let a local.tee'd call argument be folded away.
+    The canonical code never changes during a compile, so every register's
+    count is taken in one pass on first use (validated operands all lie
+    below RegisterCount); per-query scans made fusion planning quadratic. }
   function RegisterUseCount(const AReg: UInt32): UInt32;
   var
     Info: TWasmIrOpInfo;
     K, N: Integer;
 
-    procedure CountIfSame(const ASource: UInt32);
+    procedure CountRead(const ASource: UInt32);
     begin
-      if ASource = AReg then
-        Inc(Result);
+      if ASource < UInt32(Length(RegUseCounts)) then
+        Inc(RegUseCounts[ASource]);
     end;
 
   begin
-    Result := 0;
-    for K := 0 to High(AFn^.Code) do
+    if Length(RegUseCounts) = 0 then
     begin
-      Info := IR_OP_INFO[AFn^.Code[K].Op];
-      if Info.DestKind = ifkSrcReg then
-        CountIfSame(AFn^.Code[K].Dest);
-      if Info.AKind = ifkSrcReg then
-        CountIfSame(AFn^.Code[K].A)
-      else if Info.AKind = ifkAuxIndex then
-        { Every A aux block is a source-register list. B aux blocks carry
-          call results or control targets; Imm aux blocks carry literals,
-          masks, or memory arguments. }
-        for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
-          AFn^.Code[K].A)) - 1 do
-          CountIfSame(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
-            UInt32(N)));
-      if Info.BKind = ifkSrcReg then
-        CountIfSame(AFn^.Code[K].B);
-      if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
-        CountIfSame(UInt32(AFn^.Code[K].Imm));
+      SetLength(RegUseCounts, AFn^.RegisterCount + 1);
+      for K := 0 to High(AFn^.Code) do
+      begin
+        Info := IR_OP_INFO[AFn^.Code[K].Op];
+        if Info.DestKind = ifkSrcReg then
+          CountRead(AFn^.Code[K].Dest);
+        if Info.AKind = ifkSrcReg then
+          CountRead(AFn^.Code[K].A)
+        else if Info.AKind = ifkAuxIndex then
+          { Every A aux block is a source-register list. B aux blocks carry
+            call results or control targets; Imm aux blocks carry literals,
+            masks, or memory arguments. }
+          for N := 0 to Integer(IrAuxBlockCount(AFn^.AuxU32,
+            AFn^.Code[K].A)) - 1 do
+            CountRead(IrAuxBlockItem(AFn^.AuxU32, AFn^.Code[K].A,
+              UInt32(N)));
+        if Info.BKind = ifkSrcReg then
+          CountRead(AFn^.Code[K].B);
+        if Info.ImmKind in [ifkSrcReg, ifkSrcRegImm] then
+          CountRead(UInt32(AFn^.Code[K].Imm));
+      end;
     end;
+    if AReg < UInt32(Length(RegUseCounts)) then
+      Result := RegUseCounts[AReg]
+    else
+      Result := 0;
   end;
 
   function IsVisibleFrameReg(const AReg: UInt32): Boolean; forward;
