@@ -5287,23 +5287,25 @@ begin
     '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
     '(local.get $acc)) ' +
     '(func (export "store") (param $n i32) (result i32) ' +
-    '(local $i i32) (local $address i32) ' +
+    '(local $i i32) (local $address i32) (local $k i32) ' +
+    '(local.set $k (i32.const 3)) ' +
     '(loop $l ' +
     '(local.set $address (i32.shl (i32.and (local.get $i) ' +
     '(i32.const 63)) (i32.const 2))) ' +
     '(i32.store (local.get $address) (local.get $i)) ' +
     '(local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
     '(br_if $l (i32.lt_u (local.get $i) (local.get $n)))) ' +
-    '(i32.add (local.get $address) (i32.load (i32.const 8)))))');
+    '(i32.add (i32.add (local.get $address) (i32.load (i32.const 8))) ' +
+    '(i32.mul (local.get $k) (local.get $k)))))');
   { load(200): the fill writes (k*17) xor 12345 at word k < 64; the sum
     loop reads word i mod 64. store(130): word 2 last holds 130 - 64 = 66,
-    and address is 4 * (129 mod 64) = 4. }
+    address is 4 * (129 mod 64) = 4, and k * k = 9. }
   Expect<Boolean>(DiffFresh(FBytes, 'load', [MakeValueI32(200)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
   Expect<UInt64>(FDiffJitOut.Bits).ToBe(OracleFillSum(200));
   Expect<Boolean>(DiffFresh(FBytes, 'store', [MakeValueI32(130)]))
     .ToBe(JIT_BACKEND_AVAILABLE);
-  Expect<UInt64>(FDiffJitOut.Bits).ToBe(4 + 66);
+  Expect<UInt64>(FDiffJitOut.Bits).ToBe(4 + 66 + 9);
   {$IFDEF WASM_JIT_X64}
   DecodeModule(FBytes, FModule);
   FIr := ValidateModule(FModule, FBytes);
@@ -5372,6 +5374,17 @@ begin
     Expect<Integer>(Loads).ToBe(0);
     Expect<Integer>(FusedAdds).ToBe(1 - F);
     Expect<Integer>(Stores).ToBe(F);
+    { store's $k is never read in a loop, so it gets no fixed host: with
+      three loop locals, rdx stays unused (no mov rdx, [rbx+disp8] 48 8B 53
+      at entry). }
+    if F = 1 then
+    begin
+      J := 0;
+      for I := 0 to Length(Code) - 3 do
+        if (Code[I] = $48) and (Code[I + 1] = $8B) and (Code[I + 2] = $53) then
+          Inc(J);
+      Expect<Integer>(J).ToBe(0);
+    end;
   end;
   Expect<Integer>(Bodies).ToBe(2);
   {$ENDIF}
