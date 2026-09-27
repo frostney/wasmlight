@@ -44,7 +44,9 @@ type
   the OS rather than taken from argv[0] (FPC's Darwin ParamStr(0) is raw
   argv[0]; its Linux one is a 255-byte shortstring). Linux reads
   /proc/self/exe; Darwin uses _NSGetExecutablePath + realpath; elsewhere
-  ExpandFileName(ParamStr(0)). }
+  ExpandFileName(ParamStr(0)) when argv[0] has a directory part. Empty when
+  none of those names the executable, so callers fail closed rather than
+  fall back to the CWD. }
 function NativeExecutablePath: string;
 function NativeExecutableDirectory: string;
 function NativeLibraryFileName(const ABareName: string): string;
@@ -140,7 +142,11 @@ begin
   Result := string(FpReadLink('/proc/self/exe'));
   {$ENDIF}
   {$ENDIF}
-  if Result = '' then
+  { Fallback: argv[0] only when it names a directory. A bare name (a PATH
+    lookup) would expand against the CWD, which must never stand in for
+    the executable directory; leave the result empty so callers fail
+    closed. }
+  if (Result = '') and (ExtractFilePath(ParamStr(0)) <> '') then
     Result := ParamStr(0);
   if Result <> '' then
     Result := ExpandFileName(Result);
