@@ -2005,6 +2005,9 @@ var
     {$IFDEF WASM_JIT_ARM64}
     HasInlineCall: Boolean;
     {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    HasNativeLeafCall: Boolean;
+    {$ENDIF}
   begin
     UseStaticCache := False;
     {$IFDEF WASM_JIT_ARM64}
@@ -2019,12 +2022,26 @@ var
     {$IFDEF WASM_JIT_ARM64}
     HasInlineCall := False;
     {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    HasNativeLeafCall := False;
+    {$ENDIF}
     for K := 0 to High(AFn^.Code) do
     begin
       {$IFDEF WASM_JIT_ARM64}
       if (AFn^.Code[K].Op = iroCall) and
         (Length(InlineBodies[K]) <> 0) then
         HasInlineCall := True
+      else
+      {$ENDIF}
+      {$IFDEF WASM_JIT_X64}
+      { A direct call to a proven native scalar leaf clobbers only rax-rdx
+        and r8-r11 and reads only its arguments
+        (X64EmitNativeLeafCallCached). }
+      if (AFn^.Code[K].Op = iroCall) and
+        NativeScalarLeafTarget(UInt32(AFn^.Code[K].Imm)) and
+        (IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].A) in [1, 2]) and
+        (IrAuxBlockCount(AFn^.AuxU32, AFn^.Code[K].B) = 1) then
+        HasNativeLeafCall := True
       else
       {$ENDIF}
         Eligible := Eligible and StaticCacheOp(AFn^.Code[K].Op);
@@ -2036,6 +2053,19 @@ var
     {$IFDEF WASM_JIT_ARM64}
     if HasInlineCall then
     begin
+      Eligible := Eligible and not UsePinnedMemory and not HasHandlers;
+      for K := 0 to High(AFn^.RegTypes) do
+        Eligible := Eligible and (AFn^.RegTypes[K].Kind = wvkNum) and
+          ((AFn^.RegTypes[K].Num = wntI32) or
+          (AFn^.RegTypes[K].Num = wntI64));
+    end;
+    {$ENDIF}
+    {$IFDEF WASM_JIT_X64}
+    if HasNativeLeafCall then
+    begin
+      { Every value is an i32/i64 scalar (no reference a fallback helper
+        call could need rooted, no v128 in a caller-saved xmm host), and no
+        memory is pinned across the call. }
       Eligible := Eligible and not UsePinnedMemory and not HasHandlers;
       for K := 0 to High(AFn^.RegTypes) do
         Eligible := Eligible and (AFn^.RegTypes[K].Kind = wvkNum) and

@@ -68,6 +68,7 @@ type
     procedure TestEpochCheckCoreBytes;
     procedure TestNativeSelfCallBytes;
     procedure TestNativeCoreWriteBack;
+    procedure TestNativeLeafCallStaticMoves;
     procedure TestRuntimeCallMarshalBytes;
     procedure TestPositionIndependentSequences;
     procedure TestSlotOffset;
@@ -808,6 +809,95 @@ begin
   finally
     Buf.Free;
   end;
+end;
+
+procedure TX64Tests.TestNativeLeafCallStaticMoves;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0 .. 7] of UInt32;
+  Visible: array[0 .. 7] of Boolean;
+
+  { Emit a static-allocation direct call to a native leaf with arguments
+    AArg0/AArg1 and result ARes (statics: slot 0 in r8, slot 1 in r9) and
+    return the bytes around the call: APre before `xor ecx, ecx ; call rdx`,
+    APost after it up to the cold-path jump. }
+  procedure EmitCall(const AArg0, AArg1, ARes: UInt32;
+    out APre, APost: TWasmBytes);
+  var
+    I, Site, Jmp: Integer;
+  begin
+    SetLength(Aux, 5);
+    Aux[0] := 2;
+    Aux[1] := AArg0;
+    Aux[2] := AArg1;
+    Aux[3] := 1;
+    Aux[4] := ARes;
+    FillChar(UseCounts, SizeOf(UseCounts), 0);
+    FillChar(Visible, SizeOf(Visible), 0);
+    Visible[0] := True;
+    Visible[1] := True;
+    Buf := TWasmCodeBuffer.Create;
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 8);
+    Expect<Boolean>(X64EmitOpCached(Buf, MakeIrInstr(iroCall, 0, 0, 3, 1),
+      Aux, 0, False, False, False, False, 0, 0, 0, 0, 0, True, True,
+      Cache, nil, nil, nil)).ToBe(True);
+    Site := -1;
+    for I := 0 to Buf.Size - 4 do
+      if (Buf.ByteAt(I) = $31) and (Buf.ByteAt(I + 1) = $C9) and
+        (Buf.ByteAt(I + 2) = $FF) and (Buf.ByteAt(I + 3) = $D2) then
+        Site := I;
+    Expect<Boolean>(Site > 12).ToBe(True);
+    Jmp := Site + 4;
+    while (Jmp < Buf.Size) and (Buf.ByteAt(Jmp) <> $E9) do
+      Inc(Jmp);
+    SetLength(APre, 9);
+    for I := 0 to 8 do
+      APre[I] := Buf.ByteAt(Site - 9 + I);
+    SetLength(APost, Jmp - Site - 4);
+    for I := 0 to High(APost) do
+      APost[I] := Buf.ByteAt(Site + 4 + I);
+    Buf.Free;
+  end;
+
+  procedure CheckBytes(const AActual: TWasmBytes;
+    const AExpected: array of Byte; const AFrom: Integer);
+  var
+    I: Integer;
+  begin
+    Expect<Integer>(Length(AActual) - AFrom).ToBe(Length(AExpected));
+    for I := 0 to High(AExpected) do
+      if AFrom + I < Length(AActual) then
+        Expect<Byte>(AActual[AFrom + I]).ToBe(AExpected[I]);
+  end;
+
+var
+  Pre, Post: TWasmBytes;
+begin
+  { Swapped statics: the parallel move goes through rax:
+    mov rax, r8 ; mov r8, r9 ; mov r9, rax. The result (slot 2) is adopted
+    from r8 into r10 before both statics reload: mov r10, r8 ;
+    mov r8, [rbx] ; mov r9, [rbx+8]. }
+  EmitCall(1, 0, 2, Pre, Post);
+  CheckBytes(Pre, [$4C, $89, $C0, $4D, $89, $C8, $49, $89, $C1], 0);
+  CheckBytes(Post, [$4D, $89, $C2, $4C, $8B, $03, $4C, $8B, $4B, $08], 0);
+
+  { r8 is the second argument's source: r9 is filled first (mov r9, r8)
+    and then r8 from the first argument's slot 3 (not resident):
+    mov r8, [rbx+24]. A result into static slot 1 moves into r9 and only
+    r8 reloads: mov r9, r8 ; mov r8, [rbx]. }
+  EmitCall(3, 0, 1, Pre, Post);
+  CheckBytes(Pre, [$4D, $89, $C1, $4C, $8B, $43, $18], 2);
+  CheckBytes(Post, [$4D, $89, $C1, $4C, $8B, $03], 0);
+
+  { The same static twice: r8 already holds argument 0 (no move), then
+    mov r9, r8. A result into static slot 0 stays in r8 and only r9
+    reloads: mov r9, [rbx+8]. }
+  EmitCall(0, 0, 0, Pre, Post);
+  CheckBytes(Pre, [$4D, $89, $C1], 6);
+  CheckBytes(Post, [$4C, $8B, $4B, $08], 0);
 end;
 
 procedure TX64Tests.TestRuntimeCallMarshalBytes;
@@ -2081,6 +2171,8 @@ begin
     TestNativeSelfCallBytes);
   Test('the native core defers parameter and temporary stores',
     TestNativeCoreWriteBack);
+  Test('a static caller moves leaf arguments and adopts the result',
+    TestNativeLeafCallStaticMoves);
   Test('the runtime/vec helper-call marshaling emits the asserted bytes',
     TestRuntimeCallMarshalBytes);
   Test('helper calls and the IR pointer are position-independent',

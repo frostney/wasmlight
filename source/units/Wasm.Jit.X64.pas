@@ -662,6 +662,9 @@ function X64CachedOperand(const ABuf: TWasmCodeBuffer;
   out AProtectMoved: Boolean): Byte; forward;
 procedure X64PrepareNativeSelfCall(const ABuf: TWasmCodeBuffer;
   var ACache: TX64RegCache); forward;
+procedure X64EmitNativeLeafCallCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; var ACache: TX64RegCache); forward;
 procedure X64CachedFlagResult(const ABuf: TWasmCodeBuffer;
   const AOpcode: Byte; const AWide: Boolean; const ACc, AHostA,
   AHostB: Byte; const ADest: UInt32; var ACache: TX64RegCache); forward;
@@ -1041,8 +1044,20 @@ begin
         X64CachedStore(ABuf, ACache, X64_R8,
           IrAuxBlockItem(AAux, AIns.B, 0));
       end
+      else if ACache.StaticAllocation and AUseNativeScalarCall and
+        (AIns.Op = iroCall) and
+        (IrAuxBlockCount(AAux, AIns.A) in [1, 2]) and
+        (IrAuxBlockCount(AAux, AIns.B) = 1) then
+        { The driver admits a static allocation around a direct call only
+          for this proven native-leaf shape (AnalyzeStaticCache). }
+        X64EmitNativeLeafCallCached(ABuf, AIns, AAux, AInsIndex, ACache)
       else
       begin
+        if ACache.StaticAllocation then
+          { A generic call clobbers the static hosts; AnalyzeStaticCache
+            admits no call outside the two native shapes above. }
+          raise EWasmInternal.Create(
+            'internal: x64 static allocation across a generic call');
         X64FlushDynamicRegCache(ABuf, ACache);
         X64InvalidateRegCache(ACache);
         Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
@@ -4762,64 +4777,69 @@ begin
   end;
 end;
 
+{ Resolve a native scalar leaf's lightweight entry for a direct call and
+  apply JitEnterResolvedFrame's two exhaustion predicates, before any state
+  changes: caller funcidx -> store address through the live caller
+  activation's FuncAddrs (Acts[Depth-1]) -> the TWasmFuncInst in
+  Store.Funcs (reloaded per call: a host may grow it) -> its
+  CompiledNativeScalarEntry, nil (not compiled) jumping to AFallback. Leaves
+  the entry in rdx and clobbers only rax, rcx, rsi and rdi besides, so r8-r11
+  still hold their cache values on both exits. }
+procedure EmitNativeScalarLeafResolve(const ABuf: TWasmCodeBuffer;
+  const AFuncIdx: UInt32; const AFallback, AExhausted: TWasmJitLabel);
+var
+  FO: TWasmJitFrameOffsets;
+  FuncLayout: TWasmFuncInst;
+  FuncNativeEntry, MetaRegisterCount: Int32;
+begin
+  FO := WasmJitFrameOffsets;
+  FuncNativeEntry := Int32(
+    PtrUInt(@FuncLayout.CompiledNativeScalarEntry) - PtrUInt(@FuncLayout));
+  MetaRegisterCount := Int32(
+    PtrUInt(@FuncLayout.DirectMeta.RegisterCount) - PtrUInt(@FuncLayout));
+
+  { rax := context; rsi := Depth; rcx := @Acts[Depth] (the -stride folds
+    into the FuncAddrs displacement); ecx := FuncAddrs[funcidx]. }
+  X64EmitLoadMem64(ABuf, X64_RAX, X64_RSP, 8);
+  X64EmitLoadMem64(ABuf, X64_RSI, X64_RAX, Int32(FO.CtxDepth));
+  X64EmitImulImm32(ABuf, X64_RCX, X64_RSI, UInt32(FO.ActStride));
+  X64EmitAluRegMem(ABuf, $03, X64_RCX, X64_RAX, Int32(FO.CtxActs));
+  X64EmitLoadMem64(ABuf, X64_RCX, X64_RCX,
+    Int32(FO.ActFuncAddrs) - Int32(FO.ActStride));
+  X64EmitLoadMem32(ABuf, X64_RCX, X64_RCX, Int32(AFuncIdx * 4));
+  { rcx := @Store.Funcs[addr]; rdx := its lightweight entry. }
+  X64EmitImulImm32(ABuf, X64_RCX, X64_RCX, UInt32(SizeOf(TWasmFuncInst)));
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX, Int32(FO.CtxFuncsSlot));
+  X64EmitAluRegMem(ABuf, $03, X64_RCX, X64_RDX, 0);
+  X64EmitLoadMem64(ABuf, X64_RDX, X64_RCX, FuncNativeEntry);
+  X64EmitAluRegReg(ABuf, $85, True, X64_RDX, X64_RDX);
+  X64EmitJccTo(ABuf, X64_CC_E, UInt32(AFallback));
+
+  { Depth >= DepthCap, or ValueTop + RegisterCount > ValueCap: exhausted. }
+  X64EmitAluRegMem(ABuf, $3B, X64_RSI, X64_RAX, Int32(FO.CtxDepthCap));
+  X64EmitJccTo(ABuf, X64_CC_AE, UInt32(AExhausted));
+  X64EmitLoadMem64(ABuf, X64_RSI, X64_RAX, Int32(FO.CtxValueTop));
+  X64EmitLoadMem32(ABuf, X64_RDI, X64_RCX, MetaRegisterCount);
+  X64EmitAluRegReg(ABuf, $01, True, X64_RSI, X64_RDI);
+  X64EmitAluRegMem(ABuf, $3B, X64_RSI, X64_RAX, Int32(FO.CtxValueCap));
+  X64EmitJccTo(ABuf, X64_CC_A, UInt32(AExhausted));
+end;
+
 procedure EmitNativeScalarLeafDirectCall(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   const AArgN: UInt32; const AFallback, ADone: TWasmJitLabel);
 var
-  FO: TWasmJitFrameOffsets;
-  FuncLayout: TWasmFuncInst;
-  FuncNativeEntry, MetaRegisterCount: UInt32;
   Exhausted: TWasmJitLabel;
 begin
-  FO := WasmJitFrameOffsets;
-  FuncNativeEntry := UInt32(
-    PtrUInt(@FuncLayout.CompiledNativeScalarEntry) - PtrUInt(@FuncLayout));
-  MetaRegisterCount := UInt32(
-    PtrUInt(@FuncLayout.DirectMeta.RegisterCount) - PtrUInt(@FuncLayout));
   Exhausted := ABuf.NewLabel;
-
-  { Resolve caller funcidx through the live activation address map. }
-  X64EmitLoadMem64(ABuf, X64_RAX, X64_RSP, 8);       { context }
-  X64EmitLoadMem64(ABuf, X64_RCX, X64_RAX, Int32(FO.CtxDepth));
-  X64EmitMovRegImm32(ABuf, X64_RSI, 1);
-  X64EmitAluRegReg(ABuf, $29, True, X64_RCX, X64_RSI);
-  X64EmitMovRegImm64(ABuf, X64_RSI, FO.ActStride);
-  X64EmitImul(ABuf, True, X64_RCX, X64_RSI);
-  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX, Int32(FO.CtxActs));
-  X64EmitAluRegReg(ABuf, $01, True, X64_RDX, X64_RCX);
-  X64EmitLoadMem64(ABuf, X64_RDX, X64_RDX, Int32(FO.ActFuncAddrs));
-  X64EmitLoadMem32(ABuf, X64_RCX, X64_RDX,
-    Int32(UInt32(AIns.Imm) * 4));
-  X64EmitLoadMem64(ABuf, X64_RDX, X64_RAX, Int32(FO.CtxFuncsSlot));
-  X64EmitLoadMem64(ABuf, X64_RDX, X64_RDX, 0);
-  X64EmitMovRegImm64(ABuf, X64_RSI, SizeOf(TWasmFuncInst));
-  X64EmitImul(ABuf, True, X64_RCX, X64_RSI);
-  X64EmitAluRegReg(ABuf, $01, True, X64_RDX, X64_RCX);
-  X64EmitLoadMem64(ABuf, X64_RAX, X64_RDX, Int32(FuncNativeEntry));
-  X64EmitAluRegReg(ABuf, $85, True, X64_RAX, X64_RAX);
-  X64EmitJccTo(ABuf, X64_CC_E, UInt32(AFallback));
-
-  { Match JitEnterResolvedFrame's depth and value-slot predicates before the
-    lightweight call mutates native stack state. }
-  X64EmitLoadMem64(ABuf, X64_RCX, X64_RSP, 8);
-  X64EmitLoadMem64(ABuf, X64_RSI, X64_RCX, Int32(FO.CtxDepth));
-  X64EmitLoadMem64(ABuf, X64_RDI, X64_RCX, Int32(FO.CtxDepthCap));
-  X64EmitAluRegReg(ABuf, $39, True, X64_RSI, X64_RDI);
-  X64EmitJccTo(ABuf, X64_CC_AE, UInt32(Exhausted));
-  X64EmitLoadMem64(ABuf, X64_RSI, X64_RCX, Int32(FO.CtxValueTop));
-  X64EmitLoadMem32(ABuf, X64_RDI, X64_RDX, Int32(MetaRegisterCount));
-  X64EmitAluRegReg(ABuf, $01, True, X64_RSI, X64_RDI);
-  X64EmitLoadMem64(ABuf, X64_RDI, X64_RCX, Int32(FO.CtxValueCap));
-  X64EmitAluRegReg(ABuf, $39, True, X64_RSI, X64_RDI);
-  X64EmitJccTo(ABuf, X64_CC_A, UInt32(Exhausted));
-
+  EmitNativeScalarLeafResolve(ABuf, UInt32(AIns.Imm), AFallback, Exhausted);
   X64EmitLoadSlot64(ABuf, X64_R8,
     IrAuxBlockItem(AAux, AIns.A, 0));
   if AArgN = 2 then
     X64EmitLoadSlot64(ABuf, X64_R9,
       IrAuxBlockItem(AAux, AIns.A, 1));
-  X64EmitMovRegImm32(ABuf, X64_RCX, 0);              { native-leaf selector }
-  X64EmitCallReg(ABuf, X64_RAX);
+  X64EmitAluRegReg(ABuf, $31, False, X64_RCX, X64_RCX); { native-leaf selector }
+  X64EmitCallReg(ABuf, X64_RDX);
   X64EmitStoreSlot64(ABuf, X64_R8,
     IrAuxBlockItem(AAux, AIns.B, 0));
   X64EmitJmpTo(ABuf, UInt32(ADone));
@@ -5123,6 +5143,140 @@ begin
   X64EmitAddRsp(ABuf, Int32(FrameBytes));
   if UseNativeLeaf or UseGenericDirect then
     ABuf.BindLabel(NativeDone);
+end;
+
+{ A direct call to a native scalar leaf from a static-allocation caller
+  (the driver admits only i32/i64 frames whose calls all take this shape).
+  The leaf clobbers exactly rax, rcx, rdx and r8-r11 (its core's cache
+  hosts and template scratch); the resolution adds rsi/rdi. So:
+
+    1. the static hosts r8/r9 are stored (the call clobbers them; they are
+       reloaded afterwards), each argument's read is consumed, and the
+       dynamic pair is written back by the ordinary liveness rule — every
+       value a later read, local, result, or loop-carried use can observe;
+    2. EmitNativeScalarLeafResolve (touching only rax-rdi) resolves the
+       entry and applies the exhaustion predicates; the arguments move from
+       their hosts (or canonical slots) into r8/r9 and the leaf is called;
+    3. the fallback (no lightweight entry yet) first stores every argument
+       still held only in a dynamic host — the generic path marshals from
+       the slots, and r8-r11 are intact there — runs the unchanged helper
+       call, and rejoins with the result loaded into r8;
+    4. at the join the result is adopted from r8 into its destination host
+       and the other static hosts are reloaded from their slots.
+
+  An exhausted call traps to the trampoline, which reads no slot. }
+procedure X64EmitNativeLeafCallCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AInsIndex: UInt32; var ACache: TX64RegCache);
+var
+  ArgN, I: Integer;
+  ArgSlots: array[0..1] of UInt32;
+  ArgHosts: array[0..1] of Byte;
+  ResultSlot: UInt32;
+  Fallback, Exhausted, PostCall, Done: TWasmJitLabel;
+  Index: Integer;
+
+  function Resident(const ASlot: UInt32; out AHost: Byte): Boolean;
+  var
+    N: Integer;
+  begin
+    for N := 0 to High(ACache.Entries) do
+      if ACache.Entries[N].Valid and (ACache.Entries[N].Slot = ASlot) then
+      begin
+        AHost := X64CacheHostReg(N);
+        Exit(True);
+      end;
+    AHost := $FF;
+    Result := False;
+  end;
+
+  procedure MoveArg(const ADest: Byte; const AIndex: Integer);
+  begin
+    if ArgHosts[AIndex] = $FF then
+      X64EmitLoadSlot64(ABuf, ADest, ArgSlots[AIndex])
+    else if ArgHosts[AIndex] <> ADest then
+      X64EmitMovRegReg(ABuf, ADest, ArgHosts[AIndex]);
+  end;
+
+begin
+  ArgN := Integer(IrAuxBlockCount(AAux, AIns.A));
+  ResultSlot := IrAuxBlockItem(AAux, AIns.B, 0);
+  for I := 0 to ArgN - 1 do
+  begin
+    ArgSlots[I] := IrAuxBlockItem(AAux, AIns.A, UInt32(I));
+    Resident(ArgSlots[I], ArgHosts[I]);
+  end;
+
+  { 1. }
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid then
+      X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+  for I := 0 to ArgN - 1 do
+    X64ConsumeUse(ACache, ArgSlots[I]);
+  for I := 2 to 3 do
+    X64SpillCacheEntry(ABuf, ACache, I);
+
+  { 2. }
+  Fallback := ABuf.NewLabel;
+  Exhausted := ABuf.NewLabel;
+  PostCall := ABuf.NewLabel;
+  Done := ABuf.NewLabel;
+  EmitNativeScalarLeafResolve(ABuf, UInt32(AIns.Imm), Fallback, Exhausted);
+  if ArgN = 1 then
+    MoveArg(X64_R8, 0)
+  else if (ArgHosts[0] = X64_R9) and (ArgHosts[1] = X64_R8) then
+  begin
+    X64EmitMovRegReg(ABuf, X64_RAX, X64_R8);
+    X64EmitMovRegReg(ABuf, X64_R8, X64_R9);
+    X64EmitMovRegReg(ABuf, X64_R9, X64_RAX);
+  end
+  else if ArgHosts[1] = X64_R8 then
+  begin
+    MoveArg(X64_R9, 1);
+    MoveArg(X64_R8, 0);
+  end
+  else
+  begin
+    MoveArg(X64_R8, 0);
+    MoveArg(X64_R9, 1);
+  end;
+  X64EmitAluRegReg(ABuf, $31, False, X64_RCX, X64_RCX); { native-leaf selector }
+  X64EmitCallReg(ABuf, X64_RDX);
+  ABuf.BindLabel(PostCall);
+
+  { 4. Both paths arrive with the result in r8 and every cache host but the
+    statics' slots dead. }
+  for I := 2 to 3 do
+  begin
+    ACache.Entries[I].Valid := False;
+    ACache.Entries[I].Dirty := False;
+  end;
+  ACache.Next := 0;
+  Index := X64CachedDestBegin(ABuf, ACache, ResultSlot);
+  if X64CacheHostReg(Index) <> X64_R8 then
+    X64EmitMovRegReg(ABuf, X64CacheHostReg(Index), X64_R8);
+  X64CachedDestCommit(ABuf, ACache, Index, ResultSlot, False);
+  for I := 0 to 1 do
+    if ACache.Entries[I].Valid and (I <> Index) then
+      X64EmitLoadSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+  { The cold paths go after the straight line; the caller's next code must
+    not fall into them. }
+  X64EmitJmpTo(ABuf, UInt32(Done));
+
+  { 3. }
+  ABuf.BindLabel(Fallback);
+  for I := 0 to ArgN - 1 do
+    if (ArgHosts[I] <> $FF) and (ArgHosts[I] <> X64_R8) and
+      (ArgHosts[I] <> X64_R9) then
+      X64EmitStoreSlot64(ABuf, ArgHosts[I], ArgSlots[I]);
+  EmitCall(ABuf, AIns, AAux, AInsIndex, False, nil);
+  X64EmitLoadSlot64(ABuf, X64_R8, ResultSlot);
+  X64EmitJmpTo(ABuf, UInt32(PostCall));
+
+  ABuf.BindLabel(Exhausted);
+  X64EmitMovRegImm32(ABuf, X64_ARG0, UInt32(Ord(wtkStackExhausted)));
+  X64EmitCallHelper(ABuf, aohTrapKind);
+  ABuf.BindLabel(Done);
 end;
 
 procedure EmitReturnCall(const ABuf: TWasmCodeBuffer; const AIns: TWasmIrInstr;

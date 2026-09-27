@@ -653,6 +653,104 @@ begin
     ' (i32.const 1))) ');
 end;
 
+{ Loop callers of native scalar leaves, which x64 compiles with a static
+  allocation kept across each call: the loop-carried accumulator as a leaf
+  argument ($ra), swapped arguments ($rb), one value passed twice ($rc), a
+  call result stored straight into the loop counter while an earlier read
+  of the accumulator stays live across the next call ($rd), expression
+  arguments and two calls per iteration including a one-parameter leaf
+  ($re), and i64 ($rf). `check` holds each to constants from an
+  independent Python model and traps `unreachable` on a mismatch. }
+function NativeLeafCallerModuleBytes: TWasmBytes;
+begin
+  Result := AssembleWatText(
+    '(module ' +
+    '(func $mix (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.add (i32.mul (i32.xor (local.get $a) (local.get $b)) (i32.const 1664525)) (i32.const 1013904223))) ' +
+    '(func $sub2 (param $a i32) (param $b i32) (result i32) ' +
+    ' (i32.sub (local.get $a) (i32.mul (local.get $b) (i32.const 3)))) ' +
+    '(func $inc (param $a i32) (result i32) (i32.add (local.get $a) (i32.const 1))) ' +
+    '(func $mix64 (param $a i64) (param $b i64) (result i64) ' +
+    ' (i64.add (i64.mul (i64.xor (local.get $a) (local.get $b)) (i64.const 0x9E3779B97F4A7C15)) ' +
+    '  (i64.shl (local.get $b) (i64.const 7)))) ' +
+    '(func $ra (export "ra") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 123456789)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (call $mix (local.get $acc) (local.get $i))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rb (export "rb") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 7)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (call $sub2 (local.get $i) (local.get $acc))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rc (export "rc") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 99)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (i32.add (call $mix (local.get $acc) (local.get $acc)) (local.get $i))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rd (export "rd") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 5)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (i32.add (local.get $acc) ' +
+    '    (block (result i32) ' +
+    '      (local.set $i (call $inc (local.get $i))) ' +
+    '      (call $sub2 (local.get $i) (local.get $acc))))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $re (export "re") (param $n i32) (result i32) (local $i i32) (local $acc i32) ' +
+    ' (local.set $acc (i32.const 1)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i32.ge_u (local.get $i) (local.get $n))) ' +
+    '  (local.set $acc (call $mix (i32.mul (local.get $acc) (i32.const 3)) (i32.add (local.get $i) (i32.const 7)))) ' +
+    '  (local.set $acc (i32.xor (local.get $acc) (call $inc (local.get $acc)))) ' +
+    '  (local.set $i (i32.add (local.get $i) (i32.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func $rf (export "rf") (param $n i32) (result i64) (local $i i64) (local $acc i64) ' +
+    ' (local.set $acc (i64.const 0x0123456789ABCDEF)) ' +
+    ' (block $d (loop $l ' +
+    '  (br_if $d (i64.ge_u (local.get $i) (i64.extend_i32_u (local.get $n)))) ' +
+    '  (local.set $acc (call $mix64 (local.get $acc) (local.get $i))) ' +
+    '  (local.set $i (i64.add (local.get $i) (i64.const 1))) ' +
+    '  (br $l))) ' +
+    ' (local.get $acc)) ' +
+    '(func (export "check") (result i32) ' +
+    ' (if (i32.ne (call $ra (i32.const 0)) (i32.const 123456789)) (then unreachable)) ' +
+    ' (if (i32.ne (call $ra (i32.const 1)) (i32.const 920370032)) (then unreachable)) ' +
+    ' (if (i32.ne (call $ra (i32.const 2)) (i32.const -531661284)) (then unreachable)) ' +
+    ' (if (i32.ne (call $ra (i32.const 57)) (i32.const 1051844512)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 0)) (i32.const 7)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 1)) (i32.const -21)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 2)) (i32.const 64)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rb (i32.const 57)) (i32.const -624708169)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 0)) (i32.const 99)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 1)) (i32.const 1013904223)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 2)) (i32.const 1013904224)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rc (i32.const 57)) (i32.const 1013904279)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 0)) (i32.const 5)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 1)) (i32.const -9)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 2)) (i32.const 20)) (then unreachable)) ' +
+    ' (if (i32.ne (call $rd (i32.const 57)) (i32.const 1908874373)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 0)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 1)) (i32.const 7)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 2)) (i32.const 1)) (then unreachable)) ' +
+    ' (if (i32.ne (call $re (i32.const 57)) (i32.const 7)) (then unreachable)) ' +
+    ' (if (i64.ne (call $rf (i32.const 0)) (i64.const 81985529216486895)) (then unreachable)) ' +
+    ' (if (i64.ne (call $rf (i32.const 1)) (i64.const 906252357051721883)) (then unreachable)) ' +
+    ' (if (i64.ne (call $rf (i32.const 33)) (i64.const 2523068962131947067)) (then unreachable)) ' +
+    ' (i32.const 1))) ');
+end;
+
 { $sq(n) = n*n + $sq(n-1), with the square computed BEFORE the self call so
   a dirty temporary must survive it; $deep never terminates, with the same
   live temporary, so it exhausts. sq(40) = 22140 (sum of squares). }
@@ -2303,6 +2401,7 @@ type
     procedure TestNativeCoreWriteBack;
     procedure TestNativeCoreDepthAndEpoch;
     procedure TestX64NativeCoreShape;
+    procedure TestNativeLeafStaticCaller;
     procedure TestInlineScalarBodyRelocation;
     procedure TestInlineScalarBodyEpochAndMemory;
     procedure TestInlineCallCacheAcrossBranches;
@@ -5930,6 +6029,87 @@ begin
   {$ENDIF}
 end;
 
+procedure TJitTests.TestNativeLeafStaticCaller;
+var
+  Bytes: TWasmBytes;
+  Module: TWasmModule;
+  Ir: TWasmIrModule;
+  RunRegisterCount: UInt32;
+  {$IFDEF WASM_JIT_X64}
+  Code: TWasmBytes;
+  EntryOffset: NativeUInt;
+  StagedCount: UInt32;
+  I, Calls, Stores: Integer;
+  {$ENDIF}
+begin
+  Bytes := NativeLeafCallerModuleBytes;
+  Module := TWasmModule.Create;
+  Ir := nil;
+  try
+    DecodeModule(Bytes, Module);
+    Ir := ValidateModule(Module, Bytes);
+    RunRegisterCount := Ir.Functions[4].RegisterCount;
+    {$IFDEF WASM_JIT_X64}
+    { $ra's call is the static-cache form: `xor ecx, ecx ; call rdx`, and
+      the result is adopted from r8 into a host (mov r10, r8) rather than
+      stored to its slot. Its only slot stores are the two statics before
+      the call, the cold fallback's argument and result stores, and the
+      exit's write-back of the statics and the result. }
+    Code := JitStageFunctionBytes(FStore, Ir, @Ir.Functions[4],
+      Ir.FuncImportCount + 4, EntryOffset, StagedCount);
+    Calls := 0;
+    Stores := 0;
+    for I := 0 to Length(Code) - 7 do
+    begin
+      if (Code[I] = $31) and (Code[I + 1] = $C9) and (Code[I + 2] = $FF) and
+        (Code[I + 3] = $D2) and (Code[I + 4] = $4D) and
+        (Code[I + 5] = $89) and (Code[I + 6] = $C2) then
+        Inc(Calls);
+      if (Code[I] in [$48, $4C]) and (Code[I + 1] = $89) and
+        ((Code[I + 2] and 7) = 3) and ((Code[I + 2] shr 6) <> 3) then
+        Inc(Stores);
+    end;
+    Expect<Integer>(Calls).ToBe(1);
+    Expect<Integer>(Stores).ToBe(8);
+    {$ENDIF}
+  finally
+    Ir.Free;
+    Module.Free;
+  end;
+
+  { Every leaf compiled: the lightweight path. }
+  CompileExports(['ra', 'rb', 'rc', 'rd', 're', 'rf', 'check']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  { Only the callers compiled: every call takes the cold fallback, which
+    must store the arguments held only in dynamic hosts and rejoin with the
+    result. }
+  CompileExports(['ra', 'rb', 'rc', 'rd', 're', 'rf']);
+  Expect<Boolean>(DiffModule(Bytes, 'check', [])).ToBe(JIT_BACKEND_AVAILABLE);
+  Expect<Boolean>(DiffModule(Bytes, 'rd', [MakeValueI32(57)]))
+    .ToBe(JIT_BACKEND_AVAILABLE);
+
+  { The lightweight call keeps the interpreter's depth and value-slot
+    boundaries from inside a static-cache loop. }
+  WasmInterpMaxDepth := 1;
+  try
+    CompileExports(['ra', 'rd']);
+    Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+    Expect<string>(TrapMessageOf(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe('call stack exhausted');
+  finally
+    WasmInterpMaxDepth := 256;
+  end;
+  WasmInterpValueSlots := RunRegisterCount;
+  try
+    CompileExports(['ra']);
+    Expect<Boolean>(DiffModule(Bytes, 'ra', [MakeValueI32(3)]))
+      .ToBe(JIT_BACKEND_AVAILABLE);
+  finally
+    WasmInterpValueSlots := 1 shl 16;
+  end;
+end;
+
 procedure TJitTests.TestDeepRecursionExhausts;
 var
   N: Integer;
@@ -8349,6 +8529,8 @@ begin
     TestNativeCoreDepthAndEpoch);
   Test('x64 native cores store only what a later read observes',
     TestX64NativeCoreShape);
+  Test('loop callers keep a static cache across native leaf calls',
+    TestNativeLeafStaticCaller);
   Test('inlined scalar body survives relocation without a compiled target',
     TestInlineScalarBodyRelocation);
   Test('inlined scalar calls preserve epoch and caller memory behavior',
