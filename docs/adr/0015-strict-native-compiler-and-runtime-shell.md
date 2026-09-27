@@ -59,7 +59,7 @@ parameter, and neither the Component Model nor wit-bindgen defines a
 native host ABI (probed 2026-09-27 against `WebAssembly/component-model`
 `d1daf82`, wasm-tools 1.259.0, wit-bindgen 0.62.0). Adopting it would still
 need a native-mapping sidecar, which is `.wlc` again, and would pull in the
-Canonical ABI [ADR-0014](./0014-the-component-model-is-deferred-to-post-v1.md)
+canonical ABI [ADR-0014](./0014-the-component-model-is-deferred-to-post-v1.md)
 defers.
 
 Consequences:
@@ -77,9 +77,9 @@ Consequences:
   are interface names such as `local:libc/libc`, which no `.wlc` class name
   can match, and they pass lists and strings as `(ptr, len)` pairs with
   results through a return pointer and the guest's `cabi_realloc`. If
-  connectors ever accept such guests, that marshalling is the Canonical
+  connectors ever accept such guests, that convention is the canonical
   ABI's flat lowering and must be the one implementation the Component
-  Model re-entry reuses, never a separate connector marshaller.
+  Model re-entry reuses, never a separate connector lowering.
 - `VISION.md`'s "not a WebAssembly compiler" fence still means wasmlight
   does not produce `.wasm` modules. Compiling a validated module to a native
   executable is planned product work, recorded here and sequenced in

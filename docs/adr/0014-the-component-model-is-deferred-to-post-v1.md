@@ -61,4 +61,5 @@ Consequences:
   ([ADR-0015](./0015-strict-native-compiler-and-runtime-shell.md)) are
   both guest-visible handle tables. The re-entry extends the connector
   tables rather than adding a second one, and any connector support for
-  WIT-built guests uses this ADR's canonical ABI, not its own lowering.
+  WIT-built guests uses the canonical ABI this ADR defers, not its own
+  lowering.
