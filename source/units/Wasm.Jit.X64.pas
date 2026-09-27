@@ -25,7 +25,9 @@
     r14 = the epoch captured at entry (Store.EpochSnapshot, §6)
   One conditional, caller-saved pin: in a base-pinned static-cache frame rsi
   holds the pinned memory's Base (X64_REG_MEMBASE). That frame calls no helper
-  after loading it except the non-returning trap entries.
+  after loading it except the non-returning trap entries. For the same reason
+  a static-cache frame may keep v128 values in the caller-saved xmm2-xmm15
+  across ops (TX64RegCache.VecCache); xmm0/xmm1 stay per-op scratch.
   Scratch is rax/rcx/rdx (caller-saved, dead at op boundaries); the SysV arg
   registers marshal helper arguments. The prologue pushes rbx/r12/r13/r14 and
   reserves one 8-byte alignment/memory slot; scalar-call-bearing functions use
@@ -112,6 +114,20 @@ type
     Slot: UInt32;
   end;
 
+  { One xmm host of the v128 cache (TX64RegCache.VecCache). Slot is the
+    value's low register-file slot. A Fixed entry keeps its slot for the
+    whole activation and is never a victim: a static v128 local or
+    parameter (loaded at entry; its slot is never written again, because no
+    exit reads a local) or, with Constant, a loop-invariant v128.const
+    seeded once at entry whose slot is never written at all. }
+  TX64VecCacheEntry = record
+    Valid: Boolean;
+    Dirty: Boolean;
+    Fixed: Boolean;
+    Constant: Boolean;
+    Slot: UInt32;
+  end;
+
   TX64RegCache = record
     Entries: array[0..3] of TX64RegCacheEntry;
     Next: Byte;
@@ -130,12 +146,52 @@ type
       Base for the whole activation, so zero-offset i32 scalar accesses read
       and write the cache hosts directly. }
     PinnedMemoryBase: Boolean;
+    { Static allocation only: the natively emitted v128 ops keep their
+      values in xmm2-xmm15 (VecEntries[i] is xmm(i+2)) under the same
+      deferred write-back discipline as r10/r11. xmm0/xmm1 stay template
+      scratch. Every xmm is caller-saved in SysV, which is sound only
+      because a static-cache function calls no helper except the
+      non-returning trap entries. }
+    VecCache: Boolean;
+    VecEntries: array[0..13] of TX64VecCacheEntry;
+    VecNext: Byte;
   end;
 
   { Per-instruction native-shape words handed over by the driver's
     AnalyzeGcFieldAccess; indexed by IR instruction index. }
   TX64GcShapeArray = array[0..$FFFFFF] of UInt64;
   PX64GcShapeArray = ^TX64GcShapeArray;
+
+  { One field fill of the inline struct.new fast path: the byte offset in
+    the object and the storage width (1, 2, 4, or 8 — a reference is 8). }
+  TX64GcAllocField = record
+    Offset: UInt16;
+    Width: Byte;
+  end;
+
+  { Per-instruction shape for the x64 inline struct.new fast path, handed
+    over by the driver's x64 allocation analysis; indexed by IR instruction
+    index. Everything here is a pure function of the module's struct type
+    and the heap's size classes, never of a store: the engine type id is
+    per-store state that the emitted code reads through the context chain,
+    so AOT artifacts stay store-agnostic. CellShift/CellTimes3 describe the
+    class size as 2^CellShift or 3*2^CellShift, the only two forms the size
+    classes take, so the cell index needs a shift and at most one multiply.
+    Covered marks, per qword of the cell after the header, whether the field
+    fills write all eight bytes (bit k = qword k); every other qword is
+    zeroed first, so a recycled cell is overwritten in full. }
+  TX64GcAllocShape = record
+    Enabled: Boolean;
+    FieldCount: Byte;
+    ClassIndex: Byte;
+    CellShift: Byte;
+    CellTimes3: Boolean;
+    CellSize: UInt16;
+    Covered: UInt64;
+    Fields: array[0..31] of TX64GcAllocField;
+  end;
+  TX64GcAllocArray = array[0..$FFFFF] of TX64GcAllocShape;
+  PX64GcAllocArray = ^TX64GcAllocArray;
 
   { The validated layout of a direct call's target when that target is a
     DEFINED function of the module being compiled: its body is fixed by the
@@ -470,6 +526,25 @@ procedure X64EnablePinnedMemoryBase(var ACache: TX64RegCache);
 procedure X64EnableDynamicWriteBack(var ACache: TX64RegCache;
   const AUseCounts: PUInt32; const AVisibleSlots: PBoolean;
   const ASlotCount: UInt32);
+{ Enable the xmm cache for the natively emitted v128 ops on a static
+  allocation with deferred write-back (call after X64EnableDynamicWriteBack).
+  AStaticSlots are v128 locals loaded into fixed hosts here; AConstSlots are
+  loop-invariant v128.const destinations seeded here from AConstLo/AConstHi,
+  whose defining instruction then emits nothing. The driver guarantees every
+  slot's byte offset fits a disp32, so no load, store, or seed needs an
+  address scratch register. At most 8 fixed entries. }
+procedure X64EnableVecCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const AStaticSlots, AConstSlots: array of UInt32;
+  const AConstLo, AConstHi: array of UInt64);
+{ The v128 ops the xmm cache emits natively (X64NativeVecOp). }
+function X64VecCacheOp(const AOp: TWasmIrOp): Boolean;
+{ movdqa xmm, xmm (66 0F 6F /r). }
+procedure X64EmitVecMove(const ABuf: TWasmCodeBuffer; const ADstXmm,
+  ASrcXmm: Byte);
+{ Materialize a 128-bit constant in AXmm: pxor for zero, pcmpeqd for all
+  ones, otherwise two movabs/movq halves through rax and xmm0. }
+procedure X64EmitVecConst(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ALo, AHi: UInt64);
 { Write back every dirty dynamic entry a later read or the canonical frame
   still needs; entries stay valid and clean. Emits only MOV stores, so it
   preserves the flags between a compare and its conditional jump. }
@@ -491,7 +566,14 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
   const AGcShapes: PX64GcShapeArray;
-  const ADirectCallee: PX64DirectCallee = nil): Boolean; overload;
+  const ADirectCallee: PX64DirectCallee = nil;
+  const AGcAlloc: PX64GcAllocArray = nil): Boolean; overload;
+{ The inline struct.new free-list fast path. ASlowLabel is where the caller
+  binds the unchanged helper emission (the miss, over-threshold, and
+  collection route); the fast path jumps to ADoneLabel after publishing. }
+procedure X64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AShape: TX64GcAllocShape; const ASlowLabel, ADoneLabel: TWasmJitLabel);
 { Numeric struct field access with a validated baked byte offset. Null refs
   trap before the load; reference and vector fields never receive a shape. }
 procedure X64EmitGcFieldAccess(const ABuf: TWasmCodeBuffer;
@@ -577,6 +659,9 @@ procedure X64CachedSelect(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; var ACache: TX64RegCache); forward;
 procedure X64CachedRel(const ABuf: TWasmCodeBuffer;
   const AIns: TWasmIrInstr; const ACc: Byte; const AWide: Boolean;
+  var ACache: TX64RegCache); forward;
+procedure X64EmitVecCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
   var ACache: TX64RegCache); forward;
 
 { ===================================================================== }
@@ -813,12 +898,19 @@ function X64EmitOpCached(const ABuf: TWasmCodeBuffer;
   const ARetainContext, AUseNativeScalarCall: Boolean;
   var ACache: TX64RegCache;
   const AGcShapes: PX64GcShapeArray;
-  const ADirectCallee: PX64DirectCallee): Boolean;
+  const ADirectCallee: PX64DirectCallee;
+  const AGcAlloc: PX64GcAllocArray): Boolean;
 var
   Host: Byte;
   Moved: Boolean;
+  SlowLabel, DoneLabel: TWasmJitLabel;
 begin
   Result := True;
+  if ACache.VecCache and X64VecCacheOp(AIns.Op) then
+  begin
+    X64EmitVecCached(ABuf, AIns, AAux, ACache);
+    Exit;
+  end;
   { Deferred dynamic stores are an optimization of the helper-free static
     allocation only. Every op outside it can call a helper, trap, or leave the
     straight line, so the register file is made canonical first. }
@@ -847,6 +939,26 @@ begin
         AGcShapes[AInsIndex], ACache)
     else
       X64EmitGcFieldAccess(ABuf, AIns, AGcShapes[AInsIndex], ACache);
+    Exit;
+  end;
+  if (AGcAlloc <> nil) and (AIns.Op = iroStructNew) and
+    AGcAlloc[AInsIndex].Enabled and not ACache.StaticAllocation then
+  begin
+    { Inline allocation: the free-list hit under the collection trigger is
+      emitted here; every other case lands on the unchanged helper emission,
+      which stays the only place an allocation can collect (ADR-0011). The
+      canonical register file is the fast path's only operand source. }
+    X64FlushDynamicRegCache(ABuf, ACache);
+    X64InvalidateRegCache(ACache);
+    SlowLabel := ABuf.NewLabel;
+    DoneLabel := ABuf.NewLabel;
+    X64EmitInlineStructNew(ABuf, AIns, AAux, AGcAlloc[AInsIndex], SlowLabel,
+      DoneLabel);
+    ABuf.BindLabel(SlowLabel);
+    Result := X64EmitOp(ABuf, AIns, AAux, AInsIndex, ARetainContext,
+      AUseNativeScalarCall);
+    ABuf.BindLabel(DoneLabel);
+    X64InvalidateRegCache(ACache);
     Exit;
   end;
   case AIns.Op of
@@ -1093,6 +1205,172 @@ begin
     Dec(ACache.UseCounts[ASlot]);
 end;
 
+{ --- the v128 xmm cache ---------------------------------------------------
+  The xmm analogue of the dynamic r10/r11 pair, with fixed hosts added. A
+  dynamic entry is written back by the same rule and at the same points as a
+  deferred scalar entry (X64EntryNeedsWriteBack): on eviction, and by
+  X64FlushDynamicRegCache before every branch, join, back-edge, and exit. A
+  fixed static entry holds its local's only up-to-date copy for the whole
+  activation: every write to that slot targets its host, which no branch or
+  join invalidates. }
+
+function X64VecHostReg(const AIndex: Integer): Byte;
+begin
+  Result := Byte(AIndex + 2);
+end;
+
+function X64VecFind(const ACache: TX64RegCache; const ASlot: UInt32): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ACache.VecEntries) do
+    if ACache.VecEntries[I].Valid and (ACache.VecEntries[I].Slot = ASlot) then
+      Exit(I);
+  Result := -1;
+end;
+
+function X64VecNeedsWriteBack(const ACache: TX64RegCache;
+  const AIndex: Integer): Boolean;
+var
+  Slot: UInt32;
+begin
+  Result := False;
+  if not ACache.VecEntries[AIndex].Valid or
+    not ACache.VecEntries[AIndex].Dirty or
+    ACache.VecEntries[AIndex].Fixed then
+    Exit;
+  Slot := ACache.VecEntries[AIndex].Slot;
+  if Slot >= ACache.SlotCount then
+    Exit(True);
+  Result := ACache.VisibleSlots[Slot] or (ACache.UseCounts[Slot] > 0);
+end;
+
+procedure X64VecSpill(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const AIndex: Integer);
+begin
+  if X64VecNeedsWriteBack(ACache, AIndex) then
+    X64EmitStoreVec(ABuf, X64VecHostReg(AIndex),
+      ACache.VecEntries[AIndex].Slot);
+  if not ACache.VecEntries[AIndex].Fixed then
+    ACache.VecEntries[AIndex].Dirty := False;
+end;
+
+{ The cheapest non-fixed entry other than AExclude: empty or dead first,
+  then one needing only a later reload, then a dirty live value. Ties take
+  the first in round-robin order from VecNext. }
+function X64VecPickVictim(var ACache: TX64RegCache;
+  const AExclude: Integer): Integer;
+var
+  Attempt, I, Cost, BestCost: Integer;
+  Slot: UInt32;
+begin
+  Result := -1;
+  BestCost := High(Integer);
+  for Attempt := 0 to High(ACache.VecEntries) do
+  begin
+    I := (ACache.VecNext + Attempt) mod Length(ACache.VecEntries);
+    if ACache.VecEntries[I].Fixed or (I = AExclude) then
+      Continue;
+    Cost := 0;
+    if ACache.VecEntries[I].Valid then
+    begin
+      Slot := ACache.VecEntries[I].Slot;
+      if X64VecNeedsWriteBack(ACache, I) then
+        Inc(Cost);
+      if (Slot >= ACache.SlotCount) or (ACache.UseCounts[Slot] > 0) then
+        Inc(Cost);
+    end;
+    if Cost < BestCost then
+    begin
+      BestCost := Cost;
+      Result := I;
+      if Cost = 0 then
+        Break;
+    end;
+  end;
+  if Result < 0 then
+    raise EWasmInternal.Create('internal: x64 v128 cache has no victim');
+  ACache.VecNext := Byte((Result + 1) mod Length(ACache.VecEntries));
+end;
+
+{ Make the v128 in ASlot resident and return its xmm host, consuming one
+  planned read. A miss never evicts entry AExclude (an operand the caller
+  already holds). AIndex is the entry now holding ASlot. }
+function X64VecOperand(const ABuf: TWasmCodeBuffer; var ACache: TX64RegCache;
+  const ASlot: UInt32; const AExclude: Integer; out AIndex: Integer): Byte;
+begin
+  AIndex := X64VecFind(ACache, ASlot);
+  if AIndex < 0 then
+  begin
+    AIndex := X64VecPickVictim(ACache, AExclude);
+    X64VecSpill(ABuf, ACache, AIndex);
+    X64EmitLoadVec(ABuf, X64VecHostReg(AIndex), ASlot);
+    ACache.VecEntries[AIndex].Valid := True;
+    ACache.VecEntries[AIndex].Dirty := False;
+    ACache.VecEntries[AIndex].Slot := ASlot;
+  end;
+  Result := X64VecHostReg(AIndex);
+  X64ConsumeUse(ACache, ASlot);
+end;
+
+{ Pick the entry a v128 result for ASlot is computed into: the slot's fixed
+  or current dynamic host, else a (spilled) victim, which may be an
+  operand's host because a spill only stores. X64VecDestCommit records it;
+  nothing may touch the cache in between. }
+function X64VecDestBegin(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const ASlot: UInt32): Integer;
+begin
+  Result := X64VecFind(ACache, ASlot);
+  if Result >= 0 then
+    Exit;
+  Result := X64VecPickVictim(ACache, -1);
+  X64VecSpill(ABuf, ACache, Result);
+end;
+
+procedure X64VecDestCommit(var ACache: TX64RegCache; const AIndex: Integer;
+  const ASlot: UInt32);
+begin
+  if ACache.VecEntries[AIndex].Fixed then
+    Exit;
+  ACache.VecEntries[AIndex].Valid := True;
+  ACache.VecEntries[AIndex].Dirty := True;
+  ACache.VecEntries[AIndex].Slot := ASlot;
+end;
+
+procedure X64EnableVecCache(const ABuf: TWasmCodeBuffer;
+  var ACache: TX64RegCache; const AStaticSlots, AConstSlots: array of UInt32;
+  const AConstLo, AConstHi: array of UInt64);
+var
+  I, Index: Integer;
+begin
+  if not ACache.WriteBackDynamics then
+    Exit;
+  if Length(AStaticSlots) + Length(AConstSlots) > 8 then
+    raise EWasmInternal.Create('internal: too many fixed x64 v128 hosts');
+  ACache.VecCache := True;
+  ACache.VecNext := 0;
+  { Fixed hosts are taken from xmm15 downwards so the dynamic pool starts at
+    xmm2 and its short temporaries need no REX prefix. }
+  Index := High(ACache.VecEntries);
+  for I := 0 to High(AStaticSlots) do
+  begin
+    ACache.VecEntries[Index].Valid := True;
+    ACache.VecEntries[Index].Fixed := True;
+    ACache.VecEntries[Index].Slot := AStaticSlots[I];
+    X64EmitLoadVec(ABuf, X64VecHostReg(Index), AStaticSlots[I]);
+    Dec(Index);
+  end;
+  for I := 0 to High(AConstSlots) do
+  begin
+    ACache.VecEntries[Index].Valid := True;
+    ACache.VecEntries[Index].Fixed := True;
+    ACache.VecEntries[Index].Constant := True;
+    ACache.VecEntries[Index].Slot := AConstSlots[I];
+    X64EmitVecConst(ABuf, X64VecHostReg(Index), AConstLo[I], AConstHi[I]);
+    Dec(Index);
+  end;
+end;
+
 { With deferred stores, prefer the dynamic entry whose eviction costs least:
   empty or dead first, then one needing only a later reload, and only then a
   dirty live value (a store plus a reload). Ties keep round-robin order. }
@@ -1133,6 +1411,9 @@ begin
     Exit;
   for I := 2 to 3 do
     X64SpillCacheEntry(ABuf, ACache, I);
+  if ACache.VecCache then
+    for I := 0 to High(ACache.VecEntries) do
+      X64VecSpill(ABuf, ACache, I);
 end;
 
 procedure X64FlushRegCache(const ABuf: TWasmCodeBuffer;
@@ -1145,10 +1426,16 @@ begin
   for I := 0 to 1 do
     if ACache.Entries[I].Valid then
       X64EmitStoreSlot64(ABuf, X64CacheHostReg(I), ACache.Entries[I].Slot);
+  { Fixed v128 hosts need no store: the driver fixes only declared locals
+    and parameters and constant temporaries, and no exit reads either — a
+    return publishes only the result slots, which stay dynamic and visible,
+    and a trap discards the frame. }
   X64FlushDynamicRegCache(ABuf, ACache);
 end;
 
 procedure X64InvalidateRegCache(var ACache: TX64RegCache);
+var
+  I: Integer;
 begin
   if ACache.StaticAllocation then
   begin
@@ -1158,6 +1445,13 @@ begin
     ACache.Entries[3].Valid := False;
     ACache.Entries[3].Dirty := False;
     ACache.Next := 0;
+    for I := 0 to High(ACache.VecEntries) do
+      if not ACache.VecEntries[I].Fixed then
+      begin
+        ACache.VecEntries[I].Valid := False;
+        ACache.VecEntries[I].Dirty := False;
+      end;
+    ACache.VecNext := 0;
     Exit;
   end;
   ACache.Entries[0].Valid := False;
@@ -1473,6 +1767,152 @@ begin
   X64CachedOperands(ABuf, ACache, AIns.A, AIns.B, HostA, HostB);
   X64CachedFlagResult(ABuf, $39, AWide, ACc, HostA, HostB, AIns.Dest,
     ACache);
+end;
+
+{ The natively emitted v128 ops over the xmm cache: the same instructions as
+  EmitNativeVec, with operands and results in their xmm hosts. Scalar
+  operands and results (splat, extract_lane) go through the scalar cache.
+  xmm0/xmm1 serve only as within-op scratch. }
+procedure X64EmitVecCached(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  var ACache: TX64RegCache);
+var
+  HA, HB, HD, Scalar: Byte;
+  IA, IB, ID: Integer;
+  Moved: Boolean;
+  VTmp: TWasmV128;
+
+  procedure Binary(const AOpcode: Byte; const ACommutes: Boolean);
+  begin
+    HA := X64VecOperand(ABuf, ACache, AIns.A, -1, IA);
+    HB := X64VecOperand(ABuf, ACache, AIns.B, IA, IB);
+    ID := X64VecDestBegin(ABuf, ACache, AIns.Dest);
+    HD := X64VecHostReg(ID);
+    if HD = HA then
+      X64EmitVecBinary(ABuf, AOpcode, HD, HB)
+    else if HD <> HB then
+    begin
+      X64EmitVecMove(ABuf, HD, HA);
+      X64EmitVecBinary(ABuf, AOpcode, HD, HB);
+    end
+    else if ACommutes then
+      X64EmitVecBinary(ABuf, AOpcode, HD, HA)
+    else
+    begin
+      X64EmitVecMove(ABuf, 0, HA);
+      X64EmitVecBinary(ABuf, AOpcode, 0, HB);
+      X64EmitVecMove(ABuf, HD, 0);
+    end;
+    X64VecDestCommit(ACache, ID, AIns.Dest);
+  end;
+
+  procedure Splat(const ASize: Byte);
+  begin
+    Scalar := X64CachedOperand(ABuf, ACache, AIns.A, $FF, Moved);
+    ID := X64VecDestBegin(ABuf, ACache, AIns.Dest);
+    X64EmitVecDup(ABuf, X64VecHostReg(ID), Scalar, ASize);
+    X64VecDestCommit(ACache, ID, AIns.Dest);
+  end;
+
+  procedure Extract(const ASize: Byte; const ASigned: Boolean);
+  var
+    Lane: Byte;
+  begin
+    Lane := Byte(UInt32(AIns.Imm));
+    HA := X64VecOperand(ABuf, ACache, AIns.A, -1, IA);
+    { A non-zero lane shifts its source (PSRLDQ), and only xmm0 may be
+      clobbered. }
+    if (Lane shl ASize) <> 0 then
+    begin
+      X64EmitVecMove(ABuf, 0, HA);
+      HA := 0;
+    end;
+    X64EmitVecExtract(ABuf, X64_RAX, HA, ASize, Lane, ASigned);
+    X64CachedStore(ABuf, ACache, X64_RAX, AIns.Dest);
+  end;
+
+begin
+  case AIns.Op of
+    iroMoveVec:
+      begin
+        HA := X64VecOperand(ABuf, ACache, AIns.A, -1, IA);
+        ID := X64VecDestBegin(ABuf, ACache, AIns.Dest);
+        HD := X64VecHostReg(ID);
+        if HD <> HA then
+          X64EmitVecMove(ABuf, HD, HA);
+        X64VecDestCommit(ACache, ID, AIns.Dest);
+      end;
+    iroV128Const:
+      begin
+        ID := X64VecFind(ACache, AIns.Dest);
+        { A hoisted constant was seeded at entry and its slot has no other
+          writer. }
+        if (ID >= 0) and ACache.VecEntries[ID].Constant then
+          Exit;
+        IrAuxReadV128(AAux, UInt32(AIns.Imm), VTmp);
+        ID := X64VecDestBegin(ABuf, ACache, AIns.Dest);
+        X64EmitVecConst(ABuf, X64VecHostReg(ID), VTmp.U64[0], VTmp.U64[1]);
+        X64VecDestCommit(ACache, ID, AIns.Dest);
+      end;
+    iroV128Not:
+      begin
+        HA := X64VecOperand(ABuf, ACache, AIns.A, -1, IA);
+        ID := X64VecDestBegin(ABuf, ACache, AIns.Dest);
+        HD := X64VecHostReg(ID);
+        X64EmitVecBinary(ABuf, $76, 1, 1);   { PCMPEQD xmm1,xmm1 = all ones }
+        if HD <> HA then
+          X64EmitVecMove(ABuf, HD, HA);
+        X64EmitVecBinary(ABuf, $EF, HD, 1);
+        X64VecDestCommit(ACache, ID, AIns.Dest);
+      end;
+    iroV128Andnot:
+      begin
+        { PANDN computes ~dest & src; wasm's a & ~b needs b in the
+          destination. }
+        HA := X64VecOperand(ABuf, ACache, AIns.A, -1, IA);
+        HB := X64VecOperand(ABuf, ACache, AIns.B, IA, IB);
+        ID := X64VecDestBegin(ABuf, ACache, AIns.Dest);
+        HD := X64VecHostReg(ID);
+        if HD = HB then
+          X64EmitVecBinary(ABuf, $DF, HD, HA)
+        else if HD <> HA then
+        begin
+          X64EmitVecMove(ABuf, HD, HB);
+          X64EmitVecBinary(ABuf, $DF, HD, HA);
+        end
+        else
+        begin
+          X64EmitVecMove(ABuf, 0, HB);
+          X64EmitVecBinary(ABuf, $DF, 0, HA);
+          X64EmitVecMove(ABuf, HD, 0);
+        end;
+        X64VecDestCommit(ACache, ID, AIns.Dest);
+      end;
+    iroV128And: Binary($DB, True);
+    iroV128Or: Binary($EB, True);
+    iroV128Xor: Binary($EF, True);
+    iroI8x16Add: Binary($FC, True);
+    iroI8x16Sub: Binary($F8, False);
+    iroI16x8Add: Binary($FD, True);
+    iroI16x8Sub: Binary($F9, False);
+    iroI32x4Add: Binary($FE, True);
+    iroI32x4Sub: Binary($FA, False);
+    iroI64x2Add: Binary($D4, True);
+    iroI64x2Sub: Binary($FB, False);
+    iroI8x16Splat: Splat(0);
+    iroI16x8Splat: Splat(1);
+    iroI32x4Splat: Splat(2);
+    iroI64x2Splat: Splat(3);
+    iroI8x16ExtractLaneS: Extract(0, True);
+    iroI8x16ExtractLaneU: Extract(0, False);
+    iroI16x8ExtractLaneS: Extract(1, True);
+    iroI16x8ExtractLaneU: Extract(1, False);
+    iroI32x4ExtractLane: Extract(2, False);
+    iroI64x2ExtractLane: Extract(3, False);
+  else
+    raise EWasmInternal.CreateFmt(
+      'internal: op %d is not an x64 v128 cache op', [Ord(AIns.Op)]);
+  end;
 end;
 
 function X64OpUnary(const AOp: PtrUInt; const A: UInt64): UInt64; cdecl;
@@ -2660,6 +3100,30 @@ begin
   EmitModRMReg(ABuf, ADestXmm, ASrcXmm);
 end;
 
+procedure X64EmitVecMove(const ABuf: TWasmCodeBuffer; const ADstXmm,
+  ASrcXmm: Byte);
+begin
+  { MOVDQA xmm1, xmm2/m128 = 66 0F 6F /r: the integer-domain register copy. }
+  X64EmitVecBinary(ABuf, $6F, ADstXmm, ASrcXmm);
+end;
+
+procedure X64EmitVecConst(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
+  const ALo, AHi: UInt64);
+begin
+  if (ALo = 0) and (AHi = 0) then
+    X64EmitVecBinary(ABuf, $EF, AXmm, AXmm)          { PXOR xmm,xmm }
+  else if (ALo = High(UInt64)) and (AHi = High(UInt64)) then
+    X64EmitVecBinary(ABuf, $76, AXmm, AXmm)          { PCMPEQD xmm,xmm }
+  else
+  begin
+    X64EmitMovRegImm64(ABuf, X64_RAX, ALo);
+    X64EmitMovToXmm(ABuf, AXmm, X64_RAX, True);      { MOVQ xmm, rax }
+    X64EmitMovRegImm64(ABuf, X64_RAX, AHi);
+    X64EmitMovToXmm(ABuf, 0, X64_RAX, True);
+    X64EmitVecBinary(ABuf, $6C, AXmm, 0);            { PUNPCKLQDQ }
+  end;
+end;
+
 procedure X64EmitVecDup(const ABuf: TWasmCodeBuffer; const AXmm: Byte;
   const AReg, ASize: Byte);
 begin
@@ -3748,6 +4212,217 @@ begin
   EmitCanonicalFloatResult(ABuf, not ADemote, AIns.Dest);
 end;
 
+{ ===================================================================== }
+{  inline struct.new allocation                                          }
+{ ===================================================================== }
+
+{ <shift> r, imm8 = C1 /subop ib (SHL /4, SHR /5). }
+procedure X64EmitShiftImm(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg, AImm: Byte);
+begin
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  ABuf.EmitByte($C1);
+  EmitModRMReg(ABuf, ASubop, AReg);
+  ABuf.EmitByte(AImm);
+end;
+
+{ Group-1 ALU with a sign-extended imm32 = 81 /subop id, register form or
+  memory form [ABase + ADisp] (ADD /0, OR /1). }
+procedure X64EmitAluRegImm32(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const AWide: Boolean; const AReg: Byte; const AImm: UInt32);
+begin
+  X64EmitRex(ABuf, Ord(AWide), 0, 0, AReg shr 3);
+  ABuf.EmitByte($81);
+  EmitModRMReg(ABuf, ASubop, AReg);
+  ABuf.EmitU32(AImm);
+end;
+
+procedure X64EmitAluMemImm32(const ABuf: TWasmCodeBuffer; const ASubop: Byte;
+  const ABase: Byte; const ADisp: Int32; const AImm: UInt32);
+begin
+  X64EmitRex(ABuf, 1, 0, 0, ABase shr 3);
+  ABuf.EmitByte($81);
+  EmitMemOperand(ABuf, ASubop, ABase, ADisp);
+  ABuf.EmitU32(AImm);
+end;
+
+{ BTS r32, r32 = 0F AB /r (rm = ADst, reg = ABit). The register form takes
+  the bit number modulo 32, which is exactly the in-word bit of a cell. }
+procedure X64EmitBtsReg32(const ABuf: TWasmCodeBuffer; const ADst,
+  ABit: Byte);
+begin
+  X64EmitRex(ABuf, 0, ABit shr 3, 0, ADst shr 3);
+  ABuf.EmitByte($0F);
+  ABuf.EmitByte($AB);
+  EmitModRMReg(ABuf, ABit, ADst);
+end;
+
+{ A width-sized store of ASource to [ABase + ADisp]: 88 (byte), 66 89
+  (word), 89 (dword), REX.W 89 (qword). The template stores from r11, whose
+  REX prefix already makes the byte form address r11b. }
+procedure X64EmitStoreScalarDisp(const ABuf: TWasmCodeBuffer;
+  const ASource, ABase: Byte; const ADisp: Int32; const AWidth: UInt32);
+begin
+  case AWidth of
+    1:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($88);
+      end;
+    2:
+      begin
+        ABuf.EmitByte($66);
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+    4:
+      begin
+        X64EmitRex(ABuf, 0, ASource shr 3, 0, ABase shr 3);
+        ABuf.EmitByte($89);
+      end;
+  else
+    begin
+      X64EmitRex(ABuf, 1, ASource shr 3, 0, ABase shr 3);
+      ABuf.EmitByte($89);
+    end;
+  end;
+  EmitMemOperand(ABuf, ASource, ABase, ADisp);
+end;
+
+procedure X64EmitInlineStructNew(const ABuf: TWasmCodeBuffer;
+  const AIns: TWasmIrInstr; const AAux: TWasmIrAuxU32;
+  const AShape: TX64GcAllocShape; const ASlowLabel, ADoneLabel: TWasmJitLabel);
+const
+  { The caller flushed and invalidated the value cache, and a function with
+    an allocation is never static-cache eligible, so every caller-saved
+    register is dead here: no rsi memory-base pin, no cached slot. }
+  R_TYPE = X64_RAX;   { engine type id, then the header word, then zero }
+  R_CELL = X64_RCX;   { the popped free-list head: the new object }
+  R_HEAP = X64_RDX;   { Store.FHeap }
+  R_LIVE = X64_RSI;   { FBytesLive + CellSize }
+  R_PTR = X64_RDI;    { link, then block, then bitmap base }
+  R_INDEX = X64_R8;   { cell index within its block }
+  R_WORD = X64_R9;    { address of the bitmap word }
+  R_BITS = X64_R10;   { the bitmap word }
+  R_FIELD = X64_R11;  { one field value }
+var
+  GO: TWasmJitGcOffsets;
+  FO: TWasmJitFrameOffsets;
+  AO: TWasmJitStoreAllocOffsets;
+  FreeOff: Int32;
+  F, Q: Integer;
+  Header: UInt32;
+begin
+  GO := WasmJitGcHeapOffsets;
+  FO := WasmJitFrameOffsets;
+  AO := WasmJitStoreAllocOffsets;
+  FreeOff := Int32(GO.HeapFFree0) + Int32(AShape.ClassIndex) * 8;
+
+  { Engine type id: Acts[Depth-1].Instance.EngineTypeIds[Imm] — the same
+    top activation X64RtDispatch hands JitDoGc, and the same walk the
+    prologue's inline memory pin uses. It is per-store state, never baked. }
+  X64EmitLoadMem64(ABuf, R_TYPE, X64_REG_STORE, Int32(AO.TierContextOffset));
+  X64EmitLoadMem64(ABuf, R_CELL, R_TYPE, Int32(FO.CtxDepth));
+  X64EmitImulImm32(ABuf, R_CELL, R_CELL, UInt32(FO.ActStride));
+  X64EmitAluRegMem(ABuf, $03, R_CELL, R_TYPE, Int32(FO.CtxActs));
+  X64EmitLoadMem64(ABuf, R_TYPE, R_CELL,
+    Int32(FO.ActInstance) - Int32(FO.ActStride));
+  X64EmitLoadMem64(ABuf, R_TYPE, R_TYPE, Int32(AO.EngineTypeIdsOffset));
+  X64EmitLoadMem32(ABuf, R_TYPE, R_TYPE, Int32(UInt32(AIns.Imm) * 4));
+  X64EmitShiftImm(ABuf, 4, True, R_TYPE, WASM_OBJ_TYPE_SHIFT);
+
+  { Free-list head for the class; an empty list goes to the helper, which
+    carves from the bump block or grows the heap. }
+  X64EmitLoadMem64(ABuf, R_HEAP, X64_REG_STORE, Int32(AO.FHeapOffset));
+  X64EmitLoadMem64(ABuf, R_CELL, R_HEAP, FreeOff);
+  X64EmitAluRegReg(ABuf, $85, True, R_CELL, R_CELL);
+  X64EmitJccTo(ABuf, X64_CC_E, UInt32(ASlowLabel));
+
+  { THE collection trigger, verbatim from Allocate:
+    FBytesLive + CellSize > FThreshold collects, so that allocation takes
+    the helper, which re-evaluates the same comparison and collects at
+    exactly this allocation. Nothing has been written on either exit. }
+  X64EmitLoadMem64(ABuf, R_LIVE, R_HEAP, Int32(GO.HeapBytesLive));
+  X64EmitAluRegImm32(ABuf, 0, True, R_LIVE, AShape.CellSize);
+  X64EmitAluRegMem(ABuf, $3B, R_LIVE, R_HEAP, Int32(GO.HeapThreshold));
+  X64EmitJccTo(ABuf, X64_CC_A, UInt32(ASlowLabel));
+
+  { Pop FIRST. The link and the block pointer are the cell's first two
+    qwords — the header and the first field qword this template is about to
+    write — so both are read before anything is stored into the cell. }
+  X64EmitLoadMem64(ABuf, R_PTR, R_CELL, WASM_GC_FREE_LINK_OFFSET);
+  X64EmitStoreMem64(ABuf, R_PTR, R_HEAP, FreeOff);
+  X64EmitLoadMem64(ABuf, R_PTR, R_CELL, WASM_GC_FREE_BLOCK_OFFSET);
+
+  { SetCellAllocated: cell = (head - Block.Base) div CellSize, then
+    Allocated[cell div 32] |= 1 shl (cell mod 32). A block spans at most
+    WASM_GC_BLOCK_BYTES, so the byte offset is below 2^16, where
+    (x * $AAAB) shr 17 = x div 3 exactly. }
+  X64EmitMovRegReg(ABuf, R_INDEX, R_CELL);
+  X64EmitAluRegMem(ABuf, $2B, R_INDEX, R_PTR, Int32(GO.BlockBase));
+  if AShape.CellShift <> 0 then
+    X64EmitShiftImm(ABuf, 5, False, R_INDEX, AShape.CellShift);
+  if AShape.CellTimes3 then
+  begin
+    X64EmitRex(ABuf, 0, R_INDEX shr 3, 0, R_INDEX shr 3);
+    ABuf.EmitByte($69);                         { imul r32, r/m32, imm32 }
+    EmitModRMReg(ABuf, R_INDEX, R_INDEX);
+    ABuf.EmitU32($AAAB);
+    X64EmitShiftImm(ABuf, 5, False, R_INDEX, 17);
+  end;
+  X64EmitLoadMem64(ABuf, R_PTR, R_PTR, Int32(GO.BlockAllocated));
+  X64EmitMovRegReg(ABuf, R_WORD, R_INDEX);
+  X64EmitShiftImm(ABuf, 5, False, R_WORD, 5);
+  X64EmitLeaIndexed(ABuf, R_WORD, R_PTR, R_WORD, 2, 0);
+  X64EmitLoadMem32(ABuf, R_BITS, R_WORD, 0);
+  X64EmitBtsReg32(ABuf, R_BITS, R_INDEX);
+  X64EmitRex(ABuf, 0, R_BITS shr 3, 0, R_WORD shr 3);
+  ABuf.EmitByte($89);                           { mov [r9], r10d }
+  EmitMemOperand(ABuf, R_BITS, R_WORD, 0);
+
+  { Host-visible counters, as Allocate leaves them. }
+  X64EmitStoreMem64(ABuf, R_LIVE, R_HEAP, Int32(GO.HeapBytesLive));
+  X64EmitAluMemImm32(ABuf, 0, R_HEAP, Int32(GO.HeapBytesAllocated),
+    AShape.CellSize);
+  X64EmitAluMemImm32(ABuf, 0, R_HEAP, Int32(GO.HeapObjectCount), 1);
+
+  { Header = MakeHeader(wokStruct, typeId) or FMarkState, so the next
+    cycle's polarity flip unmarks it like any Allocate-written header. }
+  X64EmitAluRegMem(ABuf, $0B, R_TYPE, R_HEAP, Int32(GO.HeapMarkState));
+  Header := UInt32(Ord(wokStruct)) shl WASM_OBJ_KIND_SHIFT;
+  if Header <> 0 then
+    X64EmitAluRegImm32(ABuf, 1, True, R_TYPE, Header);
+  X64EmitStoreMem64(ABuf, R_TYPE, R_CELL, 0);
+
+  { ZeroCell, restricted to the qwords the fills below do not write whole:
+    every byte of a recycled (and, outside PRODUCTION, poisoned) cell is
+    overwritten before the reference is published. }
+  if (AShape.Covered or 1) <> (UInt64(1) shl (AShape.CellSize div 8)) - 1 then
+    X64EmitAluRegReg(ABuf, $31, False, R_TYPE, R_TYPE);
+  for Q := 1 to Integer(AShape.CellSize div 8) - 1 do
+    if (AShape.Covered and (UInt64(1) shl Q)) = 0 then
+      X64EmitStoreMem64(ABuf, R_TYPE, R_CELL, Int32(Q * 8));
+
+  { Field fills from the canonical register file. A packed store truncates
+    like WriteField; a reference is its 8 bits. These are initializing
+    stores into an object nothing else can reach yet, which is why
+    StructSetSeq writes them without the (v1-empty) write barrier too. }
+  for F := 0 to Integer(AShape.FieldCount) - 1 do
+  begin
+    X64EmitLoadSlot64(ABuf, R_FIELD,
+      IrAuxBlockItem(AAux, AIns.A, UInt32(F)));
+    X64EmitStoreScalarDisp(ABuf, R_FIELD, R_CELL,
+      Int32(AShape.Fields[F].Offset), AShape.Fields[F].Width);
+  end;
+
+  { Publish last. The template has no call and no safepoint, so nothing can
+    collect between the pop and this store; from here the object is rooted
+    by Dest's register-file slot like any helper-allocated one. A field
+    source equal to Dest was read above, before this overwrite. }
+  X64EmitStoreSlot64(ABuf, R_CELL, AIns.Dest);
+  X64EmitJmpTo(ABuf, UInt32(ADoneLabel));
+end;
+
 { The uniform three-argument runtime/vector helper call: store (r12), regbase
   (rbx), and a pointer to the live IR instruction. Fix C: the baked pointer is
   AInsPtr = @Fn^.Code[i], the driver's guaranteed-stable location in the
@@ -3791,6 +4466,11 @@ begin
   else
     Result := False;
   end;
+end;
+
+function X64VecCacheOp(const AOp: TWasmIrOp): Boolean;
+begin
+  Result := X64NativeVecOp(AOp);
 end;
 
 procedure EmitNativeVecBinary(const ABuf: TWasmCodeBuffer;

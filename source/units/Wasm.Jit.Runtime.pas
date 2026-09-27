@@ -241,8 +241,14 @@ begin
         N := IrAuxBlockCount(Fn^.AuxU32, AIns^.A);
         if ABatchStructFields and (N <= UInt32(Length(TmpFields))) then
         begin
-          for I := 0 to Integer(N) - 1 do
+          { An unsigned counter: a field-less struct (N = 0) must copy nothing,
+            where `for I := 0 to Integer(N) - 1` wrapped the bound to High(UInt32). }
+          I := 0;
+          while I < N do
+          begin
             TmpFields[I] := @Reg[IrAuxBlockItem(Fn^.AuxU32, AIns^.A, I)];
+            Inc(I);
+          end;
           AStore.Heap.StructSetSeq(Obj, @TmpFields[0], N);
         end
         else

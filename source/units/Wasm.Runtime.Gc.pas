@@ -426,12 +426,6 @@ type
       without a clear pass, and — combined with the abort recovery in
       Collect — a cycle that raises part-way leaves no lasting mark (H8). }
     FMarkState: UInt64;
-{$IFNDEF PRODUCTION}
-    { Test-only fault injection: the next N NewBlock calls report host
-      allocator failure, making the collect-then-retry path (§7.3, M8)
-      reachable from a unit test. Never compiled into a PRODUCTION build. }
-    FInjectBlockFailures: Integer;
-{$ENDIF}
 
     FBytesLive: UInt64;
     FBytesAllocated: UInt64;
@@ -441,6 +435,14 @@ type
     FCollectionCount: UInt64;
     FThreshold: UInt64;
     FThresholdFloor: UInt64;
+{$IFNDEF PRODUCTION}
+    { Test-only fault injection: the next N NewBlock calls report host
+      allocator failure, making the collect-then-retry path (§7.3, M8)
+      reachable from a unit test. Never compiled into a PRODUCTION build.
+      Declared after every field compiled code bakes an offset of, so dev
+      and PRODUCTION builds share one heap layout (Wasm.Target). }
+    FInjectBlockFailures: Integer;
+{$ENDIF}
 
     function ClassOf(const ASize: UInt32): Integer; inline;
     function NewBlock(const AClassIndex: Integer; const ACellSize: UInt32;

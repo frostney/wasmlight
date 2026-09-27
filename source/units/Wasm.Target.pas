@@ -374,10 +374,10 @@ begin
   Result.InstMemAddrs := 48;
   Result.HeapFFree0 := 48;
   Result.HeapMarkState := 264;
-  Result.HeapBytesLive := 280;
-  Result.HeapBytesAllocated := 288;
-  Result.HeapObjectCount := 312;
-  Result.HeapThreshold := 328;
+  Result.HeapBytesLive := 272;
+  Result.HeapBytesAllocated := 280;
+  Result.HeapObjectCount := 304;
+  Result.HeapThreshold := 320;
   Result.BlockBase := 8;
   Result.BlockAllocated := 32;
   Result.CtxValues := 8;

@@ -41,6 +41,9 @@ type
     { Assert the whole emitted byte sequence of ABuf against AExpected. }
     procedure CheckSeq(const ABuf: TWasmCodeBuffer;
       const AExpected: array of Byte);
+    { The first offset >= AFrom where AExpected occurs in ABuf, or -1. }
+    function FindSeq(const ABuf: TWasmCodeBuffer;
+      const AExpected: array of Byte; const AFrom: Integer = 0): Integer;
   public
     procedure SetupTests; override;
 
@@ -78,6 +81,10 @@ type
     procedure TestDirectOperandBookkeeping;
     procedure TestGcFieldAccessBytes;
     procedure TestGcArrayAccessBytes;
+    procedure TestVecCacheEncodings;
+    procedure TestVecCacheLoopBody;
+    procedure TestVecCacheOperandHazards;
+    procedure TestVecCacheExtractAndSplat;
 
     procedure TestExecPlaceholder;
   end;
@@ -91,6 +98,27 @@ begin
   for I := 0 to High(AExpected) do
     if I < ABuf.Size then
       Expect<Byte>(ABuf.ByteAt(I)).ToBe(AExpected[I]);
+end;
+
+function TX64Tests.FindSeq(const ABuf: TWasmCodeBuffer;
+  const AExpected: array of Byte; const AFrom: Integer): Integer;
+var
+  I, J: Integer;
+  Hit: Boolean;
+begin
+  for I := AFrom to ABuf.Size - Length(AExpected) do
+  begin
+    Hit := True;
+    for J := 0 to High(AExpected) do
+      if ABuf.ByteAt(I + J) <> AExpected[J] then
+      begin
+        Hit := False;
+        Break;
+      end;
+    if Hit then
+      Exit(I);
+  end;
+  Result := -1;
 end;
 
 procedure TX64Tests.TestNativeNumericEncodings;
@@ -1606,6 +1634,289 @@ begin
   Expect<Boolean>(X64CanEmitInstr(Ins, Aux)).ToBe(True);
 end;
 
+{ v128 xmm cache encodings, SDM Vol. 2: MOVDQA xmm1, xmm2/m128 = 66 0F 6F /r;
+  PXOR = 66 0F EF /r; PCMPEQD = 66 0F 76 /r; MOVQ xmm, r/m64 = 66 REX.W 0F
+  6E /r; PUNPCKLQDQ = 66 0F 6C /r; REX.R extends ModRM.reg, REX.B ModRM.rm. }
+procedure TX64Tests.TestVecCacheEncodings;
+var
+  Buf: TWasmCodeBuffer;
+begin
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EmitVecMove(Buf, 2, 15);
+    X64EmitVecMove(Buf, 15, 3);
+    X64EmitVecMove(Buf, 0, 2);
+    X64EmitVecConst(Buf, 3, 0, 0);
+    X64EmitVecConst(Buf, 9, High(UInt64), High(UInt64));
+    X64EmitVecConst(Buf, 14, UInt64($0000000200000001),
+      UInt64($0000000400000003));
+    CheckSeq(Buf, [$66, $41, $0F, $6F, $D7,        { movdqa xmm2, xmm15 }
+      $66, $44, $0F, $6F, $FB,                     { movdqa xmm15, xmm3 }
+      $66, $0F, $6F, $C2,                          { movdqa xmm0, xmm2 }
+      $66, $0F, $EF, $DB,                          { pxor xmm3, xmm3 }
+      $66, $45, $0F, $76, $C9,                     { pcmpeqd xmm9, xmm9 }
+      $48, $B8, $01, $00, $00, $00, $02, $00, $00, $00,
+      $66, $4C, $0F, $6E, $F0,                     { movq xmm14, rax }
+      $48, $B8, $03, $00, $00, $00, $04, $00, $00, $00,
+      $66, $48, $0F, $6E, $C0,                     { movq xmm0, rax }
+      $66, $44, $0F, $6C, $F0]);                   { punpcklqdq xmm14, xmm0 }
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestVecCacheLoopBody;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..31] of UInt32;
+  Visible: array[0..31] of Boolean;
+  Start, Mark: Integer;
+begin
+  { The simd loop's shape: v128 local 4 in a fixed host, the loop-invariant
+    constant 6 seeded once, temporaries 8 and 10 dying inside the body, and
+    a visible result 14. }
+  Aux := nil;
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Visible[0] := True;
+  Visible[1] := True;
+  Visible[4] := True;
+  Visible[14] := True;
+  UseCounts[4] := 2;
+  UseCounts[6] := 2;
+  UseCounts[8] := 1;
+  UseCounts[10] := 1;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 32);
+    Start := Buf.Size;
+    X64EnableVecCache(Buf, Cache, [4], [6], [UInt64($0000000200000001)],
+      [UInt64($0000000400000003)]);
+    Expect<Integer>(Buf.Size - Start).ToBe(41);
+    Expect<Integer>(FindSeq(Buf, [$F3, $44, $0F, $6F, $7B, $20,
+      $48, $B8, $01, $00, $00, $00, $02, $00, $00, $00,
+      $66, $4C, $0F, $6E, $F0,
+      $48, $B8, $03, $00, $00, $00, $04, $00, $00, $00,
+      $66, $48, $0F, $6E, $C0,
+      $66, $44, $0F, $6C, $F0], Start)).ToBe(Start);
+    Expect<Boolean>(Cache.VecEntries[13].Fixed and
+      not Cache.VecEntries[13].Constant and
+      (Cache.VecEntries[13].Slot = 4)).ToBe(True);
+    Expect<Boolean>(Cache.VecEntries[12].Fixed and
+      Cache.VecEntries[12].Constant and
+      (Cache.VecEntries[12].Slot = 6)).ToBe(True);
+
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroMoveVec, 8, 4, 0, 0), Aux, 0,
+      False, False, Cache);
+    { The hoisted constant's defining instruction emits nothing. }
+    X64EmitOpCached(Buf, MakeIrInstr(iroV128Const, 6, 0, 0, 0), Aux, 1,
+      False, False, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4Add, 10, 8, 6, 0), Aux, 2,
+      False, False, Cache);
+    X64EmitOpCached(Buf, MakeIrInstr(iroMoveVec, 4, 10, 0, 0), Aux, 3,
+      False, False, Cache);
+    Expect<Integer>(Buf.Size - Start).ToBe(19);
+    Expect<Integer>(FindSeq(Buf, [$66, $41, $0F, $6F, $D7, { movdqa xmm2,xmm15 }
+      $66, $0F, $6F, $DA,                          { movdqa xmm3, xmm2 }
+      $66, $41, $0F, $FE, $DE,                     { paddd xmm3, xmm14 }
+      $66, $44, $0F, $6F, $FB], Start)).ToBe(Start); { movdqa xmm15, xmm3 }
+    Expect<UInt32>(UseCounts[8]).ToBe(0);
+    Expect<UInt32>(UseCounts[10]).ToBe(0);
+    { Dead temporaries and the fixed local need no write-back. }
+    Mark := Buf.Size;
+    X64FlushDynamicRegCache(Buf, Cache);
+    Expect<Integer>(Buf.Size).ToBe(Mark);
+
+    { A visible result is written back at the next canonical point. }
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4Sub, 14, 4, 6, 0), Aux, 4,
+      False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $41, $0F, $6F, $E7, { movdqa xmm4,xmm15 }
+      $66, $41, $0F, $FA, $E6], Start)).ToBe(Start); { psubd xmm4, xmm14 }
+    Mark := Buf.Size;
+    X64FlushDynamicRegCache(Buf, Cache);
+    Expect<Integer>(Buf.Size - Mark).ToBe(5);
+    Expect<Integer>(FindSeq(Buf, [$F3, $0F, $7F, $63, $70], Mark))
+      .ToBe(Mark);                                 { movdqu [rbx+0x70], xmm4 }
+    { A join drops the dynamic entries and keeps the fixed hosts. }
+    X64InvalidateRegCache(Cache);
+    Expect<Boolean>(Cache.VecEntries[0].Valid or Cache.VecEntries[1].Valid or
+      Cache.VecEntries[2].Valid).ToBe(False);
+    Expect<Boolean>(Cache.VecEntries[12].Valid and
+      Cache.VecEntries[13].Valid).ToBe(True);
+    { An exit stores the scalar statics only: a fixed v128 host holds a local
+      or a constant temporary, neither of which an exit reads. }
+    Mark := Buf.Size;
+    X64FlushRegCache(Buf, Cache);
+    Expect<Integer>(FindSeq(Buf, [$0F, $7F], Mark)).ToBe(-1);
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestVecCacheOperandHazards;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..255] of UInt32;
+  Visible: array[0..255] of Boolean;
+  Start: Integer;
+
+  { Every dynamic host but xmm2 (slot 20) and xmm3 (slot 22) holds a live
+    value, so victim choice is forced. ADirty makes every value dirty. }
+  procedure Reset(const ANext: Byte; const ADirty: Boolean);
+  var
+    K: Integer;
+  begin
+    FillChar(UseCounts, SizeOf(UseCounts), 0);
+    FillChar(Visible, SizeOf(Visible), 0);
+    Buf.Free;
+    Buf := TWasmCodeBuffer.Create;
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 256);
+    X64EnableVecCache(Buf, Cache, [], [], [], []);
+    for K := 0 to High(Cache.VecEntries) do
+    begin
+      Cache.VecEntries[K].Valid := True;
+      Cache.VecEntries[K].Dirty := ADirty;
+      Cache.VecEntries[K].Slot := UInt32(100 + 2 * K);
+      UseCounts[100 + 2 * K] := 1;
+    end;
+    Cache.VecEntries[0].Slot := 20;
+    Cache.VecEntries[1].Slot := 22;
+    UseCounts[20] := 1;
+    UseCounts[22] := 1;
+    Cache.VecNext := ANext;
+  end;
+
+begin
+  Aux := nil;
+  Buf := nil;
+  try
+    { Result host = right operand host of a non-commutative op: compute in
+      xmm0 so the right operand is not overwritten first. }
+    Reset(1, False);
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4Sub, 24, 20, 22, 0), Aux, 0,
+      False, False, Cache);
+    Expect<Integer>(Buf.Size - Start).ToBe(12);
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $6F, $C2, { movdqa xmm0, xmm2 }
+      $66, $0F, $FA, $C3,                          { psubd xmm0, xmm3 }
+      $66, $0F, $6F, $D8], Start)).ToBe(Start);    { movdqa xmm3, xmm0 }
+    Expect<Boolean>(Cache.VecEntries[1].Dirty and
+      (Cache.VecEntries[1].Slot = 24)).ToBe(True);
+
+    { andnot(a, b) = PANDN with b in the destination. Result host = a's. }
+    Reset(0, False);
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroV128Andnot, 24, 20, 22, 0), Aux, 0,
+      False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $6F, $C3, { movdqa xmm0, xmm3 }
+      $66, $0F, $DF, $C2,                          { pandn xmm0, xmm2 }
+      $66, $0F, $6F, $D0], Start)).ToBe(Start);    { movdqa xmm2, xmm0 }
+    { Result host = b's: PANDN in place. }
+    Reset(1, False);
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroV128Andnot, 24, 20, 22, 0), Aux, 0,
+      False, False, Cache);
+    Expect<Integer>(Buf.Size - Start).ToBe(4);
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $DF, $DA], Start))
+      .ToBe(Start);                                { pandn xmm3, xmm2 }
+
+    { A missed right operand never evicts the left operand's host, even
+      once the left operand's last planned read makes it the cheapest. }
+    Reset(0, False);
+    Cache.VecEntries[1].Slot := 98;
+    UseCounts[98] := 1;
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4Add, 24, 20, 22, 0), Aux, 0,
+      False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$F3, $0F, $6F, $9B, $B0, $00, $00, $00,
+      $66, $0F, $FE, $D3], Start)).ToBe(Start);    { movdqu xmm3,[rbx+0xB0] }
+                                                   { paddd xmm2, xmm3 }
+
+    { Evicting a dirty value that is still read later writes it back first:
+      slot 110 from xmm7 (movdqu [rbx+0x370], xmm7). }
+    Reset(5, True);
+    UseCounts[20] := 2;
+    UseCounts[22] := 2;
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4Add, 24, 20, 22, 0), Aux, 0,
+      False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$F3, $0F, $7F, $BB, $70, $03, $00, $00,
+      $66, $0F, $6F, $FA,                          { movdqa xmm7, xmm2 }
+      $66, $0F, $FE, $FB], Start)).ToBe(Start);    { paddd xmm7, xmm3 }
+  finally
+    Buf.Free;
+  end;
+end;
+
+procedure TX64Tests.TestVecCacheExtractAndSplat;
+var
+  Aux: TWasmIrAuxU32;
+  Buf: TWasmCodeBuffer;
+  Cache: TX64RegCache;
+  UseCounts: array[0..63] of UInt32;
+  Visible: array[0..63] of Boolean;
+  Start: Integer;
+begin
+  Aux := nil;
+  FillChar(UseCounts, SizeOf(UseCounts), 0);
+  FillChar(Visible, SizeOf(Visible), 0);
+  Visible[0] := True;
+  Visible[1] := True;
+  UseCounts[20] := 4;
+  Buf := TWasmCodeBuffer.Create;
+  try
+    X64EnableStaticRegCache(Buf, Cache, [0, 1]);
+    X64EnableDynamicWriteBack(Cache, @UseCounts[0], @Visible[0], 64);
+    X64EnableVecCache(Buf, Cache, [], [], [], []);
+    Cache.VecEntries[0].Valid := True;
+    Cache.VecEntries[0].Slot := 20;
+    Cache.VecNext := 1;
+    { A non-zero lane shifts a copy in xmm0; the source host is intact. }
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4ExtractLane, 3, 20, 0, 2), Aux,
+      0, False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $6F, $C2, { movdqa xmm0, xmm2 }
+      $66, $0F, $73, $D8, $08,                     { psrldq xmm0, 8 }
+      $66, $0F, $7E, $C0], Start)).ToBe(Start);    { movd eax, xmm0 }
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI8x16ExtractLaneS, 5, 20, 0, 5), Aux,
+      1, False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $6F, $C2,
+      $66, $0F, $73, $D8, $05,                     { psrldq xmm0, 5 }
+      $66, $0F, $7E, $C0,
+      $0F, $BE, $C0], Start)).ToBe(Start);         { movsx eax, al }
+    { Lane 0 reads the host directly. }
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4ExtractLane, 7, 20, 0, 0), Aux,
+      2, False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $7E, $D0], Start))
+      .ToBe(Start);                                { movd eax, xmm2 }
+    Expect<Integer>(FindSeq(Buf, [$66, $0F, $73, $DA])).ToBe(-1);
+    Expect<UInt32>(UseCounts[20]).ToBe(1);
+    { Splats read the scalar cache hosts: r8 (static slot 0), r9 (slot 1). }
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI32x4Splat, 26, 0, 0, 0), Aux, 3,
+      False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $41, $0F, $6E, $D8, { movd xmm3, r8d }
+      $66, $0F, $70, $DB, $00], Start)).ToBe(Start); { pshufd xmm3,xmm3,0 }
+    Start := Buf.Size;
+    X64EmitOpCached(Buf, MakeIrInstr(iroI64x2Splat, 28, 1, 0, 0), Aux, 4,
+      False, False, Cache);
+    Expect<Integer>(FindSeq(Buf, [$66, $49, $0F, $6E, $E1, { movq xmm4, r9 }
+      $66, $0F, $6C, $E4], Start)).ToBe(Start);    { punpcklqdq xmm4, xmm4 }
+  finally
+    Buf.Free;
+  end;
+end;
+
 procedure TX64Tests.TestExecPlaceholder;
 begin
   { Executable proof runs only on a real x86-64 host (the amd64 VM differential
@@ -1673,6 +1984,14 @@ begin
     TestGcFieldAccessBytes);
   Test('fixed scalar arrays use native x64 loads and stores',
     TestGcArrayAccessBytes);
+  Test('v128 cache register moves and constants emit the asserted bytes',
+    TestVecCacheEncodings);
+  Test('a cached v128 loop body keeps values in xmm hosts',
+    TestVecCacheLoopBody);
+  Test('cached v128 ops keep operands live through victim choice',
+    TestVecCacheOperandHazards);
+  Test('cached lane extracts and splats keep their sources intact',
+    TestVecCacheExtractAndSplat);
   Test('executable proof is gated to a real x86-64 host', TestExecPlaceholder);
 end;
 
