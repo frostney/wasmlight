@@ -15,7 +15,10 @@ uses
   TestingPascalLibrary,
   Wasm.Compile.Catalog,
   Wasm.Core,
-  Wasm.Distro;
+  Wasm.Distro,
+  Wasm.MachO,
+  Wasm.Native.Payload,
+  Wasm.Package.Elf;
 
 type
   TDistroTests = class(TTestSuite)
@@ -24,16 +27,22 @@ type
     procedure WriteText(const APath, AText: string);
     function BuildValidTree(const ARoot, AVersion, AHost: string;
       ACatalog: TWasmDistroCatalog): TWasmDistroManifest;
+    function ProbePayload(const ATriple: string;
+      const AShell: TBytes): TBytes;
+    function UnsignedMachOTemplate(const ATarget: TWasmMachOTarget): TBytes;
   public
     procedure SetupTests; override;
 
     procedure TestHostLookup;
+    procedure TestHostShellsShareTheHostArchitecture;
     procedure TestArchiveNames;
     procedure TestManifestRoundTrip;
     procedure TestRejectUnknownHost;
     procedure TestRejectIncompleteCatalog;
     procedure TestRejectUnknownShell;
     procedure TestRejectDuplicateShell;
+    procedure TestRejectForeignArchitectureShell;
+    procedure TestRejectAllToAllCatalogTree;
     procedure TestElfAndMachOMagic;
     procedure TestSwappedShellImage;
     procedure TestValidateTree;
@@ -44,6 +53,9 @@ type
     procedure TestChecksumsRejectPath;
     procedure TestCompileHelpDetection;
     procedure TestCompileEmissionNotShipped;
+    procedure TestElfEmissionBindsItsShell;
+    procedure TestMachOEmissionBindsItsShell;
+    procedure TestUnsignedMachOEmission;
   end;
 
 function TDistroTests.TempRoot: string;
@@ -71,24 +83,26 @@ function TDistroTests.BuildValidTree(const ARoot, AVersion, AHost: string;
   ACatalog: TWasmDistroCatalog): TWasmDistroManifest;
 var
   Host: TWasmDistroHost;
+  Triples: TStringArray;
   I: Integer;
 begin
   Expect<Boolean>(DistroFindHost(AHost, Host)).ToBe(True);
-  DistroSynthesizeCatalog(ARoot);
-  DistroWriteCatalog(ARoot, AVersion);
+  Expect<Boolean>(DistroSynthesizeCatalog(ARoot, Host).IsOk).ToBe(True);
+  Triples := DistroHostShells(Host);
+  DistroWriteCatalog(ARoot, AVersion, Triples);
   WriteText(DistroJoin(ARoot, DISTRO_COMPILER_NAME), 'compiler-placeholder');
   Result.Version := AVersion;
   Result.HostTriple := Host.Triple;
   Result.Display := Host.Display;
   Result.Catalog := ACatalog;
-  SetLength(Result.Shells, DISTRO_SHELL_COUNT);
-  SetLength(Result.Files, 1 + (DISTRO_SHELL_COUNT * 2));
+  SetLength(Result.Shells, Length(Triples));
+  SetLength(Result.Files, 1 + (Length(Triples) * 2));
   Result.Files[0] := DISTRO_COMPILER_NAME;
-  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  for I := 0 to High(Triples) do
   begin
-    Result.Shells[I] := DistroShell(I).Triple;
-    Result.Files[1 + (I * 2)] := DistroShellRelPath(DistroShell(I).Triple);
-    Result.Files[2 + (I * 2)] := DistroMetaRelPath(DistroShell(I).Triple);
+    Result.Shells[I] := Triples[I];
+    Result.Files[1 + (I * 2)] := DistroShellRelPath(Triples[I]);
+    Result.Files[2 + (I * 2)] := DistroMetaRelPath(Triples[I]);
   end;
   SetLength(Result.Hashes, 0);
   WriteText(DistroJoin(ARoot, DISTRO_MANIFEST_NAME), DistroFormatManifest(Result));
@@ -107,6 +121,57 @@ begin
     Expect<string>(Host.Triple).ToBe(DistroHost(I).Triple);
   end;
   Expect<Boolean>(DistroFindHost('x86_64-win64', Host)).ToBe(False);
+end;
+
+procedure TDistroTests.TestHostShellsShareTheHostArchitecture;
+var
+  Host: TWasmDistroHost;
+  Shells: TStringArray;
+begin
+  Expect<Boolean>(DistroFindHost('x86_64-linux', Host)).ToBe(True);
+  Shells := DistroHostShells(Host);
+  Expect<Integer>(Length(Shells)).ToBe(DISTRO_HOST_SHELL_COUNT);
+  Expect<string>(Shells[0]).ToBe('x86_64-linux');
+  Expect<string>(Shells[1]).ToBe('x86_64-darwin');
+  Expect<Boolean>(DistroFindHost('macos-arm64', Host)).ToBe(True);
+  Shells := DistroHostShells(Host);
+  Expect<Integer>(Length(Shells)).ToBe(DISTRO_HOST_SHELL_COUNT);
+  Expect<string>(Shells[0]).ToBe('aarch64-linux');
+  Expect<string>(Shells[1]).ToBe('aarch64-darwin');
+  { Cross-architecture emission is not in the 0.2.0 archive contract. }
+  Expect<Boolean>(DistroHostCarriesShell(Host, 'x86_64-darwin')).ToBe(False);
+  Expect<Boolean>(DistroHostCarriesShell(Host, 'i386-win32')).ToBe(False);
+end;
+
+function TDistroTests.ProbePayload(const ATriple: string;
+  const AShell: TBytes): TBytes;
+var
+  Params: TWasmNativePayloadWriteParams;
+  Funcs: TWasmNativeCodeRecords;
+begin
+  Params.IrFormatVer := 1;
+  if Copy(ATriple, 1, 7) = 'aarch64' then
+    Params.TargetArch := WNEP_ARCH_AARCH64
+  else
+    Params.TargetArch := WNEP_ARCH_X64;
+  if Pos('linux', ATriple) > 0 then
+    Params.TargetOs := WNEP_OS_LINUX
+  else
+    Params.TargetOs := WNEP_OS_DARWIN;
+  Params.Flags := 0;
+  Params.AbiFingerprint := 1;
+  Params.ModuleBytes := TWasmBytes.Create($00, $61, $73, $6D, $01, $00, $00, $00);
+  Params.ModuleHash := WnepHash128Bytes(Params.ModuleBytes);
+  Params.ShellHash := WnepHash128Bytes(AShell);
+  SetLength(Funcs, 1);
+  Funcs[0].FuncIrIndex := 0;
+  Funcs[0].RegisterCount := 1;
+  Funcs[0].EntryOffset := 0;
+  Funcs[0].Code := TWasmBytes.Create($C3);
+  Params.Funcs := Funcs;
+  Params.ConnectorPlan := nil;
+  Params.CapabilitySet := nil;
+  Result := WriteNativePayload(Params);
 end;
 
 procedure TDistroTests.TestArchiveNames;
@@ -129,15 +194,14 @@ procedure TDistroTests.TestManifestRoundTrip;
 var
   Manifest, Parsed: TWasmDistroManifest;
   Status: TWasmDistroResult;
-  I: Integer;
 begin
   Manifest.Version := '0.2.0';
   Manifest.HostTriple := 'aarch64-darwin';
   Manifest.Display := 'macos-arm64';
   Manifest.Catalog := wdcFixture;
-  SetLength(Manifest.Shells, DISTRO_SHELL_COUNT);
-  for I := 0 to DISTRO_SHELL_COUNT - 1 do
-    Manifest.Shells[I] := DistroShell(I).Triple;
+  SetLength(Manifest.Shells, 2);
+  Manifest.Shells[0] := 'aarch64-linux';
+  Manifest.Shells[1] := 'aarch64-darwin';
   SetLength(Manifest.Files, 1);
   Manifest.Files[0] := DISTRO_COMPILER_NAME;
   SetLength(Manifest.Hashes, 1);
@@ -149,7 +213,7 @@ begin
   Expect<string>(Parsed.HostTriple).ToBe('aarch64-darwin');
   Expect<string>(Parsed.Display).ToBe('macos-arm64');
   Expect<Integer>(Ord(Parsed.Catalog)).ToBe(Ord(wdcFixture));
-  Expect<Integer>(Length(Parsed.Shells)).ToBe(4);
+  Expect<Integer>(Length(Parsed.Shells)).ToBe(2);
   Expect<string>(Parsed.Hashes[0].Digest).ToBe(StringOfChar('a', 64));
 end;
 
@@ -184,17 +248,15 @@ procedure TDistroTests.TestRejectUnknownShell;
 var
   Manifest: TWasmDistroManifest;
   Status: TWasmDistroResult;
-  Text: string;
-  I: Integer;
 begin
-  Text := 'version 0.2.0' + sLineBreak +
+  Status := DistroParseManifest(
+    'version 0.2.0' + sLineBreak +
     'host x86_64-linux' + sLineBreak +
     'display linux-x64' + sLineBreak +
-    'catalog live';
-  for I := 0 to DISTRO_SHELL_COUNT - 1 do
-    Text := Text + sLineBreak + 'shell ' + DistroShell(I).Triple;
-  Text := Text + sLineBreak + 'shell i386-win32';
-  Status := DistroParseManifest(Text, Manifest);
+    'catalog live' + sLineBreak +
+    'shell x86_64-linux' + sLineBreak +
+    'shell x86_64-darwin' + sLineBreak +
+    'shell i386-win32', Manifest);
   Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsUnknownShell));
 end;
 
@@ -209,11 +271,50 @@ begin
     'display linux-arm64' + sLineBreak +
     'catalog live' + sLineBreak +
     'shell aarch64-linux' + sLineBreak +
-    'shell x86_64-linux' + sLineBreak +
     'shell aarch64-darwin' + sLineBreak +
-    'shell x86_64-darwin' + sLineBreak +
     'shell aarch64-linux', Manifest);
   Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsDuplicateShell));
+end;
+
+procedure TDistroTests.TestRejectForeignArchitectureShell;
+var
+  Manifest: TWasmDistroManifest;
+  Status: TWasmDistroResult;
+begin
+  { An x86-64 compiler cannot emit AArch64 in 0.2.0, so an archive that
+    lists an AArch64 shell would promise a target its compiler rejects. }
+  Status := DistroParseManifest(
+    'version 0.2.0' + sLineBreak +
+    'host x86_64-linux' + sLineBreak +
+    'display linux-x64' + sLineBreak +
+    'catalog live' + sLineBreak +
+    'shell x86_64-linux' + sLineBreak +
+    'shell x86_64-darwin' + sLineBreak +
+    'shell aarch64-linux', Manifest);
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsForeignShell));
+end;
+
+procedure TDistroTests.TestRejectAllToAllCatalogTree;
+var
+  Root: string;
+  I: Integer;
+  Triples: TStringArray;
+  Status: TWasmDistroResult;
+begin
+  Root := TempRoot;
+  BuildValidTree(Root, '0.2.0', 'linux-x64', wdcFixture);
+  { Stage every released shell and index all four: the MANIFEST still names
+    only the host pair, but the catalog now offers foreign targets. }
+  SetLength(Triples, DISTRO_SHELL_COUNT);
+  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  begin
+    Triples[I] := DistroShell(I).Triple;
+    DistroWriteStructuralShell(DistroJoin(Root, DistroShellRelPath(Triples[I])),
+      Triples[I]);
+  end;
+  DistroWriteCatalog(Root, '0.2.0', Triples);
+  Status := DistroValidateTree(Root, '0.2.0');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsForeignShell));
 end;
 
 procedure TDistroTests.TestElfAndMachOMagic;
@@ -227,10 +328,11 @@ var
   Wrong: string;
 begin
   Root := TempRoot;
-  DistroSynthesizeCatalog(Root);
   for I := 0 to DISTRO_SHELL_COUNT - 1 do
   begin
     Shell := DistroShell(I);
+    DistroWriteStructuralShell(DistroJoin(Root, DistroShellRelPath(Shell.Triple)),
+      Shell.Triple);
     Stream := TFileStream.Create(DistroJoin(Root, DistroShellRelPath(Shell.Triple)),
       fmOpenRead or fmShareDenyWrite);
     try
@@ -332,6 +434,103 @@ begin
     'EWasmLinkError: unknown import')).ToBe(False);
 end;
 
+procedure TDistroTests.TestElfEmissionBindsItsShell;
+var
+  Shell, Image, Payload, Other: TBytes;
+  Info: TWasmElfPackageInfo;
+  Status: TWasmDistroResult;
+begin
+  Shell := PlaceholderElfTemplate(weptX86_64Linux);
+  Payload := ProbePayload('x86_64-linux', Shell);
+  Expect<Integer>(Ord(PackageElfShell(Shell, Payload, weptX86_64Linux, Image)))
+    .ToBe(Ord(eprOk));
+  Expect<Integer>(Ord(ParseElfPackage(Image, Info))).ToBe(Ord(eprOk));
+  Status := DistroCheckEmission(Image, Info.Payload, Shell, 'x86_64-linux');
+  Expect<Boolean>(Status.IsOk).ToBe(True);
+  { Right image, wrong requested target. }
+  Status := DistroCheckEmission(Image, Info.Payload, Shell, 'x86_64-darwin');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+  { A payload stamped for macOS inside a Linux image. }
+  Status := DistroCheckEmission(Image, ProbePayload('x86_64-darwin', Shell),
+    Shell, 'x86_64-linux');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+  { Packaged onto some other shell than the archive's. }
+  Other := Copy(Shell);
+  Other[High(Other)] := Other[High(Other)] xor $FF;
+  Status := DistroCheckEmission(Image, Info.Payload, Other, 'x86_64-linux');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+  { A payload that is not a native-executable payload at all. }
+  Status := DistroCheckEmission(Image, TBytes.Create($57, $53, $48, $4C), Shell,
+    'x86_64-linux');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+end;
+
+procedure TDistroTests.TestMachOEmissionBindsItsShell;
+var
+  Shell, Image, Payload, Extracted: TBytes;
+  Status: TWasmDistroResult;
+  Info: TWasmMachOInfo;
+begin
+  Shell := WriteMachOShellTemplate(wmtX86_64Darwin);
+  Payload := ProbePayload('x86_64-darwin', Shell);
+  Expect<Integer>(Ord(PackageMachORuntimeShell(Shell, Payload, 'probe', Image)))
+    .ToBe(Ord(mmrOk));
+  Expect<Integer>(Ord(ExtractMachOPayload(Image, Extracted))).ToBe(Ord(mmrOk));
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'x86_64-darwin');
+  Expect<Boolean>(Status.IsOk).ToBe(True);
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'aarch64-darwin');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+  { Flip a byte of the signed payload: the ad-hoc signature must fail. }
+  Expect<Integer>(Ord(InspectMachO(Image, Info))).ToBe(Ord(mmrOk));
+  Image[Info.PayloadOff] := Image[Info.PayloadOff] xor $FF;
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'x86_64-darwin');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+end;
+
+function TDistroTests.UnsignedMachOTemplate(const ATarget: TWasmMachOTarget): TBytes;
+const
+  LC_CODE_SIGNATURE = $1D;
+  LC_DYLIB_CODE_SIGN_DRS = $2B;
+var
+  Info: TWasmMachOInfo;
+  Off, Cmds, I: Integer;
+begin
+  { Intel `ld` links without a signature. Retag the template's
+    LC_CODE_SIGNATURE as an inert linkedit command to model that shell. }
+  Result := WriteMachOShellTemplate(ATarget);
+  Cmds := Result[16] or (Result[17] shl 8);
+  Off := 32;
+  for I := 1 to Cmds do
+  begin
+    if Result[Off] = LC_CODE_SIGNATURE then
+      Result[Off] := LC_DYLIB_CODE_SIGN_DRS;
+    Off := Off + (Result[Off + 4] or (Result[Off + 5] shl 8));
+  end;
+  Expect<Integer>(Ord(InspectMachO(Result, Info))).ToBe(Ord(mmrOk));
+  Expect<Boolean>(Info.HasSignature).ToBe(False);
+end;
+
+procedure TDistroTests.TestUnsignedMachOEmission;
+var
+  Shell, Image, Extracted: TBytes;
+  Status: TWasmDistroResult;
+begin
+  { x86-64 macOS runs unsigned code: the appended-trailer image passes. }
+  Shell := UnsignedMachOTemplate(wmtX86_64Darwin);
+  Expect<Integer>(Ord(PackageAppendedPayload(Shell,
+    ProbePayload('x86_64-darwin', Shell), Image))).ToBe(Ord(eprOk));
+  Expect<Integer>(Ord(ParseAppendedPayload(Image, Extracted))).ToBe(Ord(eprOk));
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'x86_64-darwin');
+  Expect<Boolean>(Status.IsOk).ToBe(True);
+  { arm64 macOS does not: the same form for AArch64 is rejected. }
+  Shell := UnsignedMachOTemplate(wmtAarch64Darwin);
+  Expect<Integer>(Ord(PackageAppendedPayload(Shell,
+    ProbePayload('aarch64-darwin', Shell), Image))).ToBe(Ord(eprOk));
+  Expect<Integer>(Ord(ParseAppendedPayload(Image, Extracted))).ToBe(Ord(eprOk));
+  Status := DistroCheckEmission(Image, Extracted, Shell, 'aarch64-darwin');
+  Expect<Integer>(Ord(Status.Status)).ToBe(Ord(ddsBadEmission));
+end;
+
 procedure TDistroTests.TestCompileHelpDetection;
 begin
   Expect<Boolean>(DistroHelpListsCompile(
@@ -349,13 +548,20 @@ procedure TDistroTests.TestCompilerCatalogIsLoadable;
 var
   Root: string;
   Entry: TWasmShellEntry;
+  Host: TWasmDistroHost;
+  Triples: TStringArray;
   I: Integer;
 begin
   Root := TempRoot;
   BuildValidTree(Root, PROGRAM_VERSION, 'aarch64-darwin', wdcFixture);
-  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  Expect<Boolean>(DistroFindHost('aarch64-darwin', Host)).ToBe(True);
+  Triples := DistroHostShells(Host);
+  for I := 0 to High(Triples) do
     Expect<Integer>(Ord(ResolveShell(DistroJoin(Root, DISTRO_SHELL_ROOT),
-      DistroShell(I).Triple, Entry))).ToBe(Ord(ssrOk));
+      Triples[I], Entry))).ToBe(Ord(ssrOk));
+  { The compiler's own selector finds no foreign-architecture shell. }
+  Expect<Integer>(Ord(ResolveShell(DistroJoin(Root, DISTRO_SHELL_ROOT),
+    'x86_64-linux', Entry))).ToBe(Ord(ssrMissingShell));
   DeleteFile(DistroJoin(Root, DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME));
   Expect<Integer>(Ord(DistroValidateTree(Root).Status)).ToBe(Ord(ddsIncompleteCatalog));
 end;
@@ -387,12 +593,16 @@ begin
   Test('archive catalogs load through the compiler selector', TestCompilerCatalogIsLoadable);
   Test('archive paths and staging versions stay contained', TestArchivePathsStayContained);
   Test('four Unix hosts resolve by triple and display name', TestHostLookup);
+  Test('a host archive carries its own architecture for Linux and macOS',
+    TestHostShellsShareTheHostArchitecture);
   Test('archive and checksum names follow the lwpt pattern', TestArchiveNames);
   Test('a valid MANIFEST round-trips', TestManifestRoundTrip);
   Test('a Win64 host is rejected in the 0.2.0 catalog', TestRejectUnknownHost);
   Test('a partial shell list is incomplete', TestRejectIncompleteCatalog);
   Test('an unknown shell triple is rejected', TestRejectUnknownShell);
   Test('a duplicated shell triple is rejected', TestRejectDuplicateShell);
+  Test('a foreign-architecture shell is rejected', TestRejectForeignArchitectureShell);
+  Test('an all-to-all catalog is not a 0.2.0 host archive', TestRejectAllToAllCatalogTree);
   Test('every synthesized shell carries its ELF or Mach-O magic', TestElfAndMachOMagic);
   Test('a swapped shell image fails structural validation', TestSwappedShellImage);
   Test('a complete tree validates and a version mismatch does not', TestValidateTree);
@@ -403,6 +613,10 @@ begin
     TestCompileHelpDetection);
   Test('stub compile/packaging errors are emission-not-shipped, not archive faults',
     TestCompileEmissionNotShipped);
+  Test('an ELF emission binds its target and the archive shell', TestElfEmissionBindsItsShell);
+  Test('a Mach-O emission binds its target, shell, and signature',
+    TestMachOEmissionBindsItsShell);
+  Test('an unsigned Mach-O emission is x86-64 only', TestUnsignedMachOEmission);
 end;
 
 begin
