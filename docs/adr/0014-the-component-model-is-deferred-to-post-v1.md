@@ -57,3 +57,9 @@ Consequences:
 - When components return, the canonical ABI's lifting and lowering
   remain hot-path code under the RTL policy in
   [code-style.md](../code-style.md).
+- Component resources and connector opaque handles
+  ([ADR-0015](./0015-strict-native-compiler-and-runtime-shell.md)) are
+  both guest-visible handle tables. The re-entry extends the connector
+  tables rather than adding a second one, and any connector support for
+  WIT-built guests uses the canonical ABI this ADR defers, not its own
+  lowering.
