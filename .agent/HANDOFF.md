@@ -14,8 +14,11 @@
   tier), #162 (#146 connector plans, contract D11–D14 recorded on #146),
   #164 (#163 DOS device names), #165 (#150 docs), #166 (release).
 - Follow-ups filed: #157 (handle release), #158 (strings/structs/by-ref),
-  both 0.3.0. Not yet filed: the Intel macOS runtime shell is unsigned, so
-  the two macOS targets package differently.
+  #168 (sign the Intel macOS shell), #169 (`run --env` validation), #170
+  (nested host-to-guest isolation), and #171 (stack probe for wide call
+  scratch), all 0.3.0. #167 has no milestone and is a candidate for a 0.2.1
+  patch: on macOS, `wasmlight compile` run by name from PATH can't find its
+  shell catalog, because FPC's Darwin `ParamStr(0)` is the raw argv[0].
 - Process notes: two API session limits killed the parallel workers. The
   maintainer then asked for no subagents, so later PRs had single-agent
   coordinator review instead of a Fable 5.1 review. The shared lwpt worker
