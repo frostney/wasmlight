@@ -75,6 +75,14 @@ class Wasmlight < Formula
     system bin/"wasmlight", "compile", testpath/"probe.wasm", "-o", testpath/"probe"
     shell_output("#{testpath}/probe", 37)
 
+    # Run by name from PATH, as a user types it: the compiler must find its
+    # installed shell catalog from its own executable path, not argv[0] or
+    # the current directory (wasmlight#167).
+    with_env(PATH: "#{bin}:#{ENV.fetch("PATH")}") do
+      system "wasmlight", "compile", "probe.wasm", "-o", "probe-by-name"
+    end
+    shell_output("#{testpath}/probe-by-name", 37)
+
     # The same-architecture shell for the other OS is packaged, not run.
     arch = Hardware::CPU.arm? ? "aarch64" : "x86_64"
     other = OS.mac? ? "#{arch}-linux" : "#{arch}-darwin"
