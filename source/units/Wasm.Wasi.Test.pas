@@ -247,7 +247,8 @@ type
     { A per-test host temp directory, created in BeforeEach and removed in
       AfterEach — the ONLY host filesystem a test touches, and only through the
       preopen (embedding-spec.md §7.3). Populated with hello.txt, a subdir, and
-      (UNIX) an escaping symlink. }
+      (UNIX) an escaping symlink. The Windows cases add their own junctions
+      and symlinks, plus a sibling temp dir as the outside target. }
     FTempDir: string;
 
     { Build the WASI context from AConfig, define all preview1 funcs,
@@ -271,6 +272,17 @@ type
     function DoPathOpen(const ADirFd: UInt32; const APath: string;
       const AOFlags, AFdFlags: UInt32; const ARights: TWasmWasiRights;
       out AOpenedFd: UInt32): Int32;
+    {$IFDEF WINDOWS}
+    { path_create_directory / path_filestat_get on the preopen (fd 3). }
+    function DoCreateDirectory(const APath: string): Int32;
+    function DoPathFilestat(const APath: string): Int32;
+    { fd_close, so a Windows case leaves no open handle to block cleanup. }
+    function DoFdClose(const AFd: UInt32): Int32;
+    function DoUnlinkFile(const APath: string): Int32;
+    { The names in the preopen and its "sub" directory, so a device case can
+      tell whether a create made a real file instead of reaching a device. }
+    function SandboxListing: string;
+    {$ENDIF}
     procedure WriteHostFile(const APath: string; const AContent: string);
     function ReadHostFile(const APath: string): string;
   protected
@@ -322,6 +334,20 @@ type
     procedure TestPathOpenExistingThroughSymlinkRefused;
     {$ENDIF}
 
+    { --- Windows reparse-point containment (#149) ------------------------ }
+    {$IFDEF WINDOWS}
+    procedure TestWinJunctionEscapeRefused;
+    procedure TestWinSymlinkEscapeRefused;
+    procedure TestWinCreateThroughDanglingLinkRefused;
+    procedure TestWinBackslashDotDotEscapeRefused;
+    procedure TestWinInPreopenLinksWork;
+    procedure TestWinPreopenRootThroughJunctionWorks;
+    { --- Windows DOS device names (#163) --------------------------------- }
+    procedure TestWinDeviceNamesRefusedOnCreate;
+    procedure TestWinDeviceNamesRefusedByEveryPathOp;
+    procedure TestWinDeviceLookAlikesStillWork;
+    {$ENDIF}
+
     { The CSPRNG DEFAULT (not injected): two random_get calls differ + fill. }
     procedure TestDefaultCsprngFillsAndDiffers;
   end;
@@ -351,19 +377,27 @@ begin
             entry, so a symlinked directory arrives as a plain directory and
             the attr guard would follow `escape -> /etc` and try to unlink
             system files. fpReadLink asks the question lstat does. Windows
-            keeps the attr check — its FindFirst reports symlinks directly. }
+            keeps the attr check — its FindFirst reports reparse points
+            directly — and removes a junction or directory symlink with
+            RemoveDir, which unlinks the link and never touches its target
+            (DeleteFile refuses a directory link). }
           {$PUSH}{$WARN SYMBOL_PLATFORM OFF}
           {$IFDEF UNIX}
           if ((Sr.Attr and faDirectory) <> 0) and
             (fpReadLink(RawByteString(Full)) = '') then
-          {$ELSE}
-          if ((Sr.Attr and faDirectory) <> 0) and
-            ((Sr.Attr and faSymLink) = 0) then
-          {$ENDIF}
-          {$POP}
             RemoveTree(Full)
           else
             DeleteFile(Full);
+          {$ELSE}
+          if ((Sr.Attr and faDirectory) <> 0) and
+            ((Sr.Attr and faSymLink) = 0) then
+            RemoveTree(Full)
+          else if (Sr.Attr and faDirectory) <> 0 then
+            RemoveDir(Full)
+          else
+            DeleteFile(Full);
+          {$ENDIF}
+          {$POP}
         until FindNext(Sr) <> 0;
       finally
         FindClose(Sr);
@@ -401,6 +435,90 @@ begin
   end;
   raise EWasmError.Create('could not create a unique temp dir for the test');
 end;
+
+{$IFDEF WINDOWS}
+{ --- Windows link fixtures (#149) ------------------------------------------ }
+
+const
+  WIN_SYMBOLIC_LINK_FLAG_DIRECTORY = UInt32(1);
+  { Lets a Developer Mode host create a symlink without the privilege. }
+  WIN_SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = UInt32(2);
+  WIN_ERROR_INVALID_PARAMETER = 87;
+  WIN_ERROR_PRIVILEGE_NOT_HELD = 1314;
+
+function WinCreateSymbolicLinkW(ALinkName, ATargetName: PWideChar;
+  AFlags: UInt32): ByteBool; stdcall;
+  external 'kernel32.dll' name 'CreateSymbolicLinkW';
+
+{ True iff APath itself (not its target) is a reparse point. FileGetAttr is
+  GetFileAttributesW, which does not follow the final component. }
+function IsHostReparsePoint(const APath: string): Boolean;
+var
+  Attr: LongInt;
+begin
+  Attr := FileGetAttr(APath);
+  {$PUSH}{$WARN SYMBOL_PLATFORM OFF}
+  Result := (Attr <> -1) and ((Attr and faSymLink) <> 0);
+  {$POP}
+end;
+
+{ A directory junction at ALink naming ATarget. Junctions need no privilege,
+  so every Windows host can build this escape. mklink /J is the stock tool;
+  its banner goes to nul. }
+function MakeJunction(const ALink, ATarget: string): Boolean;
+var
+  Shell: string;
+begin
+  Shell := GetEnvironmentVariable('ComSpec');
+  if Shell = '' then
+    Shell := 'cmd.exe';
+  Result := (ExecuteProcess(Shell, '/c mklink /J "' + ALink + '" "' + ATarget +
+    '" >nul') = 0) and IsHostReparsePoint(ALink);
+end;
+
+{ A symlink at ALink naming ATarget (which may not exist). The unprivileged
+  flag covers Developer Mode hosts; a Windows too old to know the flag rejects
+  it, so the call is retried without it. On failure AError holds the Win32
+  code — WIN_ERROR_PRIVILEGE_NOT_HELD when the runner may not create links. }
+function MakeSymlink(const ALink, ATarget: string; const ADirectory: Boolean;
+  out AError: Integer): Boolean;
+var
+  LinkW, TargetW: UnicodeString;
+  Flags: UInt32;
+begin
+  LinkW := UnicodeString(ALink);
+  TargetW := UnicodeString(ATarget);
+  Flags := 0;
+  if ADirectory then
+    Flags := WIN_SYMBOLIC_LINK_FLAG_DIRECTORY;
+  AError := 0;
+  Result := WinCreateSymbolicLinkW(PWideChar(LinkW), PWideChar(TargetW),
+    Flags or WIN_SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE);
+  if not Result then
+  begin
+    AError := GetLastOSError;
+    if AError = WIN_ERROR_INVALID_PARAMETER then
+    begin
+      Result := WinCreateSymbolicLinkW(PWideChar(LinkW), PWideChar(TargetW),
+        Flags);
+      if Result then
+        AError := 0
+      else
+        AError := GetLastOSError;
+    end;
+  end;
+end;
+
+{ The one accepted reason to skip a symlink case: the runner lacks the
+  privilege. Anything else fails the test. Both outcomes record an assertion,
+  and the skip is printed so a CI log shows whether the case ran. }
+procedure RecordSymlinkSkip(const ACase: string; const AError: Integer);
+begin
+  Expect<Integer>(AError).ToBe(WIN_ERROR_PRIVILEGE_NOT_HELD);
+  WriteLn('SKIP ', ACase, ': symlink creation privilege not held (Win32 ',
+    AError, ')');
+end;
+{$ENDIF}
 
 procedure TWasiTests.BeforeEach;
 begin
@@ -546,6 +664,84 @@ begin
     if not MemReadU32(FMem, 400, AOpenedFd) then
       raise EWasmError.Create('opened_fd read out of bounds');
 end;
+
+{$IFDEF WINDOWS}
+function TWasiTests.DoCreateDirectory(const APath: string): Int32;
+var
+  Args, Results: array of TWasmValue;
+begin
+  SetLength(Args, 3);
+  Args[0] := MakeValueI32(3);
+  Args[1] := MakeValueI32(300);
+  Args[2] := MakeValueI32(Int32(GuestPutStr(300, APath)));
+  SetLength(Results, 1);
+  Call(Wrapper('w_path_create_directory'), Args, Results);
+  Result := Results[0].I32;
+end;
+
+function TWasiTests.DoPathFilestat(const APath: string): Int32;
+var
+  Args, Results: array of TWasmValue;
+begin
+  SetLength(Args, 5);
+  Args[0] := MakeValueI32(3);
+  Args[1] := MakeValueI32(0);              { flags }
+  Args[2] := MakeValueI32(300);
+  Args[3] := MakeValueI32(Int32(GuestPutStr(300, APath)));
+  Args[4] := MakeValueI32(500);            { filestat buf }
+  SetLength(Results, 1);
+  Call(Wrapper('w_path_filestat_get'), Args, Results);
+  Result := Results[0].I32;
+end;
+
+function TWasiTests.DoFdClose(const AFd: UInt32): Int32;
+var
+  Args, Results: array of TWasmValue;
+begin
+  SetLength(Args, 1);
+  Args[0] := MakeValueI32(Int32(AFd));
+  SetLength(Results, 1);
+  Call(Wrapper('w_fd_close'), Args, Results);
+  Result := Results[0].I32;
+end;
+
+function TWasiTests.DoUnlinkFile(const APath: string): Int32;
+var
+  Args, Results: array of TWasmValue;
+begin
+  SetLength(Args, 3);
+  Args[0] := MakeValueI32(3);
+  Args[1] := MakeValueI32(300);
+  Args[2] := MakeValueI32(Int32(GuestPutStr(300, APath)));
+  SetLength(Results, 1);
+  Call(Wrapper('w_path_unlink_file'), Args, Results);
+  Result := Results[0].I32;
+end;
+
+function TWasiTests.SandboxListing: string;
+
+  procedure AddDir(const ADir, APrefix: string);
+  var
+    Sr: TSearchRec;
+  begin
+    if FindFirst(IncludeTrailingPathDelimiter(ADir) + '*', faAnyFile, Sr) = 0
+    then
+      try
+        repeat
+          if (Sr.Name <> '.') and (Sr.Name <> '..') then
+            Result := Result + APrefix + Sr.Name + '|';
+        until FindNext(Sr) <> 0;
+      finally
+        FindClose(Sr);
+      end;
+  end;
+
+begin
+  Result := '';
+  AddDir(FTempDir, '');
+  AddDir(IncludeTrailingPathDelimiter(FTempDir) + 'sub', 'sub/');
+end;
+{$ENDIF}
 
 procedure TWasiTests.WriteHostFile(const APath: string; const AContent: string);
 var
@@ -1443,6 +1639,334 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF WINDOWS}
+{ --- Windows reparse-point containment (#149) ---------------------------- }
+
+procedure TWasiTests.TestWinJunctionEscapeRefused;
+var
+  OpenedFd: UInt32;
+  Outside: string;
+begin
+  { A junction INSIDE the preopen naming a directory OUTSIDE it. It needs no
+    privilege to create, so it is the escape any Windows host can carry.
+    Every route through it — open the link, open or stat a file behind it,
+    create a file or a directory behind it — is weNotCapable, and nothing
+    lands outside. }
+  Outside := MakeTempDir;
+  try
+    WriteHostFile(IncludeTrailingPathDelimiter(Outside) + 'secret.txt',
+      'outside-secret');
+    Expect<Boolean>(MakeJunction(IncludeTrailingPathDelimiter(FTempDir) +
+      'jout', Outside)).ToBe(True);
+    BuildRun(SandboxConfig(SandboxRights));
+    Expect<Int32>(DoPathOpen(3, 'jout', 0, 0, SandboxRights, OpenedFd))
+      .ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'jout/secret.txt', 0, 0, SandboxRights,
+      OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathFilestat('jout/secret.txt')).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'jout/new.txt', WASI_OFLAGS_CREAT, 0,
+      SandboxRights, OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoCreateDirectory('jout/newdir')).ToBe(Ord(weNotCapable));
+    Expect<Boolean>(FileExists(IncludeTrailingPathDelimiter(Outside) +
+      'new.txt')).ToBe(False);
+    Expect<Boolean>(DirectoryExists(IncludeTrailingPathDelimiter(Outside) +
+      'newdir')).ToBe(False);
+  finally
+    RemoveTree(Outside);
+  end;
+end;
+
+procedure TWasiTests.TestWinSymlinkEscapeRefused;
+var
+  OpenedFd: UInt32;
+  Outside: string;
+  Error: Integer;
+begin
+  { The symlink forms of the same escape: a file symlink to an outside file
+    and a directory symlink to an outside directory. Creating one needs a
+    privilege (or Developer Mode) the runner may lack; only that refusal
+    skips, and the skip is printed. }
+  Outside := MakeTempDir;
+  try
+    WriteHostFile(IncludeTrailingPathDelimiter(Outside) + 'secret.txt',
+      'outside-secret');
+    if not MakeSymlink(IncludeTrailingPathDelimiter(FTempDir) + 'lout',
+      IncludeTrailingPathDelimiter(Outside) + 'secret.txt', False, Error) then
+    begin
+      RecordSymlinkSkip('Windows symlink escape', Error);
+      Exit;
+    end;
+    Expect<Boolean>(MakeSymlink(IncludeTrailingPathDelimiter(FTempDir) + 'dout',
+      Outside, True, Error)).ToBe(True);
+    BuildRun(SandboxConfig(SandboxRights));
+    Expect<Int32>(DoPathOpen(3, 'lout', 0, 0, SandboxRights, OpenedFd))
+      .ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'dout', 0, 0, SandboxRights, OpenedFd))
+      .ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'dout/secret.txt', 0, 0, SandboxRights,
+      OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'dout/new.txt', WASI_OFLAGS_CREAT, 0,
+      SandboxRights, OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Boolean>(FileExists(IncludeTrailingPathDelimiter(Outside) +
+      'new.txt')).ToBe(False);
+    WriteLn('RAN Windows symlink escape: symlinks created and refused');
+  finally
+    RemoveTree(Outside);
+  end;
+end;
+
+procedure TWasiTests.TestWinCreateThroughDanglingLinkRefused;
+var
+  OpenedFd: UInt32;
+  Gone, Target: string;
+  Error: Integer;
+begin
+  { A DANGLING link inside the preopen naming an outside target. Nothing
+    resolves it, so containment cannot see where a create would land: the
+    create is refused (weNotCapable) and the target is never made. Opening it
+    without O_CREAT is weNoEnt, as on POSIX. The junction always runs; the
+    file-symlink form needs the symlink privilege. }
+  Gone := MakeTempDir;
+  Expect<Boolean>(MakeJunction(IncludeTrailingPathDelimiter(FTempDir) +
+    'jdangle', Gone)).ToBe(True);
+  Expect<Boolean>(RemoveDir(Gone)).ToBe(True);
+  BuildRun(SandboxConfig(SandboxRights));
+  Expect<Int32>(DoPathOpen(3, 'jdangle', 0, 0, SandboxRights, OpenedFd))
+    .ToBe(Ord(weNoEnt));
+  Expect<Int32>(DoPathOpen(3, 'jdangle', WASI_OFLAGS_CREAT, 0, SandboxRights,
+    OpenedFd)).ToBe(Ord(weNotCapable));
+  Expect<Int32>(DoCreateDirectory('jdangle')).ToBe(Ord(weNotCapable));
+  Expect<Boolean>(DirectoryExists(Gone) or FileExists(Gone)).ToBe(False);
+
+  Target := IncludeTrailingPathDelimiter(GetTempDir) + 'wasmlight_escape_' +
+    IntToStr(GetTickCount64) + '.txt';
+  DeleteFile(Target);
+  if not MakeSymlink(IncludeTrailingPathDelimiter(FTempDir) + 'evil', Target,
+    False, Error) then
+  begin
+    RecordSymlinkSkip('Windows dangling file symlink', Error);
+    Exit;
+  end;
+  try
+    Expect<Int32>(DoPathOpen(3, 'evil', WASI_OFLAGS_CREAT, 0, SandboxRights,
+      OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Boolean>(FileExists(Target)).ToBe(False);
+    WriteLn('RAN Windows dangling file symlink: create refused');
+  finally
+    DeleteFile(Target);
+  end;
+end;
+
+procedure TWasiTests.TestWinBackslashDotDotEscapeRefused;
+var
+  OpenedFd: UInt32;
+  Above, Name: string;
+begin
+  { Windows also reads '\' as a separator, which NormalizeGuestPath does not
+    split on, so a "..\" component survives the lexical pass. The resolved
+    parent is outside the root, so each create is weNotCapable and nothing
+    lands above the preopen. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Above := IncludeTrailingPathDelimiter(ExtractFileDir(
+    ExcludeTrailingPathDelimiter(FTempDir)));
+  Name := 'wasmlight_above_' + IntToStr(GetTickCount64);
+  try
+    Expect<Int32>(DoPathOpen(3, '..\' + Name, WASI_OFLAGS_CREAT, 0,
+      SandboxRights, OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'sub\..\..\' + Name, WASI_OFLAGS_CREAT, 0,
+      SandboxRights, OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoPathOpen(3, 'sub/..\..\' + Name, WASI_OFLAGS_CREAT, 0,
+      SandboxRights, OpenedFd)).ToBe(Ord(weNotCapable));
+    Expect<Int32>(DoCreateDirectory('..\' + Name)).ToBe(Ord(weNotCapable));
+    Expect<Boolean>(FileExists(Above + Name) or DirectoryExists(Above + Name))
+      .ToBe(False);
+  finally
+    DeleteFile(Above + Name);
+    RemoveDir(Above + Name);
+  end;
+end;
+
+procedure TWasiTests.TestWinInPreopenLinksWork;
+var
+  OpenedFd: UInt32;
+  Error: Integer;
+begin
+  { Containment denies escapes, not links: a junction to a directory inside
+    the preopen opens, reads through, and creates through normally. A file
+    symlink to an inside file does too, where the runner can create one. }
+  WriteHostFile(IncludeTrailingPathDelimiter(FTempDir) + 'sub' + PathDelim +
+    'inner.txt', 'inner-data');
+  Expect<Boolean>(MakeJunction(IncludeTrailingPathDelimiter(FTempDir) + 'jin',
+    IncludeTrailingPathDelimiter(FTempDir) + 'sub')).ToBe(True);
+  BuildRun(SandboxConfig(SandboxRights));
+  Expect<Int32>(DoPathOpen(3, 'jin', WASI_OFLAGS_DIRECTORY, 0, SandboxRights,
+    OpenedFd)).ToBe(Ord(weSuccess));
+  Expect<Int32>(DoPathOpen(3, 'jin/inner.txt', 0, 0, SandboxRights, OpenedFd))
+    .ToBe(Ord(weSuccess));
+  Expect<Int32>(DoFdClose(OpenedFd)).ToBe(Ord(weSuccess));
+  Expect<Int32>(DoPathFilestat('jin/inner.txt')).ToBe(Ord(weSuccess));
+  Expect<Int32>(DoPathOpen(3, 'jin/made.txt', WASI_OFLAGS_CREAT, 0,
+    SandboxRights, OpenedFd)).ToBe(Ord(weSuccess));
+  Expect<Int32>(DoFdClose(OpenedFd)).ToBe(Ord(weSuccess));
+  Expect<Boolean>(FileExists(IncludeTrailingPathDelimiter(FTempDir) + 'sub' +
+    PathDelim + 'made.txt')).ToBe(True);
+
+  if not MakeSymlink(IncludeTrailingPathDelimiter(FTempDir) + 'lin',
+    IncludeTrailingPathDelimiter(FTempDir) + 'hello.txt', False, Error) then
+  begin
+    RecordSymlinkSkip('Windows in-preopen file symlink', Error);
+    Exit;
+  end;
+  Expect<Int32>(DoPathOpen(3, 'lin', 0, 0, SandboxRights, OpenedFd))
+    .ToBe(Ord(weSuccess));
+  Expect<Int32>(DoFdClose(OpenedFd)).ToBe(Ord(weSuccess));
+  WriteLn('RAN Windows in-preopen file symlink: opened');
+end;
+
+procedure TWasiTests.TestWinPreopenRootThroughJunctionWorks;
+var
+  OpenedFd: UInt32;
+  RootLink: string;
+  Config: TWasmWasiConfig;
+begin
+  { The preopen root is resolved too, so a host directory granted through a
+    junction is contained to the junction's target: its files open, and a
+    ".." past it is still refused. }
+  RootLink := IncludeTrailingPathDelimiter(GetTempDir) + 'wasmlight_root_' +
+    IntToStr(GetTickCount64);
+  Expect<Boolean>(MakeJunction(RootLink, FTempDir)).ToBe(True);
+  try
+    Config := TWasmWasiConfig.Create;
+    Config.AddPreopenDir('/sandbox', RootLink, SandboxRights);
+    BuildRun(Config);
+    Expect<Int32>(DoPathOpen(3, 'hello.txt', 0, 0, SandboxRights, OpenedFd))
+      .ToBe(Ord(weSuccess));
+    Expect<Int32>(DoFdClose(OpenedFd)).ToBe(Ord(weSuccess));
+    Expect<Int32>(DoPathOpen(3, '..\escape.txt', WASI_OFLAGS_CREAT, 0,
+      SandboxRights, OpenedFd)).ToBe(Ord(weNotCapable));
+  finally
+    RemoveDir(RootLink);
+  end;
+end;
+
+{ --- Windows DOS device names (#163) ------------------------------------- }
+
+{ Guest names Win32 has mapped, on some Windows version, to a DOS device
+  rather than a file in the directory: the reserved base names in any case,
+  with an extension, with trailing dots or spaces, nested below a
+  directory, and the console names CreateFile accepts. }
+function WinDeviceForms: TStringArray;
+const
+  FORMS: array[0..21] of string = ('NUL', 'nul', 'CON', 'PRN', 'AUX', 'COM1',
+    'COM9', 'LPT1', 'lpt9', 'COM0', 'LPT0', 'CONIN$', 'CONOUT$', 'NUL.txt',
+    'con.log.txt', 'NUL.', 'NUL..', 'NUL ', 'NUL .txt', 'sub/CON',
+    'sub/NUL.txt', 'AUX:stream');
+var
+  Index: Integer;
+begin
+  SetLength(Result, Length(FORMS));
+  for Index := 0 to High(FORMS) do
+    Result[Index] := FORMS[Index];
+  { COM with a superscript digit is a device too. The guest's bytes reach
+    Win32 through the ANSI code page, so the byte form is only a device where
+    that page maps $B9 to U+00B9 (1252 and friends). }
+  if UnicodeString(AnsiString('COM'#$B9)) = 'COM' + WideChar($00B9) then
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := 'COM'#$B9;
+  end;
+end;
+
+procedure TWasiTests.TestWinDeviceNamesRefusedOnCreate;
+var
+  Forms: TStringArray;
+  OpenedFd: UInt32;
+  Index, Code: Integer;
+  Before, Actual, Expected: string;
+begin
+  { O_CREAT on a device name must not reach the device (weNotCapable, before
+    any OS call) and must not leave a file behind either. Every form is
+    tried and the outcomes compared as one row, so a failure reports what
+    each form did: its errno, plus "+file" if the create made a real file. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Forms := WinDeviceForms;
+  Actual := '';
+  Expected := '';
+  for Index := 0 to High(Forms) do
+  begin
+    Before := SandboxListing;
+    Code := DoPathOpen(3, Forms[Index], WASI_OFLAGS_CREAT, 0, SandboxRights,
+      OpenedFd);
+    if Code = Ord(weSuccess) then
+      DoFdClose(OpenedFd);
+    Actual := Actual + '[' + Forms[Index] + ']=' + IntToStr(Code);
+    if SandboxListing <> Before then
+      Actual := Actual + '+file';
+    Actual := Actual + ' ';
+    Expected := Expected + '[' + Forms[Index] + ']=' +
+      IntToStr(Ord(weNotCapable)) + ' ';
+  end;
+  Expect<string>(Actual).ToBe(Expected);
+end;
+
+procedure TWasiTests.TestWinDeviceNamesRefusedByEveryPathOp;
+var
+  OpenedFd: UInt32;
+  Actual, Expected: string;
+
+  procedure Row(const AOp: string; const ACode: Int32);
+  begin
+    Actual := Actual + AOp + '=' + IntToStr(ACode) + ' ';
+    Expected := Expected + AOp + '=' + IntToStr(Ord(weNotCapable)) + ' ';
+  end;
+
+begin
+  { The refusal is in containment, so it holds for every path op, not only a
+    create: open without O_CREAT, stat, mkdir, and unlink. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Actual := '';
+  Expected := '';
+  Row('open NUL', DoPathOpen(3, 'NUL', 0, 0, SandboxRights, OpenedFd));
+  Row('open CON', DoPathOpen(3, 'CON', 0, 0, SandboxRights, OpenedFd));
+  Row('stat NUL', DoPathFilestat('NUL'));
+  Row('stat sub/COM1', DoPathFilestat('sub/COM1'));
+  Row('mkdir CON', DoCreateDirectory('CON'));
+  Row('mkdir sub/AUX', DoCreateDirectory('sub/AUX'));
+  Row('unlink NUL', DoUnlinkFile('NUL'));
+  Row('open NUL/x', DoPathOpen(3, 'NUL/x', WASI_OFLAGS_CREAT, 0,
+    SandboxRights, OpenedFd));
+  Expect<string>(Actual).ToBe(Expected);
+end;
+
+procedure TWasiTests.TestWinDeviceLookAlikesStillWork;
+const
+  NAMES: array[0..8] of string = ('console.log', 'null_data', 'NULL',
+    'COM10', 'LPT', 'CONx.txt', 'nul_', 'auxiliary', 'sub/CONSOLE');
+var
+  OpenedFd: UInt32;
+  Index, Code: Integer;
+  Actual, Expected: string;
+begin
+  { Names that only contain a device name are ordinary files: they create,
+    and the file lands in the preopen. }
+  BuildRun(SandboxConfig(SandboxRights));
+  Actual := '';
+  Expected := '';
+  for Index := 0 to High(NAMES) do
+  begin
+    Code := DoPathOpen(3, NAMES[Index], WASI_OFLAGS_CREAT, 0, SandboxRights,
+      OpenedFd);
+    if Code = Ord(weSuccess) then
+      DoFdClose(OpenedFd);
+    Actual := Actual + NAMES[Index] + '=' + IntToStr(Code) + ':' +
+      BoolToStr(FileExists(IncludeTrailingPathDelimiter(FTempDir) +
+      StringReplace(NAMES[Index], '/', PathDelim, [rfReplaceAll])), True) + ' ';
+    Expected := Expected + NAMES[Index] + '=0:True ';
+  end;
+  Expect<string>(Actual).ToBe(Expected);
+end;
+{$ENDIF}
+
 procedure TWasiTests.TestDefaultCsprngFillsAndDiffers;
 var
   Fn: TWasmFunc;
@@ -1546,6 +2070,29 @@ begin
     TestPathOpenCreateThroughDanglingSymlinkRefused);
   Test('path_open through a symlink to an existing outside file is weNotCapable',
     TestPathOpenExistingThroughSymlinkRefused);
+  {$ENDIF}
+
+  { Windows reparse-point containment (#149). }
+  {$IFDEF WINDOWS}
+  Test('Windows: every path through an escaping junction is weNotCapable',
+    TestWinJunctionEscapeRefused);
+  Test('Windows: file and directory symlink escapes are weNotCapable',
+    TestWinSymlinkEscapeRefused);
+  Test('Windows: create through a dangling junction or symlink is weNotCapable',
+    TestWinCreateThroughDanglingLinkRefused);
+  Test('Windows: a "..\" escape is weNotCapable and creates nothing above',
+    TestWinBackslashDotDotEscapeRefused);
+  Test('Windows: junctions and symlinks inside the preopen still work',
+    TestWinInPreopenLinksWork);
+  Test('Windows: a preopen root granted through a junction is contained',
+    TestWinPreopenRootThroughJunctionWorks);
+  { Windows DOS device names (#163). }
+  Test('Windows: O_CREAT on a DOS device name is weNotCapable, no file made',
+    TestWinDeviceNamesRefusedOnCreate);
+  Test('Windows: every path op on a DOS device name is weNotCapable',
+    TestWinDeviceNamesRefusedByEveryPathOp);
+  Test('Windows: names that only contain a device name still create',
+    TestWinDeviceLookAlikesStillWork);
   {$ENDIF}
 
   Test('the default CSPRNG fills the buffer and two calls differ',

@@ -8,10 +8,18 @@
        or, for the attach-seam tests, the temporary WSHL envelope.
     3. Re-decode and re-validate the embedded module (LoadModule). That
        fresh validation is the safety oracle, same as `run --aot`.
-    4. Reject a non-empty connector plan or capability set — compiled
-       WASI is deny-by-default (stdio + clock + random); connector host
-       functions and compiled `--dir`/`--env` apply later.
-    5. Link deny-by-default WASI, instantiate, and require exported
+    4. Strictly decode the compiled capability set
+       (Wasm.Compile.Capabilities) and apply exactly it to the config:
+       compiled preopens (relative hosts from the executable directory),
+       compiled env, and argv = executable basename + every invocation
+       argument. An empty set is deny-by-default WASI (stdio + clock +
+       random). The set cannot be widened: apply refuses a config that
+       already carries preopens or env.
+    5. Link deny-by-default WASI plus the embedded connector plan: the plan
+       is decoded strictly and re-resolved against the module
+       (Wasm.Connector.Plan), its application-local libraries are loaded
+       beside the executable, and Wasm.Connector.Host turns each bound
+       import into a host function. Instantiate, and require exported
        memory + `_start`.
     6. Wire ONLY a complete native image (Wasm.Native). Incomplete or
        incompatible code is EWasmLinkError; there is no interpreter
@@ -31,6 +39,7 @@ uses
   Classes,
   SysUtils,
 
+  Wasm.Connector.Host,
   Wasm.Core,
   Wasm.Engine,
   Wasm.MachO,
@@ -47,6 +56,15 @@ const
   WASM_SHELL_EXIT_ERROR = 1;
 
 type
+  { How this run was invoked: the running executable (relative compiled
+    preopens resolve from its directory; its basename is the guest argv[0])
+    and every invocation argument after it, all of which belong to the
+    guest. }
+  TWasmShellInvocation = record
+    ExecutablePath: string;
+    Args: TArray<string>;
+  end;
+
   { Outcome of a shell run. Diagnostic is empty on a clean exit or a plain
     proc_exit. NativeStatus names the load result for tests. }
   TWasmShellResult = record
@@ -79,20 +97,36 @@ type
       const AMax: NativeUInt): NativeUInt; override;
   end;
 
-{ Run a parsed-or-raw shell image against AConfig's deny-by-default WASI
-  grants. AConfig is borrowed. Never raises a guest outcome: decode,
+{ Build an invocation record. }
+function ShellInvocation(const AExecutablePath: string;
+  const AArgs: array of string): TWasmShellInvocation;
+
+{ Run a parsed-or-raw shell image. The embedded compiled capability set and
+  AInvocation's argv are applied to AConfig, which must carry no preopens or
+  env of its own. AConfig is borrowed. Never raises a guest outcome: decode,
   validation, link, trap, exception, and proc_exit become a result. }
 function RunShellBytes(const APayload: TWasmBytes;
-  const AConfig: TWasmWasiConfig): TWasmShellResult;
+  const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult; overload;
 
-{ Same, from an already-parsed image. }
+{ Same, invoked as this process's executable with no guest arguments. }
+function RunShellBytes(const APayload: TWasmBytes;
+  const AConfig: TWasmWasiConfig): TWasmShellResult; overload;
+
+{ Same, from an already-parsed image, invoked as this process's executable
+  with no guest arguments. }
 function RunShellImage(const AImage: TWasmShellImage;
   const AConfig: TWasmWasiConfig): TWasmShellResult;
 
 { File path of the payload (the template attach seam, or a packaged
   ELF/Mach-O executable whose payload `wasmlight compile` attached). }
 function RunShellFile(const APath: string;
-  const AConfig: TWasmWasiConfig): TWasmShellResult;
+  const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult; overload;
+
+{ Same, invoked as this process's executable with no guest arguments. }
+function RunShellFile(const APath: string;
+  const AConfig: TWasmWasiConfig): TWasmShellResult; overload;
 
 { Copy the attached native-executable payload out of a packaged ELF or
   Mach-O image. False when ABytes is not a packaged shell or the payload
@@ -106,6 +140,12 @@ function ExtractPackagedPayloadFromFile(const APath: string;
   out APayload: TWasmBytes): Boolean;
 
 implementation
+
+uses
+  Wasm.Compile.Capabilities,
+  Wasm.Connector.Plan,
+  Wasm.Connector.Resolve,
+  Wasm.Native.Load;
 
 type
   PWasmNativePayload = ^TWasmNativePayload;
@@ -211,10 +251,72 @@ begin
   Result := AInstance.FindExportFunc('_initialize', Fn);
 end;
 
+function ShellInvocation(const AExecutablePath: string;
+  const AArgs: array of string): TWasmShellInvocation;
+var
+  I: Integer;
+begin
+  Result.ExecutablePath := AExecutablePath;
+  Result.Args := nil;
+  SetLength(Result.Args, Length(AArgs));
+  for I := 0 to High(AArgs) do
+    Result.Args[I] := AArgs[I];
+end;
+
+function SelfInvocation: TWasmShellInvocation;
+begin
+  Result := ShellInvocation(NativeExecutablePath, []);
+end;
+
+{ Decode the embedded capability set and install exactly it, plus the
+  invocation's argv, on AConfig. False with a diagnostic otherwise. }
+function ApplyShellCapabilities(const ACapability: TWasmBytes;
+  const AConfig: TWasmWasiConfig; const AInvocation: TWasmShellInvocation;
+  out ADiagnostic: string): Boolean;
+var
+  Caps: TWasmCompiledCapabilities;
+  Err: string;
+begin
+  ADiagnostic := '';
+  if not TryDecodeCompiledCapabilities(ACapability, Caps, Err) then
+  begin
+    ADiagnostic := 'EWasmLinkError: malformed capability set: ' + Err;
+    Exit(False);
+  end;
+  try
+    Result := Caps.ApplyToConfig(AConfig, AInvocation.ExecutablePath,
+      AInvocation.Args, Err);
+    if not Result then
+      ADiagnostic := 'EWasmLinkError: ' + Err;
+  finally
+    Caps.Free;
+  end;
+end;
+
+{ nil for an empty connector-plan section. A malformed or inconsistent
+  plan, a missing library or symbol, or an unsupported lowering is
+  EWasmLinkError before instantiation. }
+function LoadShellConnectors(const AStore: TWasmStore;
+  const ALoaded: TWasmLoadedModule;
+  const AConnector: TWasmBytes): TWasmConnectorHost;
+var
+  Plan: TWlcConnectorPlan;
+begin
+  Result := nil;
+  if Length(AConnector) = 0 then
+    Exit;
+  Plan := CheckConnectorPlanForModule(AConnector, ALoaded.Model,
+    [WLC_WASI_MODULE]);
+  { Callbacks re-enter through the native invoke: the shell has no
+    interpreter. }
+  Result := TWasmConnectorHost.Create(AStore, Plan, NativeExecutableDirectory,
+    @NativeInvoke);
+end;
+
 function RunLoadedShellCore(const ALoaded: TWasmLoadedModule;
   const AConnector, ACapability: TWasmBytes;
-  const AConfig: TWasmWasiConfig; const AWaot: TWasmBytes;
-  const AWnep: PWasmNativePayload): TWasmShellResult;
+  const AConfig: TWasmWasiConfig; const AInvocation: TWasmShellInvocation;
+  const AWaot: TWasmBytes; const AWnep: PWasmNativePayload): TWasmShellResult;
 var
   Engine: TWasmEngine;
   Store: TWasmStore;
@@ -227,6 +329,8 @@ var
   StartFn: TWasmFunc;
   Imports: TWasmImports;
   Inst: TWasmModuleInstance;
+  Connectors: TWasmConnectorHost;
+  CapDiagnostic: string;
 begin
   Result.ExitCode := 0;
   Result.Diagnostic := '';
@@ -235,10 +339,9 @@ begin
   if (AConfig = nil) or (ALoaded = nil) then
     Exit(FailResult('shell needs a module and a WASI config'));
 
-  if Length(AConnector) > 0 then
-    Exit(FailResult('EWasmLinkError: connector plan is not yet loadable'));
-  if Length(ACapability) > 0 then
-    Exit(FailResult('EWasmLinkError: compiled capability set is not yet loadable'));
+  if not ApplyShellCapabilities(ACapability, AConfig, AInvocation,
+    CapDiagnostic) then
+    Exit(FailResult(CapDiagnostic));
 
   Engine := nil;
   Store := nil;
@@ -246,6 +349,7 @@ begin
   Context := nil;
   Instance := nil;
   Native := nil;
+  Connectors := nil;
   try
     Engine := TWasmEngine.Create;
     Store := TWasmStore.Create(Engine);
@@ -255,10 +359,15 @@ begin
 
     try
       WasiCheckCommandEntry(ALoaded);
+      Connectors := LoadShellConnectors(Store, ALoaded, AConnector);
+      if Connectors <> nil then
+        Connectors.DefineImports(Linker);
       Imports := Linker.ResolveImports(ALoaded);
       Inst := InstantiateModule(Store, ALoaded.Ir, ALoaded.BytesPtr,
         ALoaded.BytesLength, Imports);
       Instance := TWasmInstance.Create(Store, Inst);
+      if Connectors <> nil then
+        Connectors.Attach(Instance);
     except
       on E: EWasmError do
         Exit(FailResult(E.ClassName + ': ' + E.Message));
@@ -295,6 +404,10 @@ begin
         NativeInvoke(Store, Inst.FuncAddrs[Inst.PendingStartFuncIndex], nil, nil);
       Inst.HasPendingStart := False;
       NativeInvoke(StartFn.Store, StartFn.Addr, nil, nil);
+      { Queued connector notifications still pending when `_start`
+        returns are delivered before the executable exits. }
+      if Connectors <> nil then
+        Connectors.DrainQueued;
       Result.ExitCode := 0;
     except
       on E: EWasmExit do
@@ -325,21 +438,23 @@ begin
     Native.Free;
     Context.Free;
     Linker.Free;
+    Connectors.Free;
     FreeAndNil(Store);
     Engine.Free;
   end;
 end;
 
 function RunLoadedShell(const ALoaded: TWasmLoadedModule;
-  const AImage: TWasmShellImage;
-  const AConfig: TWasmWasiConfig): TWasmShellResult;
+  const AImage: TWasmShellImage; const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult;
 begin
   Result := RunLoadedShellCore(ALoaded, AImage.ConnectorPlan,
-    AImage.CapabilitySet, AConfig, AImage.Native, nil);
+    AImage.CapabilitySet, AConfig, AInvocation, AImage.Native, nil);
 end;
 
-function RunShellImage(const AImage: TWasmShellImage;
-  const AConfig: TWasmWasiConfig): TWasmShellResult;
+function RunShellImageAs(const AImage: TWasmShellImage;
+  const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult;
 var
   Loaded: TWasmLoadedModule;
 begin
@@ -351,14 +466,21 @@ begin
       Exit(FailResult(E.ClassName + ': ' + E.Message));
   end;
   try
-    Result := RunLoadedShell(Loaded, AImage, AConfig);
+    Result := RunLoadedShell(Loaded, AImage, AConfig, AInvocation);
   finally
     Loaded.Free;
   end;
 end;
 
-function RunNativePayload(const APayload: TWasmNativePayload;
+function RunShellImage(const AImage: TWasmShellImage;
   const AConfig: TWasmWasiConfig): TWasmShellResult;
+begin
+  Result := RunShellImageAs(AImage, AConfig, SelfInvocation);
+end;
+
+function RunNativePayload(const APayload: TWasmNativePayload;
+  const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult;
 var
   Loaded: TWasmLoadedModule;
   Payload: TWasmNativePayload;
@@ -373,7 +495,7 @@ begin
   end;
   try
     Result := RunLoadedShellCore(Loaded, Payload.ConnectorPlan,
-      Payload.CapabilitySet, AConfig, nil, @Payload);
+      Payload.CapabilitySet, AConfig, AInvocation, nil, @Payload);
   finally
     Loaded.Free;
   end;
@@ -451,7 +573,8 @@ begin
 end;
 
 function RunShellBytes(const APayload: TWasmBytes;
-  const AConfig: TWasmWasiConfig): TWasmShellResult;
+  const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult;
 var
   Image: TWasmShellImage;
   Parse: TWasmShellParseResult;
@@ -462,7 +585,7 @@ begin
     Exit(FailResult('runtime shell has no embedded module'));
   WnepParse := ParseNativePayload(APayload, Wnep);
   if WnepParse = nprOk then
-    Exit(RunNativePayload(Wnep, AConfig));
+    Exit(RunNativePayload(Wnep, AConfig, AInvocation));
   Parse := ParseShellPayload(APayload, Image);
   if Parse <> sprOk then
   begin
@@ -470,11 +593,24 @@ begin
       Exit(FailResult(WnepParseFailText(WnepParse)));
     Exit(FailResult(ParseFailText(Parse)));
   end;
-  Result := RunShellImage(Image, AConfig);
+  Result := RunShellImageAs(Image, AConfig, AInvocation);
+end;
+
+function RunShellBytes(const APayload: TWasmBytes;
+  const AConfig: TWasmWasiConfig): TWasmShellResult;
+begin
+  Result := RunShellBytes(APayload, AConfig, SelfInvocation);
 end;
 
 function RunShellFile(const APath: string;
   const AConfig: TWasmWasiConfig): TWasmShellResult;
+begin
+  Result := RunShellFile(APath, AConfig, SelfInvocation);
+end;
+
+function RunShellFile(const APath: string;
+  const AConfig: TWasmWasiConfig;
+  const AInvocation: TWasmShellInvocation): TWasmShellResult;
 var
   Stream: TFileStream;
   Bytes, Extracted: TWasmBytes;
@@ -497,9 +633,9 @@ begin
   end;
   try
     if ExtractPackagedPayload(Bytes, Extracted) then
-      Result := RunShellBytes(Extracted, AConfig)
+      Result := RunShellBytes(Extracted, AConfig, AInvocation)
     else
-      Result := RunShellBytes(Bytes, AConfig);
+      Result := RunShellBytes(Bytes, AConfig, AInvocation);
   except
     on E: EWasmDecodeError do
       Result := FailResult(E.ClassName + ': ' + E.Message);

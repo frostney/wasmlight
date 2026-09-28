@@ -109,7 +109,9 @@ end;
 function SameMarshal(const A, B: TWlcMarshal): Boolean;
 begin
   Result := (A.Kind = B.Kind) and (A.HasSizeConst = B.HasSizeConst) and
-    ((not A.HasSizeConst) or (A.SizeConst = B.SizeConst));
+    ((not A.HasSizeConst) or (A.SizeConst = B.SizeConst)) and
+    (A.HasSizeParamIndex = B.HasSizeParamIndex) and
+    ((not A.HasSizeParamIndex) or (A.SizeParamIndex = B.SizeParamIndex));
 end;
 
 function SameParam(const A, B: TWlcParam): Boolean;

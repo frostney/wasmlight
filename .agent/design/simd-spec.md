@@ -249,10 +249,9 @@ documented as such (§9 item 8):
 - **`TWasmTierInvokeProc`** (`Wasm.Runtime.Store.pas:405`) keeps its
   `PWasmValue` params; the same two-slot rule applies. The differential
   harness for Track I therefore needs no signature change.
-- **`WASM_INTERP_MAX_MARSHAL`** counts slots, so a function with 1024
-  `v128` params would now exceed it. Leave the cap; the existing
-  `'internal: host-call arity exceeds the marshal cap'` guard already
-  covers it.
+- **`WASM_INTERP_INLINE_MARSHAL`** counts slots, so a function with 1024
+  `v128` params exceeds the inline stack buffers. That is not a cap: a
+  wider block marshals through a context-owned wide block (issue #33).
 
 ### 1.7 The one store change — `v128` globals
 

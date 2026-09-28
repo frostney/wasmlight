@@ -2,14 +2,22 @@
 program VerifyArchive;
 
 { Verify a packed wasmlight host archive: checksums, MANIFEST, catalog
-  layout, ELF/Mach-O structure, and — when `wasmlight compile` can emit —
-  native execution plus cross-target structural emission. The compile CLI
-  is wired before native emission; that stub is deferred, not a pack fault.
+  layout, ELF/Mach-O structure, and — on the archive's own host — the
+  packed compiler's version and compile gates.
 
-  Same-host verification always runs the compiler inside the archive.
-  `--compiler` is only a foreign-host fallback (the packed binary cannot
-  execute). Cross-emission never executes a foreign binary. That is the
-  4-host structural check, not a 16-cell execution matrix. }
+  The compile gates run the compiler inside the archive against its own
+  catalog. For each shell it carries (the host architecture for Linux and
+  macOS) it compiles a probe that exits 37, checks the image and its
+  native payload are that target's and bound to the archive shell, and
+  executes only the host-native output. The other-OS output is checked
+  structurally, never executed: four host legs, not a 16-cell execution
+  matrix. A foreign-architecture target must be refused (#148 owns
+  cross-architecture emission).
+
+  On a foreign host the packed compiler cannot run, so only the archive
+  structure is verified; `--require-compile` then fails rather than pass
+  unverified. `--complete-set` also requires the checksums file to list
+  exactly the four host archives of the manifest version. }
 
 {$mode delphi}{$H+}
 
@@ -19,12 +27,14 @@ uses
   SysUtils,
 
   Wasm.Compile.Catalog,
-  Wasm.Distro;
+  Wasm.Core,
+  Wasm.Distro,
+  Wasm.Shell;
 
 const
   USAGE =
     'usage: verify-archive --archive FILE --checksums FILE [--version VER] ' +
-    '[--compiler PATH] [--require-compile] [--work DIR]';
+    '[--require-compile] [--complete-set] [--work DIR]';
 
 function ArgValue(const AName: string; out AValue: string): Boolean;
 var
@@ -101,7 +111,13 @@ begin
       else
         Sleep(10);
     end;
-    ACode := Proc.ExitStatus;
+    { ExitStatus is the raw wait status on Unix: the exit code lives in bits
+      8..15 only when the low 7 bits (the terminating signal) are zero. A
+      signal death is reported as 128 + signal, never as a clean exit. }
+    if (Proc.ExitStatus and $7F) = 0 then
+      ACode := (Proc.ExitStatus shr 8) and $FF
+    else
+      ACode := 128 + (Proc.ExitStatus and $7F);
     Result := True;
   finally
     Proc.Free;
@@ -156,17 +172,23 @@ begin
   Result := (Code = 0) and not DistroUnknownCompileCommand(Text);
 end;
 
+function LoadChecksums(const AChecksums: string): TWasmDistroChecksums;
+var
+  Status: TWasmDistroResult;
+begin
+  Status := DistroParseChecksums(LoadText(AChecksums), Result);
+  if not Status.IsOk then
+    Fail('checksums: ' + Status.Detail);
+end;
+
 procedure VerifyChecksum(const AArchive, AChecksums: string);
 var
   Rows: TWasmDistroChecksums;
-  Status: TWasmDistroResult;
   I: Integer;
   Base, Digest: string;
   Found: Boolean;
 begin
-  Status := DistroParseChecksums(LoadText(AChecksums), Rows);
-  if not Status.IsOk then
-    Fail('checksums: ' + Status.Detail);
+  Rows := LoadChecksums(AChecksums);
   Base := ExtractFileName(AArchive);
   Found := False;
   Digest := Sha256Of(AArchive);
@@ -200,10 +222,10 @@ var
 begin
   RequireFile(DISTRO_COMPILER_NAME);
   RequireFile(DISTRO_SHELL_ROOT + '/' + SHELL_CATALOG_FILENAME);
-  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  for I := 0 to High(AManifest.Shells) do
   begin
-    RequireFile(DistroShellRelPath(DistroShell(I).Triple));
-    RequireFile(DistroMetaRelPath(DistroShell(I).Triple));
+    RequireFile(DistroShellRelPath(AManifest.Shells[I]));
+    RequireFile(DistroMetaRelPath(AManifest.Shells[I]));
   end;
   for I := 0 to High(AManifest.Files) do
   begin
@@ -263,44 +285,77 @@ begin
   end;
 end;
 
-procedure VerifyCompileGates(const ACompiler, AWork: string);
+function ReadFileBytes(const APath: string): TWasmBytes;
+var
+  Stream: TFileStream;
+begin
+  Result := nil;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then
+      Stream.ReadBuffer(Result[0], Length(Result));
+  finally
+    Stream.Free;
+  end;
+end;
+
+{ A released target of another architecture must be refused: the archive
+  carries no shell for it and this compiler cannot emit it (#148). }
+procedure VerifyForeignArchRefused(const ACompiler, AWork, AModule: string;
+  const AHost: TWasmDistroHost);
+var
+  I: Integer;
+  Target, OutFile, Text: string;
+  Code: Integer;
+begin
+  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  begin
+    Target := DistroShell(I).Triple;
+    if DistroHostCarriesShell(AHost, Target) then
+      Continue;
+    OutFile := IncludeTrailingPathDelimiter(AWork) + 'refused-' + Target;
+    if not CombinedOutput(ACompiler,
+      ['compile', '--target', Target, '-o', OutFile, AModule], Text, Code) then
+      Fail('could not invoke compile for ' + Target);
+    if (Code = 0) or FileExists(OutFile) then
+      Fail('compile --target ' + Target + ' is outside this archive and must fail');
+  end;
+  WriteLn('verify-archive: foreign-architecture targets refused');
+end;
+
+procedure VerifyCompileGates(const ACompiler, AWork, ARoot: string;
+  const AManifest: TWasmDistroManifest);
 var
   Host: TWasmDistroHost;
   I: Integer;
   Target, OutFile, Text: string;
   Code: Integer;
-  Bytes: TBytes;
-  Stream: TFileStream;
+  Image, Payload: TWasmBytes;
+  Status: TWasmDistroResult;
   Module: string;
 begin
-  if not DistroCurrentHost(Host) then
-    Fail('compile gates need a 0.2.0 Unix host');
+  DistroFindHost(AManifest.HostTriple, Host);
   Module := IncludeTrailingPathDelimiter(AWork) + 'native-probe.wasm';
   WriteProbeModule(Module);
-  for I := 0 to DISTRO_SHELL_COUNT - 1 do
+  for I := 0 to High(AManifest.Shells) do
   begin
-    Target := DistroShell(I).Triple;
+    Target := AManifest.Shells[I];
     OutFile := IncludeTrailingPathDelimiter(AWork) + 'emit-' + Target;
     if not CombinedOutput(ACompiler,
       ['compile', '--target', Target, '-o', OutFile, Module], Text, Code) then
       Fail('could not invoke compile for ' + Target);
     if Code <> 0 then
-    begin
       Fail('compile --target ' + Target + ' failed: ' + Trim(Text));
-    end;
     if not FileExists(OutFile) then
       Fail('compile --target ' + Target + ' wrote no output');
-    Stream := TFileStream.Create(OutFile, fmOpenRead or fmShareDenyWrite);
-    try
-      SetLength(Bytes, Stream.Size);
-      if Length(Bytes) > 0 then
-        Stream.ReadBuffer(Bytes[0], Length(Bytes));
-    finally
-      Stream.Free;
-    end;
-    if not DistroImageMatchesShell(Bytes, Target) then
-      Fail('cross-emission for ' + Target + ' is not the expected image');
-    WriteLn('verify-archive: cross-emission structure ok for ', Target);
+    Image := ReadFileBytes(OutFile);
+    if not ExtractPackagedPayload(Image, Payload) then
+      Fail('compile --target ' + Target + ' output carries no native payload');
+    Status := DistroCheckEmission(Image, Payload,
+      ReadFileBytes(DistroJoin(ARoot, DistroShellRelPath(Target))), Target);
+    if not Status.IsOk then
+      Fail('compile --target ' + Target + ': ' + Status.Detail);
     if Target = Host.Triple then
     begin
       if not CombinedOutput(OutFile, [], Text, Code) then
@@ -308,15 +363,18 @@ begin
       if Code <> 37 then
         Fail('native compiled program expected exit 37, got ' + IntToStr(Code) + ': ' +
           Trim(Text));
-      WriteLn('verify-archive: native compile execution ok for ', Target);
-    end;
+      WriteLn('verify-archive: native compile and execution ok for ', Target);
+    end
+    else
+      WriteLn('verify-archive: cross-OS emission structure ok for ', Target);
   end;
+  VerifyForeignArchRefused(ACompiler, AWork, Module, Host);
 end;
 
 var
-  Archive, Checksums, Version, Compiler, HostCompiler, Work, Output,
-    UnpackRoot, CatalogLabel: string;
-  RequireCompile: Boolean;
+  Archive, Checksums, Version, Compiler, Work, Output, UnpackRoot,
+    CatalogLabel: string;
+  RequireCompile, CompleteSet: Boolean;
   Status: TWasmDistroResult;
   Manifest: TWasmDistroManifest;
   NativeHost: TWasmDistroHost;
@@ -345,10 +403,8 @@ begin
     Archive := ExpandFileName(Archive);
     Checksums := ExpandFileName(Checksums);
     ArgValue('version', Version);
-    ArgValue('compiler', HostCompiler);
-    if HostCompiler <> '' then
-      HostCompiler := ExpandFileName(HostCompiler);
     RequireCompile := HasFlag('require-compile');
+    CompleteSet := HasFlag('complete-set');
     Randomize;
     if not ArgValue('work', Work) then
       Work := IncludeTrailingPathDelimiter(GetTempDir) +
@@ -391,28 +447,40 @@ begin
       ' host=', Manifest.HostTriple, ' catalog=', CatalogLabel);
     VerifyManifestHashes(UnpackRoot, Manifest);
 
-    { The packed binary is what a download installs. A `--compiler`
-      override would let a broken archive pass against the workspace
-      build, so same-host checks always use the unpacked compiler. }
-    Compiler := DistroJoin(UnpackRoot, DISTRO_COMPILER_NAME);
-    if DistroCurrentHost(NativeHost) and (NativeHost.Triple = Manifest.HostTriple) then
-      VerifyNativeCompiler(Compiler, Manifest.Version)
-    else if HostCompiler <> '' then
+    if CompleteSet then
     begin
-      Compiler := HostCompiler;
-      VerifyNativeCompiler(Compiler, Manifest.Version);
-    end
-    else
-      WriteLn('verify-archive: skipped native --version (foreign host archive)');
+      Status := DistroChecksumsCoverArchives(Manifest.Version,
+        LoadChecksums(Checksums));
+      if not Status.IsOk then
+        Fail('checksums do not cover the release set: ' + Status.Detail);
+      WriteLn('verify-archive: checksums cover all ', DISTRO_HOST_COUNT,
+        ' host archives');
+    end;
 
     if RequireCompile and (Manifest.Catalog = wdcFixture) then
       Fail('compile verification requires a live runtime-shell catalog');
-    if (Manifest.Catalog = wdcFixture) and not RequireCompile then
-      WriteLn('verify-archive: fixture structure verified; native compile is unverified')
-    else if CompilerHasCompile(Compiler) then
-      VerifyCompileGates(Compiler, Work)
+    { The packed binary is what a download installs, so the gates always run
+      the compiler inside the archive against the catalog beside it. }
+    Compiler := DistroJoin(UnpackRoot, DISTRO_COMPILER_NAME);
+    if not DistroCurrentHost(NativeHost) or
+      (NativeHost.Triple <> Manifest.HostTriple) then
+    begin
+      if RequireCompile then
+        Fail('compile gates must run on the archive''s own host (' +
+          Manifest.HostTriple + ')');
+      WriteLn('verify-archive: foreign host archive: structure verified; ',
+        'compile gates not run here (they need ', Manifest.HostTriple, ')');
+    end
     else
-      Fail('compile subcommand is required for a live archive');
+    begin
+      VerifyNativeCompiler(Compiler, Manifest.Version);
+      if Manifest.Catalog = wdcFixture then
+        WriteLn('verify-archive: fixture structure verified; native compile is unverified')
+      else if CompilerHasCompile(Compiler) then
+        VerifyCompileGates(Compiler, Work, UnpackRoot, Manifest)
+      else
+        Fail('compile subcommand is required for a live archive');
+    end;
 
     WriteLn('verify-archive: ok');
   except

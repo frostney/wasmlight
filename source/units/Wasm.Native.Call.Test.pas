@@ -80,6 +80,13 @@ begin
   Result := P^;
 end;
 
+{ Reads the whole 32-bit register an int8/uint8 argument arrives in, so a
+  test can see the extension the caller put there. }
+function HostEchoRegister(A: Int32): Int32; cdecl;
+begin
+  Result := A;
+end;
+
 function HostSumBig(S: TBig24): Int64; cdecl;
 begin
   Result := S.A + S.B + S.C;
@@ -95,6 +102,7 @@ type
     procedure TestPascalCdeclScalars;
     procedure TestPascalCdeclStackAndAggregates;
     procedure TestPascalCdeclPointerView;
+    procedure TestNarrowRegisterArgumentKeepsExtension;
     procedure TestCAndPascalLibrariesMatch;
     procedure TestMissingSymbolIsALinkError;
   end;
@@ -195,6 +203,27 @@ begin
       RaisedOk := Pos(string(MSG_LINK_INCOMPATIBLE_PLAN), E.Message) = 1;
   end;
   Expect<Boolean>(RaisedOk).ToBe(True);
+end;
+
+procedure TCallTests.TestNarrowRegisterArgumentKeepsExtension;
+{$IFDEF WASM_NATIVE_CALL}
+var
+  Plan: TWasmAbiPlan;
+  Ret: TWasmAbiValue;
+{$ENDIF}
+begin
+  {$IFDEF WASM_NATIVE_CALL}
+  { An int8 parameter whose caller supplied a sign-extended value reaches
+    the register extended, as Apple AArch64 and SysV callees expect. }
+  Plan := PlanCall(AbiHostTarget, AbiSignature([AbiI8], AbiI32));
+  ApplyNativeCall(Plan, @HostEchoRegister, [AbiValueI64(-5)], Ret);
+  Expect<Int32>(AbiValueAsI32(Ret)).ToBe(-5);
+  Plan := PlanCall(AbiHostTarget, AbiSignature([AbiU8], AbiI32));
+  ApplyNativeCall(Plan, @HostEchoRegister, [AbiValueU64(200)], Ret);
+  Expect<Int32>(AbiValueAsI32(Ret)).ToBe(200);
+  {$ELSE}
+  Expect<Boolean>(NativeCallSupported).ToBe(False);
+  {$ENDIF}
 end;
 
 procedure TCallTests.TestPascalCdeclScalars;
@@ -486,6 +515,8 @@ begin
   Test('stack, pair, HFA, and large aggregate through the gate',
     TestPascalCdeclStackAndAggregates);
   Test('pointer-view loads through the gate', TestPascalCdeclPointerView);
+  Test('a narrow register argument keeps the caller''s extension',
+    TestNarrowRegisterArgumentKeepsExtension);
   Test('C and Pascal fixture libraries are observationally identical',
     TestCAndPascalLibrariesMatch);
   Test('missing symbol is a link error', TestMissingSymbolIsALinkError);

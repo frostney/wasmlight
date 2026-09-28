@@ -30,14 +30,14 @@
   seams are injectable, so a hermetic unit test replaces them with fixed values
   and nothing in a WASI test touches the real clock, entropy, fs, or network.
 
-  WAVE SCOPE (embedding-spec.md §3.3, §8.2). This is F2: the wave-1 MUST tier —
+  SCOPE (embedding-spec.md §3.3, §8.2). Shipped: the wave-1 set —
   args/environ, fd_write/read/close/seek/fdstat/prestat, clock, random,
-  proc_exit, sched_yield. The wave-2 filesystem functions (path_open and the
-  file ops, behind preopen containment) are F4, and the wave-3 long tail is
-  stubbed ENOSYS in F5. A module importing only the wave-1 set links and runs
-  today; one importing a wave-2 function fails to link until F4 (which is the
-  honest deny-by-default posture — an undefined import is an EWasmLinkError, not
-  a silent no-op).
+  proc_exit, sched_yield — and the wave-2 filesystem functions (path_open and
+  the file ops) behind preopen containment. The wave-3 long tail (sock_*,
+  poll_oneoff, the link/rename family, and the other non-network functions
+  tracked for 0.3.0) is not defined at all, so a module importing one fails to
+  link with EWasmLinkError — the honest deny-by-default posture, never a
+  silent no-op or an ENOSYS stub.
 
   SOURCE for the preview1 ABI (signatures, struct layouts, errno numbering):
   the frozen wasi_snapshot_preview1 witx, consumed through Wasm.Wasi.Types
@@ -397,6 +397,40 @@ const
   follow-up. }
 function RtlGenRandom(ABuffer: Pointer; ALength: UInt32): ByteBool; stdcall;
   external 'advapi32.dll' name 'SystemFunction036';
+
+{ The Windows half of preopen containment (HostRealPath, LeafIsSymlink). The
+  Windows unit is deliberately not used — its ANSI DeleteFile / FindClose would
+  shadow the SysUtils routines the fs layer calls — so the four kernel32 entry
+  points are declared here, wide-char only. FPC 3.2.2's Windows unit does not
+  declare GetFinalPathNameByHandleW at all. }
+const
+  WIN_INVALID_HANDLE_VALUE = THandle(-1);
+  WIN_INVALID_FILE_ATTRIBUTES = UInt32($FFFFFFFF);
+  WIN_FILE_SHARE_ALL = UInt32($00000007);   { READ or WRITE or DELETE }
+  WIN_OPEN_EXISTING = UInt32(3);
+  { Needed to open a directory handle; without FILE_FLAG_OPEN_REPARSE_POINT
+    the open follows every symlink and junction on the path. }
+  WIN_FILE_FLAG_BACKUP_SEMANTICS = UInt32($02000000);
+  WIN_FILE_ATTRIBUTE_REPARSE_POINT = UInt32($00000400);
+  { FILE_NAME_NORMALIZED or VOLUME_NAME_DOS: a drive-letter or UNC path. }
+  WIN_FINAL_PATH_DOS_NORMALIZED = UInt32(0);
+
+function WinCreateFileW(AFileName: PWideChar; ADesiredAccess, AShareMode: UInt32;
+  ASecurityAttributes: Pointer; ACreationDisposition, AFlagsAndAttributes: UInt32;
+  ATemplateFile: THandle): THandle; stdcall;
+  external 'kernel32.dll' name 'CreateFileW';
+function WinGetFinalPathNameByHandleW(AFile: THandle; AFilePath: PWideChar;
+  AFilePathLen, AFlags: UInt32): UInt32; stdcall;
+  external 'kernel32.dll' name 'GetFinalPathNameByHandleW';
+function WinGetFileAttributesW(AFileName: PWideChar): UInt32; stdcall;
+  external 'kernel32.dll' name 'GetFileAttributesW';
+function WinCloseHandle(AObject: THandle): LongBool; stdcall;
+  external 'kernel32.dll' name 'CloseHandle';
+{ String-only: it applies Win32 path rules, including the DOS device mapping,
+  without touching the file system. }
+function WinGetFullPathNameW(AFileName: PWideChar; ABufferLength: UInt32;
+  ABuffer: PWideChar; AFilePart: Pointer): UInt32; stdcall;
+  external 'kernel32.dll' name 'GetFullPathNameW';
 {$ENDIF}
 
 const
@@ -1676,8 +1710,17 @@ end;
 
 { Canonicalise a host path with ALL symlinks resolved. On POSIX this is
   realpath(3) — the primitive the symlink-escape check relies on; it fails if
-  the path does not exist. On non-UNIX it degrades to a lexical ExpandFileName
-  (symlink containment UNCONFIRMED off-POSIX). }
+  the path does not exist.
+
+  On Windows the equivalent is to open the path — following every symlink,
+  junction, and other reparse point — and ask the handle for its final path:
+  CreateFileW with FILE_FLAG_BACKUP_SEMANTICS (so directories open too) and
+  GetFinalPathNameByHandleW. The answer carries the \\?\ (or \\?\UNC\) prefix,
+  which is stripped so root and candidate compare in the same drive-letter or
+  UNC form. It also expands 8.3 short names. Any failure — a missing or
+  dangling target, an unopenable one, an unexpected result shape, or a name
+  the ANSI string cannot carry losslessly — is False: a path that cannot be
+  resolved is never treated as contained. }
 function HostRealPath(const APath: string; out AReal: string): Boolean;
 {$IFDEF UNIX}
 var
@@ -1692,9 +1735,57 @@ begin
   Result := True;
 end;
 {$ELSE}
+const
+  VERBATIM_PREFIX = '\\?\';
+  VERBATIM_UNC_PREFIX = '\\?\UNC\';
+var
+  Wide, Final: UnicodeString;
+  Handle: THandle;
+  Len: UInt32;
 begin
-  AReal := ExpandFileName(APath);
-  Result := FileExists(APath) or DirectoryExists(APath);
+  AReal := '';
+  Result := False;
+  if APath = '' then
+    Exit;
+  Wide := UnicodeString(APath);
+  Handle := WinCreateFileW(PWideChar(Wide), 0, WIN_FILE_SHARE_ALL, nil,
+    WIN_OPEN_EXISTING, WIN_FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if Handle = WIN_INVALID_HANDLE_VALUE then
+    Exit;
+  try
+    SetLength(Final, 512);
+    Len := WinGetFinalPathNameByHandleW(Handle, PWideChar(Final),
+      UInt32(Length(Final)), WIN_FINAL_PATH_DOS_NORMALIZED);
+    if Len >= UInt32(Length(Final)) then
+    begin
+      { Too small: Len is the required size, terminating NUL included. }
+      SetLength(Final, Len);
+      Len := WinGetFinalPathNameByHandleW(Handle, PWideChar(Final),
+        UInt32(Length(Final)), WIN_FINAL_PATH_DOS_NORMALIZED);
+      if Len >= UInt32(Length(Final)) then
+        Exit;
+    end;
+    if Len = 0 then
+      Exit;
+    SetLength(Final, Len);
+  finally
+    WinCloseHandle(Handle);
+  end;
+  if Copy(Final, 1, Length(VERBATIM_UNC_PREFIX)) = VERBATIM_UNC_PREFIX then
+    Final := '\\' + Copy(Final, Length(VERBATIM_UNC_PREFIX) + 1, MaxInt)
+  else if (Length(Final) >= 6) and
+    (Copy(Final, 1, Length(VERBATIM_PREFIX)) = VERBATIM_PREFIX) and
+    (Final[6] = ':') then
+    Final := Copy(Final, Length(VERBATIM_PREFIX) + 1, MaxInt)
+  else
+    Exit;
+  AReal := string(Final);
+  if UnicodeString(AReal) <> Final then
+  begin
+    AReal := '';
+    Exit;
+  end;
+  Result := True;
 end;
 {$ENDIF}
 
@@ -1706,7 +1797,12 @@ end;
   PARENT and handed back parent_real + '/' + leaf — so a plain FileCreate would
   follow the link and write OUTSIDE the sandbox. lstat sees the link, not its
   target, so we can refuse. A missing leaf (nothing to follow) or a non-link is
-  False and the create proceeds normally. }
+  False and the create proceeds normally.
+
+  On Windows the no-follow question is GetFileAttributesW, which reports the
+  final component's own attributes rather than its target's. Any reparse
+  point counts — a symlink, a junction, or another tag — since each can
+  redirect the create. }
 function LeafIsSymlink(const APath: string): Boolean;
 {$IFDEF UNIX}
 var
@@ -1717,10 +1813,12 @@ begin
   Result := fpS_ISLNK(St.st_mode);
 end;
 {$ELSE}
+var
+  Attr: UInt32;
 begin
-  { Off-POSIX there is no no-follow stat here; the final-component-symlink
-    guard on create is UNCONFIRMED off-UNIX (the fs layer is POSIX-first). }
-  Result := False;
+  Attr := WinGetFileAttributesW(PWideChar(UnicodeString(APath)));
+  Result := (Attr <> WIN_INVALID_FILE_ATTRIBUTES) and
+    ((Attr and WIN_FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
 end;
 {$ENDIF}
 
@@ -1786,6 +1884,97 @@ begin
     (AChild[Length(Root) + 1] = PathDelim);
 end;
 
+{$IFDEF WINDOWS}
+{ True iff Win32 may treat the path component AName as a legacy DOS device
+  (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the superscript COM/LPT digits, and
+  the console names CONIN$ / CONOUT$) rather than as a file. Win32 applies
+  this to the base name: the part before the first '.' (an extension) or ':'
+  (a stream), with trailing spaces and dots ignored, in any letter case.
+  Which forms still count as devices changes between Windows versions, so
+  every form any version has honoured is refused. }
+function WinComponentIsDevice(const AName: UnicodeString): Boolean;
+var
+  Base: UnicodeString;
+  Index: Integer;
+  Prefix: UnicodeString;
+  Digit: WideChar;
+begin
+  Base := AName;
+  for Index := 1 to Length(Base) do
+    if (Base[Index] = '.') or (Base[Index] = ':') then
+    begin
+      SetLength(Base, Index - 1);
+      Break;
+    end;
+  while (Length(Base) > 0) and
+    ((Base[Length(Base)] = ' ') or (Base[Length(Base)] = '.')) do
+    SetLength(Base, Length(Base) - 1);
+  for Index := 1 to Length(Base) do
+    if (Base[Index] >= 'a') and (Base[Index] <= 'z') then
+      Base[Index] := WideChar(Ord(Base[Index]) - 32);
+  if (Base = 'CON') or (Base = 'PRN') or (Base = 'AUX') or (Base = 'NUL') or
+    (Base = 'CONIN$') or (Base = 'CONOUT$') then
+    Exit(True);
+  Result := False;
+  if Length(Base) <> 4 then
+    Exit;
+  Prefix := Copy(Base, 1, 3);
+  if (Prefix <> 'COM') and (Prefix <> 'LPT') then
+    Exit;
+  Digit := Base[4];
+  { U+00B9, U+00B2, U+00B3: superscript one, two, three. }
+  Result := ((Digit >= '0') and (Digit <= '9')) or (Ord(Digit) = $B9) or
+    (Ord(Digit) = $B2) or (Ord(Digit) = $B3);
+end;
+
+{ True iff the guest-relative path ARel, or the full candidate host path
+  ACandidate built from it, would reach a DOS device instead of a file under
+  the preopen (#163). Two checks, because the device rules move between
+  Windows versions: every component of ARel is tested against the known
+  device names, and ACandidate is put through GetFullPathNameW (Win32 path
+  rules only, no file-system access), which on this host maps a device name
+  to the \\.\ namespace. A result in the \\.\ or \\?\ namespace, or a
+  failure to compute one, is treated as a device. }
+function WinPathNamesDevice(const ARel, ACandidate: string): Boolean;
+const
+  DEVICE_PREFIX = '\\.\';
+  VERBATIM_PREFIX = '\\?\';
+var
+  Rel, Wide, Full: UnicodeString;
+  Index, Start: Integer;
+  Len: UInt32;
+begin
+  Rel := UnicodeString(ARel);
+  Start := 1;
+  for Index := 1 to Length(Rel) + 1 do
+    if (Index > Length(Rel)) or (Rel[Index] = '\') or (Rel[Index] = '/') then
+    begin
+      if WinComponentIsDevice(Copy(Rel, Start, Index - Start)) then
+        Exit(True);
+      Start := Index + 1;
+    end;
+  Result := True;
+  Wide := UnicodeString(ACandidate);
+  SetLength(Full, 512);
+  Len := WinGetFullPathNameW(PWideChar(Wide), UInt32(Length(Full)),
+    PWideChar(Full), nil);
+  if Len >= UInt32(Length(Full)) then
+  begin
+    { Too small: Len is the required size, terminating NUL included. }
+    SetLength(Full, Len);
+    Len := WinGetFullPathNameW(PWideChar(Wide), UInt32(Length(Full)),
+      PWideChar(Full), nil);
+    if Len >= UInt32(Length(Full)) then
+      Exit;
+  end;
+  if Len = 0 then
+    Exit;
+  SetLength(Full, Len);
+  Result := (Copy(Full, 1, Length(DEVICE_PREFIX)) = DEVICE_PREFIX) or
+    (Copy(Full, 1, Length(VERBATIM_PREFIX)) = VERBATIM_PREFIX);
+end;
+{$ENDIF}
+
 { Lexically normalise a guest path into a relative host fragment, REJECTING any
   escape at the syntax level: an absolute path (leading '/') or a `..` that
   ascends above the root is weNotCapable — the deny-by-default code. `.` and
@@ -1846,6 +2035,8 @@ end;
        (symlink escape -> weNotCapable)
     3. if it does not exist: weNoEnt when ARequireExists, else resolve the
        PARENT real path and require IT under the root (so a create lands inside)
+  On Windows a path that names a DOS device (WinPathNamesDevice) is refused
+  with weNotCapable between steps 1 and 2.
   The root itself is realpath'd first so a preopen given as a symlink is handled. }
 function ResolveContained(const ARootHost, AGuestPath: string;
   const ARequireExists: Boolean; out AHostPath: string): TWasmWasiErrno;
@@ -1866,6 +2057,13 @@ begin
     Exit(weSuccess);
   end;
   Candidate := RootReal + PathDelim + Rel;
+  {$IFDEF WINDOWS}
+  { A DOS device is not in the preopen directory, whatever the path around it
+    says. Refused before the first OS call, since opening a device path even
+    to resolve it can already reach the device. }
+  if WinPathNamesDevice(Rel, Candidate) then
+    Exit(weNotCapable);
+  {$ENDIF}
   if HostRealPath(Candidate, CandReal) then
   begin
     { Exists: the resolved real path (all symlinks followed) must be contained.
@@ -1878,6 +2076,15 @@ begin
   { Does not exist. }
   if ARequireExists then
     Exit(weNoEnt);
+  {$IFDEF WINDOWS}
+  { The leaf is present but did not resolve: a dangling, looping, or otherwise
+    unopenable symlink or junction. Its target is unknown, so it is denied
+    before any create can follow it. The SysUtils existence checks path_open
+    and path_create_directory run next follow links through the reparse data
+    on their own, so the leaf guard in path_open alone is too late here. }
+  if LeafIsSymlink(Candidate) then
+    Exit(weNotCapable);
+  {$ENDIF}
   Parent := ExtractFileDir(Candidate);
   if not HostRealPath(Parent, ParentReal) then
     Exit(weNoEnt);

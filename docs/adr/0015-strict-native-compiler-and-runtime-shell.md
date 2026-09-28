@@ -84,3 +84,11 @@ Consequences:
   does not produce `.wasm` modules. Compiling a validated module to a native
   executable is planned product work, recorded here and sequenced in
   [roadmap.md](../roadmap.md), not shipped behaviour.
+
+Amendment, 2026-09-27: strict compilation of WASI command modules to
+native executables has shipped, with embedded connector plans and compiled
+capability sets. All-to-all emission remains the contract but is delivered
+in `0.3.0` by [#148](https://github.com/frostney/wasmlight/issues/148).
+Until then a compiler emits for its own architecture on both 64-bit UNIX
+operating systems, and a target it cannot emit fails with a diagnostic,
+never with a fallback.

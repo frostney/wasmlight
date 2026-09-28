@@ -5,15 +5,20 @@
   interpreter-free executable. Selected `--connector` files are parsed through
   `Wasm.Connector` and resolved through `Wasm.Connector.Resolve`. WASI
   preview1 is a built-in of the runtime shell; other imports must resolve
-  uniquely. Connector host functions are not yet embedded in the generated
-  executable, so a resolved non-WASI import fails closed at link.
+  uniquely, and the resolved connector plan is embedded in the payload for
+  the shell to bind at startup (Wasm.Connector.Host).
 
   It is a THIN driver over shipped stages, adding no tier logic and never
   publishing output until every stage succeeds:
 
     1. Request check     — module path and `-o` are required; `--target`
                            defaults to the host and must be a released
-                           compile target (or fail before decode).
+                           compile target (or fail before decode). Every
+                           `--dir GUEST=HOST` / `--env KEY=VALUE` must
+                           parse into the compiled capability set
+                           (Wasm.Compile.Capabilities) — a usage error
+                           otherwise. The encoded set is embedded as the
+                           payload's capability-set section.
     2. LoadModuleFromFile / LoadModule — decode + validate, keeping
                            EWasmDecodeError and EWasmValidationError
                            distinct.
@@ -22,7 +27,8 @@
                            malformed `.wlc` is EWasmConnectorError.
     4. Link              — deny-by-default: `wasi_snapshot_preview1` is
                            granted; any other import is EWasmLinkError
-                           unless a selected connector binds it uniquely.
+                           unless a selected connector binds it uniquely
+                           with a fixed lowering the target ABI can call.
     5. Strict compile    — AotCompileModuleStrict for the requested
                            target. A decline is EWasmCompileError.
     6. Packaging         — WriteNativePayload into a catalog (or host
@@ -83,6 +89,11 @@ type
     { Empty means the catalog beside the compiler, then the host sibling
       `wasmlight-shell` for the host target. Tests inject a fixture root. }
     CatalogRoot: string;
+    { The compiled capability set, as the `--dir GUEST=HOST` and
+      `--env KEY=VALUE` specs in the order named. Empty grants no
+      filesystem and no environment. }
+    Dirs: TArray<string>;
+    Envs: TArray<string>;
   end;
 
   { The outcome of a compile: the process exit code and a diagnostic the
@@ -109,8 +120,8 @@ function IsUnreleasedCompileTarget(const ATarget: string): Boolean;
 function CompileReleasedTargetsHelp: string;
 
 { Registry-owned compile options: `--output`/`-o`, `--target`, repeatable
-  `--connector`. The caller (the subcommand registry, or a test) owns the
-  objects. }
+  `--connector`, then repeatable `--dir` and `--env` at indices 3 and 4.
+  The caller (the subcommand registry, or a test) owns the objects. }
 function CreateCompileOptions(out AOutput, ATarget: TStringOption;
   out AConnector: TRepeatableOption): TOptionArray;
 
@@ -155,10 +166,14 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
+  Wasm.Abi,
   Wasm.Aot,
   Wasm.Aot.Artifact,
+  Wasm.Compile.Capabilities,
   Wasm.Compile.Catalog,
   Wasm.Connector,
+  Wasm.Connector.Host,
+  Wasm.Connector.Plan,
   Wasm.Connector.Resolve,
   Wasm.MachO,
   Wasm.Native.Payload,
@@ -280,10 +295,53 @@ begin
   AConnector := TRepeatableOption.Create('connector',
     'select a .wlc connector (repeatable; no discovery)');
 
-  SetLength(Result, 3);
+  SetLength(Result, 5);
   Result[0] := AOutput;
   Result[1] := ATarget;
   Result[2] := AConnector;
+  Result[3] := TRepeatableOption.Create('dir',
+    'embed a preopened directory as GUEST=HOST; a relative HOST resolves ' +
+    'from the executable''s directory at run time (repeatable)');
+  Result[4] := TRepeatableOption.Create('env',
+    'embed an environment variable KEY=VALUE; the value is readable in the ' +
+    'executable and is not a secret (repeatable)');
+end;
+
+{ Build and encode the compiled capability set from the request's specs.
+  False with AError on the first spec the model refuses. }
+function CompileCapabilityBytes(const ADirs, AEnvs: array of string;
+  out ABytes: TWasmBytes; out AError: string): Boolean;
+var
+  Caps: TWasmCompiledCapabilities;
+  I: Integer;
+begin
+  ABytes := nil;
+  Result := False;
+  Caps := TWasmCompiledCapabilities.Create;
+  try
+    for I := 0 to High(ADirs) do
+      if not Caps.TryAddDirSpec(ADirs[I], AError) then
+        Exit;
+    for I := 0 to High(AEnvs) do
+      if not Caps.TryAddEnvSpec(AEnvs[I], AError) then
+        Exit;
+    Caps.Freeze;
+    ABytes := EncodeCompiledCapabilities(Caps);
+    Result := True;
+  finally
+    Caps.Free;
+  end;
+end;
+
+procedure CopyOptionValues(const AOption: TRepeatableOption;
+  out AValues: TArray<string>);
+var
+  I: Integer;
+begin
+  AValues := nil;
+  SetLength(AValues, AOption.Values.Count);
+  for I := 0 to AOption.Values.Count - 1 do
+    AValues[I] := AOption.Values[I];
 end;
 
 function CompileRequestFromOptions(const APositionals: TStringList;
@@ -294,12 +352,15 @@ var
   TargetOpt: TStringOption;
   ConnectorOpt: TRepeatableOption;
   I: Integer;
+  CapBytes: TWasmBytes;
 begin
   ARequest.ModulePath := '';
   ARequest.OutputPath := '';
   ARequest.Target := '';
   ARequest.Connectors := nil;
   ARequest.CatalogRoot := '';
+  ARequest.Dirs := nil;
+  ARequest.Envs := nil;
   AError := '';
 
   if APositionals.Count < 1 then
@@ -330,7 +391,11 @@ begin
   SetLength(ARequest.Connectors, ConnectorOpt.Values.Count);
   for I := 0 to ConnectorOpt.Values.Count - 1 do
     ARequest.Connectors[I] := ConnectorOpt.Values[I];
-  Result := True;
+  CopyOptionValues(TRepeatableOption(AOptions[3]), ARequest.Dirs);
+  CopyOptionValues(TRepeatableOption(AOptions[4]), ARequest.Envs);
+  { A malformed grant is a usage error before decode. }
+  Result := CompileCapabilityBytes(ARequest.Dirs, ARequest.Envs, CapBytes,
+    AError);
 end;
 
 function ResolvedCompileTarget(const ARequested: string;
@@ -368,8 +433,34 @@ begin
   end;
 end;
 
-procedure CheckConnectorsAndLink(const ALoaded: TWasmLoadedModule;
-  const AConnectors: array of string);
+function CompileWasmTarget(const ATriple: string;
+  out ATarget: TWasmTarget): Boolean; forward;
+
+{ The connector call ABI of a released compile target. }
+function CompileAbiTarget(const ATriple: string): TWasmAbiTarget;
+var
+  Target: TWasmTarget;
+begin
+  Result := wabNone;
+  if not CompileWasmTarget(ATriple, Target) then
+    Exit;
+  if Target.Arch = wtaAArch64 then
+  begin
+    if Target.Os = wtoDarwin then
+      Result := wabAapcs64Apple
+    else
+      Result := wabAapcs64;
+  end
+  else if Target.Arch = wtaX86_64 then
+    Result := wabSysvX64;
+end;
+
+{ Parse the selected connectors, resolve the module's imports, and prove
+  the result links: WASI plus exactly the connector plan's imports, each
+  callable on ATarget's C ABI. Returns the encoded plan for the payload —
+  empty when no connector import is bound. }
+function CheckConnectorsAndLink(const ALoaded: TWasmLoadedModule;
+  const AConnectors: array of string; const ATarget: string): TWasmBytes;
 var
   I, J: Integer;
   Path: string;
@@ -407,9 +498,7 @@ begin
   end;
   BuiltIn[0] := WLC_WASI_MODULE;
   Plan := ResolveConnectorModule(Docs, ALoaded.Model, BuiltIn);
-  if Length(Plan.Thunks) > 0 then
-    raise EWasmLinkError.Create(
-      'compiled executables grant WASI only; connector host functions are not embedded');
+  CheckConnectorPlanTarget(Plan, CompileAbiTarget(ATarget));
   Engine := TWasmEngine.Create;
   Store := nil;
   Linker := nil;
@@ -421,6 +510,7 @@ begin
     Context := TWasmWasiContext.Create(Config);
     Linker := TWasmLinker.Create(Store);
     WasiDefineAll(Linker, Context);
+    DefineConnectorSignatures(Linker, Plan);
     { Resolve the shell's actual names, kinds and signatures without
       instantiating the module or executing its start function. }
     Linker.ResolveImports(ALoaded);
@@ -431,6 +521,7 @@ begin
     Store.Free;
     Engine.Free;
   end;
+  Result := EncodeConnectorPlan(Plan);
 end;
 
 function CompileWasmTarget(const ATriple: string;
@@ -506,7 +597,8 @@ end;
 
 function NativePayloadFromArtifact(const ALoaded: TWasmLoadedModule;
   const AArtifact, ATemplate: TWasmBytes;
-  const ATarget: string): TWasmBytes;
+  const ATarget: string; const AConnectorPlan, ACapabilitySet: TWasmBytes):
+  TWasmBytes;
 var
   Parsed: TWasmAotArtifact;
   Params: TWasmNativePayloadWriteParams;
@@ -543,8 +635,8 @@ begin
   Params.ShellHash := WnepHash128Bytes(ATemplate);
   Params.ModuleBytes := CopyLoadedBytes(ALoaded);
   Params.Funcs := Funcs;
-  Params.ConnectorPlan := nil;
-  Params.CapabilitySet := nil;
+  Params.ConnectorPlan := AConnectorPlan;
+  Params.CapabilitySet := ACapabilitySet;
   Result := WriteNativePayload(Params);
 end;
 
@@ -706,17 +798,24 @@ function CompileLoaded(const ALoaded: TWasmLoadedModule;
   const ARequest: TWasmCompileRequest): TWasmCompileResult;
 var
   Target: string;
-  Artifact, Template, Payload, Packaged: TWasmBytes;
+  Artifact, Template, Payload, Packaged, ConnectorPlan,
+    Capabilities: TWasmBytes;
+  CapError: string;
 begin
   if not ResolvedCompileTarget(ARequest.Target, Target, Result) then
     Exit;
+  if not CompileCapabilityBytes(ARequest.Dirs, ARequest.Envs, Capabilities,
+    CapError) then
+    Exit(FailResult('', CapError));
 
   try
-    CheckConnectorsAndLink(ALoaded, ARequest.Connectors);
+    ConnectorPlan := CheckConnectorsAndLink(ALoaded, ARequest.Connectors,
+      Target);
     WasiCheckCommandEntry(ALoaded);
     Artifact := StrictCompileNative(ALoaded, Target);
     Template := LoadCompileTemplate(Target, ARequest.CatalogRoot);
-    Payload := NativePayloadFromArtifact(ALoaded, Artifact, Template, Target);
+    Payload := NativePayloadFromArtifact(ALoaded, Artifact, Template, Target,
+      ConnectorPlan, Capabilities);
     Packaged := PackageCompilePayload(Target, Payload, ARequest.CatalogRoot,
       ARequest.OutputPath);
     WriteCompileOutput(ARequest.OutputPath, Packaged);
