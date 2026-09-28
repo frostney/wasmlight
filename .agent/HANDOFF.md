@@ -1,5 +1,31 @@
 # Handoff
 
+## 0.2.0 delivered — 2026-09-28
+
+- Milestone 0.2.0 is closed (28/28). The release
+  [0.2.0](https://github.com/frostney/wasmlight/releases/tag/0.2.0) has its
+  annotated tag on `19e2156`. `ci.yml` passed on all six targets on that
+  commit, and the four host archives plus checksums are attached by
+  release-assets run 36366275368. The Homebrew formula is live in
+  frostney/homebrew-tap#18; `brew install` and `brew test` passed on Linux,
+  and test-bot passed on macOS arm, macOS Intel, and Linux.
+- Merged for 0.2.0: #156 (#46 archives), #160 (#149 Windows links), #161
+  (#40 compiled capabilities + argv[0]), #159 (#33 wide tail calls in every
+  tier), #162 (#146 connector plans, contract D11–D14 recorded on #146),
+  #164 (#163 DOS device names), #165 (#150 docs), #166 (release).
+- Follow-ups filed: #157 (handle release), #158 (strings/structs/by-ref),
+  both 0.3.0. Not yet filed: the Intel macOS runtime shell is unsigned, so
+  the two macOS targets package differently.
+- Process notes: two API session limits killed the parallel workers. The
+  maintainer then asked for no subagents, so later PRs had single-agent
+  coordinator review instead of a Fable 5.1 review. The shared lwpt worker
+  budget is 1, so local full gates queued for up to about 50 minutes. The
+  release PR was merged before its wait result was read (a Win64 FPC-installer
+  download flake); the tag was held until `ci.yml` passed on the release
+  commit.
+- Next: 0.3.0 (WASI P1 judged by wasi-testsuite, #78–#85, plus #148
+  cross-architecture emission, #157, #158).
+
 ## Roadmap review and re-plan — 2026-09-27
 
 - Snapshot: `origin/main` 4641af5, CI green. Decisions D1–D5 were accepted by
