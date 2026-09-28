@@ -224,8 +224,10 @@ assembles, decodes, validates, instantiates, and executes over the whole
 corpus, and the embedding API and WASI preview1 host surface that run that
 core as real programs — `wasmlight run` executes a WASI command to a
 process exit code under deny-by-default capabilities (Track F) — `wasmlight
-compile` emits an interpreter-free WASI native executable on the four
-released 64-bit UNIX targets — and both
+compile` emits an interpreter-free WASI native executable for the host's
+architecture on both 64-bit UNIX operating systems (emitting every target
+from every host is [#148](https://github.com/frostney/wasmlight/issues/148),
+[ADR-0019](docs/adr/0019-cross-architecture-emission-follows-0-2-0.md)) — and both
 compiling tiers behind the seam: the baseline JIT (Track I) and the AOT
 compiler (Track J), two backends (aarch64 + x86-64) on a 64-bit UNIX host,
 each proven byte-identical to the interpreter over the corpus. **The whole
