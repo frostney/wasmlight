@@ -78,9 +78,9 @@ class Wasmlight < Formula
     # Run by name from PATH, as a user types it: the compiler must find its
     # installed shell catalog from its own executable path, not argv[0] or
     # the current directory (wasmlight#167).
-    with_env(PATH: "#{bin}:#{ENV.fetch("PATH")}") do
-      system "wasmlight", "compile", "probe.wasm", "-o", "probe-by-name"
-    end
+    # brew audit requires fully scoped `system` calls, so the bare-name run
+    # goes through a shell command.
+    shell_output("cd #{testpath} && PATH=#{bin}:$PATH wasmlight compile probe.wasm -o probe-by-name")
     shell_output("#{testpath}/probe-by-name", 37)
 
     # The same-architecture shell for the other OS is packaged, not run.
