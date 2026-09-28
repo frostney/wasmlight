@@ -107,6 +107,8 @@ type
     procedure TestWriteOutputRejectsDirectory;
     procedure TestWriteOutputIsAtomic;
     procedure TestPackageWithoutCatalogIsPackagingError;
+    procedure TestCatalogComesFromCompilerPathNotCwd;
+    procedure TestUnknownCompilerPathIsPackagingError;
     procedure TestHostTargetEmitsNativeExecutable;
     procedure TestWrongMachOTemplateFails;
     procedure TestHelpDocumentsCapabilityOptions;
@@ -756,6 +758,70 @@ begin
   DeleteFile(FOutputPath + '.bak');
 end;
 
+procedure TCompileTests.TestCatalogComesFromCompilerPathNotCwd;
+var
+  Prefix, Decoy, SavedDir: string;
+  Got, Want: TWasmBytes;
+begin
+  { An installed prefix holds the real catalog; the current directory holds
+    a decoy whose aarch64-darwin shell is the wrong template. The compiler
+    path decides, never the CWD (#167). }
+  Prefix := IncludeTrailingPathDelimiter(FTempDir) + 'prefix';
+  ForceDirectories(Prefix + '/bin');
+  ForceDirectories(Prefix + '/share/wasmlight');
+  WritePackagingCatalog(Prefix + '/share/wasmlight/shells');
+  Decoy := IncludeTrailingPathDelimiter(FTempDir) + 'cwd';
+  ForceDirectories(Decoy + '/share/wasmlight');
+  WritePackagingCatalog(Decoy + '/shells', True);
+  WritePackagingCatalog(Decoy + '/share/wasmlight/shells', True);
+  SavedDir := GetCurrentDir;
+  SetCurrentDir(Decoy);
+  try
+    Got := LoadCompileTemplateFor(WASM_COMPILE_TARGET_AARCH64_DARWIN, '',
+      Prefix + '/bin/wasmlight');
+  finally
+    SetCurrentDir(SavedDir);
+  end;
+  Want := WriteMachOShellTemplate(wmtAarch64Darwin);
+  Expect<Integer>(Length(Got)).ToBe(Length(Want));
+  Expect<Boolean>((Length(Got) = Length(Want)) and
+    CompareMem(@Got[0], @Want[0], Length(Want))).ToBe(True);
+end;
+
+procedure TCompileTests.TestUnknownCompilerPathIsPackagingError;
+var
+  Decoy, SavedDir, Path: string;
+  Paths: array[0..1] of string;
+  Msg: string;
+begin
+  { With no catalog root, an empty or bare compiler path (argv[0] as typed)
+    must not fall back to the current directory, even when it holds a
+    usable-looking catalog. }
+  Decoy := IncludeTrailingPathDelimiter(FTempDir) + 'cwd';
+  ForceDirectories(Decoy);
+  WritePackagingCatalog(Decoy + '/shells');
+  Paths[0] := '';
+  Paths[1] := 'wasmlight';
+  SavedDir := GetCurrentDir;
+  SetCurrentDir(Decoy);
+  try
+    for Path in Paths do
+    begin
+      Msg := '';
+      try
+        LoadCompileTemplateFor(WASM_COMPILE_TARGET_AARCH64_DARWIN, '', Path);
+      except
+        on E: EWasmPackagingError do
+          Msg := E.Message;
+      end;
+      Expect<Boolean>(Pos('compiler executable path is unknown', Msg) > 0)
+        .ToBe(True);
+    end;
+  finally
+    SetCurrentDir(SavedDir);
+  end;
+end;
+
 procedure TCompileTests.TestPackageWithoutCatalogIsPackagingError;
 var
   Raised: Boolean;
@@ -1032,6 +1098,10 @@ begin
     TestWriteOutputIsAtomic);
   Test('a missing catalog is a packaging error',
     TestPackageWithoutCatalogIsPackagingError);
+  Test('the shell catalog comes from the compiler path, never the CWD',
+    TestCatalogComesFromCompilerPathNotCwd);
+  Test('an unknown or bare compiler path is a packaging error',
+    TestUnknownCompilerPathIsPackagingError);
   Test('the host target emits a packaged native executable',
     TestHostTargetEmitsNativeExecutable);
   Test('help documents --dir and --env and warns env is not secret',

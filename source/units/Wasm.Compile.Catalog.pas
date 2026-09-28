@@ -121,7 +121,9 @@ function TargetOsName(const AOs: TWasmTargetOs): string;
 function ShellFormatName(const AFormat: TWasmShellFormat): string;
 
 { Distribution share/wasmlight/shells, installed prefix share directory, or
-  the development <compiler-dir>/shells. The CLI supplies ParamStr(0). }
+  the development <compiler-dir>/shells. ACompilerPath must be the
+  compiler's absolute executable path from the OS (NativeExecutablePath),
+  never argv[0]; `wasmlight compile` refuses to resolve without one. }
 function CompilerCatalogRoot(const ACompilerPath: string): string;
 
 { FNV-1a-64 of the shell bytes — a corruption guard, not authentication.

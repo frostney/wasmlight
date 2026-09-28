@@ -160,6 +160,17 @@ function PackageCompilePayload(const ATarget: string;
   const APayload: TWasmBytes; const ACatalogRoot, AOutputPath: string):
   TWasmBytes;
 
+{ The runtime-shell template for ATarget. An explicit ACatalogRoot wins;
+  otherwise the catalog (and, for the host target, a sibling
+  `wasmlight-shell`) is found from ACompilerPath, the compiler's absolute
+  executable path. The compile path supplies the OS-reported path
+  (NativeExecutablePath), never argv[0]: FPC's Darwin ParamStr(0) is the raw
+  argv[0], so a compiler run by name from PATH would resolve against the
+  current directory. An empty or relative ACompilerPath with no catalog
+  root is EWasmPackagingError, as is a missing shell. Exported for tests. }
+function LoadCompileTemplateFor(const ATarget, ACatalogRoot,
+  ACompilerPath: string): TWasmBytes;
+
 implementation
 
 uses
@@ -176,6 +187,7 @@ uses
   Wasm.Connector.Plan,
   Wasm.Connector.Resolve,
   Wasm.MachO,
+  Wasm.Native.Load,
   Wasm.Native.Payload,
   Wasm.Package.Elf,
   Wasm.Runtime.Store,
@@ -557,7 +569,8 @@ begin
   end;
 end;
 
-function LoadCompileTemplate(const ATarget, ACatalogRoot: string): TWasmBytes;
+function LoadCompileTemplateFor(const ATarget, ACatalogRoot,
+  ACompilerPath: string): TWasmBytes;
 var
   Root, Sibling: string;
   Entry: TWasmShellEntry;
@@ -565,19 +578,34 @@ var
 begin
   Root := ACatalogRoot;
   if Root = '' then
-    Root := CompilerCatalogRoot(ParamStr(0));
+  begin
+    { Never resolve the catalog against the current directory: only an
+      absolute compiler path names where the installed shells live. }
+    if (ACompilerPath = '') or
+      not CompiledHostPathIsAbsolute(ACompilerPath) then
+      raise EWasmPackagingError.Create(
+        'cannot locate the runtime-shell catalog: the compiler executable ' +
+        'path is unknown');
+    Root := CompilerCatalogRoot(ACompilerPath);
+  end;
   Sel := ResolveShell(Root, ATarget, Entry);
   if Sel = ssrOk then
     Exit(ReadAllBytes(Entry.ShellPath));
   if (ACatalogRoot = '') and (ATarget = CompileHostTarget) and
     not FileExists(IncludeTrailingPathDelimiter(Root) + SHELL_CATALOG_FILENAME) then
   begin
-    Sibling := IncludeTrailingPathDelimiter(ExtractFileDir(ParamStr(0))) +
+    Sibling := IncludeTrailingPathDelimiter(ExtractFileDir(ACompilerPath)) +
       'wasmlight-shell';
     if FileExists(Sibling) then
       Exit(ReadAllBytes(Sibling));
   end;
   raise EWasmPackagingError.Create(FormatSelectError(Sel, ATarget));
+end;
+
+function LoadCompileTemplate(const ATarget, ACatalogRoot: string): TWasmBytes;
+begin
+  Result := LoadCompileTemplateFor(ATarget, ACatalogRoot,
+    NativeExecutablePath);
 end;
 
 function CopyLoadedBytes(const ALoaded: TWasmLoadedModule): TWasmBytes;
