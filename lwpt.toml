@@ -4,7 +4,7 @@
 
 [package]
 name = "wasmlight"
-version = "0.2.0"
+version = "0.2.1"
 # Only wasmlight's own unit dir is listed — lwpt discovers dependency
 # units through their nested manifests.
 units = ["source/units"]

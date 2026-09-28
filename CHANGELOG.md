@@ -2,6 +2,16 @@
 
 All notable changes to wasmlight are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
 
+## [0.2.1] - 2026-09-28
+
+### Bug Fixes
+
+- find the shell catalog from the OS executable path, not argv[0] (#174)
+
+### Documentation
+
+- record the 0.2.0 retrospective lessons (#173)
+- record WIT as rejected for connectors and the 2026-09-27 re-plan handoff (#147)
 ## [0.2.0] - 2026-09-28
 
 ### Bug Fixes
