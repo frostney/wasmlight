@@ -581,8 +581,8 @@ begin
   begin
     { Never resolve the catalog against the current directory: only an
       absolute compiler path names where the installed shells live. }
-    if (ACompilerPath = '') or (ExtractFileDir(ACompilerPath) = '') or
-      (ExpandFileName(ACompilerPath) <> ACompilerPath) then
+    if (ACompilerPath = '') or
+      not CompiledHostPathIsAbsolute(ACompilerPath) then
       raise EWasmPackagingError.Create(
         'cannot locate the runtime-shell catalog: the compiler executable ' +
         'path is unknown');
