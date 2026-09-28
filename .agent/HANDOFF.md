@@ -51,7 +51,7 @@
     SysV fast paths off.
   - 0.6.0: i386 (#54–#61).
   - 0.7.0: observability (#86–#90).
-- **Connector language:** WIT was rejected (ADR-0015 note, PR #147). Any
+- **Connector language:** WIT was rejected (ADR-0018, PR #147). Any
   future support for WIT-built guests must reuse the canonical ABI's flat
   lowering.
 - **Performance:** the goal counts as met on the CI geomean (0.75× standard,

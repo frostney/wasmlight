@@ -1,5 +1,10 @@
 # Strict native compilation uses an interpreter-free runtime shell
 
+**Extended by [ADR-0018](./0018-wit-is-not-the-connector-language.md)**
+(WIT is not the connector language). **Timing revised by
+[ADR-0019](./0019-cross-architecture-emission-follows-0-2-0.md):** emitting
+every target from every host arrives after `0.2.0`.
+
 `wasmlight compile` is the next product spine: it validates a module once,
 compiles every guest function, and fails with a structured diagnostic if any
 function cannot be compiled. The output is a complete native executable
@@ -51,16 +56,7 @@ loader paths** for connector libraries, which widens host capability past
 the deny-by-default boundary. **Skipping startup revalidation because the
 artifact is local**, which would turn the payload into a trust boundary.
 **Choosing the target from host CPU/OS defines**, which prevents one
-compiler binary from emitting another supported target. **WIT as the
-connector language**, which describes component interfaces, not native
-bindings: its grammar has no library or symbol attribute, no pointer type,
-no function-typed parameter, no explicit enum value, and no `out`
-parameter, and neither the Component Model nor wit-bindgen defines a
-native host ABI (probed 2026-09-27 against `WebAssembly/component-model`
-`d1daf82`, wasm-tools 1.259.0, wit-bindgen 0.62.0). Adopting it would still
-need a native-mapping sidecar, which is `.wlc` again, and would pull in the
-canonical ABI [ADR-0014](./0014-the-component-model-is-deferred-to-post-v1.md)
-defers.
+compiler binary from emitting another supported target.
 
 Consequences:
 
@@ -73,22 +69,7 @@ Consequences:
 - The error hierarchy, memory chokepoint, store-thread rule
   ([ADR-0008](./0008-a-store-is-confined-to-one-thread.md)), and
   deny-by-default host boundary remain intact.
-- Guests built by WIT tooling cannot use connectors. Their import modules
-  are interface names such as `local:libc/libc`, which no `.wlc` class name
-  can match, and they pass lists and strings as `(ptr, len)` pairs with
-  results through a return pointer and the guest's `cabi_realloc`. If
-  connectors ever accept such guests, that convention is the canonical
-  ABI's flat lowering and must be the one implementation the Component
-  Model re-entry reuses, never a separate connector lowering.
 - `VISION.md`'s "not a WebAssembly compiler" fence still means wasmlight
   does not produce `.wasm` modules. Compiling a validated module to a native
   executable is planned product work, recorded here and sequenced in
   [roadmap.md](../roadmap.md), not shipped behaviour.
-
-Amendment, 2026-09-27: strict compilation of WASI command modules to
-native executables has shipped, with embedded connector plans and compiled
-capability sets. All-to-all emission remains the contract but is delivered
-in `0.3.0` by [#148](https://github.com/frostney/wasmlight/issues/148).
-Until then a compiler emits for its own architecture on both 64-bit UNIX
-operating systems, and a target it cannot emit fails with a diagnostic,
-never with a fallback.
