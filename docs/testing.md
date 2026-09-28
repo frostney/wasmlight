@@ -42,6 +42,20 @@ Each `*.Test.pas` is a self-contained program using
 `TestingPascalLibrary` from lwpt's `testing` package. The runner exits
 non-zero if any test or compile fails.
 
+### Running CI on a branch
+
+To run the full post-merge matrix (`ci.yml`, all six targets) against a
+branch before it merges, for example to exercise Windows-only paths, push
+the branch and dispatch the workflow against it:
+
+```bash
+gh workflow run ci.yml --ref <branch>
+```
+
+`ci.yml` already accepts `workflow_dispatch`, so no temporary workflow
+file or trigger change is needed. Git hooks are never skipped
+(`--no-verify`), including on throwaway probe branches.
+
 ## The three tiers
 
 | Tier | What it proves | Status |
