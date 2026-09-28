@@ -41,6 +41,16 @@ missing file permits a generic fallback.
   host-reported reset. Resume each lane from its checkpoint and report the
   lost window.
 
+## Context limits
+
+- Record a warning when a lane's context passes 100k tokens. Past 150k
+  tokens, checkpoint and split or replace the lane before its next
+  inference. This is an absolute limit, independent of the model's context
+  window: a large window lets a lane grow, and every later inference pays
+  for re-reading the whole context.
+- A milestone-sized run starts from a fresh coordinator session seeded by
+  the handoff, not from a long-running conversation.
+
 ## Context packets
 
 Lanes start with no inherited conversation. A packet carries the applicable
@@ -58,3 +68,11 @@ when the host exposes no record of it.
 
 External state (CI, merges, releases) is awaited with non-model watchers.
 A model is invoked only on changed, terminal, or exceptional state.
+
+A lane never waits more than five minutes inside its own context. Before a
+longer wait (CI, a queued build or test run, a release workflow, or a
+usage-limit reset), the lane pushes its checkpoint, hands the wait to the
+coordinator or a non-model watcher, and ends its turn. It resumes when the
+result arrives. Lane context caches can expire within minutes, so each
+longer wait rewrites the whole context; in the `0.2.0` run, that caused 83%
+of all cache writes.
