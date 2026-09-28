@@ -42,6 +42,16 @@ unit. Toolkit state under `.lwpt/` is excluded by lwpt itself.
 - Test programs are `Wasm.<Unit>.Test.pas`, co-located with the unit they
   cover.
 
+## Locating installed files
+
+Locate files that ship beside a program (the runtime-shell catalog, a
+sibling `wasmlight-shell`, application-local connector libraries) from
+`NativeExecutablePath` in `Wasm.Native.Load`, never from `ParamStr(0)`.
+FPC 3.2.2's Darwin `ParamStr(0)` is the raw `argv[0]`, so a program run by
+name from `PATH` has no directory, and its Linux value is a 255-byte
+shortstring. When the executable path cannot be determined, fail with a
+diagnostic rather than resolving against the current directory.
+
 ## Comments
 
 Comment the decision, not the mechanics. A unit header says what the unit

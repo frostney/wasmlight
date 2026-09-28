@@ -19,6 +19,11 @@ recorded reason.
 - The solution is the smallest complete change; no unrelated refactoring
   rides along.
 - Terminology matches [CONTEXT.md](CONTEXT.md).
+- An issue closes only when its acceptance criteria are observable end to
+  end from a shipped entry point (CLI, embedding API, or packaged
+  executable). A unit that exists but cannot yet be reached keeps the issue
+  open, or its unreachable part is split into a linked follow-up issue
+  before the issue closes.
 
 ## Tests and verification
 
@@ -30,6 +35,11 @@ recorded reason.
   lwpt build
   lwpt test
   ```
+
+  PR CI on the exact head satisfies this gate: `pr.yml` runs these
+  commands on Linux, macOS, and both Windows targets. Locally, run the
+  focused suites for the change, and run the full gate only when CI cannot
+  cover it.
 
 - Focused tests covering the changed behaviour pass first, including the
   negative paths: a malformed module must be rejected with the right
