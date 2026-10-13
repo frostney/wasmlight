@@ -406,6 +406,86 @@ jobs:
   # Same-runner base-vs-PR measurement, following GocciaScript's benchmark
   # reporting shape. The job is a correctness/executability gate: timing
   # deltas are reported, never asserted (VISION.md, "Honest measurement").
+  # wasi-testsuite Preview 1 oracle (#78). Non-blocking: continue-on-error
+  # keeps it out of the verdict while the committed baseline is still a work
+  # list (#79-#85). run.py exits non-zero only when results differ from
+  # tools/wasi-testsuite/expectations/<os>.toml. The corpus is vendored in
+  # tests/spec/wasi, so the run itself needs no network.
+  wasi-testsuite:
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            lwpt-asset: linux-x64
+            fpc-install: apt
+          - runner: macos-latest
+            lwpt-asset: macos-arm64
+            fpc-install: brew
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the test runner's Python dependencies
+        run: python3 -m pip install -r tests/spec/wasi/test-runner/requirements/common.txt
+
+      - name: Install FPC (apt)
+        if: matrix.fpc-install == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install FPC (brew)
+        if: matrix.fpc-install == 'brew'
+        run: |
+          brew install fpc
+          fpc -iV
+
+      - name: Install lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ASSET="lwpt-${LWPT_VERSION}-${{ matrix.lwpt-asset }}"
+          BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
+          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          else
+            sha256sum -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          fi
+          tar xzf "${ASSET}.tar.gz"
+          echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
+
+      - name: Build wasmlight from source
+        run: |
+          lwpt install --frozen
+          lwpt build --mode release wasmlight
+
+      - name: Run wasi-testsuite against the committed baseline
+        run: lwpt run wasi-testsuite
+
+      - name: Upload wasi-testsuite results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasi-testsuite-results-${{ matrix.lwpt-asset }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: build/wasi-testsuite/results.json
+
   runtime-comparison:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
