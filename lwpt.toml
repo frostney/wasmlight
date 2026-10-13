@@ -47,6 +47,14 @@ stamp-version = { command = "instantfpc",
                   inputs = ["lwpt.toml"],
                   output = "source/units/Version.inc" }
 
+# Run the vendored wasi-testsuite Preview 1 corpus (tests/spec/wasi) against
+# build/wasmlight and compare with the committed baseline in
+# tools/wasi-testsuite/expectations. Needs Python 3.11+ with colorama and
+# requests. Exits non-zero only when results differ from the baseline.
+[wasi-testsuite]
+command = "python3"
+args = ["tools/wasi-testsuite/run.py"]
+
 # The formatter's scope is seeded by [package].units. scripts/ holds
 # project-owned Pascal that is not a unit, so it is added explicitly.
 [format]
