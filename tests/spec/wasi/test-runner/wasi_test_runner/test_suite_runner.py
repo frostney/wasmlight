@@ -1,0 +1,602 @@
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import socket
+import threading
+import time
+
+from datetime import datetime
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from typing import List, NamedTuple, Tuple, Dict, Any, IO
+
+from .filters import TestFilter
+from .runtime_adapter import RuntimeAdapter
+from .test_case import (
+    Result, Failure, WasiVersion, Config, Outcome,
+    TestCase, TestCaseRunnerBase, TestCaseValidator,
+    Endpoint, EndpointMode, ServerKind, ECHO_HEADER_PREFIX, TRAILER_HEADER_PREFIX,
+    # Operation types
+    Run, Read, Write, Wait, Send, Recv, Connect, Request, Kill
+)
+from .reporters import TestReporter
+from .test_suite import TestSuite, TestSuiteMeta
+
+
+class Manifest(NamedTuple):
+    name: str
+    wasi_version: WasiVersion
+
+
+class _TestSpec(NamedTuple):
+    path: str
+    name: str
+    config: Config
+
+
+class _EndpointServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address: Tuple[str, int], handler: Any) -> None:
+        super().__init__(server_address, handler)
+        self.routes: Dict[Tuple[str, str], Endpoint] = {}
+
+
+class _EndpointRequestHandler(BaseHTTPRequestHandler):
+    # Chunked transfer encoding, and therefore trailers, needs HTTP/1.1.
+    protocol_version = "HTTP/1.1"
+
+    def _close_after_reply(self) -> None:
+        # Ensure one connection per request. `close_connection` is defined by
+        # `BaseHTTPRequestHandler`.
+        # pylint: disable-msg=attribute-defined-outside-init
+        self.close_connection = True
+        self.send_header("Connection", "close")
+
+    def _read_body(self) -> Tuple[bytes, Dict[str, str]]:
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            return self._read_chunked()
+        length = int(self.headers.get("Content-Length") or 0)
+        return (self.rfile.read(length) if length else b""), {}
+
+    def _read_chunked(self) -> Tuple[bytes, Dict[str, str]]:
+        # `http.server` doesn't provide any builtin utilities for trailers.
+        body = b""
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                return body, {}
+            # A chunk size may carry extensions: `4;name=value`.
+            size = int(line.split(b";")[0], 16)
+            if size == 0:
+                break
+            body += self.rfile.read(size)
+            self.rfile.read(2)  # the CRLF terminating each chunk
+        return body, self._read_trailers()
+
+    def _read_trailers(self) -> Dict[str, str]:
+        # Trailers sit after the terminating chunk, spelled like headers and
+        # ended by a blank line.
+        trailers: Dict[str, str] = {}
+        while True:
+            line = self.rfile.readline()
+            if not line or line in (b"\r\n", b"\n"):
+                return trailers
+            name, _, value = line.decode("utf-8").partition(":")
+            trailers[name.strip().lower()] = value.strip()
+
+    def _dispatch(self) -> None:
+        body, trailers = self._read_body()
+        endpoint = self.server.routes.get((self.command, self.path))  # type: ignore[attr-defined]
+        if endpoint is None:
+            self._reply(404, [], b"")
+        elif endpoint.mode is EndpointMode.ECHO_BODY:
+            self._reply(200, [], body)
+        elif endpoint.mode is EndpointMode.ECHO_HEADERS:
+            self._reply(200, self._echoed_headers(trailers), b"")
+        else:
+            response = endpoint.response
+            assert response is not None
+            headers = list(response.headers.items())
+            if response.chunks is None:
+                self._reply(response.status, headers,
+                            response.body.encode("utf-8"))
+            else:
+                self._reply_chunked(
+                    response.status, headers,
+                    [chunk.encode("utf-8") for chunk in response.chunks],
+                    response.trailers)
+
+    def _echoed_headers(self, trailers: Dict[str, str]) -> List[Tuple[str, str]]:
+        echoed = [("x-request-method", self.command),
+                  ("x-request-path", self.path)]
+
+        for name in dict.fromkeys(key.lower() for key in self.headers.keys()):
+            for value in self.headers.get_all(name, []):
+                echoed.append((f"{ECHO_HEADER_PREFIX}{name}", value))
+        for name, value in trailers.items():
+            echoed.append((f"{TRAILER_HEADER_PREFIX}{name}", value))
+        return echoed
+
+    do_GET = _dispatch
+    do_POST = _dispatch
+    do_PUT = _dispatch
+    do_DELETE = _dispatch
+    do_PATCH = _dispatch
+    do_HEAD = _dispatch
+    do_OPTIONS = _dispatch
+
+    def _reply(self, status: int, headers: List[Tuple[str, str]], body: bytes) -> None:
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self._close_after_reply()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _reply_chunked(self, status: int, headers: List[Tuple[str, str]],
+                       chunks: List[bytes], trailers: Dict[str, str]) -> None:
+        # No `Content-Length`: the chunk framing delimits the body instead.
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Transfer-Encoding", "chunked")
+        if trailers:
+            self.send_header("Trailer", ", ".join(trailers))
+        self._close_after_reply()
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        for chunk in chunks:
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+        self.wfile.write(b"0\r\n")
+        for name, value in trailers.items():
+            self.wfile.write(f"{name}: {value}\r\n".encode("utf-8"))  # noqa: E231
+        self.wfile.write(b"\r\n")
+
+    def log_message(self, *_args: Any) -> None:
+        # Avoiding polluting stderr.
+        pass
+
+
+def _reserve_closed_addr() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+    return f"{host}:{port}"  # noqa: E231
+
+
+class TestCaseRunner(TestCaseRunnerBase):
+    # pylint: disable-msg=too-many-instance-attributes
+    _test_path: str
+    _wasi_version: WasiVersion
+    _runtime: RuntimeAdapter
+    _proc: subprocess.Popen[Any] | None
+    _cleanup_dirs: List[Path]
+    _pipes: Dict[str, IO[str]]
+    _sockets: Dict[str, socket.socket]
+    _last_argv: List[str]
+    _http_server: str | None
+    _endpoint_servers: List[_EndpointServer]
+    _server_addrs: Dict[str, str]
+    _windows_terminated_by_runner: bool
+
+    def __init__(self, config: Config, test_path: str, wasi_version: WasiVersion,
+                 runtime: RuntimeAdapter) -> None:
+        TestCaseRunnerBase.__init__(self, config)
+        self._test_path = test_path
+        self._wasi_version = wasi_version
+        self._runtime = runtime
+        self._proc = None
+        self._cleanup_dirs = []
+        self._pipes = {}
+        self._sockets = {}
+        self._last_argv = []
+        self._http_server = None
+        self._endpoint_servers = []
+        self._server_addrs = {}
+        self._windows_terminated_by_runner = False
+
+    def _start_servers(self) -> None:
+        if self._server_addrs:
+            return
+        for spec in self.config.servers:
+            if spec.kind is ServerKind.CLOSED:
+                self._server_addrs[spec.env_var] = _reserve_closed_addr()
+                continue
+            server = _EndpointServer(("127.0.0.1", 0), _EndpointRequestHandler)
+            for endpoint in spec.endpoints:
+                server.routes[(endpoint.method, endpoint.path)] = endpoint
+            host, port = server.server_address
+            self._server_addrs[spec.env_var] = f"{host}:{port}"  # noqa: E231
+            self._endpoint_servers.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def _add_cleanup_dir(self, d: Path) -> None:
+        _cleanup_test_output(d)
+        self._cleanup_dirs.append(d)
+
+    def _wait(self, timeout: float | None) -> Tuple[int, str, str]:
+        proc = self._proc
+        assert proc is not None
+        out, err = proc.communicate(timeout=timeout)
+        self._proc = None
+        return proc.returncode, out, err
+
+    def fail_unexpected(self, msg: str) -> None:
+        self._failures.append(Failure.unexpected(msg))
+
+    def fail_expectation(self, msg: str) -> None:
+        self._failures.append(Failure.expectation(msg))
+
+    def has_failure(self) -> bool:
+        return bool(self._failures)
+
+    def add_socket(self, name: str, sock: socket.socket) -> None:
+        self._sockets[name] = sock
+
+    def add_pipe(self, name: str, pipe: IO[str]) -> None:
+        self._pipes[name] = pipe
+
+    def get_socket(self, name: str) -> socket.socket:
+        assert name in self._sockets
+        return self._sockets[name]
+
+    def get_pipe(self, name: str) -> IO[str]:
+        assert name in self._pipes
+        return self._pipes[name]
+
+    def last_argv(self) -> List[str]:
+        return self._last_argv
+
+    def get_http_server(self) -> str | None:
+        if self._http_server:
+            return self._http_server
+        line = self.get_pipe('stderr').readline().strip()
+        start = line.find('http://')
+        if start < 0:
+            self.fail_unexpected(f"Expected 'http://' in first line, got {line}")  # noqa: E231
+            return None
+        # The server URL starts with http:// and ends at EOL or whitespace.
+        self._http_server = line[start:].split()[0]
+        return self._http_server
+
+    def do_run(self, run: Run) -> None:
+        if run.root:
+            self._add_cleanup_dir(run.root)
+        self._start_servers()
+        proposals = self.config.proposals_as_str()
+        wasi_env = dict(run.env)
+        wasi_env.update(self._server_addrs)
+        argv = self._runtime.compute_argv(
+            self._test_path, run.args, wasi_env, run.root, proposals,
+            self.config.world, self._wasi_version)
+        self._last_argv = argv
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP")
+
+            env = os.environ.copy()
+            if self.config.debug:
+                env["DEBUG"] = "true"
+
+            # pylint: disable-msg=consider-using-with
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+                creationflags=creationflags,
+            )
+            stdin, stdout, stderr = \
+                self._proc.stdin, self._proc.stdout, self._proc.stderr
+            assert stdin is not None
+            assert stdout is not None
+            assert stderr is not None
+            self.add_pipe('stdin', stdin)
+            self.add_pipe('stdout', stdout)
+            self.add_pipe('stderr', stderr)
+        except (OSError, ValueError) as e:
+            self.fail_unexpected(f"Failed to start process: {e}")
+
+    def do_read(self, read: Read) -> None:
+        stream = self.get_pipe(read.id)
+        expected_length = len(read.payload)
+        payload = stream.read(expected_length)
+        if payload != read.payload:
+            self.fail_expectation(f"{read} {read.id} failed: expected {read.payload}, got {payload}")
+
+    def do_write(self, write: Write) -> None:
+        stream = self.get_pipe(write.id)
+        stream.write(write.payload)
+        stream.flush()
+
+    def do_wait(self, wait: Wait) -> None:
+        try:
+            exit_code, out, err = self._wait(self._runtime.get_timeout_seconds())
+            if (
+                os.name == "nt"
+                and self._windows_terminated_by_runner
+                and wait.exit_code == 0
+                and exit_code == 1
+            ):
+                return
+            if wait.exit_code != exit_code:
+                msg = f"{wait} failed: expected {wait.exit_code}, got {exit_code}"
+                msg = _append_stdout_and_stderr(msg, out, err)
+                self.fail_expectation(msg)
+
+        except subprocess.TimeoutExpired:
+            self.fail_expectation(f"{wait} failed: timeout expired")
+
+    def do_connect(self, conn: Connect) -> None:
+        # Discover the port.
+        line = self.get_pipe('stdout').readline().strip()
+        match line.split(':'):
+            case [host, port_str] if port_str.isnumeric():
+                port = int(port_str)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    sock.connect((host, port))
+                    self.add_socket(conn.id, sock)
+                except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                    sock.close()
+                    self.fail_unexpected(
+                        f"{conn}: Could not connect to {host}:{port}: {e}")  # noqa: E231
+                    return
+            case _:
+                self.fail_unexpected(
+                    f"{conn}: Expected address information to be available as <host>: <port>, found {line}")
+                return
+
+    def do_send(self, send: Send) -> None:
+        sock = self.get_socket(send.id)
+        try:
+            sock.sendall(send.payload.encode('utf-8'))
+        except (OSError, socket.error) as e:
+            self.fail_unexpected(f"{send}: Failed to send data: {e}")
+
+    def do_recv(self, recv: Recv) -> None:
+        sock = self.get_socket(recv.id)
+        try:
+            response_bytes = sock.recv(len(recv.payload))
+            response = response_bytes.decode('utf-8')
+            if response != recv.payload:
+                self.fail_unexpected(f"{recv}: Expected {recv.payload}, got {response}")
+        except (OSError, socket.error) as e:
+            self.fail_unexpected(f"{recv}: Failed to receive data: {e}")
+        except UnicodeDecodeError as e:
+            self.fail_unexpected(f"{recv}: Failed to decode response: {e}")
+
+    def do_request(self, req: Request) -> None:
+        # pylint: disable-msg=too-many-return-statements
+        # Only HTTP tests need requests; keep CLI tests runnable without it.
+        import requests  # pylint: disable=import-outside-toplevel
+
+        http_server = self.get_http_server()
+        if http_server is None:
+            return
+        url = join_http_url(http_server, req.path)
+        try:
+            response = requests.request(
+                req.method,
+                url,
+                headers=req.headers or None,
+                data=req.body.encode("utf-8") if req.body else None,
+                timeout=5,
+            )
+        except requests.exceptions.Timeout:
+            self.fail_unexpected(f"{req}: Timeout waiting for response")
+            return
+        except requests.exceptions.RequestException as e:
+            self.fail_unexpected(f"{req}: Failed to make request: {e}")
+            return
+        if response.status_code != req.response.status:
+            self.fail_unexpected(
+                f"{req}: Expected status {req.response.status}, got {response.status_code}")
+            return
+        for h, expected in req.response.headers.items():
+            if h not in response.headers:
+                self.fail_unexpected(f"{req}: Response missing header {h}")
+                return
+            actual = response.headers[h]
+            if actual != expected:
+                self.fail_unexpected(
+                    f"{req}: Expected response header {h}={expected}, got {actual}")
+                return
+        if response.text != req.response.body:
+            self.fail_unexpected(
+                f"{req}: Expected response body '{req.response.body}', got '{response.text}'")
+            return
+
+    def do_kill(self, kill: Kill) -> None:
+        try:
+            proc = self._proc
+            assert proc is not None
+            if os.name == "nt":
+                self._windows_terminated_by_runner = True
+                proc.terminate()
+            else:
+                proc.send_signal(kill.signal)
+        except (OSError, ValueError) as e:
+            self.fail_unexpected(f"{kill}: Failed to send {kill.signal}: {e}")
+
+    def do_cleanup(self, successful: bool) -> None:
+        if self._proc:
+            self._proc.kill()
+            try:
+                _, out, err = self._wait(timeout=5)
+                self.fail_unexpected(
+                    _append_stdout_and_stderr("", out, err))
+            except subprocess.TimeoutExpired:
+                self.fail_unexpected(
+                    f"Timeout expired after killing proc {self._proc}")
+                self._proc = None
+
+        for server in self._endpoint_servers:
+            server.shutdown()
+            server.server_close()
+        self._endpoint_servers = []
+        self._server_addrs = {}
+
+        for sock in self._sockets.values():
+            sock.close()
+        self._sockets = {}
+
+        for pipe in self._pipes.values():
+            pipe.close()
+        self._pipes = {}
+
+        for d in self._cleanup_dirs:
+            _cleanup_test_output(d)
+        self._cleanup_dirs = []
+
+
+# pylint: disable-msg=too-many-locals
+def run_tests_from_test_suite(
+    test_suite_path: str,
+    runtime: RuntimeAdapter,
+    reporters: List[TestReporter],
+    filters: List[TestFilter]
+) -> TestSuite:
+    test_cases: List[TestCase] = []
+    test_start = datetime.now()
+
+    manifest = _read_manifest(Path(test_suite_path))
+    meta = TestSuiteMeta(manifest.name, manifest.wasi_version,
+                         runtime.get_meta())
+
+    all_tests = [
+        _TestSpec(
+            path=test_path,
+            name=os.path.splitext(os.path.basename(test_path))[0],
+            config=_read_test_config(test_path),
+        )
+        for test_path in glob.glob(os.path.join(test_suite_path, "*.wasm"))
+    ]
+
+    for spec in all_tests:
+        for filt in filters:
+            # for now, just drop the skip reason string. it might be
+            # useful to make reporters report it.
+            skip, _ = filt.should_skip(meta, spec.name, spec.config)
+            if skip:
+                test_case = _skip_single_test(spec)
+                break
+        else:
+            expected_to_fail = any(
+                filt.expected_to_fail(meta, spec.name) for filt in filters
+            )
+            test_case = _execute_single_test(runtime, meta, spec, expected_to_fail)
+        test_cases.append(test_case)
+        for reporter in reporters:
+            reporter.report_test(meta, test_case)
+
+    elapsed = (datetime.now() - test_start).total_seconds()
+
+    return TestSuite(
+        meta=meta,
+        time=test_start,
+        duration_s=elapsed,
+        test_cases=test_cases,
+    )
+
+
+def _skip_single_test(spec: _TestSpec) -> TestCase:
+    return TestCase(
+        name=spec.name,
+        argv=[],
+        config=spec.config,
+        result=Result(is_executed=False, failures=[]),
+        duration_s=0,
+        outcome=Outcome.SKIP,
+    )
+
+
+def _append_stdout_and_stderr(msg: str, out: str | None, err: str | None) -> str:
+    if out:
+        msg += f"\n\n==STDOUT==\n{out}"
+
+    if err:
+        msg += f"\n\n==STDERR==\n{err}"
+
+    return msg
+
+
+def join_http_url(http_server: str, path: str) -> str:
+    if path.startswith("/"):
+        return http_server.rstrip("/") + path
+    return http_server.rstrip("/") + "/" + path
+
+
+def _cleanup_test_output(host_dir: Path) -> None:
+    for f in host_dir.glob("**/*.cleanup"):
+        if f.is_symlink():
+            continue
+
+        if f.is_file():
+            f.unlink()
+        elif f.is_dir():
+            shutil.rmtree(f)
+
+
+def _execute_single_test(
+        runtime: RuntimeAdapter, meta: TestSuiteMeta,
+        spec: _TestSpec, expected_to_fail: bool
+) -> TestCase:
+    runner = TestCaseRunner(spec.config, spec.path, meta.wasi_version, runtime)
+    test_start = time.time()
+    result = runner.run()
+    elapsed = time.time() - test_start
+
+    return TestCase(
+        name=spec.name,
+        argv=runner.last_argv(),
+        config=spec.config,
+        result=result,
+        duration_s=elapsed,
+        outcome=Outcome.evaluate(expected_to_fail, result),
+    )
+
+
+def _read_test_config(test_path: str) -> Config:
+    config_file = re.sub("\\.wasm$", ".json", test_path)
+    if os.path.exists(config_file):
+        config = Config.from_file(config_file)
+        TestCaseValidator(config, config_file).validate()
+        return config
+    return Config()
+
+
+def _read_manifest(test_suite_path: Path) -> Manifest:
+    manifest_path = test_suite_path / "manifest.json"
+    if test_suite_path.name in WasiVersion:
+        name = str(test_suite_path.parent)
+        wasi_version = WasiVersion(test_suite_path.name)
+    else:
+        name = str(test_suite_path)
+        wasi_version = WasiVersion.WASM32_WASIP1
+
+    if manifest_path.exists():
+        with open(str(manifest_path), encoding="utf-8") as file:
+            contents = json.load(file)
+            assert isinstance(contents, dict)
+            for k, v in contents.items():
+                match k:
+                    case "name":
+                        assert isinstance(v, str)
+                        name = v
+                    case "version":
+                        wasi_version = WasiVersion(v)
+                    case _:
+                        raise RuntimeError(f"unexpected manifest option: {k}={v}")
+
+    return Manifest(name=name, wasi_version=wasi_version)

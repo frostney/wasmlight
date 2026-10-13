@@ -1,0 +1,778 @@
+import logging
+import json
+import re
+import signal
+from pathlib import Path
+from enum import Enum, StrEnum, auto
+from typing import List, NamedTuple, TypeVar, Type, Dict, Any, Set, Optional
+
+# Top level configuration keys
+LEGACY_CONFIG_KEYS = {"args", "root", "env", "exit_code", "stderr", "stdout"}
+CONFIG_KEYS = {"operations", "proposals", "world", "servers"}
+
+
+# Supported operations.
+SUPPORTED_OPERATIONS = {"run", "wait", "read", "write", "connect",
+                        "send", "recv", "request", "kill"}
+
+# Supported http methods.
+HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+
+# Prefix under which request headers are echoed back as response headers.
+ECHO_HEADER_PREFIX = "x-echo-"
+
+# Prefix under which request trailers are echoed back as response headers.
+TRAILER_HEADER_PREFIX = "x-trailer-"
+
+# Server names travel to the guest inside an environment variable name.
+SERVER_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+class EndpointMode(StrEnum):
+    # Answer with the endpoint's configured `response`.
+    STATIC = 'static'
+    # Echo the request body back verbatim.
+    ECHO_BODY = 'echo-body'
+    # Echo the request line and headers back as response headers.
+    ECHO_HEADERS = 'echo-headers'
+
+
+class ServerKind(StrEnum):
+    # Listening server.
+    LISTENING = 'listening'
+    # An address with nothing listening on it, so connecting is refused.
+    CLOSED = 'closed'
+
+
+class WasiWorld(StrEnum):
+    CLI_COMMAND = 'wasi:cli/command'
+    HTTP_SERVICE = 'wasi:http/service'
+
+
+class WasiVersion(StrEnum):
+    WASM32_WASIP1 = 'wasm32-wasip1'
+    WASM32_WASIP2 = 'wasm32-wasip2'
+    WASM32_WASIP3 = 'wasm32-wasip3'
+
+
+F = TypeVar("F", bound="Failure")
+
+
+class Failure(NamedTuple):
+    type: str
+    message: str
+
+    @classmethod
+    def expectation(cls, message: str) -> "Failure":
+        return Failure(type="Expectation mismatch", message=message)
+
+    @classmethod
+    def unexpected(cls, message: str) -> "Failure":
+        return Failure(type="Unexpected", message=message)
+
+
+class Result(NamedTuple):
+    is_executed: bool
+    failures: List[Failure]
+
+    @property
+    def failed(self) -> bool:
+        return len(self.failures) > 0
+
+
+class Outcome(StrEnum):
+    # Test ran and matched the expectation (expected to pass, passed).
+    PASS = "pass"
+    # Test ran and failed while expected to pass (a regression).
+    FAIL = "fail"
+    # Test was not executed (skipped by a filter / expectation).
+    SKIP = "skip"
+    # Test failed exactly as the expectation file predicted.
+    XFAIL = "xfail"
+    # Test was expected to fail but passed (the expectation is now stale).
+    XPASS = "xpass"
+
+    @property
+    def is_failure(self) -> bool:
+        # Outcomes that turn the suite (and CI) red.
+        return self in (Outcome.FAIL, Outcome.XPASS)
+
+    @classmethod
+    def evaluate(cls, expected_to_fail: bool, result: "Result") -> "Outcome":
+        if not result.is_executed:
+            return cls.SKIP
+        if expected_to_fail:
+            return cls.XFAIL if result.failed else cls.XPASS
+        return cls.FAIL if result.failed else cls.PASS
+
+
+class ProtocolType(StrEnum):
+    TCP = 'tcp'
+    UDP = 'udp'
+    HTTP = 'http'
+
+
+R = TypeVar("R", bound="Run")
+
+
+class Run(NamedTuple):
+    args: List[str] = []
+    env: Dict[str, str] = {}
+    root: Optional[Path] = None
+
+    @classmethod
+    def from_config(cls: Type[R], test_config_path: Path, config: Dict[str, Any]) -> R:
+        default = cls()
+        root = config.get("root", default.root)
+        if root:
+            root = test_config_path.parent / root
+        return cls(
+            args=config.get("args", default.args),
+            env=config.get("env", default.env),
+            root=root
+        )
+
+
+W = TypeVar("W", bound="Wait")
+
+
+class Wait(NamedTuple):
+    exit_code: int = 0
+
+    @classmethod
+    def from_config(cls: Type[W], config: Dict[str, Any]) -> W:
+        default = cls()
+        return cls(
+            exit_code=config.get("exit_code", default.exit_code)
+        )
+
+
+S = TypeVar("S", bound="Send")
+
+
+class Send(NamedTuple):
+    id: str
+    payload: str
+
+    @classmethod
+    def from_config(cls: Type[S], config: Dict[str, Any]) -> S:
+        if "id" not in config:
+            raise ValueError("Send operation requires 'id' field")
+        return cls(
+            id=config["id"],
+            payload=config.get("payload", "")
+        )
+
+
+Rv = TypeVar("Rv", bound="Recv")
+
+
+class Recv(NamedTuple):
+    id: str
+    payload: str
+
+    @classmethod
+    def from_config(cls: Type[Rv], config: Dict[str, Any]) -> Rv:
+        if "id" not in config:
+            raise ValueError("Recv operation requires 'id' field")
+        return cls(
+            id=config["id"],
+            payload=config.get("payload", "")
+        )
+
+
+Rx = TypeVar("Rx", bound="Read")
+
+
+class Read(NamedTuple):
+    id: str = "stdout"
+    payload: str = ""
+
+    @classmethod
+    def from_config(cls: Type[Rx], config: Dict[str, Any]) -> Rx:
+        default = cls()
+        return cls(
+            id=config.get("id", default.id),
+            payload=config.get("payload", default.payload)
+        )
+
+
+Wr = TypeVar("Wr", bound="Write")
+
+
+class Write(NamedTuple):
+    id: str = "write"
+    payload: str = ""
+
+    @classmethod
+    def from_config(cls: Type[Wr], config: Dict[str, Any]) -> Wr:
+        default = cls()
+        return cls(
+            id=config.get("id", default.id),
+            payload=config.get("payload", default.payload)
+        )
+
+
+C = TypeVar("C", bound="Connect")
+
+
+class Connect(NamedTuple):
+    id: str = "server"
+    protocol_type: ProtocolType = ProtocolType("tcp")
+
+    @classmethod
+    def from_config(cls: Type[C], config: Dict[str, Any]) -> C:
+        default = cls()
+        return cls(
+            id=config.get("id", default.id),
+            protocol_type=ProtocolType(config.get("protocol_type", default.protocol_type))
+        )
+
+
+Resp = TypeVar("Resp", bound="Response")
+
+
+class Response(NamedTuple):
+    status: int
+    headers: Dict[str, str]
+    body: str
+
+    @classmethod
+    def from_config(cls: Type[Resp], config: Dict[str, Any]) -> Resp:
+        status = config.get("status", 200)
+        headers = config.get("headers", {})
+        body = config.get("body", "")
+
+        if not isinstance(status, int):
+            raise ValueError("Response status code should be an int")
+        if not isinstance(headers, dict):
+            raise ValueError("Response expected headers should be a dict")
+        for k, v in headers.items():
+            if not isinstance(k, str):
+                raise ValueError("Response expected header name should be a str")
+            if not isinstance(v, str):
+                raise ValueError("Response expected header value should be a str")
+        if not isinstance(body, str):
+            raise ValueError("Response expected body should be a str")
+
+        return cls(status, headers, body)
+
+
+Req = TypeVar("Req", bound="Request")
+
+
+class Request(NamedTuple):
+    method: str
+    path: str
+    response: Response
+    headers: Dict[str, str] = {}
+    body: str = ""
+
+    @classmethod
+    def from_config(cls: Type[Req], config: Dict[str, Any]) -> Req:
+        method = config.get("method", "GET")
+        path = config.get("path", "/")
+        response = config.get("response", {})
+        headers = config.get("headers", {})
+        body = config.get("body", "")
+
+        if not isinstance(method, str):
+            raise ValueError("Request method should be a str")
+        if not isinstance(path, str):
+            raise ValueError("Request path should be a str")
+        if not isinstance(headers, dict):
+            raise ValueError("Request headers should be a dict")
+        for k, v in headers.items():
+            if not isinstance(k, str):
+                raise ValueError("Request header name should be a str")
+            if not isinstance(v, str):
+                raise ValueError("Request header value should be a str")
+        if not isinstance(body, str):
+            raise ValueError("Request body should be a str")
+        response = Response.from_config(response)
+
+        return cls(method, path, response, headers, body)
+
+
+Er = TypeVar("Er", bound="EndpointResponse")
+
+
+class EndpointResponse(NamedTuple):
+    status: int = 200
+    headers: Dict[str, str] = {}
+    body: str = ""
+    chunks: Optional[List[str]] = None
+    trailers: Dict[str, str] = {}
+
+    @classmethod
+    def from_config(cls: Type[Er], config: Any) -> Er:
+        # This is a shorthand for { status: 200, body: config }
+        if isinstance(config, str):
+            return cls(body=config)
+        if not isinstance(config, dict):
+            raise ValueError("Endpoint response should be a str or an object")
+        base = Response.from_config(config)
+
+        chunks = config.get("chunks")
+        if chunks is not None:
+            if not isinstance(chunks, list) or not all(
+                    isinstance(chunk, str) for chunk in chunks):
+                raise ValueError(
+                    "Endpoint response chunks should be a list of str")
+            if "body" in config:
+                raise ValueError(
+                    "Endpoint response takes 'body' or 'chunks', not both")
+
+        trailers = config.get("trailers", {})
+        if not isinstance(trailers, dict) or not all(
+                isinstance(name, str) and isinstance(value, str)
+                for name, value in trailers.items()):
+            raise ValueError(
+                "Endpoint response trailers should be an object of str to str")
+        if trailers and chunks is None:
+            raise ValueError("Endpoint response trailers require 'chunks'")
+
+        return cls(status=base.status, headers=base.headers, body=base.body,
+                   chunks=chunks, trailers=trailers)
+
+
+Ep = TypeVar("Ep", bound="Endpoint")
+
+
+class Endpoint(NamedTuple):
+    method: str
+    path: str
+    response: Optional[EndpointResponse]
+    mode: EndpointMode = EndpointMode.STATIC
+
+    @classmethod
+    def from_config(cls: Type[Ep], config: Dict[str, Any]) -> Ep:
+        method = config.get("method", "GET")
+        path = config.get("path", "/")
+
+        if not isinstance(method, str):
+            raise ValueError("Endpoint method should be a str")
+        if method.upper() not in HTTP_METHODS:
+            raise ValueError(f"Unknown endpoint method: {method}")
+        if not isinstance(path, str):
+            raise ValueError("Endpoint path should be a str")
+
+        method = method.upper()
+
+        mode = config.get("mode", EndpointMode.STATIC.value)
+        if not isinstance(mode, str):
+            raise ValueError("Endpoint mode should be a str")
+        if mode not in EndpointMode:
+            raise ValueError(f"Unknown endpoint mode: {mode}")
+        mode = EndpointMode(mode)
+
+        if mode is not EndpointMode.STATIC:
+            if "response" in config:
+                raise ValueError(
+                    f"An endpoint in '{mode}' mode takes no 'response'")
+            return cls(method=method, path=path, response=None, mode=mode)
+
+        response = EndpointResponse.from_config(config.get("response", ""))
+        return cls(method=method, path=path, response=response, mode=mode)
+
+
+Sv = TypeVar("Sv", bound="Server")
+
+
+class Server(NamedTuple):
+    # Exported to the guest as `HTTP_SERVER_<NAME>`, uppercased.
+    name: str
+    kind: ServerKind = ServerKind.LISTENING
+    endpoints: List[Endpoint] = []
+
+    @property
+    def env_var(self) -> str:
+        return f"HTTP_SERVER_{self.name.upper()}"
+
+    @classmethod
+    def from_config(cls: Type[Sv], config: Dict[str, Any]) -> Sv:
+        name = config.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Server name should be a non-empty str")
+        # The name becomes part of an environment variable, sent to the guest.
+        if not SERVER_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Server name should be alphanumeric or '_': {name}")
+
+        kind = config.get("kind", ServerKind.LISTENING.value)
+        if not isinstance(kind, str):
+            raise ValueError("Server kind should be a str")
+        if kind not in ServerKind:
+            raise ValueError(f"Unknown server kind: {kind}")
+        kind = ServerKind(kind)
+
+        # No endpoints should be defined in a closed server.
+        if kind is ServerKind.CLOSED:
+            if "endpoints" in config:
+                raise ValueError(
+                    "A server of kind 'closed' takes no 'endpoints'")
+            return cls(name=name, kind=kind, endpoints=[])
+
+        endpoints = config.get("endpoints", [])
+        if not isinstance(endpoints, list):
+            raise ValueError("Server endpoints should be a list")
+        return cls(name=name, kind=kind,
+                   endpoints=[Endpoint.from_config(ep) for ep in endpoints])
+
+
+K = TypeVar("K", bound="Kill")
+
+
+class Kill(NamedTuple):
+    signal: signal.Signals
+
+    @classmethod
+    def from_config(cls: Type[K], config: Dict[str, Any]) -> K:
+        signame = config.get("signal", "SIGTERM")
+
+        if not isinstance(signame, str):
+            raise ValueError(f"Signal name should be a str: {signame}")
+        if signame not in signal.Signals.__members__:
+            raise ValueError(f"Unknown signal name: {signame}")
+
+        return cls(signal.Signals[signame])
+
+
+Operation = Run | Wait | Read | Write | Connect | Send | Recv | Request | Kill
+
+
+class WasiProposal(StrEnum):
+    HTTP = 'http'
+    SOCKETS = 'sockets'
+
+
+T = TypeVar("T", bound="Config")
+
+
+class Config(NamedTuple):
+    # List of operations.
+    operations: List[Operation] = [Run(), Wait()]
+    # WASI proposals needed for the test.
+    proposals: List[WasiProposal] = []
+    # whether debug is enabled
+    debug: bool = False
+    # WASI world to target
+    world: WasiWorld = WasiWorld.CLI_COMMAND
+    # HTTP servers stood up for outbound `wasi:http/client` requests.
+    servers: List[Server] = []
+
+    @classmethod
+    def from_file(cls: Type[T], config_file: str) -> T:
+        with open(config_file, encoding="utf-8") as file:
+            dict_config = json.load(file)
+
+        test_config_path = Path(config_file)
+        if (dict_config.get("operations") is not None
+                or dict_config.get("proposals") is not None
+                or dict_config.get("servers") is not None):
+            cls._validate_config(dict_config, CONFIG_KEYS)
+
+            operations = []
+            if dict_config.get("operations") is not None:
+                operations = cls._operations_from_config(test_config_path, dict_config.get("operations"))
+
+            proposals = []
+            if dict_config.get("proposals") is not None:
+                proposals = cls._proposals_from_config(dict_config.get("proposals"))
+
+            servers = []
+            if dict_config.get("servers") is not None:
+                servers = cls._servers_from_config(dict_config.get("servers"))
+
+            world = dict_config.get("world", WasiWorld.CLI_COMMAND.value)
+            if world not in WasiWorld:
+                raise ValueError(f"Unknown WASI world: {world}")
+
+            debug = bool(dict_config.get("debug"))
+
+            return cls(operations=operations, proposals=proposals,
+                       world=WasiWorld(world), debug=debug, servers=servers)
+
+        cls._validate_config(dict_config, LEGACY_CONFIG_KEYS)
+
+        # Construct the configuration from the v0 configuration.
+        # The legacy configuration can be described in terms of
+        # `Run`, `Read` and `Wait` operations.
+        run_op = Run.from_config(
+            test_config_path,
+            dict_config,
+        )
+
+        legacy_operations: List[Operation] = [run_op]
+
+        if dict_config.get("stdout") is not None:
+            legacy_operations.append(Read(id="stdout", payload=dict_config.get("stdout")))
+
+        if dict_config.get("stderr") is not None:
+            legacy_operations.append(Read(id="stderr", payload=dict_config.get("stderr")))
+
+        wait_op = Wait(
+            exit_code=dict_config.get("exit_code", 0)
+        )
+        legacy_operations.append(wait_op)
+
+        return cls(
+            operations=legacy_operations,
+            # Tests which require explicit proposals must be
+            # configured using the new configuration.
+            # See http-response.json
+            # We could potentially use additional heuristics to derive
+            # the proposals to enable, but that doesn't seem entirely
+            # reliable, plus we'd be introducing a third level of
+            # configuration.
+            proposals=[],
+            world=WasiWorld.CLI_COMMAND
+        )
+
+    def proposals_as_str(self) -> List[str]:
+        return [p.value for p in self.proposals]
+
+    @classmethod
+    def _validate_config(cls: Type[T], dict_config: Dict[str, Any], expected_keys: Set[str]) -> None:
+        # Check that the test configuration is unique, either v0 or v1
+        actual_keys = set(dict_config.keys())
+        if (actual_keys & CONFIG_KEYS) and (actual_keys & LEGACY_CONFIG_KEYS):
+            raise ValueError("Cannot mix configuration styles")
+
+        # Warn if there are any extra unknown fields in the configuration, relative to
+        # the expected keys.
+        for field_name in dict_config:
+            if field_name not in expected_keys:
+                logging.warning("Unknown field in the config file: %s", field_name)
+
+    @classmethod
+    def _operations_from_config(cls: Type[T], test_config_path: Path, ops: List[Any]) -> List[Operation]:
+        operations: List[Operation] = []
+        for op in ops:
+            ty = op.get("type")
+            if ty is None or ty not in SUPPORTED_OPERATIONS:
+                raise ValueError(f"Unsupported operation type {ty}")
+
+            match ty:
+                case "run":
+                    operations.append(Run.from_config(test_config_path, op))
+                case "wait":
+                    operations.append(Wait.from_config(op))
+                case "read":
+                    operations.append(Read.from_config(op))
+                case "write":
+                    operations.append(Write.from_config(op))
+                case "connect":
+                    operations.append(Connect.from_config(op))
+                case "send":
+                    operations.append(Send.from_config(op))
+                case "recv":
+                    operations.append(Recv.from_config(op))
+                case "request":
+                    operations.append(Request.from_config(op))
+                case "kill":
+                    operations.append(Kill.from_config(op))
+
+        return operations
+
+    @classmethod
+    def _proposals_from_config(cls: Type[T], proposals: List[Any]) -> List[WasiProposal]:
+        return [WasiProposal(p) for p in proposals]
+
+    @classmethod
+    def _servers_from_config(cls: Type[T], servers: List[Any]) -> List[Server]:
+        parsed = [Server.from_config(sv) for sv in servers]
+        names = [sv.name.upper() for sv in parsed]
+        duplicates = {name for name in names if names.count(name) > 1}
+        if duplicates:
+            raise ValueError(f"Duplicate server names: {sorted(duplicates)}")
+        return parsed
+
+
+class TestCase(NamedTuple):
+    name: str
+    argv: List[str]
+    config: Config
+    result: Result
+    duration_s: float
+    outcome: Outcome
+
+
+class TestCaseRunnerBase:
+    config: Config
+    _failures: List[Failure]
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self._failures = []
+
+    def do_run(self, run: Run) -> None:
+        raise NotImplementedError()
+
+    def do_write(self, write: Write) -> None:
+        raise NotImplementedError()
+
+    def do_read(self, read: Read) -> None:
+        raise NotImplementedError()
+
+    def do_wait(self, wait: Wait) -> None:
+        raise NotImplementedError()
+
+    def do_connect(self, conn: Connect) -> None:
+        raise NotImplementedError()
+
+    def do_send(self, send: Send) -> None:
+        raise NotImplementedError()
+
+    def do_recv(self, recv: Recv) -> None:
+        raise NotImplementedError()
+
+    def do_request(self, req: Request) -> None:
+        raise NotImplementedError()
+
+    def do_kill(self, kill: Kill) -> None:
+        raise NotImplementedError()
+
+    def do_cleanup(self, successful: bool) -> None:
+        raise NotImplementedError()
+
+    def as_result(self) -> Result:
+        failures, self._failures = self._failures, []
+        return Result(is_executed=True, failures=failures)
+
+    def has_failure(self) -> bool:
+        return bool(self._failures)
+
+    def run(self) -> Result:
+        successful = False
+        try:
+            for op in self.config.operations:
+                if self.has_failure():
+                    break
+
+                # The isinstance asserts in these clauses might seem
+                # redudant, given the match.  Asserts merely exist to
+                # ensure that mypy can fully resolve the underlying
+                # type; else it will report errors like:
+                #   wasi_test_runner/runtime_adapter.py:131: error: Argument 2 to "_handle_read"
+                #   has incompatible type "Read"; expected "Read" [arg-type]
+                match op:
+                    case Run():
+                        assert isinstance(op, Run)
+                        self.do_run(op)
+                    case Write():
+                        assert isinstance(op, Write)
+                        self.do_write(op)
+                    case Read():
+                        assert isinstance(op, Read)
+                        self.do_read(op)
+                    case Wait():
+                        assert isinstance(op, Wait)
+                        self.do_wait(op)
+                    case Connect():
+                        assert isinstance(op, Connect)
+                        self.do_connect(op)
+                    case Send():
+                        assert isinstance(op, Send)
+                        self.do_send(op)
+                    case Recv():
+                        assert isinstance(op, Recv)
+                        self.do_recv(op)
+                    case Request():
+                        assert isinstance(op, Request)
+                        self.do_request(op)
+                    case Kill():
+                        assert isinstance(op, Kill)
+                        self.do_kill(op)
+
+            successful = not self.has_failure()
+        finally:
+            self.do_cleanup(successful)
+
+        return self.as_result()
+
+
+class StreamType(Enum):
+    READABLE_PIPE = auto()
+    WRITABLE_PIPE = auto()
+    SOCKET = auto()
+
+
+class TestCaseValidator(TestCaseRunnerBase):
+    _config_path: str
+    _has_proc: bool
+    _streams: Dict[str, StreamType]
+
+    def __init__(self, config: Config, config_path: str) -> None:
+        TestCaseRunnerBase.__init__(self, config)
+        self._config_path = config_path
+        self._has_proc = False
+        self._streams = {}
+
+    def assert_proc(self, op: Any) -> None:
+        assert self._has_proc, \
+            f"{self._config_path}: {op}: no process running"
+
+    def assert_no_proc(self, op: Any) -> None:
+        assert not self._has_proc, \
+            f"{self._config_path}: {op}: process still running"
+
+    def assert_stream(self, op: Any, name: str, typ: StreamType) -> None:
+        assert name in self._streams, \
+            f"{self._config_path}: {op}: no such stream: {name}"
+        t = self._streams[name]
+        assert t == typ, \
+            f"{self._config_path}: {op}: expected {typ}, but got {t}: {name}"
+
+    def add_stream(self, op: Any, name: str, typ: StreamType) -> None:
+        assert name not in self._streams, \
+            f"{self._config_path}: {op}: stream exists: {name}"
+        self._streams[name] = typ
+
+    def do_run(self, run: Run) -> None:
+        self.assert_no_proc(run)
+        self.add_stream(run, "stdin", StreamType.WRITABLE_PIPE)
+        self.add_stream(run, "stdout", StreamType.READABLE_PIPE)
+        self.add_stream(run, "stderr", StreamType.READABLE_PIPE)
+        self._has_proc = True
+
+    def do_write(self, write: Write) -> None:
+        self.assert_proc(write)
+        self.assert_stream(write, write.id, StreamType.WRITABLE_PIPE)
+
+    def do_read(self, read: Read) -> None:
+        self.assert_proc(read)
+        self.assert_stream(read, read.id, StreamType.READABLE_PIPE)
+
+    def do_wait(self, wait: Wait) -> None:
+        self.assert_proc(wait)
+        self._has_proc = False
+        self._streams.clear()
+
+    def do_connect(self, conn: Connect) -> None:
+        self.assert_proc(conn)
+        assert conn.protocol_type == ProtocolType.TCP, \
+            f"{self._config_path}: {conn}: {conn.protocol_type} not supported"
+        self.add_stream(conn, conn.id, StreamType.SOCKET)
+
+    def do_send(self, send: Send) -> None:
+        self.assert_proc(send)
+        self.assert_stream(send, send.id, StreamType.SOCKET)
+
+    def do_recv(self, recv: Recv) -> None:
+        self.assert_proc(recv)
+        self.assert_stream(recv, recv.id, StreamType.SOCKET)
+
+    def do_request(self, req: Request) -> None:
+        self.assert_proc(req)
+
+    def do_kill(self, kill: Kill) -> None:
+        self.assert_proc(kill)
+
+    def do_cleanup(self, successful: bool) -> None:
+        if successful:
+            self.assert_no_proc(self._config_path)
+            assert not bool(self._streams)
+
+    def validate(self) -> None:
+        self.run()
