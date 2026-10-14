@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the vendored wasi-testsuite Preview 1 corpus against wasmlight and
+"""Run the fetched wasi-testsuite Preview 1 corpus against wasmlight and
 compare the results with the committed baseline.
 
 Exit status is non-zero only when the results differ from the baseline: a
@@ -49,6 +49,13 @@ def main() -> int:
     parser.add_argument("--json-output", type=Path,
                         default=ROOT / "build" / "wasi-testsuite" / "results.json")
     opts = parser.parse_args()
+    missing = [p for p in (RUNNER, *SUITES) if not p.exists()]
+    if missing:
+        print(f"wasi-testsuite corpus not fetched: {missing[0]} is missing.\n"
+              "Run tools/wasi-testsuite/vendor.sh first (fetches the pinned "
+              "commit and verifies it against tools/wasi-testsuite/manifest.sha256).",
+              file=sys.stderr)
+        return 2
     opts.json_output.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [sys.executable, str(RUNNER), "-t", *map(str, SUITES),

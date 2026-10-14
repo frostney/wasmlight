@@ -47,7 +47,8 @@ stamp-version = { command = "instantfpc",
                   inputs = ["lwpt.toml"],
                   output = "source/units/Version.inc" }
 
-# Run the vendored wasi-testsuite Preview 1 corpus (tests/spec/wasi) against
+# Run the wasi-testsuite Preview 1 corpus (fetched into tests/spec/wasi by
+# tools/wasi-testsuite/vendor.sh; fails clearly if not fetched) against
 # build/wasmlight and compare with the committed baseline in
 # tools/wasi-testsuite/expectations. Needs Python 3.11+ with colorama and
 # requests. Exits non-zero only when results differ from the baseline.

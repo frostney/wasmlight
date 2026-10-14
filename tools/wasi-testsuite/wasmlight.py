@@ -9,7 +9,7 @@ root). $WASI_TESTSUITE_TIMEOUT sets the per-test timeout in seconds (default
 30); the runner records an expired timeout as a test failure.
 
 Every test that declares a fixture root gets a fresh scratch copy of it, so
-no test can change the fixtures another test sees, and the vendored corpus is
+no test can change the fixtures another test sees, and the fetched corpus is
 never written to.
 """
 
