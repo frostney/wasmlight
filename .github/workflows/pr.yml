@@ -409,8 +409,10 @@ jobs:
   # wasi-testsuite Preview 1 oracle (#78). Non-blocking: continue-on-error
   # keeps it out of the verdict while the committed baseline is still a work
   # list (#79-#85). run.py exits non-zero only when results differ from
-  # tools/wasi-testsuite/expectations/<os>.toml. The corpus is vendored in
-  # tests/spec/wasi, so the run itself needs no network.
+  # tools/wasi-testsuite/expectations/<os>.toml. The corpus is fetched into
+  # tests/spec/wasi at the pinned commit by tools/wasi-testsuite/vendor.sh
+  # (verified against manifest.sha256, cached on commit + manifest hash);
+  # the test run itself needs no network.
   wasi-testsuite:
     continue-on-error: true
     strategy:
@@ -436,6 +438,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+
+      - name: Cache the wasi-testsuite corpus
+        id: wasi-corpus-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            tests/spec/wasi
+            !tests/spec/wasi/LICENSE
+            !tests/spec/wasi/PROVENANCE.md
+          key: wasi-testsuite-e0aa527fab67f2f311882bcee4f62cc755433b73-${{ hashFiles('tools/wasi-testsuite/manifest.sha256') }}
+
+      - name: Fetch the wasi-testsuite corpus (pinned, manifest-verified)
+        run: |
+          if [ "${{ steps.wasi-corpus-cache.outputs.cache-hit }}" = "true" ]; then
+            tools/wasi-testsuite/vendor.sh --verify
+          else
+            tools/wasi-testsuite/vendor.sh
+          fi
 
       - name: Install the test runner's Python dependencies
         run: python3 -m pip install -r tests/spec/wasi/test-runner/requirements/common.txt
