@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - FPC **3.2.2** (Delphi mode) is the pinned compiler; the
-  [lwpt](https://github.com/frostney/lwpt) **0.7.0 release binary** is the
+  [lwpt](https://github.com/frostney/lwpt) **0.8.0 release binary** is the
   single toolchain entry point for install / build / test / format.
 - Lefthook runs `lwpt format` and `lwpt agents` pre-commit; markdownlint and
   the PR workflow are the blocking gates.
@@ -17,7 +17,7 @@
 | Tool | Version / source | Role |
 | --- | --- | --- |
 | FPC | 3.2.2 (brew / apt / choco) | compiler, Delphi mode via `source/units/Shared.inc` |
-| lwpt | 0.7.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball). Local and CI versions are pinned to 0.7.0. | build, test, format, agents, health, duplication, outdated/update |
+| lwpt | 0.8.0 (`brew install frostney/tap/lwpt`, or the checksum-verified release tarball). Local and CI versions are pinned to 0.8.0. | build, test, format, agents, health, duplication, outdated/update |
 | InstantFPC | ships with FPC | runs `scripts/stamp-version.pas` as a build hook, and the release pack/verify scripts |
 | Lefthook | ≥ 1.5 | pre-commit formatter + agent-reference hooks (`lefthook install`) |
 | markdownlint-cli2 | latest | blocking docs gate |

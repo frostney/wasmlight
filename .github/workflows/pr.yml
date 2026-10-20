@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.7.0"
+  LWPT_VERSION: "0.8.0"
 
 jobs:
   # Branches come from main only. A PR head must CONTAIN the current default
@@ -574,6 +574,29 @@ jobs:
           tar xzf "${ASSET}.tar.gz"
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
+      - name: Install main's own lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          # Build main with main's pinned lwpt, not this PR's pin, so the
+          # comparison only reflects what the PR changes (main's lockfile
+          # may not install on the PR's lwpt version).
+          MAIN_LWPT_VERSION="$(sed -nE 's/^  LWPT_VERSION: "?([^"]+)"?\s*$/\1/p' baseline-source/.github/workflows/pr.yml | head -1)"
+          if [ -z "$MAIN_LWPT_VERSION" ]; then
+            echo "::error::Could not read LWPT_VERSION from main's .github/workflows/pr.yml"
+            exit 1
+          fi
+          echo "main lwpt: $MAIN_LWPT_VERSION (PR lwpt: $LWPT_VERSION)"
+          MAIN_LWPT_ROOT="$RUNNER_TEMP/lwpt-main"
+          mkdir -p "$MAIN_LWPT_ROOT"
+          cd "$MAIN_LWPT_ROOT"
+          ASSET="lwpt-${MAIN_LWPT_VERSION}-linux-x64"
+          BASE="https://github.com/frostney/lwpt/releases/download/${MAIN_LWPT_VERSION}"
+          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl -fsSLO "${BASE}/lwpt-${MAIN_LWPT_VERSION}-checksums.txt"
+          sha256sum -c <(grep "${ASSET}.tar.gz" "lwpt-${MAIN_LWPT_VERSION}-checksums.txt")
+          tar xzf "${ASSET}.tar.gz"
+          echo "MAIN_LWPT=$MAIN_LWPT_ROOT/${ASSET}/lwpt" >> "$GITHUB_ENV"
+
       - name: Build release binaries for main and PR
         run: |
           set -euo pipefail
@@ -581,8 +604,8 @@ jobs:
 
           (
             cd baseline-source
-            lwpt install --frozen
-            lwpt build --mode release
+            "$MAIN_LWPT" install --frozen
+            "$MAIN_LWPT" build --mode release
           )
           install -m 755 baseline-source/build/wasmlight \
             "$RUNNER_TEMP/wasmlight-binaries/main"
