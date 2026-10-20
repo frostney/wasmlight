@@ -25,3 +25,10 @@ tests/spec/testsuite/
 # OS noise.
 .DS_Store
 Thumbs.db
+
+# wasi-testsuite corpus: fetched by tools/wasi-testsuite/vendor.sh, verified
+# against tools/wasi-testsuite/manifest.sha256. Only LICENSE and PROVENANCE.md
+# are committed.
+tests/spec/wasi/*
+!tests/spec/wasi/LICENSE
+!tests/spec/wasi/PROVENANCE.md

@@ -1,0 +1,214 @@
+# wasi-testsuite Preview 1 baseline for wasmlight on macos.
+# Format: upstream wasi-testsuite expectations (version 1).
+# Corpus: tests/spec/wasi (see PROVENANCE.md). Runner: tools/wasi-testsuite/run.py.
+#
+# Expected failures carry the issue that owns the WASI function they exercise.
+# Remove an entry when its test passes: run.py reports it as an unexpected pass.
+# Unsupported (sockets) cases are skipped and are not failures.
+
+version = 1
+
+[[suite]]
+name = "WASI C tests [wasm32-wasip1]"
+
+# --- #79: positional I/O, fd_tell, fd_renumber, fd_seek hardening ---
+# #79: fd_pread
+[[suite.test]]
+name = "pread-with-access"
+expected = "fail"
+
+# #79: fd_pwrite
+[[suite.test]]
+name = "pwrite-with-access"
+expected = "fail"
+
+# #79: fd_pwrite
+[[suite.test]]
+name = "pwrite-with-append"
+expected = "fail"
+
+# --- #80: allocation, sync, flags, rights, timestamps ---
+# #80: fd_fdstat_set_flags
+[[suite.test]]
+name = "fopen-with-access"
+expected = "fail"
+
+# #80: fd_fdstat_set_flags
+[[suite.test]]
+name = "fopen-with-no-access"
+expected = "fail"
+
+# #80: fd_fdstat_set_flags (imported by libc fopen)
+[[suite.test]]
+name = "lseek"
+expected = "fail"
+
+# --- Unsupported: sockets are outside the non-network Preview 1 scope (#78). Not failures. ---
+# unsupported: sock_shutdown
+[[suite.test]]
+name = "sock_shutdown-invalid_fd"
+action = "skip"
+
+# unsupported: sock_shutdown
+[[suite.test]]
+name = "sock_shutdown-not_sock"
+action = "skip"
+
+[[suite]]
+name = "WASI Rust tests [wasm32-wasip1]"
+
+# --- #79: positional I/O, fd_tell, fd_renumber, fd_seek hardening ---
+# #79: fd_pread/fd_pwrite
+[[suite.test]]
+name = "file_pread_pwrite"
+expected = "fail"
+
+# #79: fd_tell
+[[suite.test]]
+name = "file_seek_tell"
+expected = "fail"
+
+# #79: fd_seek on a directory returns SPIPE (fd_seek hardening)
+[[suite.test]]
+name = "directory_seek"
+expected = "fail"
+
+# #79: fd_renumber
+[[suite.test]]
+name = "overwrite_preopen"
+expected = "fail"
+
+# #79: fd_renumber
+[[suite.test]]
+name = "renumber"
+expected = "fail"
+
+# #79: fd_renumber
+[[suite.test]]
+name = "stdio"
+expected = "fail"
+
+# --- #80: allocation, sync, flags, rights, timestamps ---
+# #80: fd_fdstat_set_flags
+[[suite.test]]
+name = "fd_flags_set"
+expected = "fail"
+
+# #80: fd_allocate/fd_advise/fd_sync on a directory
+[[suite.test]]
+name = "dir_fd_op_failures"
+expected = "fail"
+
+# #80: fd_advise
+[[suite.test]]
+name = "fd_advise"
+expected = "fail"
+
+# #80: fd_allocate
+[[suite.test]]
+name = "file_allocate"
+expected = "fail"
+
+# #80: fd_fdstat_set_rights
+[[suite.test]]
+name = "fd_fdstat_set_rights"
+expected = "fail"
+
+# #80: fd_fdstat_set_rights
+[[suite.test]]
+name = "truncation_rights"
+expected = "fail"
+
+# #80: fd_filestat_set_size/fd_filestat_set_times
+[[suite.test]]
+name = "fd_filestat_set"
+expected = "fail"
+
+# #80: fd_filestat_set_times flag validation
+[[suite.test]]
+name = "fstflags_validate"
+expected = "fail"
+
+# --- #81: path_link and path_readlink ---
+# #81: path_link (also imports path_symlink, #82)
+[[suite.test]]
+name = "path_link"
+expected = "fail"
+
+# #81: path_readlink (also imports path_symlink, #82)
+[[suite.test]]
+name = "readlink"
+expected = "fail"
+
+# --- #82: path_rename, path_symlink, path_filestat_set_times ---
+# #82: path_symlink
+[[suite.test]]
+name = "dangling_symlink"
+expected = "fail"
+
+# #82: path_symlink
+[[suite.test]]
+name = "nofollow_errors"
+expected = "fail"
+
+# #82: path_symlink
+[[suite.test]]
+name = "path_exists"
+expected = "fail"
+
+# #82: path_symlink
+[[suite.test]]
+name = "path_symlink_trailing_slashes"
+expected = "fail"
+
+# #82: path_symlink
+[[suite.test]]
+name = "symlink_create"
+expected = "fail"
+
+# #82: path_symlink
+[[suite.test]]
+name = "symlink_filestat"
+expected = "fail"
+
+# #82: path_symlink
+[[suite.test]]
+name = "symlink_loop"
+expected = "fail"
+
+# #82: path_rename
+[[suite.test]]
+name = "path_rename"
+expected = "fail"
+
+# #82: path_rename
+[[suite.test]]
+name = "path_rename_dir_trailing_slashes"
+expected = "fail"
+
+# #82: path_filestat_set_times
+[[suite.test]]
+name = "path_filestat"
+expected = "fail"
+
+# --- #83: poll_oneoff and remaining process behaviour ---
+# #83: poll_oneoff
+[[suite.test]]
+name = "poll_oneoff_stdio"
+expected = "fail"
+
+# --- #85: containment and negative-path behaviour ---
+# #85: path_open: trailing slash on a file must fail
+[[suite.test]]
+name = "interesting_paths"
+expected = "fail"
+
+# #85: path_open: O_DIRECTORY with read/write rights must fail
+[[suite.test]]
+name = "path_open_preopen"
+expected = "fail"
+
+# #85: path_unlink_file: trailing slash must fail
+[[suite.test]]
+name = "unlink_file_trailing_slashes"
+expected = "fail"
