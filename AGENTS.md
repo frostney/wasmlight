@@ -284,7 +284,7 @@ prefix no shipped path reaches yet still carries an `UNCONFIRMED` marker.
   `.lwpt/install.lock`.
 - Benchmarks (`wasmbench`) are measurement tools; never wire their numbers
   into CI assertions.
-- Edit `AGENTS.md` only — `CLAUDE.md` is a symlink to it.
+- Edit shared instructions in `AGENTS.md`; `CLAUDE.md` contains only `@AGENTS.md`.
 
 <!-- lwpt:agents:begin -->
 
