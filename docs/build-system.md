@@ -74,8 +74,10 @@ node <lakon>/tests/support/run-wasi.mjs --dir tests/fixtures/wasi::/f \
   build/wasmlight.wasm run /f/hello.wasm
 ```
 
-`wasmlight-shell` and `wasmspec` build the same way. `wasmbench` does not:
-it measures the native call gates and JIT, which a WebAssembly host lacks.
+`wasmlight-shell` and `wasmspec` build the same way. `wasmbench` does not
+compile: it builds its synthetic modules in a `TMemoryStream`, which lakon's
+`Classes` lacks, and it measures native call gates and the JIT, which a
+WebAssembly host does not have anyway.
 
 lakon defines `LAKON`, `WASI`, `CPUWASM`, and `CPUWASM32`, and `Shared.inc`
 derives the host's capabilities from them:
@@ -87,8 +89,9 @@ derives the host's capabilities from them:
   64-bit UNIX host.
 - `WASM_HOST_WASI` (a WASI target): the outer runtime is the only operating
   system. With no `realpath`, `lstat`, or CSPRNG to reach, `Wasm.Wasi` fails
-  closed: a `--dir` preopen is still advertised, but every path under it
-  answers `ENOENT`, and `random_get` answers `EIO`.
+  closed: a `--dir` preopen is still advertised, and `fd_readdir` and
+  `fd_filestat_get` on the preopen itself still work, but every path under
+  it answers `ENOENT`, and `random_get` answers `EIO`.
 - No second thread bumps the epoch, so a runaway guest is not interrupted.
 - An exhausted heap traps the whole host: lakon's allocator cannot raise
   `EOutOfMemory`, so the collector's recovery path never runs.

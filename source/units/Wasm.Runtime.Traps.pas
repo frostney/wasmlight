@@ -342,8 +342,8 @@ end;
 
 procedure LongJmp(var ABuf: jmp_buf; AValue: LongInt);
 begin
-  raise EWasmError.Create(
-    'internal error: a WebAssembly host has no jump target');
+  raise EWasmInternal.Create(
+    'internal: a WebAssembly host has no jump target');
 end;
 {$ENDIF}
 

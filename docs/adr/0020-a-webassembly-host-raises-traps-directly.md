@@ -29,7 +29,7 @@ Consequences:
 - `Wasm.Runtime.Traps` keeps the trampoline and seam records. Their jump
   buffers are never jumped to on a WebAssembly host: `SetJmp` there answers
   0, and `LongJmp`, reachable only from a seam around compiled code that a
-  WebAssembly host never runs, raises an internal `EWasmError`.
+  WebAssembly host never runs, raises `EWasmInternal`.
 - TRAP-1 still holds on native hosts. On a WebAssembly host it is moot: a
   raise runs the finalisation a `longjmp` would skip.
 - The trap message and the exit code (134) match the native hosts, and the
