@@ -33,6 +33,7 @@ uses
   Wasm.Module,
   Wasm.Run,
   Wasm.Runtime.Store,
+  Wasm.Target,
   Wasm.Validator,
   Wasm.Wasi;
 
@@ -314,7 +315,11 @@ end;
 
   The artifact is ARCH-SPECIFIC: it carries the host CPU's machine code and is
   rejected by `run` on a different CPU (a transparent fall-back, never a wrong
-  run). -o names the output; omitted, it defaults to a sibling `<module>.waot`. }
+  run). -o names the output; omitted, it defaults to a sibling `<module>.waot`.
+
+  A host with no backend (Windows, 32-bit, a WebAssembly host) refuses before
+  writing anything: every function would be declined and every loader would
+  reject the artifact, so it could only ever be a file that does nothing. }
 function HandleAot(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
@@ -330,6 +335,16 @@ begin
   if APositionals.Count < 1 then
   begin
     WriteLn(ErrOutput, ErrPrefix('aot'), 'expected <module.wasm>');
+    Exit(1);
+  end;
+  { The backend emits only for the released targets (Linux or macOS on
+    aarch64 or x86-64); elsewhere — a known CPU on Windows, another UNIX —
+    every function would be declined. }
+  if not WasmTargetSupported(WasmTargetHost) then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('aot'), 'this host has no ahead-of-time ',
+      'backend (it needs Linux or macOS on aarch64 or x86-64); ',
+      '`wasmlight run` interprets the module instead');
     Exit(1);
   end;
   ModulePath := APositionals[0];

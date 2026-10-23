@@ -232,6 +232,20 @@ jobs:
           if ./build/wasmlight${{ matrix.exe }} inspect "$RUNNER_TEMP/bad.wasm"; then
             echo "::error::a non-module was accepted"; exit 1
           fi
+          # A host with no AOT backend refuses `aot` and writes no artifact.
+          if [ "${{ matrix.jit }}" != "true" ]; then
+            if ./build/wasmlight${{ matrix.exe }} aot tests/fixtures/wasi/hello.wasm \
+                -o "$RUNNER_TEMP/none.waot" 2>"$RUNNER_TEMP/aot.err"; then
+              echo "::error::aot succeeded on a host without an AOT backend"; exit 1
+            fi
+            if ! grep -q "no ahead-of-time backend" "$RUNNER_TEMP/aot.err"; then
+              echo "::error::aot refused without the expected message"
+              cat "$RUNNER_TEMP/aot.err"; exit 1
+            fi
+            if [ -e "$RUNNER_TEMP/none.waot" ]; then
+              echo "::error::aot wrote an artifact on a host without an AOT backend"; exit 1
+            fi
+          fi
 
       - name: runtime-shell audit
         run: |
