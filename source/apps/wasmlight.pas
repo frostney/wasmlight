@@ -337,12 +337,13 @@ begin
     WriteLn(ErrOutput, ErrPrefix('aot'), 'expected <module.wasm>');
     Exit(1);
   end;
-  { The backend runs only on the released 64-bit UNIX targets; elsewhere a
-    known CPU (Windows x86-64) still has no code to emit, only declines. }
+  { The backend emits only for the released targets (Linux or macOS on
+    aarch64 or x86-64); elsewhere — a known CPU on Windows, another UNIX —
+    every function would be declined. }
   if not WasmTargetSupported(WasmTargetHost) then
   begin
     WriteLn(ErrOutput, ErrPrefix('aot'), 'this host has no ahead-of-time ',
-      'backend (it needs a 64-bit UNIX host on aarch64 or x86-64); ',
+      'backend (it needs Linux or macOS on aarch64 or x86-64); ',
       '`wasmlight run` interprets the module instead');
     Exit(1);
   end;

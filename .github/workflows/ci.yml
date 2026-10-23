@@ -238,7 +238,10 @@ jobs:
                 -o "$RUNNER_TEMP/none.waot" 2>"$RUNNER_TEMP/aot.err"; then
               echo "::error::aot succeeded on a host without an AOT backend"; exit 1
             fi
-            grep -q "no ahead-of-time backend" "$RUNNER_TEMP/aot.err"
+            if ! grep -q "no ahead-of-time backend" "$RUNNER_TEMP/aot.err"; then
+              echo "::error::aot refused without the expected message"
+              cat "$RUNNER_TEMP/aot.err"; exit 1
+            fi
             if [ -e "$RUNNER_TEMP/none.waot" ]; then
               echo "::error::aot wrote an artifact on a host without an AOT backend"; exit 1
             fi
