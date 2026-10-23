@@ -59,6 +59,49 @@ published-layout artifact. `[test].flags = ["-O4"]` compiles the unit tests
 at release's optimization level, so `Wasm.Target.Test` checks the release
 layout directly; development checks stay on.
 
+## A WebAssembly host (lakon)
+
+wasmlight also compiles to a wasm32 WASI command with
+[lakon](https://github.com/frostney/lakon), an Object Pascal compiler that
+targets WebAssembly, so a wasmlight host can run inside another WebAssembly
+runtime. lwpt does not drive lakon yet, so this build is a cross-check run by
+hand, not a `[build]` target:
+
+```bash
+lakon compile source/apps/wasmlight.pas -Fu source/units \
+  -Fu .lwpt/modules/cli/packages/cli/source -o build/wasmlight.wasm
+node <lakon>/tests/support/run-wasi.mjs --dir tests/fixtures/wasi::/f \
+  build/wasmlight.wasm run /f/hello.wasm
+```
+
+`wasmlight-shell` and `wasmspec` build the same way. `wasmbench` does not
+compile: it builds its synthetic modules in a `TMemoryStream`, which lakon's
+`Classes` lacks, and it measures native call gates and the JIT, which a
+WebAssembly host does not have anyway.
+
+lakon defines `LAKON`, `WASI`, `CPUWASM`, and `CPUWASM32`, and `Shared.inc`
+derives the host's capabilities from them:
+
+- `WASM_TRAPS_RAISE` (any wasm CPU target): traps raise instead of jumping
+  to the trampoline
+  ([ADR-0020](adr/0020-a-webassembly-host-raises-traps-directly.md)). The
+  host is interpreter-only: the JIT, AOT, and native call gates need a
+  64-bit UNIX host.
+- `WASM_HOST_WASI` (a WASI target): the outer runtime is the only operating
+  system. With no `realpath`, `lstat`, or CSPRNG to reach, `Wasm.Wasi` fails
+  closed: a `--dir` preopen is still advertised, and `fd_readdir` and
+  `fd_filestat_get` on the preopen itself still work, but every path under
+  it answers `ENOENT`, and `random_get` answers `EIO`.
+- No second thread bumps the epoch, so a runaway guest is not interrupted.
+- An exhausted heap traps the whole host: lakon's allocator cannot raise
+  `EOutOfMemory`, so the collector's recovery path never runs.
+
+A wasmlight string holds UTF-8 bytes, one per character. Under lakon a
+character is a UTF-16 unit, so each byte rides in its own unit; `Move`
+between byte and character elements copies byte for byte under both
+compilers. Names and paths outside ASCII therefore differ from the native
+host where lakon hands a string to the outer runtime.
+
 ## Generated version constant
 
 ```toml

@@ -251,7 +251,7 @@ type
       canonical (symlink-resolved) OS path this fd descends from — the
       containment root every path_* op under this fd is re-checked against
       (embedding-spec.md §5.3). OsHandle is the open OS file handle for a
-      wfkFile (feInvalidHandle otherwise). The guest never learns HostPath. }
+      wfkFile (WASI_NO_OS_HANDLE otherwise). The guest never learns HostPath. }
     HostPath: string;
     OsHandle: THandle;
   end;
@@ -327,6 +327,23 @@ procedure WasiDefineAll(const ALinker: TWasmLinker;
 procedure WasiCheckCommandEntry(const ALoaded: TWasmLoadedModule);
 
 implementation
+
+const
+  { The "no OS handle" sentinel FileOpen returns on failure: FPC spells it
+    feInvalidHandle, which is FPC-only, so it is spelled out for lakon. }
+  WASI_NO_OS_HANDLE = THandle(-1);
+
+{ The OS error code of the host call that just failed. FPC's GetLastOSError is
+  FPC-only, and a WebAssembly host under WASI has no errno channel at all, so
+  there it is 0 — which OsErrnoToWasi maps to weIo. }
+function LastHostOsError: Integer;
+begin
+  {$IFDEF WASM_HOST_WASI}
+  Result := 0;
+  {$ELSE}
+  Result := GetLastOSError;
+  {$ENDIF}
+end;
 
 procedure WasiCheckCommandEntry(const ALoaded: TWasmLoadedModule);
 var
@@ -595,7 +612,8 @@ end;
 var
   Days, Millis: Double;
 begin
-  { Non-UNIX fallback (Windows this wave): millisecond precision from the RTL.
+  { Non-UNIX fallback (Windows, and a WebAssembly host under WASI): millisecond
+    precision from the RTL.
     UNCONFIRMED epoch/timezone fidelity — a platform QueryPerformanceCounter /
     GetSystemTimePreciseAsFileTime upgrade is a follow-up. }
   ANanos := 0;
@@ -846,7 +864,7 @@ begin
     { The containment root: every path_* op under this preopen fd re-resolves
       the guest path against this host directory and rejects any escape. }
     Entry.HostPath := AConfig.Preopens[Index].HostPath;
-    Entry.OsHandle := feInvalidHandle;
+    Entry.OsHandle := WASI_NO_OS_HANDLE;
     SetLength(FFds, Length(FFds) + 1);
     FFds[High(FFds)] := Entry;
   end;
@@ -870,7 +888,7 @@ begin
   Entry.GuestPath := '';
   Entry.Offset := 0;
   Entry.HostPath := '';
-  Entry.OsHandle := feInvalidHandle;
+  Entry.OsHandle := WASI_NO_OS_HANDLE;
   SetLength(FFds, Length(FFds) + 1);
   FFds[High(FFds)] := Entry;
 end;
@@ -1311,10 +1329,10 @@ begin
   end;
   { Closing a preopen is allowed and removes it (embedding-spec.md §3.3). A
     real open file releases its host handle. }
-  if (Entry^.Kind = wfkFile) and (Entry^.OsHandle <> feInvalidHandle) then
+  if (Entry^.Kind = wfkFile) and (Entry^.OsHandle <> WASI_NO_OS_HANDLE) then
   begin
     FileClose(Entry^.OsHandle);
-    Entry^.OsHandle := feInvalidHandle;
+    Entry^.OsHandle := WASI_NO_OS_HANDLE;
   end;
   Entry^.Used := False;
   ReturnErrno(AResults, weSuccess);
@@ -1735,6 +1753,15 @@ begin
   Result := True;
 end;
 {$ELSE}
+{$IFDEF WASM_HOST_WASI}
+begin
+  { No realpath under WASI: a symlink cannot be resolved, so no host path is
+    ever treated as contained, and every path under a preopen resolves as
+    missing (fail closed). }
+  AReal := '';
+  Result := False;
+end;
+{$ELSE}
 const
   VERBATIM_PREFIX = '\\?\';
   VERBATIM_UNC_PREFIX = '\\?\UNC\';
@@ -1788,6 +1815,7 @@ begin
   Result := True;
 end;
 {$ENDIF}
+{$ENDIF}
 
 { F1 (final-component symlink on create): lstat the leaf WITHOUT following it.
   True iff the leaf itself exists and is a symbolic link. Used by path_open to
@@ -1813,6 +1841,12 @@ begin
   Result := fpS_ISLNK(St.st_mode);
 end;
 {$ELSE}
+{$IFDEF WASM_HOST_WASI}
+begin
+  { No lstat under WASI: every leaf may be a link, so creates are refused. }
+  Result := True;
+end;
+{$ELSE}
 var
   Attr: UInt32;
 begin
@@ -1821,12 +1855,13 @@ begin
     ((Attr and WIN_FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
 end;
 {$ENDIF}
+{$ENDIF}
 
 { W2 (one OS-error home): translate a captured host errno into the wasi errno,
   so the fs failure paths report the REAL reason instead of a fixed guess
   (FileOpen -> always weAcces, RemoveDir -> always weNotEmpty, ...). The caller
-  captures GetLastOSError immediately after the failed OS call and routes it
-  here. On UNIX GetLastOSError is the POSIX errno, mapped below. Off-UNIX it is
+  captures LastHostOsError immediately after the failed OS call and routes it
+  here. On UNIX LastHostOsError is the POSIX errno, mapped below. Off-UNIX it is
   a Win32 code, NOT an errno, so the fs layer (POSIX-first) maps it conservatively
   to weIo — UNCONFIRMED, revisited when a Windows fs path is a target. }
 function OsErrnoToWasi(const AOsErr: Integer): TWasmWasiErrno;
@@ -2310,7 +2345,7 @@ begin
   Entry.GuestPath := '';
   Entry.Offset := 0;
   Entry.HostPath := HostPath;
-  Entry.OsHandle := feInvalidHandle;
+  Entry.OsHandle := WASI_NO_OS_HANDLE;
 
   WantDir := (OFlags and WASI_OFLAGS_DIRECTORY) <> 0;
   if DirectoryExists(HostPath) then
@@ -2374,11 +2409,11 @@ begin
         Mode := fmOpenRead;
       Handle := FileOpen(HostPath, Mode or fmShareDenyNone);
     end;
-    if Handle = feInvalidHandle then
+    if Handle = WASI_NO_OS_HANDLE then
     begin
       { W2: report the REAL OS reason (ENOENT/EACCES/EEXIST/...), captured right
         after the failed open, instead of a fixed weAcces guess. }
-      ReturnErrno(AResults, OsErrnoToWasi(GetLastOSError));
+      ReturnErrno(AResults, OsErrnoToWasi(LastHostOsError));
       Exit;
     end;
     Entry.Kind := wfkFile;
@@ -2391,12 +2426,12 @@ begin
   if E <> weSuccess then
   begin
     { Could not hand the fd back: undo the open so no handle leaks. }
-    if (Entry.Kind = wfkFile) and (Entry.OsHandle <> feInvalidHandle) then
+    if (Entry.Kind = wfkFile) and (Entry.OsHandle <> WASI_NO_OS_HANDLE) then
       FileClose(Entry.OsHandle);
     Dir := Ctx.FdEntry(NewFd);
     if Dir <> nil then
     begin
-      Dir^.OsHandle := feInvalidHandle;
+      Dir^.OsHandle := WASI_NO_OS_HANDLE;
       Dir^.Used := False;
     end;
     ReturnErrno(AResults, E);
@@ -2644,7 +2679,7 @@ begin
     Exit;
   end;
 
-  { W2: the failure arms capture the real OS errno (GetLastOSError immediately
+  { W2: the failure arms capture the real OS errno (LastHostOsError immediately
     after the failed syscall) and route it through OsErrnoToWasi, instead of a
     fixed guess — so a permission denial is weAcces, a read-only fs weRofs, a
     non-empty rmdir weNotEmpty, etc., honestly. }
@@ -2656,7 +2691,7 @@ begin
         else if CreateDir(HostPath) then
           ReturnErrno(AResults, weSuccess)
         else
-          ReturnErrno(AResults, OsErrnoToWasi(GetLastOSError));
+          ReturnErrno(AResults, OsErrnoToWasi(LastHostOsError));
       end;
     OP_UNLINK:
       begin
@@ -2667,7 +2702,7 @@ begin
         else if DeleteFile(HostPath) then
           ReturnErrno(AResults, weSuccess)
         else
-          ReturnErrno(AResults, OsErrnoToWasi(GetLastOSError));
+          ReturnErrno(AResults, OsErrnoToWasi(LastHostOsError));
       end;
     OP_RMDIR:
       begin
@@ -2676,7 +2711,7 @@ begin
         else if RemoveDir(HostPath) then
           ReturnErrno(AResults, weSuccess)
         else
-          ReturnErrno(AResults, OsErrnoToWasi(GetLastOSError));
+          ReturnErrno(AResults, OsErrnoToWasi(LastHostOsError));
       end;
   else
     ReturnErrno(AResults, weNoSys);

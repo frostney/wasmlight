@@ -29,6 +29,14 @@ const
     pair — see Wasm.Component once that lands (ADR-0002). }
   WASM_BINARY_VERSION = 1;
 
+{$IFDEF WASM_HOST_WASI}
+  { FPC's System.StdInputHandle family is FPC-only. A WebAssembly host's
+    standard streams are the outer runtime's preview1 stdio descriptors. }
+  StdInputHandle = THandle(0);
+  StdOutputHandle = THandle(1);
+  StdErrorHandle = THandle(2);
+{$ENDIF}
+
 type
   { Numeric, vector, and reference types as they appear in the binary
     format.
@@ -132,9 +140,13 @@ type
       5: (F64: array[0..1] of Double);
   end;
 
+{ lakon's preprocessor runs before types exist, so it cannot evaluate
+  SizeOf of a declared type; the FPC build keeps the compile-time guard. }
+{$IFNDEF LAKON}
 {$IF SizeOf(TWasmV128) <> 16}
   {$MESSAGE ERROR 'TWasmV128 must be exactly 16 bytes; see the header in Wasm.Core'}
 {$IFEND}
+{$ENDIF}
 
   { Address types index a linear memory or a table; Wasm 3.0 makes both
     64-bit addressable. The address type is carried INSIDE the limits
@@ -487,7 +499,22 @@ function MakeArrayCompType(const AArr: TWasmArrayType): TWasmCompType;
 
 function ExecutionTierName(const ATier: TWasmExecutionTier): string;
 
+{ RenameFile where the host has one. A WebAssembly host has none: WASI's
+  path_rename would add an import to every lakon module, and the artifacts
+  published through a rename (AOT caches, native executables) cannot be
+  produced there anyway, so the rename fails and the caller reports it. }
+function HostRenameFile(const AOldName, ANewName: string): Boolean;
+
 implementation
+
+function HostRenameFile(const AOldName, ANewName: string): Boolean;
+begin
+  {$IFDEF WASM_HOST_WASI}
+  Result := False;
+  {$ELSE}
+  Result := RenameFile(AOldName, ANewName);
+  {$ENDIF}
+end;
 
 const
   SECTION_NAMES: array[TWasmSectionId] of string = (

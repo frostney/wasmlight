@@ -497,12 +497,12 @@ begin
           untruthful bookkeeping (B6). }
         if Bytes = 0 then
         begin
-          AMem.ReserveBase := GetMem(1);
+          GetMem(AMem.ReserveBase, 1);
           AMem.ReserveBytes := 1;
         end
         else
         begin
-          AMem.ReserveBase := GetMem(NativeUInt(Bytes));
+          GetMem(AMem.ReserveBase, NativeUInt(Bytes));
           AMem.ReserveBytes := Bytes;
         end;
         if AMem.ReserveBase = nil then

@@ -434,15 +434,22 @@ end;
 function ReadConnectorSource(const APath: string): string;
 var
   Stream: TFileStream;
+  Bytes: TBytes;
 begin
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
   try
-    SetLength(Result, Stream.Size);
+    SetLength(Bytes, Stream.Size);
     if Stream.Size > 0 then
-      Stream.ReadBuffer(Result[1], Stream.Size);
+      Stream.ReadBuffer(Bytes[0], Stream.Size);
   finally
     Stream.Free;
   end;
+  { Through a byte buffer, not ReadBuffer(Result[1]): a string character is
+    one byte under FPC but a UTF-16 unit under lakon, and Move between byte
+    and character elements copies byte for byte under both. }
+  SetLength(Result, Length(Bytes));
+  if Length(Bytes) > 0 then
+    Move(Bytes[0], Result[1], Length(Bytes));
 end;
 
 function CompileWasmTarget(const ATriple: string;
@@ -803,14 +810,14 @@ begin
     {$IFNDEF UNIX}
     if FileExists(APath) then
     begin
-      if not RenameFile(APath, BackupPath) then
+      if not HostRenameFile(APath, BackupPath) then
         raise EStreamError.Create('cannot replace "' + APath + '"');
     end;
     {$ENDIF}
-    if not RenameFile(TmpPath, APath) then
+    if not HostRenameFile(TmpPath, APath) then
     begin
       if FileExists(BackupPath) then
-        RenameFile(BackupPath, APath);
+        HostRenameFile(BackupPath, APath);
       raise EStreamError.Create('cannot publish executable "' + APath + '"');
     end;
     if FileExists(BackupPath) then

@@ -48,3 +48,20 @@
 {$IF DEFINED(UNIX) AND (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
   {$DEFINE WASM_NATIVE_CALL}
 {$ENDIF}
+
+{ A WebAssembly host under WASI — the wasm32 build lakon compiles. The outer
+  WASI runtime is the only operating system: there is no realpath, lstat, or
+  CSPRNG to reach, so Wasm.Wasi's filesystem containment check and random_get
+  fail closed there instead of borrowing the Windows paths. }
+{$IFDEF WASI}
+  {$DEFINE WASM_HOST_WASI}
+{$ENDIF}
+
+{ WebAssembly has no setjmp/longjmp: a WebAssembly host cannot capture or
+  restore its own stack, so a trap cannot jump to the invocation trampoline
+  (ADR-0009). There traps raise EWasmTrap directly and the exception unwinds
+  to WasmInvoke instead (ADR-0020). A WebAssembly host is interpreter-only,
+  so no JIT frame ever sits between the two. }
+{$IF DEFINED(CPUWASM) OR DEFINED(CPUWASM32)}
+  {$DEFINE WASM_TRAPS_RAISE}
+{$ENDIF}

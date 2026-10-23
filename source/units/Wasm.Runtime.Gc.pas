@@ -852,6 +852,23 @@ type
   PWasmU64 = ^UInt64;
   PWasmHostRelease = ^TWasmHostRelease;
 
+{$IFDEF LAKON}
+{ BsfDWord is an FPC RTL intrinsic that lakon does not provide; the root
+  scan only asks it for the lowest set bit of a non-zero word. }
+function BsfDWord(const AValue: UInt32): Integer;
+var
+  Bits: UInt32;
+begin
+  Result := 0;
+  Bits := AValue;
+  while (Bits and 1) = 0 do
+  begin
+    Inc(Result);
+    Bits := Bits shr 1;
+  end;
+end;
+{$ENDIF}
+
 { A store is confined to one thread (ADR-0008), so a threadvar bridges the
   heap's collection state to TWasmGcTypes.Define without coupling the two
   classes. Define must never run mid-collection: Layout returns @FLayouts[i]
@@ -1362,7 +1379,7 @@ begin
   Raw := nil;
   Failed := False;
   try
-    Raw := GetMem(Bytes);
+    GetMem(Raw, Bytes);
   except
     { The RTL heap manager RAISES rather than returning nil, so the nil
       test alone would never fire. }

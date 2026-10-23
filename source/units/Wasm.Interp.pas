@@ -496,7 +496,7 @@ end;
 function NewWideBlock(const ASlots: NativeUInt;
   const APrev: PWasmWideBlock): PWasmWideBlock;
 begin
-  Result := GetMem(WIDE_BLOCK_HEADER + ASlots * SizeOf(TWasmValue));
+  GetMem(Result, WIDE_BLOCK_HEADER + ASlots * SizeOf(TWasmValue));
   Result^.Prev := APrev;
   Result^.Slots := ASlots;
 end;
@@ -3435,10 +3435,10 @@ begin
     Over-allocate 16 bytes and round the base up to a 16-byte boundary rather
     than trusting GetMem's alignment, so every even slot is 16-aligned for
     v128 (simd-spec §1.5). ValuesRaw keeps the real allocation for FreeMem. }
-  Result^.ValuesRaw := GetMem(Result^.ValueCap * SizeOf(TWasmValue) + 16);
+  GetMem(Result^.ValuesRaw, Result^.ValueCap * SizeOf(TWasmValue) + 16);
   Result^.Values := PWasmValue((NativeUInt(Result^.ValuesRaw) + 15)
     and not NativeUInt(15));
-  Result^.Acts := GetMem(Result^.DepthCap * SizeOf(TWasmActivation));
+  GetMem(Result^.Acts, Result^.DepthCap * SizeOf(TWasmActivation));
   Result^.FuncsSlot := @AStore.Funcs;
   Result^.GcFrameSlot := AStore.Heap.FrameSlot;
   Result^.WideScratch := nil;
