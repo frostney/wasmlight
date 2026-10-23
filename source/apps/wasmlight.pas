@@ -33,6 +33,7 @@ uses
   Wasm.Module,
   Wasm.Run,
   Wasm.Runtime.Store,
+  Wasm.Target,
   Wasm.Validator,
   Wasm.Wasi;
 
@@ -336,7 +337,9 @@ begin
     WriteLn(ErrOutput, ErrPrefix('aot'), 'expected <module.wasm>');
     Exit(1);
   end;
-  if AotHostArch = WAOT_ARCH_UNKNOWN then
+  { The backend runs only on the released 64-bit UNIX targets; elsewhere a
+    known CPU (Windows x86-64) still has no code to emit, only declines. }
+  if not WasmTargetSupported(WasmTargetHost) then
   begin
     WriteLn(ErrOutput, ErrPrefix('aot'), 'this host has no ahead-of-time ',
       'backend (it needs a 64-bit UNIX host on aarch64 or x86-64); ',
