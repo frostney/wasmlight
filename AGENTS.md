@@ -59,6 +59,9 @@ canonical vocabulary before planning anything.
 - **Traps unwind to the invocation trampoline**, never out of a signal
   handler or SEH filter
   ([ADR-0009](docs/adr/0009-traps-unwind-to-a-per-invocation-trampoline.md)).
+  A WebAssembly host has no `longjmp`, so there a trap raises and unwinds to
+  `WasmInvoke` instead
+  ([ADR-0020](docs/adr/0020-a-webassembly-host-raises-traps-directly.md)).
 - **Tiers must be observationally identical.** Any divergence between
   interpreter, baseline JIT, and AOT for the same module — including
   which trap fires and when — is a bug, not a tier characteristic. All

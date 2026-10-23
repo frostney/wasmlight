@@ -253,6 +253,13 @@ _Avoid_: client, sandbox, user code, the wasm
 The Pascal program that owns a store and grants its capabilities.
 _Avoid_: host application, consumer, user (a user is a person)
 
+**WebAssembly host**:
+An embedder compiled to wasm32 (by lakon) and run inside another WebAssembly
+runtime. Interpreter-only; its traps raise instead of jumping
+([ADR-0020](docs/adr/0020-a-webassembly-host-raises-traps-directly.md)), and
+under WASI its filesystem and random capabilities fail closed.
+_Avoid_: wasm-in-wasm, nested runtime, self-hosting
+
 **Embedding ABI**:
 The versioned C calling-convention surface exported by `libwasmlight`. It is
 the sole foreign-language boundary over the Pascal embedding facade and uses

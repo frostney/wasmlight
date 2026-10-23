@@ -29,6 +29,14 @@ const
     pair — see Wasm.Component once that lands (ADR-0002). }
   WASM_BINARY_VERSION = 1;
 
+{$IFDEF WASM_HOST_WASI}
+  { FPC's System.StdInputHandle family is FPC-only. A WebAssembly host's
+    standard streams are the outer runtime's preview1 stdio descriptors. }
+  StdInputHandle = THandle(0);
+  StdOutputHandle = THandle(1);
+  StdErrorHandle = THandle(2);
+{$ENDIF}
+
 type
   { Numeric, vector, and reference types as they appear in the binary
     format.
@@ -132,9 +140,13 @@ type
       5: (F64: array[0..1] of Double);
   end;
 
+{ lakon's preprocessor runs before types exist, so it cannot evaluate
+  SizeOf of a declared type; the FPC build keeps the compile-time guard. }
+{$IFNDEF LAKON}
 {$IF SizeOf(TWasmV128) <> 16}
   {$MESSAGE ERROR 'TWasmV128 must be exactly 16 bytes; see the header in Wasm.Core'}
 {$IFEND}
+{$ENDIF}
 
   { Address types index a linear memory or a table; Wasm 3.0 makes both
     64-bit addressable. The address type is carried INSIDE the limits

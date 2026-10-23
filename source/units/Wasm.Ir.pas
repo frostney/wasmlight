@@ -702,9 +702,13 @@ type
     Imm: Int64;
   end;
 
+{ lakon's preprocessor runs before types exist, so it cannot evaluate
+  SizeOf of a declared type; the FPC build keeps the compile-time guard. }
+{$IFNDEF LAKON}
 {$IF SizeOf(TWasmIrInstr) <> 24}
   {$MESSAGE ERROR 'TWasmIrInstr must stay 24 bytes; see Wasm.Ir header'}
 {$IFEND}
+{$ENDIF}
 
 type
   { What a field of TWasmIrInstr means for a given op. }

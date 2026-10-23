@@ -214,6 +214,21 @@ function ReservationContains(const AAddress: Pointer): Boolean;
 function ReservationSlotCount: Integer;
 function ReservationLiveCount: Integer;
 
+{$IFDEF WASM_TRAPS_RAISE}
+type
+  { A WebAssembly host has no setjmp/longjmp (lakon's RTL declares none, and
+    FPC's wasm32 RTL aborts in longjmp). The trampoline and seam records keep
+    their shape, but nothing ever jumps to their buffers: traps raise directly
+    (ADR-0020), and a seam catch only guards a call into compiled code, which
+    an interpreter-only WebAssembly host never makes. }
+  jmp_buf = record
+    Unused: Byte;
+  end;
+
+function SetJmp(var ABuf: jmp_buf): LongInt;
+procedure LongJmp(var ABuf: jmp_buf; AValue: LongInt);
+{$ENDIF}
+
 type
   PWasmTrampoline = ^TWasmTrampoline;
 
@@ -319,6 +334,19 @@ function FaultHandlerInstalled: Boolean;
 
 implementation
 
+{$IFDEF WASM_TRAPS_RAISE}
+function SetJmp(var ABuf: jmp_buf): LongInt;
+begin
+  Result := 0;
+end;
+
+procedure LongJmp(var ABuf: jmp_buf; AValue: LongInt);
+begin
+  raise EWasmError.Create(
+    'internal error: a WebAssembly host has no jump target');
+end;
+{$ENDIF}
+
 { --- messages -------------------------------------------------------- }
 
 function TrapMessage(const AKind: TWasmTrapKind): PAnsiChar;
@@ -391,7 +419,7 @@ begin
   else
     NewCapacity := GCapacity * 2;
 
-  NewBlock := GetMem(NativeUInt(NewCapacity) * SizeOf(TWasmReservation));
+  GetMem(NewBlock, NativeUInt(NewCapacity) * SizeOf(TWasmReservation));
   FillChar(NewBlock^, NativeUInt(NewCapacity) * SizeOf(TWasmReservation), 0);
   for Index := 0 to GSlotCount - 1 do
     NewBlock^[Index] := GReservations^[Index];
@@ -702,6 +730,13 @@ begin
 end;
 
 procedure TrapNowDetail(const AKind: TWasmTrapKind; const ADetail: UInt32);
+{$IFDEF WASM_TRAPS_RAISE}
+begin
+  { No longjmp on a WebAssembly host: raise here, on any ground, and let the
+    exception unwind to WasmInvoke (ADR-0020). }
+  RaiseTrapDirect(AKind, ADetail, nil);
+end;
+{$ELSE}
 var
   Trampoline: PWasmTrampoline;
 begin
@@ -719,6 +754,7 @@ begin
   Trampoline^.Detail := ADetail;
   LongJmp(Trampoline^.JmpBuf, 1);
 end;
+{$ENDIF}
 
 procedure TrapNow(const AKind: TWasmTrapKind);
 begin
@@ -759,6 +795,17 @@ begin
     later SeamHop would jump into a reclaimed frame. }
   SavedSeam := CurrentSeamCatch;
 
+  {$IFDEF WASM_TRAPS_RAISE}
+  { A trap arrives as an EWasmTrap raised where it happened (ADR-0020); the
+    finally restores this invocation's state on that path and the normal one
+    alike. }
+  try
+    AGuest(AData);
+  finally
+    CurrentTrampoline := Trampoline.Prev;
+    CurrentSeamCatch := SavedSeam;
+  end;
+  {$ELSE}
   if SetJmp(Trampoline.JmpBuf) = 0 then
   begin
     { The restore is in a finally so an ORDINARY Pascal exception escaping
@@ -785,6 +832,7 @@ begin
     CurrentSeamCatch := SavedSeam;
     RaiseTrapDirect(Trampoline.Kind, Trampoline.Detail, Trampoline.HostMsg);
   end;
+  {$ENDIF}
 end;
 
 var
