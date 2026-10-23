@@ -87,7 +87,9 @@ $ echo $?
 On a 64-bit UNIX host, `wasmlight aot` compiles a module ahead of time to a
 `.waot` artifact, and `run --aot` loads it for instant startup — always
 re-validating the module first and falling back to the interpreter if the
-artifact is stale, wrong-arch, or absent (`--no-aot` forces interpret):
+artifact is stale, wrong-arch, or absent (`--no-aot` forces interpret). On
+any other host `aot` refuses with an error instead of writing an artifact that
+nothing could load:
 
 ```text
 $ ./build/wasmlight aot tests/fixtures/wasi/hello.wasm -o hello.waot
