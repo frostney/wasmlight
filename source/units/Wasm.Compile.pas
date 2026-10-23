@@ -810,14 +810,14 @@ begin
     {$IFNDEF UNIX}
     if FileExists(APath) then
     begin
-      if not RenameFile(APath, BackupPath) then
+      if not HostRenameFile(APath, BackupPath) then
         raise EStreamError.Create('cannot replace "' + APath + '"');
     end;
     {$ENDIF}
-    if not RenameFile(TmpPath, APath) then
+    if not HostRenameFile(TmpPath, APath) then
     begin
       if FileExists(BackupPath) then
-        RenameFile(BackupPath, APath);
+        HostRenameFile(BackupPath, APath);
       raise EStreamError.Create('cannot publish executable "' + APath + '"');
     end;
     if FileExists(BackupPath) then

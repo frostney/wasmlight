@@ -466,7 +466,7 @@ begin
     if FileExists(APath) and not DeleteFile(APath) then
       raise EInOutError.CreateFmt('cannot replace "%s"', [APath]);
     {$ENDIF}
-    if not RenameFile(TmpPath, APath) then
+    if not HostRenameFile(TmpPath, APath) then
       raise EInOutError.CreateFmt('cannot publish "%s"', [APath]);
   finally
     Stream.Free;

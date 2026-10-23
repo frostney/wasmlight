@@ -499,7 +499,22 @@ function MakeArrayCompType(const AArr: TWasmArrayType): TWasmCompType;
 
 function ExecutionTierName(const ATier: TWasmExecutionTier): string;
 
+{ RenameFile where the host has one. A WebAssembly host has none: WASI's
+  path_rename would add an import to every lakon module, and the artifacts
+  published through a rename (AOT caches, native executables) cannot be
+  produced there anyway, so the rename fails and the caller reports it. }
+function HostRenameFile(const AOldName, ANewName: string): Boolean;
+
 implementation
+
+function HostRenameFile(const AOldName, ANewName: string): Boolean;
+begin
+  {$IFDEF WASM_HOST_WASI}
+  Result := False;
+  {$ELSE}
+  Result := RenameFile(AOldName, ANewName);
+  {$ENDIF}
+end;
 
 const
   SECTION_NAMES: array[TWasmSectionId] of string = (
