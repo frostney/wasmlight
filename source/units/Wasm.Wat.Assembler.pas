@@ -1,5 +1,5 @@
 { Wasm.Wat.Assembler — the `wat` text-format assembler (Track C;
-  .agent/design/wat-assembler.md §2, §3, §6).
+  docs/design/wat-assembler.md §2, §3, §6).
 
   The assembler lowers module TEXT to the binary encoding and hands the bytes
   to the shipped DecodeModule -> ValidateModule pipeline (§1): it produces

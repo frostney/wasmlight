@@ -2,7 +2,7 @@
   floating-point literal TEXT to their exact bit patterns.
 
   This is the highest single fidelity risk in the text-format assembler and is
-  deliberately a leaf unit (design .agent/design/wat-assembler.md §2(d), §6):
+  deliberately a leaf unit (design docs/design/wat-assembler.md §2(d), §6):
   it depends only on Wasm.Core, so every boundary case is testable in
   isolation with a literal spelled next to its expected bits. It emits BITS,
   not sLEB128 — the emitter (Wasm.Wat.Emit) encodes them — and it enforces the

@@ -9,6 +9,11 @@ build/
 .lwpt/sessions/
 .lwpt/install.lock
 
+# Agent working state: handoffs, wait checkpoints, and scratch designs are
+# local to a session and never committed. Design contracts that still
+# describe the shipped code live in docs/design/.
+.agent/
+
 # FPC artefacts. These should never appear with -FE build, but defensive
 # in case a contributor runs fpc by hand without the output-dir flag.
 *.o

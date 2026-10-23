@@ -13,7 +13,7 @@
 
   The grammar (the Track C assembler) consumes this table and never
   hard-codes an opcode; the table is data-driven and lives in its own unit
-  (.agent/design/wat-assembler.md §6) so that families can be appended
+  (docs/design/wat-assembler.md §6) so that families can be appended
   without touching the grammar.
 
   The $FD vector space is present: BuildVector adds the 256 assigned

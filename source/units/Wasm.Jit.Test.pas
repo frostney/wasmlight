@@ -1,5 +1,5 @@
 { Unit suite for Wasm.Jit — the differential milestone and the Wave-2 spine
-  (.agent/design/jit-spec.md §11, §12.2, §12.3 Wave 2).
+  (jit-spec.md §11, §12.2, §12.3 Wave 2).
 
   THE METHOD IS DIFFERENTIAL (ADR-0001, §11). Every test builds a small module,
   runs an export INTERPRETED (the tier of record, the oracle), then force-

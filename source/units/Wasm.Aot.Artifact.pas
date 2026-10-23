@@ -1,6 +1,6 @@
 { Wasm.Aot.Artifact — the `.waot` ahead-of-time artifact format: the fixed-width
   little-endian reader and writer, the content hashes, and the reloc-table
-  encode/decode (.agent/design/aot-spec.md §2).
+  encode/decode (aot-spec.md §2).
 
   PURE FORMAT. This unit knows how to lay out and parse the bytes of a `.waot`
   file and nothing else: it does not emit machine code, map memory, decode wasm,

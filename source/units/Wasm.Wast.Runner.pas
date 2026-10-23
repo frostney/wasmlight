@@ -120,7 +120,7 @@ type
     wrsStaged   { would fail, but only on deliberately staged work }
   );
 
-  { Which execution tier a run drives (.agent/design/jit-spec.md §11, §12.3).
+  { Which execution tier a run drives (jit-spec.md §11, §12.3).
 
     wtmInterp is the DEFAULT and the tier of record (ADR-0001): no JIT is
     registered, every function runs interpreted, and every corpus number is

@@ -1,16 +1,21 @@
 # The `wat` text-format assembler — design contract
 
-Status: design, not yet implemented. Track C (docs/roadmap.md).
+> **Status.** This is the design contract Track C was implemented
+> against, moved out of the agent scratchpad. The shipped code is the
+> authority; where they differ, trust the code and
+> [architecture.md](../architecture.md). Checked against the source at
+> `deff651`, the design below still describes what shipped, except
+> these passages, which are historical:
+>
+> - the executive summary's corpus counts and §6's "modified elsewhere" list and waves.
+> - §2(a) "Feeding the two module forms" and the source-span bullet in §5: re-lexing from source spans was never built; the runner rebuilds text from the parsed tree.
+> - §4's "today/after" taxonomy: `assert_unlinkable`, `invoke` and `register` are now judged.
+> - The open items.
+
 Spec citations are against `wasm-mcp` pinned `spec/main`
 `d7b37e4170d8315f2f1283aed4e8076591a9a333`; corpus tallies against
 `WebAssembly/testsuite@de54fd27ecf3e68dfd16b6199c548df77b6a2cc1`
 (288 scripts, the checkout under `tests/spec/testsuite/`).
-
-This file is persisted in-repo deliberately: the implementation spans
-sessions and the decisions below are the thing that must survive a
-context reset. It is **not to be committed** — it is working state, like
-`.agent/HANDOFF.md` is working state, and unlike `.agent/HANDOFF.md` it
-has no audience outside the implementing agent.
 
 ## Executive summary
 

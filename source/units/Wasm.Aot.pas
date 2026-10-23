@@ -1,4 +1,4 @@
-{ Wasm.Aot — the ahead-of-time compile and load drivers (.agent/design/aot-spec.md
+{ Wasm.Aot — the ahead-of-time compile and load drivers (aot-spec.md
   §3, §4). Serializes a module's JIT-compiled functions into a `.waot` artifact
   (AotCompileModule) and, in a fresh store, re-decodes+re-validates the module,
   checks every guard, maps the artifact's code executable, fills the helper

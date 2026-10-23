@@ -113,7 +113,7 @@ type
 
   { The runtime representation of a v128 value — the SHARED shape both the
     interpreter's register file and the GC's struct/array storage read and
-    write through (.agent/design/simd-spec.md §1.3). It is deliberately a
+    write through (docs/design/simd-spec.md §1.3). It is deliberately a
     plain 16-byte value record with NO managed fields, so it may live on a
     frame a trap unwind can skip (ADR-0009) and be copied with a raw Move.
 
@@ -343,7 +343,7 @@ type
     NativeUInt, so Wasm.Core keeps its no-runtime-dependency rule — a runtime
     TWasmRef is NativeUInt) and the thrown tag's store address, so an embedder
     (Track F) can recover the tag and payload; the conformance corpus only
-    needs the class. .agent/design/eh-spec.md §2.4. }
+    needs the class. docs/design/eh-spec.md §2.4. }
   EWasmException = class(EWasmError)
   public
     ExnRef: NativeUInt;
@@ -358,7 +358,7 @@ type
     what lets the conformance runner discriminate a real text error (which
     `assert_malformed` over a text/quote module expects) from a decode error
     on the assembler's OWN output (which is an internal defect — INV-1 in
-    .agent/design/wat-assembler.md, never a malformed pass).
+    docs/design/wat-assembler.md, never a malformed pass).
 
     Line and Column locate the fault, 1-based, for diagnostics; the corpus
     match on `assert_malformed` is a PREFIX match, so the canonical string

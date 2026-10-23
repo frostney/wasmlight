@@ -1,5 +1,5 @@
 { Wasm.Wat.Names — identifier and symbol resolution for the `wat` text-format
-  assembler (Track C, .agent/design/wat-assembler.md §2(b), §2(c.1), §7).
+  assembler (Track C, docs/design/wat-assembler.md §2(b), §2(c.1), §7).
 
   This unit owns the twelve identifier contexts the module grammar names, the
   label stack, the per-type field namespaces, duplicate detection, and — the

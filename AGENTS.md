@@ -127,7 +127,7 @@ canonical vocabulary before planning anything.
      `TRepeatableOption` objects, so the registry stays the single source of
      truth and `run --help` renders from it. The clean upstream fix is a
      `--` terminator in lwpt's `cli`; until it lands this pre-scan is the
-     sanctioned workaround (embedding-spec.md §4.2).
+     sanctioned workaround (`ParseRunArgs` in `source/apps/wasmlight.pas`).
   3. `wasmlight-shell` has no Wasmlight runtime flags. It pre-scans
      `ParamStr` only to split an optional template payload path from the
      guest argv: an empty embedded image takes the first token as the
@@ -201,7 +201,7 @@ they still belong in a test.
 | `scripts/` | InstantFPC automation (`stamp-version.pas`, `pack-release.pas`, `verify-archive.pas`) |
 | `tests/fixtures/` | Real toolchain-compiled `.wasm` cross-check corpus (committed; regenerate with `regenerate.sh`) |
 | `tests/spec/` | The upstream conformance harness lands here |
-| `docs/` | Architecture, quick start, tooling, code style, build system, testing, deployment, roadmap, ADRs |
+| `docs/` | Architecture, quick start, tooling, code style, build system, testing, deployment, roadmap, ADRs, design contracts (`docs/design/`) |
 
 ### Library units by layer
 

@@ -1,5 +1,5 @@
 { Unit suite for Wasm.Jit.Arm64 — the aarch64 encoder and op templates
-  (.agent/design/jit-spec.md §12.3 Wave 1 + Wave 2).
+  (jit-spec.md §12.3 Wave 1 + Wave 2).
 
   TWO layers of proof:
     - PORTABLE bit assertions on the pure word builders, so a wrong constant is

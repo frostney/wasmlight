@@ -1,5 +1,5 @@
 { Wasm.Jit.X64 — the x86-64 (System V AMD64) instruction encoder and the
-  per-IR-op code templates the baseline JIT emits (.agent/design/jit-spec.md
+  per-IR-op code templates the baseline JIT emits (jit-spec.md
   §12.3 Wave 7). Second backend; mirrors Wasm.Jit.Arm64 op-for-op behind the
   same driver (Wasm.Jit). No new semantics — encoder work only.
 
