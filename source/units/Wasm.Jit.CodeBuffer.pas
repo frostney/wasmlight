@@ -1,6 +1,6 @@
 { Wasm.Jit.CodeBuffer — executable-memory allocation, the W^X transition,
   and the raw byte/word emission primitives the A64/x64 encoders build on
-  (.agent/design/jit-spec.md §3, §12.1).
+  (jit-spec.md §3, §12.1).
 
   This is Track I's de-risking unit: it proves that JIT-emitted machine-code
   bytes can be written, made executable, cache-flushed, and CALLED on this

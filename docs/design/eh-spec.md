@@ -10,6 +10,7 @@
 > - §0's "today" (`StageException`), §6's "replace the arm", and §7.2–§8: the staging and wave plan.
 > - §2.3 predates the compiled tiers: an unwind also crosses compiled-seam frames (`rtCompiledSeam`, `Native`, `SeamHop` in `Wasm.Interp`).
 > - §3: a `v128` argument occupies a pair of slots (`ExnSetArgSlot` / `ExnGetArgSlot`), not one.
+> - The reference to `interp-spec.md` below: that contract is retired (see the [index](README.md)).
 
 The contract builds on the shipped source of `Wasm.Ir`,
 `Wasm.Validator.Body`, `Wasm.Runtime.*`,

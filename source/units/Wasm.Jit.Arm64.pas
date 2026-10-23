@@ -1,5 +1,5 @@
 { Wasm.Jit.Arm64 — the aarch64 (A64) instruction encoder and the per-IR-op
-  code templates the baseline JIT emits (.agent/design/jit-spec.md §1, §5, §6,
+  code templates the baseline JIT emits (jit-spec.md §1, §5, §6,
   §8, §12.3 Wave 1 + Wave 2).
 
   This is the FIRST backend (§2.1: the dev host is aarch64-darwin, so the whole

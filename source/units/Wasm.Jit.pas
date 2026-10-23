@@ -1,5 +1,5 @@
 { Wasm.Jit — the baseline-JIT driver, the compiled-function dispatcher, and the
-  per-store code cache (.agent/design/jit-spec.md §4, §5, §10.3, §12.2/§12.3
+  per-store code cache (jit-spec.md §4, §5, §10.3, §12.2/§12.3
   Wave 1).
 
   This is the unit that plugs the JIT in behind the tier seam (§4.1). It does

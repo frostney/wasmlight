@@ -1,6 +1,6 @@
 { Unit suite for Wasm.Jit.CodeBuffer — the Track I de-risking proof.
 
-  THE POINT of this suite (.agent/design/jit-spec.md §12.2/§12.3 Wave 1): show
+  THE POINT of this suite (jit-spec.md §12.2/§12.3 Wave 1): show
   that on this host a JIT-emitted machine-code function can be written, made
   executable, cache-flushed, and CALLED, returning the right value. If the
   executable-memory machinery does not work here the whole track is blocked, so

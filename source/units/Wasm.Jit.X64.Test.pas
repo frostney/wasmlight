@@ -1,5 +1,5 @@
 { Unit suite for Wasm.Jit.X64 — the x86-64 (System V AMD64) encoder and op
-  templates (.agent/design/jit-spec.md §12.3 Wave 7).
+  templates (jit-spec.md §12.3 Wave 7).
 
   PRIMARY PROOF ON THIS HOST: PORTABLE byte assertions on the encoder. The
   emitters compute bytes and never execute, so every assertion runs on the

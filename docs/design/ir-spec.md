@@ -13,6 +13,7 @@
 > - §3.2 and §8.1's `ReturnRegBase = P+L`: registers follow the slot rule (`LocalRegs` / `ResultRegs`) since a `v128` takes two slots.
 > - §6.2's start-function bullet: the start function is not part of C.REFS.
 > - Cross-references in §1.2 and §1.4 to §4.4–§4.9 point at shifted subsections.
+> - `track-b-contract.md`, which this document says it elaborates, was never tracked.
 
 This document **elaborates** `track-b-contract.md` and may not contradict
 it. Where the contract pinned something, this document says so; where it
