@@ -6,7 +6,7 @@
   reader in Wasm.Binary / Wasm.Decoder.Common / Wasm.Decoder.Types, and
   the Track C differential test proves the inversion by feeding this unit's
   output straight back through DecodeModule and comparing the model — no
-  grammar required (.agent/design/wat-assembler.md §2(e), §6).
+  grammar required (docs/design/wat-assembler.md §2(e), §6).
 
   Two rules run through the whole unit and both come from the decoder
   being our oracle:
@@ -31,7 +31,7 @@
   Section framing uses build-then-prefix, never reserve-and-backpatch: a
   section body is built into its own buffer, then emitted as
   [id][u32 length][body] with the length computed from the finished body
-  (.agent/design/wat-assembler.md §2(e)). A padded five-byte length LEB
+  (docs/design/wat-assembler.md §2(e)). A padded five-byte length LEB
   would again be the over-long encoding the decoder rejects, so the extra
   copy on this cold path is the honest choice. The name section is
   deliberately NOT emitted (§2(e)): it is custom, so no conformance
@@ -130,7 +130,7 @@ type
     they were added (Wasm.Core.SectionOrderPosition — which is NOT id
     order). Text field order is free but section order is fixed, so this
     is where the "scramble the fields, assemble, decode, assert the
-    section table" invariant is enforced (.agent/design/wat-assembler.md
+    section table" invariant is enforced (docs/design/wat-assembler.md
     §2(e)). }
   TWasmModuleEmitter = class
   private

@@ -1,7 +1,14 @@
 # Track G — SIMD (the `v128` vector instruction set)
 
-Status: design contract, not yet implemented. Written against the tree at
-`.agent/HANDOFF.md` (Tracks A/B/C/D/E delivered, `$FD` staged everywhere).
+> **Status.** This is the design contract Track G was implemented
+> against, moved out of the agent scratchpad. The shipped code is the
+> authority; where they differ, trust the code and
+> [architecture.md](../architecture.md). Checked against the source at
+> `deff651`, the design below still describes what shipped, except
+> these passages, which are historical:
+>
+> - the staging-removal passages in §3.1, §3.6, §5.6, §6.4 and Appendix C, and §8's wave and corpus arithmetic.
+> - §4.1's leaf names: the shipped leaves are `I8x16Add` and so on, and `MemLoadV128` / `MemStoreV128` take the interpreter context.
 
 Spec authority: `wasm-mcp` 0.2.16, pinned `spec/main`
 `d7b37e4170d8315f2f1283aed4e8076591a9a333` (ADR-0004's 3.0 draft).
@@ -239,9 +246,12 @@ documented as such (§9 item 8):
 
 - **Wasm→wasm calls.** `AuxU32` argument and result blocks name *slots*,
   so a `v128` argument contributes **two consecutive entries** (`k`,
-  `k+1`). `PushWasmFrame`'s existing per-slot copy loop is then correct
-  unmodified, because the callee's `v128` parameter also occupies two
-  consecutive slots in the same order.
+  `k+1`) in a dense block. The callee's registers are not dense: each
+  `v128` parameter or result starts on an even slot, with a pad before it
+  where needed. The copy is therefore not positional: `ScatterParamsFlat`,
+  `ScatterParamsFromBlock` and `ScatterResultsFlat` (`Wasm.Interp`) place
+  argument `i` at `LocalRegs[i]` and result `k` at `ResultRegs[k]` (plus
+  one for the high half) and skip the pads.
 - **Host calls.** `TWasmHostCallback`'s `AParams` / `AResults` are
   positional `TWasmValue` arrays; a `v128` param or result occupies two
   consecutive entries, low half first. `HostCall`'s buffers and loops are

@@ -1,8 +1,18 @@
 # Track H — exception handling (`try_table` / `throw` / `throw_ref`)
 
-Design spec. **Not source.** Scratchpad only — never commit. The deliverable
-is this document; implementation spans a few waves and agents (§8). It builds
-on the shipped source of `Wasm.Ir`, `Wasm.Validator.Body`, `Wasm.Runtime.*`,
+> **Status.** This is the design contract Track H was implemented
+> against, moved out of the agent scratchpad. The shipped code is the
+> authority; where they differ, trust the code and
+> [architecture.md](../architecture.md). Checked against the source at
+> `deff651`, the design below still describes what shipped, except
+> these passages, which are historical:
+>
+> - §0's "today" (`StageException`), §6's "replace the arm", and §7.2–§8: the staging and wave plan.
+> - §2.3 predates the compiled tiers: an unwind also crosses compiled-seam frames (`rtCompiledSeam`, `Native`, `SeamHop` in `Wasm.Interp`).
+> - §3: a `v128` argument occupies a pair of slots (`ExnSetArgSlot` / `ExnGetArgSlot`), not one.
+
+The contract builds on the shipped source of `Wasm.Ir`,
+`Wasm.Validator.Body`, `Wasm.Runtime.*`,
 `Wasm.Interp`, and `Wasm.Wast.*`, and on the design docs `ir-spec.md`,
 `runtime-spec.md`, and `interp-spec.md`, which it may not contradict.
 
@@ -316,13 +326,12 @@ end;
 Notes tying this to shipped code:
 
 - **`ip` for an unwound-through caller is the call site.** `iroCall` stores
-  `Act^.IP := IP + 1` before descending (verified in `Wasm.Interp`), so a
-  caller's saved IP is `callsite+1`. That still lies within the enclosing
-  `try_table`'s `[StartInstr, EndInstr)`: the validator sets `EndInstr` at the
-  try_table's `end` **after** its own merge moves (`HandleEnd` comment: "the
-  protected range ends after the frame's own merge moves"), so both the call
-  instruction and the instruction after it are inside the range. A `call`
-  inside a `try_table` body is therefore correctly covered.
+  `Act^.IP := IP + 1` before descending, so a caller's saved IP is
+  `callsite+1`, and the unwind scans such a caller at `IP - 1`, the call
+  instruction itself: the instruction after the call is not always inside
+  the enclosing `try_table`'s `[StartInstr, EndInstr)` (corpus
+  `test-throw-1-2`). The throwing frame is scanned at its own IP, and a frame
+  that has published no call site (`IP = 0`) is scanned as is.
 - **Innermost-first, matching-aware.** Multiple table entries can cover one
   `ip` (nested `try_table`s in one function). The scan must try each covering
   entry's clauses and only fall through to the caller when *no* covering entry

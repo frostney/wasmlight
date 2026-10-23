@@ -1,5 +1,5 @@
 { Unit suite for Wasm.Wat.Lexer — the STRICT module-text tokenizer (Track C,
-  .agent/design/wat-assembler.md §2a, §4, §7).
+  docs/design/wat-assembler.md §2a, §4, §7).
 
   Every case here is one a permissive lexer gets wrong, and most are lifted
   from the upstream corpus (token.wast, const.wast, id.wast, annotations.wast)

@@ -1,6 +1,6 @@
 { Wasm.Wat.Lexer — the STRICT tokenizer for the WebAssembly text (module)
   format, the front end of the `wat` assembler (Track C, docs/roadmap.md,
-  design in .agent/design/wat-assembler.md §2a).
+  design in docs/design/wat-assembler.md §2a).
 
   This is deliberately NOT `Wasm.Wast`'s lexer. `Wasm.Wast` tokenizes the
   conformance SCRIPT — a command soup that can afford to treat annotations

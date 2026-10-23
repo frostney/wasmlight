@@ -1,6 +1,18 @@
 # Track D — Runtime state and the precise collector
 
-Design contract. **Not source.** Scratchpad only — never commit.
+> **Status.** This is the design contract Track D was implemented
+> against, moved out of the agent scratchpad. The shipped code is the
+> authority; where they differ, trust the code and
+> [architecture.md](../architecture.md). Checked against the source at
+> `deff651`, the design below still describes what shipped, except
+> these passages, which are historical:
+>
+> - §1.2's side vector: a `v128` occupies two adjacent slots.
+> - §1.3's extern conversions: `extern.convert_any` / `any.convert_extern` allocate wrapper objects (`wokExternalized` / `wokInternalized`); they are not identity.
+> - §2.1's `TWasmStore` field list: memories and the heap are private, and there are no `Traps` / `HostRoots` fields.
+> - §5.4's `sigsetjmp(buf, 1)`: the trap path uses `setjmp` with `SA_NODEFER`, and a WebAssembly host raises instead ([ADR-0020](../adr/0020-a-webassembly-host-raises-traps-directly.md)).
+> - §6.5's UNCONFIRMED marker (settled) and §6.6's "Track D has no tier" framing.
+> - §8 and Appendix B: the unit and wave plan.
 
 Spec pin: `wasm-mcp` 0.2.16, upstream `spec/main`
 `d7b37e4170d8315f2f1283aed4e8076591a9a333` (ADR-0004). Every spec claim
